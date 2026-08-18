@@ -10,3 +10,17 @@ When working on Douyinie architecture, provider selection, benchmarks, implement
 6. Preserve provider boundaries and fallbacks: CapCut/private APIs may accelerate the pipeline but must not be the only path required for core functionality.
 
 If new external repositories become materially useful, update `docs/reference-repositories.md` rather than creating another competing list.
+
+## Agent skills
+
+### Issue tracker
+
+Issues tracked in GitHub Issues via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five default triage labels, strings equal to role names. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout — root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
