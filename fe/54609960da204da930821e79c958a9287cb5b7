@@ -1,0 +1,31 @@
+AGENTS.md
+  s_fc393794a43864::t_e797a72e3ff375 8,25,36
+PRODUCT.md
+  s_cbac58c95f7438::t_db4ee9cab56bd0 54-56
+docs/agents/domain.md
+  s_fc393794a43864::t_59e56fc6150e16 7,21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "fe54609960da204da930821e79c958a9287cb5b7",
+  "prompts": {},
+  "sessions": {
+    "s_cbac58c95f7438": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "495274df-aecb-4cb4-b670-07e5888ed572",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_fc393794a43864": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53502eb6-5951-4a14-b9da-23d4c0e7c655",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
