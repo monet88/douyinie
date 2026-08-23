@@ -1,8 +1,8 @@
 # Douyinie — Domain Context & Invariant Glossary
 
 > [!IMPORTANT]
-> This document defines the canonical domain vocabulary and invariant contracts for Douyinie Phase 1.
-> If this document ever drifts from **[Implementation Spec #18](https://github.com/monet88/douyinie/issues/18)** (including normative amendment comments) or **[Wayfinder #1](https://github.com/monet88/douyinie/issues/1)**, the GitHub issues remain authoritative.
+> This document defines the canonical domain vocabulary and invariant contracts for Douyinie Phase 1. Detailed system architecture is materialized in **[`docs/architecture/phase1-architecture.md`](docs/architecture/phase1-architecture.md)**.
+> If this document or the architecture document ever drifts from **[Implementation Spec #18](https://github.com/monet88/douyinie/issues/18)** (including normative amendment comments) or **[Wayfinder #1](https://github.com/monet88/douyinie/issues/1)**, the GitHub issues remain authoritative.
 
 ---
 
@@ -52,7 +52,7 @@ Calculates cadence and duration adaptation for each speech segment:
 
 ## Approved Testing Seams
 
-Phase 1 maintains **exactly two approved testing seams**:
+Phase 1 maintains **exactly two approved architectural integration/acceptance testing seams**; ordinary in-memory unit tests for pure helpers/parsers/math do not count as additional architectural seams:
 
 1. **Seam 1 — RuntimeHost Localhost API Contract**:
    Acceptance seam testing end-to-end pipeline execution over versioned localhost API endpoints (audio routing, `TextRegionPlan`, compact overlays, voice audition, zero-overrun timing, and exception queues).

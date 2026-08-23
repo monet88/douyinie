@@ -51,5 +51,6 @@ The system is designed for unattended execution by default, surfacing only genui
 
 1. **[Wayfinder Issue #1](https://github.com/monet88/douyinie/issues/1)**: Authoritative architectural and product decisions.
 2. **[Implementation Spec #18](https://github.com/monet88/douyinie/issues/18)**: Authoritative implementation spec, including normative revalidation amendments.
-3. **`PRODUCT.md` & `CONTEXT.md`**: Repo-local product charter and domain invariants.
-4. **`docs/reference-repositories.md`**: External mining inventory (not a dependency lockfile).
+3. **[`docs/architecture/phase1-architecture.md`](docs/architecture/phase1-architecture.md)**: Canonical repo-local Phase 1 architecture synthesis of the locked #16 architecture plus authoritative #18 amendments.
+4. **`PRODUCT.md` & `CONTEXT.md`**: Repo-local product charter and domain invariants.
+5. **`docs/reference-repositories.md`**: External mining inventory (not a dependency lockfile).

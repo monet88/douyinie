@@ -5,6 +5,7 @@ When working on Douyinie architecture, provider selection, benchmarks, implement
 1. **Hierarchy of Truth**:
    - **[Wayfinder Issue #1](https://github.com/monet88/douyinie/issues/1)**: Canonical source of truth for resolved decisions.
    - **[Implementation Spec #18](https://github.com/monet88/douyinie/issues/18)**: Authoritative Phase 1 implementation spec (body + normative revalidation amendments).
+   - **[`docs/architecture/phase1-architecture.md`](docs/architecture/phase1-architecture.md)**: Canonical repo-local Phase 1 architecture synthesis; it materializes the locked #16 architecture plus authoritative #18 amendments. If it drifts from #1/#18, GitHub issues win.
    - **[`PRODUCT.md`](PRODUCT.md)** & **[`CONTEXT.md`](CONTEXT.md)**: Repo-local product charter and domain invariant glossary.
    - **[`docs/reference-repositories.md`](docs/reference-repositories.md)**: Mining and reference inventory (**not** a dependency lockfile).
 
@@ -21,7 +22,7 @@ When working on Douyinie architecture, provider selection, benchmarks, implement
    - Keep `CODE_LICENSE`, `MODEL_LICENSE`, `DATA_LICENSE`, and `SERVICE_TERMS` separate. Rewriting source code does not remove model/data obligations.
 
 4. **Testing Seams**:
-   - Maintain exactly two approved testing seams: **Seam 1** (localhost RuntimeHost API) and **Seam 2** (StageWorker runtime contract).
+   - Maintain exactly two approved architectural integration/acceptance seams: **Seam 1** (localhost RuntimeHost API) and **Seam 2** (StageWorker runtime contract). Ordinary in-memory unit tests for pure helpers/parsers/math do not create another architectural seam.
 
 ## Agent Skills
 
@@ -32,4 +33,4 @@ Issues tracked in GitHub Issues via the `gh` CLI. See `docs/agents/issue-tracker
 Five default triage labels, strings equal to role names. See `docs/agents/triage-labels.md`.
 
 ### Domain Docs
-Single-context layout — root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
+Single-context layout — root `CONTEXT.md` + `docs/adr/`; Phase 1 architecture is materialized in `docs/architecture/phase1-architecture.md`. See `docs/agents/domain.md`.
