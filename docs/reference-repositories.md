@@ -1,6 +1,6 @@
 # Douyinie Reference Repository Inventory
 
-Last reviewed: 2026-08-18
+Last reviewed: 2026-08-23
 
 This file is the canonical inventory of external repositories worth studying for Douyinie. It is a **reference/mining list, not a dependency lockfile**.
 
@@ -9,6 +9,7 @@ For resolved architecture decisions, the source of truth is the Wayfinder map: h
 ## How to use this list
 
 - Prefer reading architecture, interfaces, data models, retry logic, timing logic, and UX patterns before copying code.
+- Clone repositories being actively mined into the repo-local .ref/ directory; keep .ref/ git-ignored and pin observations to the tested commit SHA.
 - A repository being listed here does not mean it is approved as a production dependency.
 - Track `CODE_LICENSE`, `MODEL_LICENSE`, and `DATA_LICENSE` separately. Rewriting source code does not remove model/checkpoint/data/service obligations.
 - Private/reverse-engineered CapCut endpoints are technically useful references but must remain behind provider adapters and fallbacks.
@@ -78,6 +79,7 @@ These are the highest-value repositories to inspect before implementation.
 - MioSub — https://github.com/corvo007/MioSub
 - xiaohu-video-translate — https://github.com/xiaohuailabs/xiaohu-video-translate
 - VideoSubX — https://github.com/assassinliujie/VideoSubX
+- VoiceStudio — https://github.com/debpalash/VoiceStudio
 - video_translator — https://github.com/wencharmwang/video_translator
 - VideoSyncMaster — https://github.com/TianDongL/VideoSyncMaster
 - AutoVidDub — https://github.com/aidayang/AutoVidDub
@@ -201,6 +203,11 @@ These are retained only for future optional facial/mouth-sync work. V1 requires 
 
 - TrackExtract — local-first desktop shell + Python ML engine/job/model-registry patterns
   - https://github.com/AdamWentworth/TrackExtract
+- VoiceStudio (formerly OmniVoice-Studio; tested v0.5.0 at `98c9e68aae96ce83db580afa4ca0bdce79a454ae`) — local-first Tauri + React/Vite + FastAPI app with engine/model catalogue, CPU/CUDA/MPS/ROCm routing, OpenAI-compatible local API, authenticated remote GPU workers, and a Colab T4 notebook. Dubbing is useful to mine for pre-TTS slot adaptation, measured natural-rate TTS, gap/slack accounting, deterministic fit plans/fingerprints, cache-aware incremental regeneration, and golden tests. Do not copy its Smart Fit policy into Douyinie: it may slow short audio, retime video, or trim overflow; Wayfinder #6 keeps source anchors immutable and prefers silence/rewrite/review. App code is AGPL-3.0-only; bundled upstream `omnivoice/` remains Apache-2.0.
+  - https://github.com/debpalash/VoiceStudio
+  - Low-resource OmniVoice runtime to benchmark: https://github.com/ServeurpersoCom/omnivoice.cpp (MIT runtime; VoiceStudio pins `886fc079838ca7400cb2b42b36e2a65aa1daabe8` and Q4/Q8/BF16 GGUF profiles. The local VoiceStudio checkout contains zero-byte runtime placeholders, so build/download the binary before any Douyinie benchmark.)
+- T-blao — local-first Electron shell, on-demand engine/bootstrap manager, JSONL worker protocol, deterministic subtitle layout/rendering; root PolyForm Noncommercial, mine architecture/UX patterns only
+  - https://github.com/NeeyuBL/neeyut-blao
 - mlx-audio-separator — Apple Silicon/MLX audio-separation reference
   - https://github.com/ssmall256/mlx-audio-separator
 - Music-Separator-GUI — audio-separator/UVR integration and model-selection UX

@@ -1,26 +1,35 @@
-# Douyinie Agent Context
+# Douyinie Agent Context & Guidelines
 
 When working on Douyinie architecture, provider selection, benchmarks, implementation planning, or code changes:
 
-1. Read `docs/reference-repositories.md` before selecting or adding external components.
-2. Treat the Wayfinder map as the source of truth for resolved product/architecture decisions: https://github.com/monet88/douyinie/issues/1
-3. Treat `docs/reference-repositories.md` as a mining/reference inventory, **not** a dependency lockfile. Resolved Wayfinder decisions outrank generic repository examples.
-4. Keep `CODE_LICENSE`, `MODEL_LICENSE`, and `DATA_LICENSE` separate. Rewriting code does not remove checkpoint/data/service obligations.
-5. Core V1 dubbing is timeline-constrained speech alignment, not facial lip synchronization.
-6. Preserve provider boundaries and fallbacks: CapCut/private APIs may accelerate the pipeline but must not be the only path required for core functionality.
+1. **Hierarchy of Truth**:
+   - **[Wayfinder Issue #1](https://github.com/monet88/douyinie/issues/1)**: Canonical source of truth for resolved decisions.
+   - **[Implementation Spec #18](https://github.com/monet88/douyinie/issues/18)**: Authoritative Phase 1 implementation spec (body + normative revalidation amendments).
+   - **[`PRODUCT.md`](PRODUCT.md)** & **[`CONTEXT.md`](CONTEXT.md)**: Repo-local product charter and domain invariant glossary.
+   - **[`docs/reference-repositories.md`](docs/reference-repositories.md)**: Mining and reference inventory (**not** a dependency lockfile).
 
-If new external repositories become materially useful, update `docs/reference-repositories.md` rather than creating another competing list.
+2. **Core Pipeline Invariants**:
+   - **Dialogue/Narration Dubbing Only**: Preserve BGM, sound effects (Foley/ambient), singing/music-vocals, and instrumental outros perceptually and semantically. Never replace full audio tracks with TTS.
+   - **Immutable Source Timing**: Video cuts are locked; shorten/rewrite text concise first; probe actual duration; enforce zero overrun (`tts_finish <= source_end`) with natural inter-turn breathing room.
+   - **Multi-Role `TextRegionPlan`**: Classify text as `speech_subtitle`, `semantic_text`, `instructional_ui_text`, `brand_keep`, or `ignore`. In-place cover/overlay is the default; inpainting is non-default.
+   - **Compact Fit-Content Subtitle Box**: Background box must hug rendered text (1–2 lines max, compact padding), never a full-width rectangle. Keep UI buttons, timeline tracks, and finger tap targets unobstructed.
+   - **Pre-Dub Voice Audition**: AI recommended default, 5s standalone or 10s contextual audition mixed with video BGM, 1 stable voice per speaker per run.
+   - **Target Languages**: Vietnamese AND English (VI/EN).
+   - **No Facial Lip-Sync**: Timeline-constrained speech alignment defines V1; facial lip sync is out of scope.
 
-## Agent skills
+3. **Obligation Layers**:
+   - Keep `CODE_LICENSE`, `MODEL_LICENSE`, `DATA_LICENSE`, and `SERVICE_TERMS` separate. Rewriting source code does not remove model/data obligations.
 
-### Issue tracker
+4. **Testing Seams**:
+   - Maintain exactly two approved testing seams: **Seam 1** (localhost RuntimeHost API) and **Seam 2** (StageWorker runtime contract).
 
+## Agent Skills
+
+### Issue Tracker
 Issues tracked in GitHub Issues via the `gh` CLI. See `docs/agents/issue-tracker.md`.
 
-### Triage labels
-
+### Triage Labels
 Five default triage labels, strings equal to role names. See `docs/agents/triage-labels.md`.
 
-### Domain docs
-
+### Domain Docs
 Single-context layout — root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
