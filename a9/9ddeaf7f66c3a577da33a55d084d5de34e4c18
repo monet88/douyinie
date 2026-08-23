@@ -1,0 +1,39 @@
+docs/reference-repositories.md
+  s_6a9f1c04854135::t_f5656c315a49e2 3,12,82,206-210
+PRODUCT.md
+  s_cbac58c95f7438::t_9b570f2077d0e2 1-55
+AGENTS.md
+  s_fc393794a43864::t_94464eebbc6110 1,5-9,11-18,20-21,23-24,26,28-29,31,34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "a99ddeaf7f66c3a577da33a55d084d5de34e4c18",
+  "prompts": {},
+  "sessions": {
+    "s_6a9f1c04854135": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fd2cd430dffeWOgs3RQG91HVQu",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_cbac58c95f7438": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "495274df-aecb-4cb4-b670-07e5888ed572",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_fc393794a43864": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53502eb6-5951-4a14-b9da-23d4c0e7c655",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
