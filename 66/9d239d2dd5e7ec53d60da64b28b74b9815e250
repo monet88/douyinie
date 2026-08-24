@@ -1,0 +1,46 @@
+.gitignore
+  h_17f2fa2b92da6a 37-43,47
+cmd/runtimehost/main.go
+  h_17f2fa2b92da6a 1-121
+go.mod
+  h_17f2fa2b92da6a 1-19
+go.sum
+  h_17f2fa2b92da6a 1-50
+internal/cas/cas.go
+  h_17f2fa2b92da6a 1-241
+internal/cas/cas_test.go
+  h_17f2fa2b92da6a 1-129
+internal/domain/types.go
+  h_17f2fa2b92da6a 1-105
+internal/media/probe.go
+  h_17f2fa2b92da6a 1-255
+internal/media/probe_test.go
+  h_17f2fa2b92da6a 1-101
+internal/provider/fake.go
+  h_17f2fa2b92da6a 1-127
+internal/provider/provider.go
+  h_17f2fa2b92da6a 1-95
+internal/server/server.go
+  h_17f2fa2b92da6a 1-387
+internal/service/ingest.go
+  h_17f2fa2b92da6a 1-167
+internal/service/ingest_test.go
+  h_17f2fa2b92da6a 1-309
+internal/storage/sqlite.go
+  h_17f2fa2b92da6a 1-539
+internal/storage/sqlite_test.go
+  h_17f2fa2b92da6a 1-161
+test/seam1/acceptance_test.go
+  h_17f2fa2b92da6a 1-428
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "669d239d2dd5e7ec53d60da64b28b74b9815e250",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
