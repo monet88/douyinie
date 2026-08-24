@@ -1,0 +1,58 @@
+cmd/runtimehost/main.go
+  h_17f2fa2b92da6a 17,59,61-64,99-107
+internal/cas/stage_identity.go
+  h_17f2fa2b92da6a 1-71
+internal/cas/stage_identity_test.go
+  h_17f2fa2b92da6a 1-63
+internal/config/config.go
+  h_17f2fa2b92da6a 1-153
+internal/config/config_test.go
+  h_17f2fa2b92da6a 1-133
+internal/domain/governance.go
+  h_17f2fa2b92da6a 1-201
+internal/governance/credentials.go
+  h_17f2fa2b92da6a 1-259
+internal/governance/credentials_other.go
+  h_17f2fa2b92da6a 1-14
+internal/governance/credentials_windows.go
+  h_17f2fa2b92da6a 1-118
+internal/governance/credentials_windows_test.go
+  h_17f2fa2b92da6a 1-60
+internal/governance/governance_test.go
+  h_17f2fa2b92da6a 1-529
+internal/governance/license.go
+  h_17f2fa2b92da6a 1-153
+internal/governance/policy.go
+  h_17f2fa2b92da6a 1-92
+internal/provider/circuit.go
+  h_17f2fa2b92da6a 1-133
+internal/provider/fake.go
+  h_17f2fa2b92da6a 3-4,11-13,16-21,36-46,64-74,86-89,96-106,124-134,151-161,178-188,203-269
+internal/provider/provider.go
+  h_17f2fa2b92da6a 5,7-8,22-23,26-29,38-39,76-91,102-104,108,110-112
+internal/provider/router.go
+  h_17f2fa2b92da6a 1-604
+internal/provider/router_test.go
+  h_17f2fa2b92da6a 1-613
+internal/server/server.go
+  h_17f2fa2b92da6a 8,14,16,22-24,27-37,42-51,56-68,70-79,94-98,137-155,415-421,426-429,431-440,446-811
+internal/storage/sqlite.go
+  h_17f2fa2b92da6a 14,170-334,631,706-1093
+internal/storage/sqlite_test.go
+  h_17f2fa2b92da6a 5,162-377
+test/seam1/acceptance_test.go
+  h_17f2fa2b92da6a 15,19,29,33,37-40,65-87,90-98,109,113
+test/seam1/governance_test.go
+  h_17f2fa2b92da6a 1-1188
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "4fee2460da9513477f594785b57ba13384498859",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
