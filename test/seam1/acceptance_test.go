@@ -12,9 +12,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/governance"
 	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/server"
@@ -24,10 +26,16 @@ import (
 
 type testHarness struct {
 	server   *httptest.Server
+	srv      *server.Server
 	db       *storage.DB
 	casStore *cas.Store
 	registry *provider.Registry
+	router   *provider.Router
 	dir      string
+}
+
+func (h *testHarness) SetExecutor(exec server.Executor) {
+	h.srv.SetExecutor(exec)
 }
 
 func setupHarness(t *testing.T) *testHarness {
@@ -54,13 +62,40 @@ func setupHarness(t *testing.T) *testHarness {
 
 	ingestSvc := service.NewIngestService(db, casStore, prober)
 	fakeRegistry := provider.NewSeam1FakeRegistry()
+	polSvc := governance.NewPolicyService(db)
+	licSvc := governance.NewLicenseService(db)
+	credSvc := governance.NewCredentialService(db)
+
+	initCtx := context.Background()
+	for _, p := range fakeRegistry.ListAll() {
+		mName, mVer := p.ModelInfo()
+		if mName != "" {
+			_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+				DependencyName: mName,
+				Version:        mVer,
+				SHA256:         "sha256_mock_" + mName,
+				SourceRepo:     "github.com/monet88/douyinie/models/" + mName,
+				CodeLicense:    "Apache-2.0",
+				ModelLicense:   "Apache-2.0",
+				DataLicense:    "OpenData",
+				ServiceTerms:   "Standard",
+				Verified:       true,
+				CreatedAt:      time.Now().UTC(),
+			})
+		}
+	}
+	router := provider.NewRouter(fakeRegistry, polSvc, licSvc, credSvc, nil, db)
 
 	srv := server.New(server.Config{
-		Addr:     "127.0.0.1:0",
-		DB:       db,
-		CASStore: casStore,
-		Ingest:   ingestSvc,
-		Registry: fakeRegistry,
+		Addr:       "127.0.0.1:0",
+		DB:         db,
+		CASStore:   casStore,
+		Ingest:     ingestSvc,
+		Registry:   fakeRegistry,
+		PolicySvc:  polSvc,
+		LicenseSvc: licSvc,
+		CredSvc:    credSvc,
+		Router:     router,
 	})
 
 	ts := httptest.NewServer(srv.Handler())
@@ -71,9 +106,11 @@ func setupHarness(t *testing.T) *testHarness {
 
 	return &testHarness{
 		server:   ts,
+		srv:      srv,
 		db:       db,
 		casStore: casStore,
 		registry: fakeRegistry,
+		router:   router,
 		dir:      tmpDir,
 	}
 }

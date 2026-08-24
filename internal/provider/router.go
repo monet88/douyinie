@@ -1,0 +1,604 @@
+package provider
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/governance"
+	"github.com/monet88/douyinie/internal/storage"
+)
+
+// RouteRequest defines the input criteria for provider selection.
+type RouteRequest struct {
+	RunID                 string
+	Stage                 ProviderType
+	Language              string
+	ExecutionProfile      domain.ExecutionProfile
+	ConsentGranted        bool
+	AuthorizedCredentials []string // Valid credential reference IDs or names
+	RequiredFeatures      []string
+	ExcludedProviders     []string
+}
+
+// RouteResult returns the selected provider, fallback candidates, and the selection decision.
+type RouteResult struct {
+	SelectedProvider Provider
+	FallbackOrdered  []Provider
+	Decision         domain.SelectionDecision
+}
+
+// Router orchestrates policy-before-health provider selection, credential-backed authorization, and execution provenance.
+type Router struct {
+	registry   *Registry
+	policySvc  *governance.PolicyService
+	licenseSvc *governance.LicenseService
+	credSvc    *governance.CredentialService
+	circuit    *CircuitBreaker
+	db         *storage.DB
+}
+
+// NewRouter creates a new ProviderRouter.
+func NewRouter(
+	registry *Registry,
+	policySvc *governance.PolicyService,
+	licenseSvc *governance.LicenseService,
+	credSvc *governance.CredentialService,
+	circuit *CircuitBreaker,
+	db *storage.DB,
+) *Router {
+	if circuit == nil {
+		circuit = NewCircuitBreaker(CircuitBreakerConfig{})
+	}
+	return &Router{
+		registry:   registry,
+		policySvc:  policySvc,
+		licenseSvc: licenseSvc,
+		credSvc:    credSvc,
+		circuit:    circuit,
+		db:         db,
+	}
+}
+
+// Circuit returns the underlying circuit breaker.
+func (r *Router) Circuit() *CircuitBreaker {
+	return r.circuit
+}
+
+// Helper to check if slice contains string (case-insensitive)
+func containsFold(slice []string, s string) bool {
+	for _, item := range slice {
+		if strings.EqualFold(item, s) || item == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+// Route enforces the strict routing order:
+// 1. Policy eligibility (PolicyService + LicenseService + Credential-backed Authorization)
+// 2. Declared capability (Stage, Language, Required Features)
+// 3. Runtime health & circuit breaker
+// 4. Profile / Quality / Cost ranking
+func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, error) {
+	if req.ExecutionProfile == "" {
+		req.ExecutionProfile = domain.ExecutionProfileHybrid // Cost-first hybrid default
+	}
+
+	allProviders := r.registry.ListAll()
+	var evaluations []domain.CandidateEvaluation
+	type candidateScore struct {
+		provider Provider
+		score    float64
+		eval     domain.CandidateEvaluation
+	}
+	var eligibleCandidates []candidateScore
+
+	excludedMap := make(map[string]bool)
+	for _, id := range req.ExcludedProviders {
+		excludedMap[id] = true
+	}
+
+	for _, p := range allProviders {
+		eval := domain.CandidateEvaluation{
+			ProviderID:  p.ID(),
+			PolicyState: string(p.PolicyState()),
+			HealthOK:    p.IsHealthy(),
+		}
+
+		if excludedMap[p.ID()] {
+			eval.Eligible = false
+			eval.RejectionCode = "EXCLUDED_BY_REQUEST"
+			eval.Reason = "provider was explicitly excluded"
+			evaluations = append(evaluations, eval)
+			continue
+		}
+
+		// 1. Policy & Authorization Check (backed by CredentialService)
+		isAuth := false
+		if r.credSvc != nil && len(req.AuthorizedCredentials) > 0 {
+			for _, refIDOrName := range req.AuthorizedCredentials {
+				if ok, err := r.credSvc.ValidateCredentialRef(ctx, refIDOrName, p.ID()); ok && err == nil {
+					isAuth = true
+					break
+				}
+			}
+		}
+
+		var policyEligible bool
+		var effectivePolicy domain.PolicyState
+		var policyErr error
+		if r.policySvc != nil {
+			policyEligible, effectivePolicy, policyErr = r.policySvc.EvaluateEligibility(ctx, p.ID(), p.PolicyState(), req.ConsentGranted, isAuth)
+		} else {
+			effectivePolicy = p.PolicyState()
+			if effectivePolicy == "" {
+				effectivePolicy = domain.PolicyBlocked
+			}
+			policyEligible = effectivePolicy == domain.PolicyAllowed
+			if !policyEligible {
+				policyErr = domain.ErrPolicyBlocked
+			}
+		}
+		eval.PolicyState = string(effectivePolicy)
+
+		if !policyEligible {
+			eval.Eligible = false
+			if errors.Is(policyErr, domain.ErrConsentRequired) {
+				eval.RejectionCode = "REQUIRES_CONSENT"
+				eval.Reason = "explicit operator consent required"
+			} else if errors.Is(policyErr, domain.ErrAuthRequired) {
+				eval.RejectionCode = "REQUIRES_AUTHORIZATION"
+				eval.Reason = "valid credential reference authorization required"
+			} else {
+				eval.RejectionCode = "POLICY_BLOCKED"
+				eval.Reason = "blocked by governance policy"
+			}
+			evaluations = append(evaluations, eval)
+			continue
+		}
+
+		// License checkpoint validation (versioned & fail-closed)
+		modelName, modelVer := p.ModelInfo()
+		if modelName != "" && r.licenseSvc != nil {
+			if err := r.licenseSvc.VerifyCheckpoint(ctx, modelName, modelVer, ""); err != nil {
+				// If manifest is missing or unverified, fail closed
+				eval.Eligible = false
+				eval.RejectionCode = "LICENSE_MANIFEST_MISSING"
+				eval.Reason = "unmanifested or unverified checkpoint: " + err.Error()
+				evaluations = append(evaluations, eval)
+				continue
+			}
+		}
+
+		// 2. Declared Capability Check (Stage, Language, Required Features)
+		cap := p.Capability()
+		if req.Stage != "" && p.Type() != req.Stage {
+			eval.Eligible = false
+			eval.RejectionCode = "STAGE_MISMATCH"
+			eval.Reason = fmt.Sprintf("provider stage %s does not match requested %s", p.Type(), req.Stage)
+			evaluations = append(evaluations, eval)
+			continue
+		}
+
+		if req.Language != "" && len(cap.Languages) > 0 && !containsFold(cap.Languages, req.Language) {
+			eval.Eligible = false
+			eval.RejectionCode = "LANGUAGE_NOT_SUPPORTED"
+			eval.Reason = fmt.Sprintf("language %s not supported", req.Language)
+			evaluations = append(evaluations, eval)
+			continue
+		}
+
+		if len(req.RequiredFeatures) > 0 {
+			missingFeature := ""
+			for _, reqFeat := range req.RequiredFeatures {
+				if !containsFold(cap.Features, reqFeat) {
+					missingFeature = reqFeat
+					break
+				}
+			}
+			if missingFeature != "" {
+				eval.Eligible = false
+				eval.RejectionCode = "FEATURE_NOT_SUPPORTED"
+				eval.Reason = fmt.Sprintf("missing required feature: %s", missingFeature)
+				evaluations = append(evaluations, eval)
+				continue
+			}
+		}
+
+		// 3. Runtime Health & Circuit Breaker Check
+		if !p.IsHealthy() {
+			eval.Eligible = false
+			eval.RejectionCode = "UNHEALTHY"
+			eval.Reason = "provider reported unhealthy state"
+			evaluations = append(evaluations, eval)
+			continue
+		}
+
+		canAttempt := true
+		if r.circuit != nil {
+			canAttempt = r.circuit.CanAttempt(p.ID())
+		}
+		eval.CircuitClosed = canAttempt
+		if !canAttempt {
+			eval.Eligible = false
+			eval.RejectionCode = "CIRCUIT_OPEN"
+			eval.Reason = "circuit breaker open due to consecutive failures"
+			evaluations = append(evaluations, eval)
+			continue
+		}
+
+		// 4. Profile / Quality / Cost Scoring
+		score := calculateScore(cap, req.ExecutionProfile)
+		eval.Eligible = true
+		eval.Score = score
+		eval.Reason = "eligible for execution"
+		evaluations = append(evaluations, eval)
+
+		eligibleCandidates = append(eligibleCandidates, candidateScore{
+			provider: p,
+			score:    score,
+			eval:     eval,
+		})
+	}
+
+	if len(eligibleCandidates) == 0 {
+		// Record decision failure
+		dec := domain.SelectionDecision{
+			ID:                  uuid.NewString(),
+			RunID:               req.RunID,
+			Stage:               string(req.Stage),
+			SelectedProviderID:  "",
+			CandidatesEvaluated: evaluations,
+			PolicyCheckResult:   "FAILED",
+			DecisionReason:      "no eligible providers found",
+			CreatedAt:           time.Now().UTC(),
+		}
+		if r.db != nil {
+			if err := r.db.RecordSelectionDecision(ctx, dec); err != nil {
+				return nil, fmt.Errorf("fail-closed: record selection decision provenance: %w", err)
+			}
+		}
+		return nil, domain.ErrNoEligibleProvider
+	}
+
+	// Sort eligible candidates deterministically: score desc -> quality desc -> cost asc -> provider ID asc
+	sort.Slice(eligibleCandidates, func(i, j int) bool {
+		if eligibleCandidates[i].score != eligibleCandidates[j].score {
+			return eligibleCandidates[i].score > eligibleCandidates[j].score
+		}
+		if eligibleCandidates[i].provider.Capability().QualityScore != eligibleCandidates[j].provider.Capability().QualityScore {
+			return eligibleCandidates[i].provider.Capability().QualityScore > eligibleCandidates[j].provider.Capability().QualityScore
+		}
+		if eligibleCandidates[i].provider.Capability().CostPerUnit != eligibleCandidates[j].provider.Capability().CostPerUnit {
+			return eligibleCandidates[i].provider.Capability().CostPerUnit < eligibleCandidates[j].provider.Capability().CostPerUnit
+		}
+		return eligibleCandidates[i].provider.ID() < eligibleCandidates[j].provider.ID()
+	})
+
+	selected := eligibleCandidates[0].provider
+	var fallback []Provider
+	for _, c := range eligibleCandidates[1:] {
+		fallback = append(fallback, c.provider)
+	}
+
+	decision := domain.SelectionDecision{
+		ID:                  uuid.NewString(),
+		RunID:               req.RunID,
+		Stage:               string(req.Stage),
+		SelectedProviderID:  selected.ID(),
+		CandidatesEvaluated: evaluations,
+		PolicyCheckResult:   "ALLOWED",
+		DecisionReason:      fmt.Sprintf("selected highest ranking candidate with score %.2f", eligibleCandidates[0].score),
+		CreatedAt:           time.Now().UTC(),
+	}
+
+	if r.db != nil {
+		if err := r.db.RecordSelectionDecision(ctx, decision); err != nil {
+			return nil, fmt.Errorf("fail-closed: record selection decision provenance: %w", err)
+		}
+	}
+
+	return &RouteResult{
+		SelectedProvider: selected,
+		FallbackOrdered:  fallback,
+		Decision:         decision,
+	}, nil
+}
+
+func calculateScore(cap domain.ProviderCapability, profile domain.ExecutionProfile) float64 {
+	var baseScore float64
+
+	switch profile {
+	case domain.ExecutionProfileLocal:
+		if strings.EqualFold(cap.ExecutionTier, "local") {
+			baseScore += 10.0
+		} else if strings.EqualFold(cap.ExecutionTier, "hybrid") {
+			baseScore += 2.0
+		} else {
+			baseScore -= 5.0
+		}
+	case domain.ExecutionProfileCloud:
+		if strings.EqualFold(cap.ExecutionTier, "cloud") {
+			baseScore += 10.0
+		} else if strings.EqualFold(cap.ExecutionTier, "hybrid") {
+			baseScore += 5.0
+		} else {
+			baseScore += 2.0
+		}
+	case domain.ExecutionProfileHybrid:
+		fallthrough
+	default:
+		// Cost-First Hybrid Default:
+		if strings.EqualFold(cap.ExecutionTier, "local") {
+			baseScore += 6.0
+		} else if strings.EqualFold(cap.ExecutionTier, "hybrid") {
+			baseScore += 5.0
+		} else {
+			baseScore += 3.0
+		}
+		// Cost penalty
+		baseScore -= cap.CostPerUnit * 10.0
+	}
+
+	// Quality boost
+	baseScore += cap.QualityScore * 4.0
+	return baseScore
+}
+
+// ExecuteWithRetry executes a function with transient retry, quality failure fallback, and immutable attempt logging.
+// When execution moves to an alternate candidate after failure, it preserves policy re-evaluation and appends a selection decision.
+func (r *Router) ExecuteWithRetry(
+	ctx context.Context,
+	req RouteRequest,
+	inputHash string,
+	maxRetries int,
+	executeFn func(p Provider, attemptNumber int) error,
+) error {
+	if strings.TrimSpace(inputHash) == "" {
+		return errors.New("input_hash is required")
+	}
+	if executeFn == nil {
+		return errors.New("execute function is required")
+	}
+	if maxRetries <= 0 {
+		maxRetries = 1
+	}
+
+	routeRes, err := r.Route(ctx, req)
+	if err != nil {
+		return err
+	}
+
+	candidates := append([]Provider{routeRes.SelectedProvider}, routeRes.FallbackOrdered...)
+	var lastErr error
+	attemptGlobal := 0
+
+	for idx, p := range candidates {
+		modelName, modelVer := p.ModelInfo()
+		var effectivePolicy domain.PolicyState
+
+		// When moving to an alternate candidate (idx > 0), re-evaluate policy eligibility and append selection decision provenance
+		if idx > 0 {
+			isAuth := false
+			if r.credSvc != nil && len(req.AuthorizedCredentials) > 0 {
+				for _, refIDOrName := range req.AuthorizedCredentials {
+					if ok, err := r.credSvc.ValidateCredentialRef(ctx, refIDOrName, p.ID()); ok && err == nil {
+						isAuth = true
+						break
+					}
+				}
+			}
+
+			var policyEligible bool
+			var policyErr error
+			if r.policySvc != nil {
+				policyEligible, effectivePolicy, policyErr = r.policySvc.EvaluateEligibility(ctx, p.ID(), p.PolicyState(), req.ConsentGranted, isAuth)
+			} else {
+				effectivePolicy = p.PolicyState()
+				policyEligible = effectivePolicy == domain.PolicyAllowed
+				if !policyEligible {
+					policyErr = domain.ErrPolicyBlocked
+				}
+			}
+
+			if !policyEligible {
+				lastErr = policyErr
+				continue
+			}
+
+			if modelName != "" && r.licenseSvc != nil {
+				if err := r.licenseSvc.VerifyCheckpoint(ctx, modelName, modelVer, ""); err != nil {
+					lastErr = err
+					continue
+				}
+			}
+		}
+
+		if r.circuit != nil && !r.circuit.CanAttempt(p.ID()) {
+			attemptGlobal++
+			pa := domain.ProviderAttempt{
+				ID:            uuid.NewString(),
+				RunID:         req.RunID,
+				Stage:         string(req.Stage),
+				ProviderID:    p.ID(),
+				ModelName:     modelName,
+				ModelVersion:  modelVer,
+				InputHash:     inputHash,
+				AttemptNumber: attemptGlobal,
+				Status:        "circuit_broken",
+				ErrorMessage:  domain.ErrCircuitOpen.Error(),
+				LatencyMs:     0,
+				CostUnits:     0.0,
+				CreatedAt:     time.Now().UTC(),
+			}
+			if r.db != nil {
+				if err := r.db.RecordProviderAttempt(ctx, pa); err != nil {
+					return fmt.Errorf("fail-closed: record circuit_broken attempt provenance: %w", err)
+				}
+			}
+			lastErr = domain.ErrCircuitOpen
+			continue
+		}
+
+		if idx > 0 {
+			// Append SelectionDecision provenance for the alternate candidate actually selected
+			altDecision := domain.SelectionDecision{
+				ID:                 uuid.NewString(),
+				RunID:              req.RunID,
+				Stage:              string(req.Stage),
+				SelectedProviderID: p.ID(),
+				CandidatesEvaluated: []domain.CandidateEvaluation{
+					{
+						ProviderID:    p.ID(),
+						Eligible:      true,
+						PolicyState:   string(effectivePolicy),
+						HealthOK:      p.IsHealthy(),
+						CircuitClosed: true,
+						Score:         calculateScore(p.Capability(), req.ExecutionProfile),
+						Reason:        "selected alternate fallback candidate after prior failure",
+					},
+				},
+				PolicyCheckResult: string(effectivePolicy),
+				DecisionReason:    fmt.Sprintf("selected alternate candidate %s after prior candidate failure", p.ID()),
+				CreatedAt:         time.Now().UTC(),
+			}
+			if r.db != nil {
+				if err := r.db.RecordSelectionDecision(ctx, altDecision); err != nil {
+					return fmt.Errorf("fail-closed: record alternate selection decision provenance: %w", err)
+				}
+			}
+		}
+
+		candidateRetries := maxRetries
+		if p.Capability().MaxRetries != nil {
+			candidateRetries = *p.Capability().MaxRetries
+			if candidateRetries <= 0 {
+				candidateRetries = 1
+			}
+		}
+
+		for attempt := 1; attempt <= candidateRetries; attempt++ {
+			attemptGlobal++
+			start := time.Now()
+			err := executeFn(p, attempt)
+			latency := time.Since(start).Milliseconds()
+
+			if err == nil {
+				// Record successful attempt
+				pa := domain.ProviderAttempt{
+					ID:            uuid.NewString(),
+					RunID:         req.RunID,
+					Stage:         string(req.Stage),
+					ProviderID:    p.ID(),
+					ModelName:     modelName,
+					ModelVersion:  modelVer,
+					InputHash:     inputHash,
+					AttemptNumber: attemptGlobal,
+					Status:        "succeeded",
+					LatencyMs:     latency,
+					CostUnits:     p.Capability().CostPerUnit,
+					CreatedAt:     time.Now().UTC(),
+				}
+				if r.db != nil {
+					if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
+						return fmt.Errorf("fail-closed: record succeeded attempt provenance: %w", errDB)
+					}
+				}
+				if r.circuit != nil {
+					r.circuit.RecordSuccess(p.ID())
+				}
+				return nil
+			}
+
+			lastErr = err
+
+			// 1. Check for non-transient governance/policy errors (FAIL-CLOSED, no retry, no fallback)
+			if errors.Is(err, domain.ErrPolicyBlocked) ||
+				errors.Is(err, domain.ErrConsentRequired) ||
+				errors.Is(err, domain.ErrAuthRequired) ||
+				errors.Is(err, domain.ErrLicenseManifestMissing) ||
+				errors.Is(err, domain.ErrRawSecretForbidden) {
+
+				pa := domain.ProviderAttempt{
+					ID:            uuid.NewString(),
+					RunID:         req.RunID,
+					Stage:         string(req.Stage),
+					ProviderID:    p.ID(),
+					ModelName:     modelName,
+					ModelVersion:  modelVer,
+					InputHash:     inputHash,
+					AttemptNumber: attemptGlobal,
+					Status:        "policy_rejected",
+					ErrorMessage:  err.Error(),
+					LatencyMs:     latency,
+					CostUnits:     0.0,
+					CreatedAt:     time.Now().UTC(),
+				}
+				if r.db != nil {
+					if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
+						return fmt.Errorf("fail-closed: record policy_rejected attempt provenance: %w (original: %v)", errDB, err)
+					}
+				}
+				return err
+			}
+
+			// 2. Check for Quality failure (Record quality-failed attempt, break attempt loop to advance to alternate candidate)
+			if errors.Is(err, domain.ErrQualityRejected) {
+				pa := domain.ProviderAttempt{
+					ID:            uuid.NewString(),
+					RunID:         req.RunID,
+					Stage:         string(req.Stage),
+					ProviderID:    p.ID(),
+					ModelName:     modelName,
+					ModelVersion:  modelVer,
+					InputHash:     inputHash,
+					AttemptNumber: attemptGlobal,
+					Status:        "quality_failed",
+					ErrorMessage:  err.Error(),
+					LatencyMs:     latency,
+					CostUnits:     p.Capability().CostPerUnit,
+					CreatedAt:     time.Now().UTC(),
+				}
+				if r.db != nil {
+					if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
+						return fmt.Errorf("fail-closed: record quality_failed attempt provenance: %w", errDB)
+					}
+				}
+				break
+			}
+
+			// 3. Transient failure (retry candidate up to candidateRetries, trip circuit breaker if repeated)
+			pa := domain.ProviderAttempt{
+				ID:            uuid.NewString(),
+				RunID:         req.RunID,
+				Stage:         string(req.Stage),
+				ProviderID:    p.ID(),
+				ModelName:     modelName,
+				ModelVersion:  modelVer,
+				InputHash:     inputHash,
+				AttemptNumber: attemptGlobal,
+				Status:        "failed",
+				ErrorMessage:  err.Error(),
+				LatencyMs:     latency,
+				CostUnits:     0.0,
+				CreatedAt:     time.Now().UTC(),
+			}
+			if r.db != nil {
+				if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
+					return fmt.Errorf("fail-closed: record failed attempt provenance: %w", errDB)
+				}
+			}
+			if r.circuit != nil {
+				r.circuit.RecordFailure(p.ID(), true)
+			}
+		}
+	}
+
+	return fmt.Errorf("all provider candidates failed for stage %s: %w", req.Stage, lastErr)
+}

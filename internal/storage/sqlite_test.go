@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -157,5 +158,221 @@ func TestStorage_SQLiteFlow(t *testing.T) {
 	}
 	if fetchedRun.JobID != jobID || fetchedRun.Status != "queued" {
 		t.Errorf("run mismatch: got %+v", fetchedRun)
+	}
+
+	// 6. License Manifests
+	lm := domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: "qwen3_asr_1.7b",
+		SHA256:         "sha256_mock_qwen3_asr_123",
+		SourceRepo:     "Qwen/Qwen3-ASR",
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Self-Hosted",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	}
+	if err := db.SaveLicenseManifest(ctx, lm); err != nil {
+		t.Fatalf("SaveLicenseManifest failed: %v", err)
+	}
+	fetchedLM, err := db.GetLicenseManifest(ctx, lm.DependencyName, "")
+	if err != nil {
+		t.Fatalf("GetLicenseManifest failed: %v", err)
+	}
+	if fetchedLM.SHA256 != lm.SHA256 || !fetchedLM.Verified {
+		t.Errorf("license manifest mismatch: got %+v", fetchedLM)
+	}
+
+	// Save version 2 of the same dependency without overwriting version 1 (immutable versioning)
+	lmV2 := domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: "qwen3_asr_1.7b",
+		Version:        "2.0.0",
+		SHA256:         "sha256_mock_qwen3_asr_v2_456",
+		SourceRepo:     "Qwen/Qwen3-ASR",
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Self-Hosted",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC().Add(time.Second),
+	}
+	if err := db.SaveLicenseManifest(ctx, lmV2); err != nil {
+		t.Fatalf("SaveLicenseManifest V2 failed: %v", err)
+	}
+	allVersions, err := db.ListLicenseManifests(ctx, "qwen3_asr_1.7b")
+	if err != nil || len(allVersions) != 2 {
+		t.Fatalf("expected 2 versioned manifest entries for qwen3_asr_1.7b, got %d (err: %v)", len(allVersions), err)
+	}
+
+	// 7. Credential References
+	cr := domain.CredentialRef{
+		ID:          uuid.NewString(),
+		Name:        "douyin_session_token",
+		StorageType: "os_credential_store",
+		KeyRef:      "douyin_cookie_ref_01",
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := db.SaveCredentialRef(ctx, cr); err != nil {
+		t.Fatalf("SaveCredentialRef failed: %v", err)
+	}
+	fetchedCR, err := db.GetCredentialRef(ctx, cr.ID)
+	if err != nil {
+		t.Fatalf("GetCredentialRef failed: %v", err)
+	}
+	if fetchedCR.KeyRef != cr.KeyRef {
+		t.Errorf("credential ref mismatch: got %+v", fetchedCR)
+	}
+
+	// 8. Provider Policies
+	if err := db.SetProviderPolicy(ctx, "fake_vieneu_tts_vi", domain.PolicyAllowed, "baseline approved"); err != nil {
+		t.Fatalf("SetProviderPolicy failed: %v", err)
+	}
+	policy, err := db.GetProviderPolicy(ctx, "fake_vieneu_tts_vi")
+	if err != nil {
+		t.Fatalf("GetProviderPolicy failed: %v", err)
+	}
+	if policy != domain.PolicyAllowed {
+		t.Errorf("expected ALLOWED policy, got %s", policy)
+	}
+
+	// 9. Provider Attempts & Selection Decisions
+	pa := domain.ProviderAttempt{
+		ID:            uuid.NewString(),
+		RunID:         runID,
+		Stage:         "tts",
+		ProviderID:    "fake_vieneu_tts_vi",
+		ModelName:     "vieneu-v1",
+		ModelVersion:  "1.0.0",
+		InputHash:     "hash123",
+		AttemptNumber: 1,
+		Status:        "succeeded",
+		LatencyMs:     120,
+		CostUnits:     0.0,
+		CreatedAt:     time.Now().UTC(),
+	}
+	if err := db.RecordProviderAttempt(ctx, pa); err != nil {
+		t.Fatalf("RecordProviderAttempt failed: %v", err)
+	}
+	attempts, err := db.ListProviderAttempts(ctx, runID, "tts")
+	if err != nil || len(attempts) != 1 {
+		t.Fatalf("ListProviderAttempts failed: %v, got %d", err, len(attempts))
+	}
+
+	sd := domain.SelectionDecision{
+		ID:                 uuid.NewString(),
+		RunID:              runID,
+		Stage:              "tts",
+		SelectedProviderID: "fake_vieneu_tts_vi",
+		CandidatesEvaluated: []domain.CandidateEvaluation{
+			{ProviderID: "fake_vieneu_tts_vi", Eligible: true, PolicyState: "ALLOWED", HealthOK: true, CircuitClosed: true, Score: 0.95},
+		},
+		PolicyCheckResult: "ALLOWED",
+		DecisionReason:    "highest scoring eligible candidate",
+		CreatedAt:         time.Now().UTC(),
+	}
+	if err := db.RecordSelectionDecision(ctx, sd); err != nil {
+		t.Fatalf("RecordSelectionDecision failed: %v", err)
+	}
+	decisions, err := db.ListSelectionDecisions(ctx, runID, "tts")
+	if err != nil || len(decisions) != 1 {
+		t.Fatalf("ListSelectionDecisions failed: %v, got %d", err, len(decisions))
+	}
+}
+
+func TestStorage_MigrationV2ToV3_ForwardSafeAndPreservesData(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "migration_test.db")
+
+	// 1. Manually initialize a database at migration version 2 (with old single-version UNIQUE dependency_name schema)
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+
+	initSQL := `
+	CREATE TABLE schema_migrations (
+		version INTEGER PRIMARY KEY,
+		applied_at TEXT NOT NULL
+	);
+	INSERT INTO schema_migrations (version, applied_at) VALUES (1, datetime('now'));
+	INSERT INTO schema_migrations (version, applied_at) VALUES (2, datetime('now'));
+
+	CREATE TABLE license_manifests (
+		id TEXT PRIMARY KEY,
+		dependency_name TEXT NOT NULL UNIQUE,
+		sha256 TEXT NOT NULL,
+		source_repo TEXT NOT NULL,
+		code_license TEXT NOT NULL,
+		model_license TEXT NOT NULL,
+		data_license TEXT NOT NULL,
+		service_terms TEXT NOT NULL,
+		verified INTEGER NOT NULL,
+		created_at TEXT NOT NULL
+	);
+
+	INSERT INTO license_manifests (id, dependency_name, sha256, source_repo, code_license, model_license, data_license, service_terms, verified, created_at)
+	VALUES ('legacy_id_001', 'qwen_legacy_asr', 'sha256_legacy_111', 'Qwen/ASR', 'Apache-2.0', 'Apache-2.0', 'OpenData', 'Self-Hosted', 1, '2026-01-01T00:00:00Z');
+	`
+	if _, err := rawDB.Exec(initSQL); err != nil {
+		rawDB.Close()
+		t.Fatalf("init legacy v2 db failed: %v", err)
+	}
+	rawDB.Close()
+
+	// 2. Open via storage.Open which executes migrate() forward to v3
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("storage.Open failed on legacy v2 db: %v", err)
+	}
+	defer db.Close()
+
+	// 3. Verify schema migration version is now 3
+	var v3Count int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 3`).Scan(&v3Count); err != nil || v3Count != 1 {
+		t.Fatalf("expected migration version 3 recorded, got count=%d, err=%v", v3Count, err)
+	}
+
+	// 4. Verify existing record was preserved with default version 'v1'
+	legacyEntry, err := db.GetLicenseManifest(ctx, "qwen_legacy_asr", "")
+	if err != nil {
+		t.Fatalf("GetLicenseManifest for legacy record failed: %v", err)
+	}
+	if legacyEntry.ID != "legacy_id_001" || legacyEntry.Version != "v1" || legacyEntry.SHA256 != "sha256_legacy_111" {
+		t.Errorf("legacy record data corrupted during migration: %+v", legacyEntry)
+	}
+
+	// 5. Verify forward-safe versioning: can now register version 2.0.0 for the same dependency without unique violation
+	v2Entry := domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: "qwen_legacy_asr",
+		Version:        "2.0.0",
+		SHA256:         "sha256_legacy_v2_222",
+		SourceRepo:     "Qwen/ASR",
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Self-Hosted",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	}
+	if err := db.SaveLicenseManifest(ctx, v2Entry); err != nil {
+		t.Fatalf("SaveLicenseManifest for version 2.0.0 failed after migration: %v", err)
+	}
+
+	// 6. Verify listing manifests returns both versions in immutable history
+	allVersions, err := db.ListLicenseManifests(ctx, "qwen_legacy_asr")
+	if err != nil || len(allVersions) != 2 {
+		t.Fatalf("expected 2 versions after adding v2, got %d (err: %v)", len(allVersions), err)
+	}
+
+	// 7. Verify duplicate of exact same (dependency_name, version) is still rejected (immutability preserved)
+	dupEntry := v2Entry
+	dupEntry.ID = uuid.NewString()
+	dupEntry.SHA256 = "sha256_corrupted"
+	if err := db.SaveLicenseManifest(ctx, dupEntry); err == nil {
+		t.Fatalf("expected error when inserting duplicate (dependency_name, version), got nil")
 	}
 }

@@ -5,44 +5,78 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/cas"
+	"github.com/monet88/douyinie/internal/config"
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/governance"
 	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
 )
 
+// Executor defines an injected execution seam for stage provider execution.
+type Executor func(ctx context.Context, p provider.Provider, attemptNumber int) error
+
 // Server encapsulates the RuntimeHost HTTP daemon.
 type Server struct {
-	db       *storage.DB
-	casStore *cas.Store
-	ingest   *service.IngestService
-	registry *provider.Registry
-	mux      *http.ServeMux
-	server   *http.Server
+	db         *storage.DB
+	casStore   *cas.Store
+	ingest     *service.IngestService
+	registry   *provider.Registry
+	policySvc  *governance.PolicyService
+	licenseSvc *governance.LicenseService
+	credSvc    *governance.CredentialService
+	router     *provider.Router
+	executor   Executor
+	mux        *http.ServeMux
+	server     *http.Server
 }
 
 // Config specifies initialization options for RuntimeHost Server.
 type Config struct {
-	Addr     string
-	DB       *storage.DB
-	CASStore *cas.Store
-	Ingest   *service.IngestService
-	Registry *provider.Registry
+	Addr       string
+	DB         *storage.DB
+	CASStore   *cas.Store
+	Ingest     *service.IngestService
+	Registry   *provider.Registry
+	PolicySvc  *governance.PolicyService
+	LicenseSvc *governance.LicenseService
+	CredSvc    *governance.CredentialService
+	Router     *provider.Router
+	Executor   Executor // Injected execution seam for testing and custom worker dispatch
 }
 
 // New creates a new RuntimeHost Server instance.
 func New(cfg Config) *Server {
+	if cfg.PolicySvc == nil && cfg.DB != nil {
+		cfg.PolicySvc = governance.NewPolicyService(cfg.DB)
+	}
+	if cfg.LicenseSvc == nil && cfg.DB != nil {
+		cfg.LicenseSvc = governance.NewLicenseService(cfg.DB)
+	}
+	if cfg.CredSvc == nil && cfg.DB != nil {
+		cfg.CredSvc = governance.NewCredentialService(cfg.DB)
+	}
+	if cfg.Router == nil && cfg.Registry != nil {
+		cfg.Router = provider.NewRouter(cfg.Registry, cfg.PolicySvc, cfg.LicenseSvc, cfg.CredSvc, nil, cfg.DB)
+	}
+
 	s := &Server{
-		db:       cfg.DB,
-		casStore: cfg.CASStore,
-		ingest:   cfg.Ingest,
-		registry: cfg.Registry,
-		mux:      http.NewServeMux(),
+		db:         cfg.DB,
+		casStore:   cfg.CASStore,
+		ingest:     cfg.Ingest,
+		registry:   cfg.Registry,
+		policySvc:  cfg.PolicySvc,
+		licenseSvc: cfg.LicenseSvc,
+		credSvc:    cfg.CredSvc,
+		router:     cfg.Router,
+		executor:   cfg.Executor,
+		mux:        http.NewServeMux(),
 	}
 
 	s.routes()
@@ -55,6 +89,11 @@ func New(cfg Config) *Server {
 	}
 
 	return s
+}
+
+// SetExecutor sets or replaces the injected execution seam (e.g. for Seam 1 retry/fallback testing).
+func (s *Server) SetExecutor(exec Executor) {
+	s.executor = exec
 }
 
 // Handler returns the underlying http.Handler for in-memory / testing purposes.
@@ -95,6 +134,25 @@ func (s *Server) routes() {
 
 	// Provider Registry Inspection
 	s.mux.HandleFunc("GET /api/v1/providers", s.handleListProviders)
+
+	// Governance & Routing
+	s.mux.HandleFunc("POST /api/v1/routing/decide", s.handleRouteDecide)
+	s.mux.HandleFunc("POST /api/v1/routing/execute", s.handleRouteExecute)
+	s.mux.HandleFunc("GET /api/v1/routing/decisions", s.handleListDecisions)
+	s.mux.HandleFunc("GET /api/v1/routing/attempts", s.handleListAttempts)
+
+	// Policies & Licenses
+	s.mux.HandleFunc("GET /api/v1/policies", s.handleListPolicies)
+	s.mux.HandleFunc("PUT /api/v1/policies/{id}", s.handleSetPolicy)
+	s.mux.HandleFunc("GET /api/v1/licenses", s.handleListLicenses)
+	s.mux.HandleFunc("POST /api/v1/licenses", s.handleRegisterLicense)
+
+	// Credential References
+	s.mux.HandleFunc("GET /api/v1/credentials", s.handleListCredentials)
+	s.mux.HandleFunc("POST /api/v1/credentials", s.handleRegisterCredential)
+
+	// Layered Configuration
+	s.mux.HandleFunc("GET /api/v1/config/layered", s.handleGetLayeredConfig)
 }
 
 // JSON helpers
@@ -354,34 +412,400 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 	type providerSummary struct {
-		ID      string `json:"id"`
-		Type    string `json:"type"`
-		Policy  string `json:"policy"`
-		Healthy bool   `json:"healthy"`
-	}
-
-	types := []provider.ProviderType{
-		provider.TypeASR,
-		provider.TypeAligner,
-		provider.TypeTTS,
-		provider.TypeSeparator,
-		provider.TypeOCR,
-		provider.TypeTranslation,
+		ID         string                    `json:"id"`
+		Type       string                    `json:"type"`
+		Policy     string                    `json:"policy"`
+		Healthy    bool                      `json:"healthy"`
+		Capability domain.ProviderCapability `json:"capability"`
+		ModelName  string                    `json:"model_name"`
+		ModelVer   string                    `json:"model_version"`
 	}
 
 	var list []providerSummary
 	if s.registry != nil {
-		for _, t := range types {
-			for _, p := range s.registry.ListByType(t) {
-				list = append(list, providerSummary{
-					ID:      p.ID(),
-					Type:    string(p.Type()),
-					Policy:  string(p.PolicyState()),
-					Healthy: p.IsHealthy(),
-				})
+		for _, p := range s.registry.ListAll() {
+			effectivePolicy := p.PolicyState()
+			if s.policySvc != nil {
+				effectivePolicy = s.policySvc.GetPolicy(r.Context(), p.ID(), p.PolicyState())
 			}
+			mName, mVer := p.ModelInfo()
+			list = append(list, providerSummary{
+				ID:         p.ID(),
+				Type:       string(p.Type()),
+				Policy:     string(effectivePolicy),
+				Healthy:    p.IsHealthy(),
+				Capability: p.Capability(),
+				ModelName:  mName,
+				ModelVer:   mVer,
+			})
 		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"providers": list})
+}
+
+func (s *Server) handleRouteDecide(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		RunID                 string                  `json:"run_id"`
+		Stage                 string                  `json:"stage"`
+		Language              string                  `json:"language"`
+		ExecutionProfile      domain.ExecutionProfile `json:"execution_profile"`
+		ConsentGranted        bool                    `json:"consent_granted"`
+		AuthorizedCredentials []string                `json:"authorized_credentials"`
+		RequiredFeatures      []string                `json:"required_features"`
+		ExcludedProviders     []string                `json:"excluded_providers"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	if body.Stage == "" {
+		writeError(w, http.StatusBadRequest, "stage is required")
+		return
+	}
+
+	req := provider.RouteRequest{
+		RunID:                 body.RunID,
+		Stage:                 provider.ProviderType(body.Stage),
+		Language:              body.Language,
+		ExecutionProfile:      body.ExecutionProfile,
+		ConsentGranted:        body.ConsentGranted,
+		AuthorizedCredentials: body.AuthorizedCredentials,
+		RequiredFeatures:      body.RequiredFeatures,
+		ExcludedProviders:     body.ExcludedProviders,
+	}
+
+	res, err := s.router.Route(r.Context(), req)
+	if err != nil {
+		if errors.Is(err, domain.ErrNoEligibleProvider) || errors.Is(err, domain.ErrPolicyBlocked) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var fallbackIDs []string
+	for _, f := range res.FallbackOrdered {
+		fallbackIDs = append(fallbackIDs, f.ID())
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"selected_provider_id": res.SelectedProvider.ID(),
+		"fallback_candidates":  fallbackIDs,
+		"decision":             res.Decision,
+	})
+}
+
+func (s *Server) handleRouteExecute(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		RunID                 string                  `json:"run_id"`
+		Stage                 string                  `json:"stage"`
+		Language              string                  `json:"language"`
+		InputHash             string                  `json:"input_hash"`
+		ExecutionProfile      domain.ExecutionProfile `json:"execution_profile"`
+		ConsentGranted        bool                    `json:"consent_granted"`
+		AuthorizedCredentials []string                `json:"authorized_credentials"`
+		RequiredFeatures      []string                `json:"required_features"`
+		ExcludedProviders     []string                `json:"excluded_providers"`
+		MaxRetries            *int                    `json:"max_retries,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	if body.Stage == "" {
+		writeError(w, http.StatusBadRequest, "stage is required")
+		return
+	}
+	if strings.TrimSpace(body.InputHash) == "" {
+		writeError(w, http.StatusBadRequest, "input_hash is required")
+		return
+	}
+	if body.RunID == "" {
+		body.RunID = uuid.NewString()
+	}
+	maxRetries := 2
+	if body.MaxRetries != nil {
+		maxRetries = *body.MaxRetries
+	}
+
+	req := provider.RouteRequest{
+		RunID:                 body.RunID,
+		Stage:                 provider.ProviderType(body.Stage),
+		Language:              body.Language,
+		ExecutionProfile:      body.ExecutionProfile,
+		ConsentGranted:        body.ConsentGranted,
+		AuthorizedCredentials: body.AuthorizedCredentials,
+		RequiredFeatures:      body.RequiredFeatures,
+		ExcludedProviders:     body.ExcludedProviders,
+	}
+
+	if s.router == nil {
+		writeError(w, http.StatusInternalServerError, "router is not configured")
+		return
+	}
+
+	if s.executor == nil {
+		writeError(w, http.StatusInternalServerError, "runtime executor is not configured")
+		return
+	}
+
+	execFn := func(p provider.Provider, attemptNum int) error {
+		return s.executor(r.Context(), p, attemptNum)
+	}
+
+	err := s.router.ExecuteWithRetry(r.Context(), req, body.InputHash, maxRetries, execFn)
+
+	if err != nil {
+		if errors.Is(err, domain.ErrPolicyBlocked) ||
+			errors.Is(err, domain.ErrNoEligibleProvider) ||
+			errors.Is(err, domain.ErrConsentRequired) ||
+			errors.Is(err, domain.ErrAuthRequired) ||
+			errors.Is(err, domain.ErrLicenseManifestMissing) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "succeeded",
+		"run_id": body.RunID,
+		"stage":  body.Stage,
+	})
+}
+
+func (s *Server) handleListDecisions(w http.ResponseWriter, r *http.Request) {
+	runID := r.URL.Query().Get("run_id")
+	stage := r.URL.Query().Get("stage")
+
+	if s.db == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"decisions": []domain.SelectionDecision{}})
+		return
+	}
+
+	decisions, err := s.db.ListSelectionDecisions(r.Context(), runID, stage)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if decisions == nil {
+		decisions = []domain.SelectionDecision{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"decisions": decisions})
+}
+
+func (s *Server) handleListAttempts(w http.ResponseWriter, r *http.Request) {
+	runID := r.URL.Query().Get("run_id")
+	stage := r.URL.Query().Get("stage")
+
+	if s.db == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"attempts": []domain.ProviderAttempt{}})
+		return
+	}
+
+	attempts, err := s.db.ListProviderAttempts(r.Context(), runID, stage)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if attempts == nil {
+		attempts = []domain.ProviderAttempt{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"attempts": attempts})
+}
+
+func (s *Server) handleListPolicies(w http.ResponseWriter, r *http.Request) {
+	type policyEntry struct {
+		ProviderID  string             `json:"provider_id"`
+		PolicyState domain.PolicyState `json:"policy_state"`
+	}
+
+	var list []policyEntry
+	if s.registry != nil {
+		for _, p := range s.registry.ListAll() {
+			effectivePolicy := p.PolicyState()
+			if s.policySvc != nil {
+				effectivePolicy = s.policySvc.GetPolicy(r.Context(), p.ID(), p.PolicyState())
+			}
+			list = append(list, policyEntry{
+				ProviderID:  p.ID(),
+				PolicyState: effectivePolicy,
+			})
+		}
+	}
+
+	if list == nil {
+		list = []policyEntry{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"policies": list})
+}
+
+func (s *Server) handleSetPolicy(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if strings.TrimSpace(id) == "" {
+		writeError(w, http.StatusBadRequest, "provider id is required")
+		return
+	}
+	var body struct {
+		PolicyState domain.PolicyState `json:"policy_state"`
+		Reason      string             `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	if body.PolicyState == "" {
+		writeError(w, http.StatusBadRequest, "policy_state is required")
+		return
+	}
+
+	if !body.PolicyState.IsValid() {
+		writeError(w, http.StatusBadRequest, "invalid policy_state: must be ALLOWED, REQUIRES_EXPLICIT_CONSENT, REQUIRES_AUTHORIZATION, or BLOCKED")
+		return
+	}
+
+	if err := s.policySvc.SetPolicy(r.Context(), id, body.PolicyState, body.Reason); err != nil {
+		if errors.Is(err, domain.ErrInvalidPolicyState) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"provider_id":  id,
+		"policy_state": body.PolicyState,
+		"reason":       body.Reason,
+	})
+}
+
+func (s *Server) handleListLicenses(w http.ResponseWriter, r *http.Request) {
+	depName := r.URL.Query().Get("dependency_name")
+	list, err := s.licenseSvc.ListManifests(r.Context(), depName)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.LicenseManifestEntry{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"licenses":          list,
+		"license_manifests": list,
+	})
+}
+
+func (s *Server) handleRegisterLicense(w http.ResponseWriter, r *http.Request) {
+	var body domain.LicenseManifestEntry
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	if body.ID == "" {
+		body.ID = uuid.NewString()
+	}
+	if body.CreatedAt.IsZero() {
+		body.CreatedAt = time.Now().UTC()
+	}
+
+	if err := s.licenseSvc.RegisterManifest(r.Context(), body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"license_manifest": body})
+}
+
+func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
+	list, err := s.credSvc.ListCredentialRefs(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.CredentialRef{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"credentials": list})
+}
+
+func (s *Server) handleRegisterCredential(w http.ResponseWriter, r *http.Request) {
+	var body domain.CredentialRef
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	if body.ID == "" {
+		body.ID = uuid.NewString()
+	}
+	if body.CreatedAt.IsZero() {
+		body.CreatedAt = time.Now().UTC()
+	}
+
+	if err := s.credSvc.RegisterCredentialRef(r.Context(), body); err != nil {
+		if errors.Is(err, domain.ErrRawSecretForbidden) ||
+			errors.Is(err, domain.ErrUnsupportedStorageType) ||
+			strings.Contains(err.Error(), "required") {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"credential": body, "credential_ref": body})
+}
+
+func (s *Server) handleGetLayeredConfig(w http.ResponseWriter, r *http.Request) {
+	profStr := r.URL.Query().Get("profile")
+	profile := domain.ExecutionProfile(profStr)
+	if profile == "" {
+		profile = domain.ExecutionProfileHybrid
+	}
+
+	var userSettings *domain.LayeredConfig
+	retriesStr := r.URL.Query().Get("max_retries")
+	if retriesStr != "" {
+		if n, err := strconv.Atoi(retriesStr); err == nil {
+			if userSettings == nil {
+				userSettings = &domain.LayeredConfig{CustomSettings: make(map[string]any)}
+			}
+			userSettings.MaxRetries = &n
+		}
+	}
+
+	telemetryStr := r.URL.Query().Get("telemetry_enabled")
+	if telemetryStr != "" {
+		b := strings.EqualFold(telemetryStr, "true") || telemetryStr == "1"
+		if userSettings == nil {
+			userSettings = &domain.LayeredConfig{CustomSettings: make(map[string]any)}
+		}
+		userSettings.Telemetry.Enabled = &b
+	}
+
+	zeroOverrunStr := r.URL.Query().Get("zero_overrun_strict")
+	if zeroOverrunStr != "" {
+		b := strings.EqualFold(zeroOverrunStr, "true") || zeroOverrunStr == "1"
+		if userSettings == nil {
+			userSettings = &domain.LayeredConfig{CustomSettings: make(map[string]any)}
+		}
+		userSettings.ZeroOverrunStrict = &b
+	}
+
+	resolved := config.ResolveLayeredConfig(profile, userSettings, nil)
+	writeJSON(w, http.StatusOK, map[string]any{"config": resolved})
 }

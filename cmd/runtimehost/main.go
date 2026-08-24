@@ -14,6 +14,7 @@ import (
 
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/governance"
 	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/server"
@@ -55,8 +56,12 @@ func main() {
 	prober := media.NewFFprobeProber(*ffprobePath)
 	ingestSvc := service.NewIngestService(db, casStore, prober)
 
-	// 4. Initialize Provider Registry with Seam 1 Fake Providers
+	// 4. Initialize Provider Registry with Governance
 	fakeRegistry := provider.NewSeam1FakeRegistry()
+	polSvc := governance.NewPolicyService(db)
+	licSvc := governance.NewLicenseService(db)
+	credSvc := governance.NewCredentialService(db)
+	router := provider.NewRouter(fakeRegistry, polSvc, licSvc, credSvc, nil, db)
 
 	// 5. Optional Demo Ingestion
 	if *demoFile != "" {
@@ -91,11 +96,15 @@ func main() {
 	// 6. Start HTTP Server
 	addr := fmt.Sprintf("127.0.0.1:%d", *port)
 	srv := server.New(server.Config{
-		Addr:     addr,
-		DB:       db,
-		CASStore: casStore,
-		Ingest:   ingestSvc,
-		Registry: fakeRegistry,
+		Addr:       addr,
+		DB:         db,
+		CASStore:   casStore,
+		Ingest:     ingestSvc,
+		Registry:   fakeRegistry,
+		PolicySvc:  polSvc,
+		LicenseSvc: licSvc,
+		CredSvc:    credSvc,
+		Router:     router,
 	})
 
 	go func() {

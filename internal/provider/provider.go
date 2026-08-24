@@ -2,7 +2,10 @@ package provider
 
 import (
 	"fmt"
+	"sort"
 	"sync"
+
+	"github.com/monet88/douyinie/internal/domain"
 )
 
 type ProviderType string
@@ -16,13 +19,14 @@ const (
 	TypeTranslation ProviderType = "translation"
 )
 
-type PolicyState string
+// Alias for domain.PolicyState
+type PolicyState = domain.PolicyState
 
 const (
-	PolicyAllowed                 PolicyState = "ALLOWED"
-	PolicyRequiresExplicitConsent PolicyState = "REQUIRES_EXPLICIT_CONSENT"
-	PolicyRequiresAuthorization   PolicyState = "REQUIRES_AUTHORIZATION"
-	PolicyBlocked                 PolicyState = "BLOCKED"
+	PolicyAllowed                 = domain.PolicyAllowed
+	PolicyRequiresExplicitConsent = domain.PolicyRequiresExplicitConsent
+	PolicyRequiresAuthorization   = domain.PolicyRequiresAuthorization
+	PolicyBlocked                 = domain.PolicyBlocked
 )
 
 // Provider represents a model or external service adapter.
@@ -31,6 +35,8 @@ type Provider interface {
 	Type() ProviderType
 	PolicyState() PolicyState
 	IsHealthy() bool
+	Capability() domain.ProviderCapability
+	ModelInfo() (name string, version string)
 }
 
 // Registry maintains available providers indexed by ID and Type.
@@ -67,7 +73,22 @@ func (r *Registry) Get(id string) (Provider, bool) {
 	return p, ok
 }
 
-// ListByType returns all providers registered for a given type.
+// ListAll returns all registered providers in deterministic ID order.
+func (r *Registry) ListAll() []Provider {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var result []Provider
+	for _, p := range r.providers {
+		result = append(result, p)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].ID() < result[j].ID()
+	})
+	return result
+}
+
+// ListByType returns all providers registered for a given type in deterministic ID order.
 func (r *Registry) ListByType(t ProviderType) []Provider {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -78,16 +99,17 @@ func (r *Registry) ListByType(t ProviderType) []Provider {
 			result = append(result, p)
 		}
 	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].ID() < result[j].ID()
+	})
 	return result
 }
 
-// GetDefault returns the first healthy and allowed provider for a type.
+// GetDefault returns the first healthy and allowed provider for a type in deterministic ID order.
 func (r *Registry) GetDefault(t ProviderType) (Provider, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	for _, p := range r.providers {
-		if p.Type() == t && p.PolicyState() == PolicyAllowed && p.IsHealthy() {
+	all := r.ListByType(t)
+	for _, p := range all {
+		if p.PolicyState() == domain.PolicyAllowed && p.IsHealthy() {
 			return p, true
 		}
 	}

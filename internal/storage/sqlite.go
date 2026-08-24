@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/domain"
 	_ "modernc.org/sqlite"
 )
@@ -163,6 +164,171 @@ func (s *DB) migrate(ctx context.Context) error {
 
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit migration v1: %w", err)
+		}
+	}
+
+	// 3. Schema migration v2 (Governance, Licences, Routing, Decisions, Attempts)
+	var countV2 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 2`).Scan(&countV2)
+	if err != nil {
+		return fmt.Errorf("check migration version 2: %w", err)
+	}
+
+	if countV2 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v2 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		schemaV2SQL := `
+		CREATE TABLE IF NOT EXISTS license_manifests (
+			id TEXT PRIMARY KEY,
+			dependency_name TEXT NOT NULL UNIQUE,
+			sha256 TEXT NOT NULL,
+			source_repo TEXT NOT NULL,
+			code_license TEXT NOT NULL,
+			model_license TEXT NOT NULL,
+			data_license TEXT NOT NULL,
+			service_terms TEXT NOT NULL,
+			verified INTEGER NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		CREATE TABLE IF NOT EXISTS credential_references (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			provider_id TEXT,
+			storage_type TEXT NOT NULL,
+			key_ref TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		CREATE TABLE IF NOT EXISTS provider_policies (
+			provider_id TEXT PRIMARY KEY,
+			policy_state TEXT NOT NULL,
+			reason TEXT,
+			updated_at TEXT NOT NULL
+		);
+
+		CREATE TABLE IF NOT EXISTS provider_attempts (
+			id TEXT PRIMARY KEY,
+			run_id TEXT NOT NULL,
+			stage TEXT NOT NULL,
+			provider_id TEXT NOT NULL,
+			model_name TEXT NOT NULL,
+			model_version TEXT NOT NULL,
+			input_hash TEXT NOT NULL,
+			attempt_number INTEGER NOT NULL,
+			status TEXT NOT NULL,
+			error_message TEXT,
+			latency_ms INTEGER NOT NULL,
+			cost_units REAL NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		CREATE TABLE IF NOT EXISTS selection_decisions (
+			id TEXT PRIMARY KEY,
+			run_id TEXT NOT NULL,
+			stage TEXT NOT NULL,
+			selected_provider_id TEXT NOT NULL,
+			candidates_evaluated_json TEXT NOT NULL,
+			policy_check_result TEXT NOT NULL,
+			decision_reason TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (2, datetime('now'));
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaV2SQL); err != nil {
+			return fmt.Errorf("execute migration v2: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v2: %w", err)
+		}
+	}
+
+	// 4. Schema migration v3 (Versioned License Manifests with composite dependency+version uniqueness)
+	var countV3 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 3`).Scan(&countV3)
+	if err != nil {
+		return fmt.Errorf("check migration version 3: %w", err)
+	}
+
+	if countV3 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v3 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		var hasVersionCol bool
+		rows, err := tx.QueryContext(ctx, `PRAGMA table_info(license_manifests)`)
+		if err != nil {
+			return fmt.Errorf("query table_info for license_manifests: %w", err)
+		}
+		for rows.Next() {
+			var cid int
+			var name, colType string
+			var notnull, pk int
+			var dfltValue sql.NullString
+			if err := rows.Scan(&cid, &name, &colType, &notnull, &dfltValue, &pk); err == nil {
+				if name == "version" {
+					hasVersionCol = true
+				}
+			}
+		}
+		rows.Close()
+
+		var copySQL string
+		if hasVersionCol {
+			copySQL = `
+			INSERT INTO license_manifests_v3 (id, dependency_name, version, sha256, source_repo, code_license, model_license, data_license, service_terms, verified, created_at)
+			SELECT id, dependency_name, CASE WHEN version IS NULL OR version = '' THEN 'v1' ELSE version END, sha256, source_repo, code_license, model_license, data_license, service_terms, verified, created_at
+			FROM license_manifests;
+			`
+		} else {
+			copySQL = `
+			INSERT INTO license_manifests_v3 (id, dependency_name, version, sha256, source_repo, code_license, model_license, data_license, service_terms, verified, created_at)
+			SELECT id, dependency_name, 'v1', sha256, source_repo, code_license, model_license, data_license, service_terms, verified, created_at
+			FROM license_manifests;
+			`
+		}
+
+		schemaV3SQL := fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS license_manifests_v3 (
+			id TEXT PRIMARY KEY,
+			dependency_name TEXT NOT NULL,
+			version TEXT NOT NULL DEFAULT 'v1',
+			sha256 TEXT NOT NULL,
+			source_repo TEXT NOT NULL,
+			code_license TEXT NOT NULL,
+			model_license TEXT NOT NULL,
+			data_license TEXT NOT NULL,
+			service_terms TEXT NOT NULL,
+			verified INTEGER NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		%s
+
+		DROP TABLE license_manifests;
+
+		ALTER TABLE license_manifests_v3 RENAME TO license_manifests;
+
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_license_manifests_dep_ver ON license_manifests(dependency_name, version);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (3, datetime('now'));
+		`, copySQL)
+
+		if _, err := tx.ExecContext(ctx, schemaV3SQL); err != nil {
+			return fmt.Errorf("execute migration v3: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v3: %w", err)
 		}
 	}
 
@@ -462,7 +628,7 @@ func (s *DB) ListJobs(ctx context.Context) ([]domain.LocalizationJob, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	query := `SELECT id, source_asset_id, target_language, status, created_at, updated_at FROM localization_jobs ORDER BY created_at DESC`
+	query := `SELECT id, source_asset_id, target_language, status, created_at, updated_at FROM localization_jobs ORDER BY created_at DESC, id ASC`
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("query jobs: %w", err)
@@ -536,4 +702,392 @@ func (s *DB) GetRun(ctx context.Context, id string) (*domain.LocalizationRun, er
 		r.CompletedAt = &t
 	}
 	return &r, nil
+}
+
+// SaveLicenseManifest stores an immutable versioned license manifest entry.
+func (s *DB) SaveLicenseManifest(ctx context.Context, entry domain.LicenseManifestEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	verInt := 0
+	if entry.Verified {
+		verInt = 1
+	}
+
+	if entry.ID == "" {
+		entry.ID = uuid.NewString()
+	}
+	if entry.Version == "" {
+		entry.Version = "v1"
+	}
+	if entry.CreatedAt.IsZero() {
+		entry.CreatedAt = time.Now().UTC()
+	}
+
+	var existingID string
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM license_manifests WHERE dependency_name = ? AND version = ?`, entry.DependencyName, entry.Version).Scan(&existingID)
+	if err == nil {
+		return fmt.Errorf("license manifest for dependency %q version %q already exists (immutable)", entry.DependencyName, entry.Version)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("check existing license manifest: %w", err)
+	}
+
+	query := `
+		INSERT INTO license_manifests (id, dependency_name, version, sha256, source_repo, code_license, model_license, data_license, service_terms, verified, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err = s.db.ExecContext(ctx, query,
+		entry.ID,
+		entry.DependencyName,
+		entry.Version,
+		entry.SHA256,
+		entry.SourceRepo,
+		entry.CodeLicense,
+		entry.ModelLicense,
+		entry.DataLicense,
+		entry.ServiceTerms,
+		verInt,
+		entry.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("insert license_manifest: %w", err)
+	}
+	return nil
+}
+
+// GetLicenseManifest retrieves a license manifest by dependency name and optional version.
+func (s *DB) GetLicenseManifest(ctx context.Context, dependencyName string, version string) (*domain.LicenseManifestEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var query string
+	var args []any
+	if version != "" {
+		query = `SELECT id, dependency_name, version, sha256, source_repo, code_license, model_license, data_license, service_terms, verified, created_at FROM license_manifests WHERE dependency_name = ? AND version = ? ORDER BY created_at DESC LIMIT 1`
+		args = []any{dependencyName, version}
+	} else {
+		query = `SELECT id, dependency_name, version, sha256, source_repo, code_license, model_license, data_license, service_terms, verified, created_at FROM license_manifests WHERE dependency_name = ? ORDER BY created_at DESC LIMIT 1`
+		args = []any{dependencyName}
+	}
+
+	row := s.db.QueryRowContext(ctx, query, args...)
+
+	var entry domain.LicenseManifestEntry
+	var verInt int
+	var createdStr string
+	err := row.Scan(&entry.ID, &entry.DependencyName, &entry.Version, &entry.SHA256, &entry.SourceRepo, &entry.CodeLicense, &entry.ModelLicense, &entry.DataLicense, &entry.ServiceTerms, &verInt, &createdStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query license_manifest: %w", err)
+	}
+	entry.Verified = verInt == 1
+	entry.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	return &entry, nil
+}
+
+// ListLicenseManifests retrieves all license manifests, optionally filtered by dependency name.
+func (s *DB) ListLicenseManifests(ctx context.Context, dependencyName string) ([]domain.LicenseManifestEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var query string
+	var args []any
+	if dependencyName != "" {
+		query = `SELECT id, dependency_name, version, sha256, source_repo, code_license, model_license, data_license, service_terms, verified, created_at FROM license_manifests WHERE dependency_name = ? ORDER BY version ASC, created_at DESC, id ASC`
+		args = []any{dependencyName}
+	} else {
+		query = `SELECT id, dependency_name, version, sha256, source_repo, code_license, model_license, data_license, service_terms, verified, created_at FROM license_manifests ORDER BY dependency_name ASC, version ASC, created_at DESC, id ASC`
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query license_manifests: %w", err)
+	}
+	defer rows.Close()
+
+	var list []domain.LicenseManifestEntry
+	for rows.Next() {
+		var entry domain.LicenseManifestEntry
+		var verInt int
+		var createdStr string
+		if err := rows.Scan(&entry.ID, &entry.DependencyName, &entry.Version, &entry.SHA256, &entry.SourceRepo, &entry.CodeLicense, &entry.ModelLicense, &entry.DataLicense, &entry.ServiceTerms, &verInt, &createdStr); err != nil {
+			return nil, fmt.Errorf("scan license_manifest: %w", err)
+		}
+		entry.Verified = verInt == 1
+		entry.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+		list = append(list, entry)
+	}
+	return list, nil
+}
+
+// SaveCredentialRef stores a credential reference.
+func (s *DB) SaveCredentialRef(ctx context.Context, ref domain.CredentialRef) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if ref.ID == "" {
+		ref.ID = uuid.NewString()
+	}
+	if ref.CreatedAt.IsZero() {
+		ref.CreatedAt = time.Now().UTC()
+	}
+
+	query := `
+		INSERT INTO credential_references (id, name, provider_id, storage_type, key_ref, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			name=excluded.name,
+			provider_id=excluded.provider_id,
+			storage_type=excluded.storage_type,
+			key_ref=excluded.key_ref
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		ref.ID,
+		ref.Name,
+		ref.ProviderID,
+		ref.StorageType,
+		ref.KeyRef,
+		ref.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("insert credential_reference: %w", err)
+	}
+	return nil
+}
+
+// GetCredentialRef retrieves a credential reference by ID or name.
+func (s *DB) GetCredentialRef(ctx context.Context, idOrName string) (*domain.CredentialRef, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `SELECT id, name, provider_id, storage_type, key_ref, created_at FROM credential_references WHERE id = ? OR name = ? ORDER BY created_at DESC, id ASC LIMIT 1`
+	row := s.db.QueryRowContext(ctx, query, idOrName, idOrName)
+
+	var ref domain.CredentialRef
+	var provID sql.NullString
+	var createdStr string
+	err := row.Scan(&ref.ID, &ref.Name, &provID, &ref.StorageType, &ref.KeyRef, &createdStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query credential_reference: %w", err)
+	}
+	if provID.Valid {
+		ref.ProviderID = provID.String
+	}
+	ref.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	return &ref, nil
+}
+
+// ListCredentialRefs lists all credential references.
+func (s *DB) ListCredentialRefs(ctx context.Context) ([]domain.CredentialRef, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `SELECT id, name, provider_id, storage_type, key_ref, created_at FROM credential_references ORDER BY name ASC, created_at DESC, id ASC`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("query credential_references: %w", err)
+	}
+	defer rows.Close()
+
+	var list []domain.CredentialRef
+	for rows.Next() {
+		var ref domain.CredentialRef
+		var provID sql.NullString
+		var createdStr string
+		if err := rows.Scan(&ref.ID, &ref.Name, &provID, &ref.StorageType, &ref.KeyRef, &createdStr); err != nil {
+			return nil, fmt.Errorf("scan credential_reference: %w", err)
+		}
+		if provID.Valid {
+			ref.ProviderID = provID.String
+		}
+		ref.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+		list = append(list, ref)
+	}
+	return list, nil
+}
+
+// SetProviderPolicy updates the policy state for a provider.
+func (s *DB) SetProviderPolicy(ctx context.Context, providerID string, state domain.PolicyState, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO provider_policies (provider_id, policy_state, reason, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(provider_id) DO UPDATE SET
+			policy_state=excluded.policy_state,
+			reason=excluded.reason,
+			updated_at=excluded.updated_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		providerID,
+		string(state),
+		reason,
+		time.Now().UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("insert provider_policy: %w", err)
+	}
+	return nil
+}
+
+// GetProviderPolicy retrieves the policy state for a provider.
+func (s *DB) GetProviderPolicy(ctx context.Context, providerID string) (domain.PolicyState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `SELECT policy_state FROM provider_policies WHERE provider_id = ?`
+	row := s.db.QueryRowContext(ctx, query, providerID)
+
+	var stateStr string
+	err := row.Scan(&stateStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("query provider_policy: %w", err)
+	}
+	return domain.PolicyState(stateStr), nil
+}
+
+// RecordProviderAttempt logs an immutable execution attempt.
+func (s *DB) RecordProviderAttempt(ctx context.Context, attempt domain.ProviderAttempt) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO provider_attempts (id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		attempt.ID,
+		attempt.RunID,
+		attempt.Stage,
+		attempt.ProviderID,
+		attempt.ModelName,
+		attempt.ModelVersion,
+		attempt.InputHash,
+		attempt.AttemptNumber,
+		attempt.Status,
+		attempt.ErrorMessage,
+		attempt.LatencyMs,
+		attempt.CostUnits,
+		attempt.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("insert provider_attempt: %w", err)
+	}
+	return nil
+}
+
+// ListProviderAttempts retrieves attempts for a run and stage.
+func (s *DB) ListProviderAttempts(ctx context.Context, runID string, stage string) ([]domain.ProviderAttempt, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var query string
+	var args []any
+	if stage != "" {
+		query = `SELECT id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at FROM provider_attempts WHERE run_id = ? AND stage = ? ORDER BY attempt_number ASC, created_at ASC, id ASC`
+		args = []any{runID, stage}
+	} else if runID != "" {
+		query = `SELECT id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at FROM provider_attempts WHERE run_id = ? ORDER BY attempt_number ASC, created_at ASC, id ASC`
+		args = []any{runID}
+	} else {
+		query = `SELECT id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at FROM provider_attempts ORDER BY created_at DESC, id ASC LIMIT 100`
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query provider_attempts: %w", err)
+	}
+	defer rows.Close()
+
+	var list []domain.ProviderAttempt
+	for rows.Next() {
+		var a domain.ProviderAttempt
+		var createdStr string
+		var errMsg sql.NullString
+		if err := rows.Scan(&a.ID, &a.RunID, &a.Stage, &a.ProviderID, &a.ModelName, &a.ModelVersion, &a.InputHash, &a.AttemptNumber, &a.Status, &errMsg, &a.LatencyMs, &a.CostUnits, &createdStr); err != nil {
+			return nil, fmt.Errorf("scan provider_attempt: %w", err)
+		}
+		if errMsg.Valid {
+			a.ErrorMessage = errMsg.String
+		}
+		a.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+		list = append(list, a)
+	}
+	return list, nil
+}
+
+// RecordSelectionDecision appends an immutable routing decision.
+func (s *DB) RecordSelectionDecision(ctx context.Context, dec domain.SelectionDecision) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	candJSON, err := json.Marshal(dec.CandidatesEvaluated)
+	if err != nil {
+		return fmt.Errorf("marshal candidates evaluated: %w", err)
+	}
+
+	query := `
+		INSERT INTO selection_decisions (id, run_id, stage, selected_provider_id, candidates_evaluated_json, policy_check_result, decision_reason, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err = s.db.ExecContext(ctx, query,
+		dec.ID,
+		dec.RunID,
+		dec.Stage,
+		dec.SelectedProviderID,
+		string(candJSON),
+		dec.PolicyCheckResult,
+		dec.DecisionReason,
+		dec.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("insert selection_decision: %w", err)
+	}
+	return nil
+}
+
+// ListSelectionDecisions retrieves decision history.
+func (s *DB) ListSelectionDecisions(ctx context.Context, runID string, stage string) ([]domain.SelectionDecision, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var query string
+	var args []any
+	if stage != "" && runID != "" {
+		query = `SELECT id, run_id, stage, selected_provider_id, candidates_evaluated_json, policy_check_result, decision_reason, created_at FROM selection_decisions WHERE run_id = ? AND stage = ? ORDER BY created_at ASC, id ASC`
+		args = []any{runID, stage}
+	} else if runID != "" {
+		query = `SELECT id, run_id, stage, selected_provider_id, candidates_evaluated_json, policy_check_result, decision_reason, created_at FROM selection_decisions WHERE run_id = ? ORDER BY created_at ASC, id ASC`
+		args = []any{runID}
+	} else {
+		query = `SELECT id, run_id, stage, selected_provider_id, candidates_evaluated_json, policy_check_result, decision_reason, created_at FROM selection_decisions ORDER BY created_at DESC, id ASC LIMIT 100`
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query selection_decisions: %w", err)
+	}
+	defer rows.Close()
+
+	var list []domain.SelectionDecision
+	for rows.Next() {
+		var d domain.SelectionDecision
+		var candJSON, createdStr string
+		if err := rows.Scan(&d.ID, &d.RunID, &d.Stage, &d.SelectedProviderID, &candJSON, &d.PolicyCheckResult, &d.DecisionReason, &createdStr); err != nil {
+			return nil, fmt.Errorf("scan selection_decision: %w", err)
+		}
+		_ = json.Unmarshal([]byte(candJSON), &d.CandidatesEvaluated)
+		d.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+		list = append(list, d)
+	}
+	return list, nil
 }
