@@ -21,7 +21,7 @@ import (
 
 func TestSeam1_PolicyBeforeHealth(t *testing.T) {
 	h := setupHarness(t)
-	runID := uuid.NewString()
+	runID := setupRunAndPlan(t, h)
 
 	// 1. Route TTS for Vietnamese:
 	// "fake_indextts2_blocked" has higher quality (0.99) and is Healthy=true, but has PolicyState=BLOCKED.
@@ -281,7 +281,7 @@ func TestSeam1_RetryProvenanceAndDecisions_RealExecutionPath(t *testing.T) {
 	}
 
 	// 2. Execute with Quality Rejection simulation via injected executor seam (real HTTP path)
-	runIDQuality := uuid.NewString()
+	runIDQuality := setupRunAndPlan(t, h)
 	h.SetExecutor(func(ctx context.Context, p provider.Provider, attemptNumber int) error {
 		if p.ID() == "fake_vieneu_tts_vi" {
 			return domain.ErrQualityRejected
@@ -410,7 +410,7 @@ func TestSeam1_RetryProvenanceAndDecisions_RealExecutionPath(t *testing.T) {
 	// Route candidates: 1. fake_cloud_tts_consent, 2. fake_vieneu_tts_vi, 3. fake_z_seam1_tts_vi
 	// When candidate 1 executes, it fails quality and trips candidate 2's circuit breaker.
 	// Router fallback skips candidate 2 (logging circuit_broken) and executes candidate 3 (logging succeeded).
-	runIDCircuit := uuid.NewString()
+	runIDCircuit := setupRunAndPlan(t, h)
 	h.SetExecutor(func(ctx context.Context, p provider.Provider, attemptNumber int) error {
 		if p.ID() == "fake_cloud_tts_consent" {
 			for i := 0; i < 3; i++ {
@@ -620,7 +620,7 @@ func TestSeam1_ExecutionProfilesAndLayeredConfig(t *testing.T) {
 
 	// 2. Routing with Cloud profile preference selects cloud provider
 	cloudPayload := map[string]any{
-		"run_id":            uuid.NewString(),
+		"run_id":            setupRunAndPlan(t, h),
 		"stage":             "tts",
 		"language":          "vi",
 		"execution_profile": "cloud",
@@ -643,7 +643,7 @@ func TestSeam1_ExecutionProfilesAndLayeredConfig(t *testing.T) {
 
 	// 3. Routing with Hybrid profile preference selects local cost-first provider
 	hybridPayload := map[string]any{
-		"run_id":            uuid.NewString(),
+		"run_id":            setupRunAndPlan(t, h),
 		"stage":             "tts",
 		"language":          "vi",
 		"execution_profile": "hybrid",
@@ -894,7 +894,7 @@ func TestSeam1_RouteExecute_HonorsExcludedProviders(t *testing.T) {
 	})
 
 	execPayload := map[string]any{
-		"run_id":             uuid.NewString(),
+		"run_id":             setupRunAndPlan(t, h),
 		"stage":              "tts",
 		"language":           "vi",
 		"consent_granted":    true,
@@ -924,7 +924,7 @@ func TestSeam1_RouteExecute_HonorsExcludedProviders(t *testing.T) {
 
 func TestSeam1_FallbackSelectionDecision_PersistsEffectivePolicyState(t *testing.T) {
 	h := setupHarness(t)
-	runID := uuid.NewString()
+	runID := setupRunAndPlan(t, h)
 
 	// Override policy for fake_cloud_tts_consent from REQUIRES_EXPLICIT_CONSENT to ALLOWED via PUT /api/v1/policies
 	overrideBody, _ := json.Marshal(map[string]string{
@@ -1108,7 +1108,7 @@ func TestSeam1_UnknownPolicy_NoDeclaredDefault_FailsClosed(t *testing.T) {
 
 	// Exclude all known allowed providers so only the undeclared provider is considered
 	decidePayload := map[string]any{
-		"run_id":             uuid.NewString(),
+		"run_id":             setupRunAndPlan(t, h),
 		"stage":              "tts",
 		"language":           "vi",
 		"excluded_providers": []string{"fake_vieneu_tts_vi", "fake_cloud_tts_consent", "fake_indextts2_blocked"},
@@ -1185,4 +1185,30 @@ func TestSeam1_RegisterCredential_UnsupportedStorageType_ClientError(t *testing.
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("expected 400 Bad Request for unsupported storage_type, got %d", resp.StatusCode)
 	}
+}
+
+func setupRunAndPlan(t *testing.T, h *testHarness) string {
+	t.Helper()
+	_, runID := createJobAndRun(t, h)
+	ctx := context.Background()
+	run, err := h.db.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("failed to get run %q: %v", runID, err)
+	}
+	job, err := h.db.GetJob(ctx, run.JobID)
+	if err != nil {
+		t.Fatalf("failed to get job: %v", err)
+	}
+	plan := domain.AudioRolePlan{
+		ID:      uuid.NewString(),
+		AssetID: job.SourceAssetID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := h.db.SaveAudioRolePlan(ctx, plan); err != nil {
+		t.Fatalf("failed to save audio role plan: %v", err)
+	}
+	return runID
 }

@@ -86,6 +86,109 @@ func containsFold(slice []string, s string) bool {
 // 3. Runtime health & circuit breaker
 // 4. Profile / Quality / Cost ranking
 func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, error) {
+	if r.db != nil {
+		isTTS := req.Stage == TypeTTS
+		isDialogueTranslation := req.Stage == TypeTranslation && containsFold(req.RequiredFeatures, "shorten_first_adaptation")
+		isDubStage := isTTS || isDialogueTranslation
+
+		var plan *domain.AudioRolePlan
+		var job *domain.LocalizationJob
+
+		if req.RunID != "" {
+			run, err := r.db.GetRun(ctx, req.RunID)
+			if err != nil {
+				if !errors.Is(err, storage.ErrNotFound) {
+					return nil, fmt.Errorf("failed to get run due to storage failure: %w", err)
+				}
+				if isDubStage {
+					return nil, fmt.Errorf("unknown run_id: audio role plan required for dub stage: %w", err)
+				}
+			}
+			if run != nil {
+				j, err := r.db.GetJob(ctx, run.JobID)
+				if err != nil {
+					if !errors.Is(err, domain.ErrJobNotFound) {
+						return nil, fmt.Errorf("failed to get job due to storage failure: %w", err)
+					}
+					if isDubStage {
+						return nil, fmt.Errorf("job not found: audio role plan required for dub stage: %w", err)
+					}
+				}
+				job = j
+				if job != nil {
+					p, err := r.db.GetAudioRolePlan(ctx, job.SourceAssetID)
+					if err != nil {
+						if !errors.Is(err, storage.ErrNotFound) {
+							return nil, fmt.Errorf("failed to get audio role plan due to storage failure: %w", err)
+						}
+						if isDubStage {
+							return nil, fmt.Errorf("audio role plan required for dub stage: %w", err)
+						}
+					}
+					plan = p
+				} else if isDubStage {
+					return nil, fmt.Errorf("job not found: audio role plan required for dub stage: %w", storage.ErrNotFound)
+				}
+			}
+		} else if isDubStage {
+			return nil, fmt.Errorf("missing run_id: audio role plan required for dub stage: %w", storage.ErrNotFound)
+		}
+
+		if plan != nil {
+			hasUncertain := false
+			hasSinging := false
+			hasNarration := false
+			for _, seg := range plan.Segments {
+				if seg.Role == domain.AudioRoleUncertain || (seg.Role != domain.AudioRoleNarrationDialogue &&
+					seg.Role != domain.AudioRoleSingingMusicVocal &&
+					seg.Role != domain.AudioRoleInstrumentalBgm &&
+					seg.Role != domain.AudioRoleAmbienceSFX) {
+					hasUncertain = true
+				}
+				if seg.Role == domain.AudioRoleSingingMusicVocal {
+					hasSinging = true
+				}
+				if seg.Role == domain.AudioRoleNarrationDialogue {
+					hasNarration = true
+				}
+			}
+
+			if isDubStage {
+				if hasUncertain {
+					if err := r.db.UpdateJobStatus(ctx, job.ID, "review_required"); err != nil {
+						return nil, fmt.Errorf("failed to update job status: %w", err)
+					}
+					return nil, domain.ErrUncertainRole
+				}
+				if !hasNarration {
+					// No-dub bypass contract
+					reason := "no-dub: no narration dialogue segments in plan, stage bypassed"
+					if hasSinging {
+						reason = "no-dub: singing-only/no narration speech segments in plan, stage bypassed"
+					}
+					decision := domain.SelectionDecision{
+						ID:                  uuid.NewString(),
+						RunID:               req.RunID,
+						Stage:               string(req.Stage),
+						SelectedProviderID:  "",
+						CandidatesEvaluated: nil,
+						PolicyCheckResult:   "BYPASS",
+						DecisionReason:      reason,
+						CreatedAt:           time.Now().UTC(),
+					}
+					if err := r.db.RecordSelectionDecision(ctx, decision); err != nil {
+						return nil, fmt.Errorf("fail-closed: record selection decision provenance: %w", err)
+					}
+					return &RouteResult{
+						SelectedProvider: nil,
+						FallbackOrdered:  nil,
+						Decision:         decision,
+					}, nil
+				}
+			}
+		}
+	}
+
 	if req.ExecutionProfile == "" {
 		req.ExecutionProfile = domain.ExecutionProfileHybrid // Cost-first hybrid default
 	}
@@ -373,6 +476,10 @@ func (r *Router) ExecuteWithRetry(
 	routeRes, err := r.Route(ctx, req)
 	if err != nil {
 		return err
+	}
+
+	if routeRes.SelectedProvider == nil {
+		return nil
 	}
 
 	candidates := append([]Provider{routeRes.SelectedProvider}, routeRes.FallbackOrdered...)

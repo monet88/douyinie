@@ -59,13 +59,15 @@ func setupTestRouter(t *testing.T) (*provider.Router, *storage.DB, *provider.Reg
 }
 
 func TestRouter_PolicyBeforeHealth(t *testing.T) {
-	router, _, _, polSvc, _, _ := setupTestRouter(t)
+	router, db, _, polSvc, _, _ := setupTestRouter(t)
 	ctx := context.Background()
 
 	// "fake_indextts2_blocked" has QualityScore 0.99 and Healthy=true, but Policy=BLOCKED.
 	// Router should NEVER select it.
+	runID1 := uuid.NewString()
+	seedDefaultAudioRolePlan(t, db, runID1)
 	res, err := router.Route(ctx, provider.RouteRequest{
-		RunID:    uuid.NewString(),
+		RunID:    runID1,
 		Stage:    provider.TypeTTS,
 		Language: "vi",
 	})
@@ -84,8 +86,10 @@ func TestRouter_PolicyBeforeHealth(t *testing.T) {
 	_ = polSvc.SetPolicy(ctx, "fake_vieneu_tts_vi", domain.PolicyBlocked, "temporary restriction")
 
 	// Now routing for VI should fail since the other candidate is also blocked
+	runID2 := uuid.NewString()
+	seedDefaultAudioRolePlan(t, db, runID2)
 	_, err = router.Route(ctx, provider.RouteRequest{
-		RunID:    uuid.NewString(),
+		RunID:    runID2,
 		Stage:    provider.TypeTTS,
 		Language: "vi",
 	})
@@ -95,15 +99,17 @@ func TestRouter_PolicyBeforeHealth(t *testing.T) {
 }
 
 func TestRouter_ConsentRequirement(t *testing.T) {
-	router, _, _, polSvc, _, _ := setupTestRouter(t)
+	router, db, _, polSvc, _, _ := setupTestRouter(t)
 	ctx := context.Background()
 
 	// Block local provider so only cloud consent provider remains
 	_ = polSvc.SetPolicy(ctx, "fake_vieneu_tts_vi", domain.PolicyBlocked, "disabled")
 
 	// 1. Without consent -> rejection
+	runID1 := uuid.NewString()
+	seedDefaultAudioRolePlan(t, db, runID1)
 	_, err := router.Route(ctx, provider.RouteRequest{
-		RunID:          uuid.NewString(),
+		RunID:          runID1,
 		Stage:          provider.TypeTTS,
 		Language:       "vi",
 		ConsentGranted: false,
@@ -113,8 +119,10 @@ func TestRouter_ConsentRequirement(t *testing.T) {
 	}
 
 	// 2. With consent -> selected
+	runID2 := uuid.NewString()
+	seedDefaultAudioRolePlan(t, db, runID2)
 	res, err := router.Route(ctx, provider.RouteRequest{
-		RunID:          uuid.NewString(),
+		RunID:          runID2,
 		Stage:          provider.TypeTTS,
 		Language:       "vi",
 		ConsentGranted: true,
@@ -219,6 +227,7 @@ func TestRouter_ExecuteWithRetry_QualityVsTransient(t *testing.T) {
 	router, db, _, _, _, _ := setupTestRouter(t)
 	ctx := context.Background()
 	runID := uuid.NewString()
+	seedDefaultAudioRolePlan(t, db, runID)
 
 	req := provider.RouteRequest{
 		RunID:    runID,
@@ -244,6 +253,7 @@ func TestRouter_ExecuteWithRetry_QualityVsTransient(t *testing.T) {
 
 	// 2. Quality Rejection Test: quality gate rejects candidate -> logged as quality_failed and advances to fallback candidate without retrying same candidate
 	runIDQuality := uuid.NewString()
+	seedDefaultAudioRolePlan(t, db, runIDQuality)
 	reqQuality := provider.RouteRequest{
 		RunID:          runIDQuality,
 		Stage:          provider.TypeTTS,
@@ -306,6 +316,7 @@ func TestRouter_CircuitBreaker_SkipsAndRecordsProvenance(t *testing.T) {
 	})
 
 	runID := uuid.NewString()
+	seedDefaultAudioRolePlan(t, db, runID)
 	req := provider.RouteRequest{
 		RunID:            runID,
 		Stage:            provider.TypeTTS,
@@ -406,10 +417,12 @@ func TestRouter_UnmanifestedCheckpointFailClosed(t *testing.T) {
 }
 
 func TestRouter_ExecuteWithRetry_InputHashAndExecutorValidation(t *testing.T) {
-	router, _, _, _, _, _ := setupTestRouter(t)
+	router, db, _, _, _, _ := setupTestRouter(t)
 	ctx := context.Background()
+	runID := uuid.NewString()
+	seedDefaultAudioRolePlan(t, db, runID)
 	req := provider.RouteRequest{
-		RunID:    uuid.NewString(),
+		RunID:    runID,
 		Stage:    provider.TypeTTS,
 		Language: "vi",
 	}
@@ -438,10 +451,12 @@ func TestRouter_ExecuteWithRetry_InputHashAndExecutorValidation(t *testing.T) {
 }
 
 func TestRouter_ExecuteWithRetry_HonorsExcludedProviders(t *testing.T) {
-	router, _, _, _, _, _ := setupTestRouter(t)
+	router, db, _, _, _, _ := setupTestRouter(t)
 	ctx := context.Background()
+	runID := uuid.NewString()
+	seedDefaultAudioRolePlan(t, db, runID)
 	req := provider.RouteRequest{
-		RunID:             uuid.NewString(),
+		RunID:             runID,
 		Stage:             provider.TypeTTS,
 		Language:          "vi",
 		ConsentGranted:    true,
@@ -469,6 +484,7 @@ func TestRouter_FallbackSelectionDecision_PersistsEffectivePolicyState(t *testin
 	router, db, _, polSvc, _, _ := setupTestRouter(t)
 	ctx := context.Background()
 	runID := uuid.NewString()
+	seedDefaultAudioRolePlan(t, db, runID)
 
 	// "fake_cloud_tts_consent" has declared PolicyState = REQUIRES_EXPLICIT_CONSENT.
 	// Operator overrides policy to ALLOWED via PolicyService.
@@ -545,6 +561,7 @@ func TestRouter_PerProviderRetryPolicyOverride(t *testing.T) {
 	})
 
 	runID := uuid.NewString()
+	seedDefaultAudioRolePlan(t, db, runID)
 	req := provider.RouteRequest{
 		RunID:             runID,
 		Stage:             provider.TypeTTS,
@@ -577,7 +594,7 @@ func TestRouter_PerProviderRetryPolicyOverride(t *testing.T) {
 }
 
 func TestRouter_UnknownPolicyFailsClosed(t *testing.T) {
-	router, _, reg, _, licSvc, _ := setupTestRouter(t)
+	router, db, reg, _, licSvc, _ := setupTestRouter(t)
 	ctx := context.Background()
 
 	// Provider with empty PolicyState (undeclared / unknown policy)
@@ -599,8 +616,10 @@ func TestRouter_UnknownPolicyFailsClosed(t *testing.T) {
 		CreatedAt:      time.Now().UTC(),
 	})
 
+	runID := uuid.NewString()
+	seedDefaultAudioRolePlan(t, db, runID)
 	req := provider.RouteRequest{
-		RunID:             uuid.NewString(),
+		RunID:             runID,
 		Stage:             provider.TypeTTS,
 		Language:          "vi",
 		ExcludedProviders: []string{"fake_vieneu_tts_vi", "fake_cloud_tts_consent", "fake_indextts2_blocked"},
@@ -609,5 +628,72 @@ func TestRouter_UnknownPolicyFailsClosed(t *testing.T) {
 	_, err := router.Route(ctx, req)
 	if !errors.Is(err, domain.ErrNoEligibleProvider) {
 		t.Errorf("expected ErrNoEligibleProvider for provider with undeclared policy, got %v", err)
+	}
+}
+
+func seedDefaultAudioRolePlan(t *testing.T, db *storage.DB, runID string) {
+	t.Helper()
+	ctx := context.Background()
+
+	raID := uuid.NewString()
+	err := db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              raID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		DeclaredBy:      "test_operator",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create dummy rights attestation: %v", err)
+	}
+
+	assetID := uuid.NewString()
+	err = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		SHA256:              "hash_" + assetID,
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		OriginalFilename:    "dummy.mp4",
+		RightsAttestationID: raID,
+		CASPath:             "dummy.mp4",
+		CreatedAt:           time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create dummy asset: %v", err)
+	}
+
+	jobID := uuid.NewString()
+	err = db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             jobID,
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		Status:         "queued",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create dummy job: %v", err)
+	}
+
+	err = db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        runID,
+		JobID:     jobID,
+		Status:    "running",
+		CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("failed to create dummy run: %v", err)
+	}
+
+	plan := domain.AudioRolePlan{
+		ID:      uuid.NewString(),
+		AssetID: assetID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := db.SaveAudioRolePlan(ctx, plan); err != nil {
+		t.Fatalf("failed to save dummy plan: %v", err)
 	}
 }

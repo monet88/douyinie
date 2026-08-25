@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -138,6 +139,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/assets/ingest", s.handleIngestAsset)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}", s.handleGetAsset)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/preflight", s.handleGetAssetPreflight)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/audio-role-plan", s.handleSaveAudioRolePlan)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/audio-role-plan", s.handleGetAudioRolePlan)
 
 	// Localization Jobs & Runs
 	s.mux.HandleFunc("POST /api/v1/jobs", s.handleCreateJob)
@@ -313,6 +316,69 @@ func (s *Server) handleGetAssetPreflight(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"preflight_report": report})
+}
+
+func (s *Server) handleSaveAudioRolePlan(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if _, err := s.db.GetSourceAsset(r.Context(), assetID); err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var body struct {
+		Segments []domain.AudioSegment `json:"segments"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	for _, seg := range body.Segments {
+		switch seg.Role {
+		case domain.AudioRoleNarrationDialogue,
+			domain.AudioRoleSingingMusicVocal,
+			domain.AudioRoleInstrumentalBgm,
+			domain.AudioRoleAmbienceSFX,
+			domain.AudioRoleUncertain:
+			// valid
+		default:
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid audio role value: %q", seg.Role))
+			return
+		}
+	}
+
+	plan := domain.AudioRolePlan{
+		ID:        uuid.NewString(),
+		AssetID:   assetID,
+		Segments:  body.Segments,
+		CreatedAt: time.Now().UTC(),
+	}
+
+	if err := s.db.SaveAudioRolePlan(r.Context(), plan); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"audio_role_plan": plan})
+}
+
+func (s *Server) handleGetAudioRolePlan(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	plan, err := s.db.GetAudioRolePlan(r.Context(), assetID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "audio role plan not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"audio_role_plan": plan})
 }
 
 func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
@@ -673,7 +739,13 @@ func (s *Server) handleRouteDecide(w http.ResponseWriter, r *http.Request) {
 
 	res, err := s.router.Route(r.Context(), req)
 	if err != nil {
-		if errors.Is(err, domain.ErrNoEligibleProvider) || errors.Is(err, domain.ErrPolicyBlocked) {
+		if errors.Is(err, domain.ErrNoEligibleProvider) ||
+			errors.Is(err, domain.ErrPolicyBlocked) ||
+			errors.Is(err, domain.ErrConsentRequired) ||
+			errors.Is(err, domain.ErrAuthRequired) ||
+			errors.Is(err, domain.ErrLicenseManifestMissing) ||
+			errors.Is(err, domain.ErrUncertainRole) ||
+			strings.Contains(err.Error(), "audio role plan required") {
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
 				"error": err.Error(),
 			})
@@ -683,13 +755,20 @@ func (s *Server) handleRouteDecide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var selectedProviderID string
+	if res.SelectedProvider != nil {
+		selectedProviderID = res.SelectedProvider.ID()
+	}
+
 	var fallbackIDs []string
 	for _, f := range res.FallbackOrdered {
-		fallbackIDs = append(fallbackIDs, f.ID())
+		if f != nil {
+			fallbackIDs = append(fallbackIDs, f.ID())
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"selected_provider_id": res.SelectedProvider.ID(),
+		"selected_provider_id": selectedProviderID,
 		"fallback_candidates":  fallbackIDs,
 		"decision":             res.Decision,
 	})
@@ -762,7 +841,9 @@ func (s *Server) handleRouteExecute(w http.ResponseWriter, r *http.Request) {
 			errors.Is(err, domain.ErrNoEligibleProvider) ||
 			errors.Is(err, domain.ErrConsentRequired) ||
 			errors.Is(err, domain.ErrAuthRequired) ||
-			errors.Is(err, domain.ErrLicenseManifestMissing) {
+			errors.Is(err, domain.ErrLicenseManifestMissing) ||
+			errors.Is(err, domain.ErrUncertainRole) ||
+			strings.Contains(err.Error(), "audio role plan required") {
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
 			return
 		}
