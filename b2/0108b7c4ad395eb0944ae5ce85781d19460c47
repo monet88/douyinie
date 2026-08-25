@@ -1,0 +1,51 @@
+internal/domain/types.go
+  s_6a9f1c04854135::t_717dff472cef35 90,96-159
+internal/queue/queue.go
+  s_6a9f1c04854135::t_06948310d02dc6 1-164
+internal/server/server.go
+  s_6a9f1c04854135::t_b45611a7be5e9a 18-19,37-38,55-56,74-79,90-91,148-160,417-419,441-606
+test/seam1/acceptance_test.go
+  s_6a9f1c04854135::t_f472c3adbada9c 22-23,30-38,60-90,124,134-136
+test/seam1/queue_test.go
+  s_6a9f1c04854135::t_2faa5fe81c318a 1-899
+cmd/runtimehost/main.go
+  s_53ee15f3b8bfde::t_2ad1270d3d3435 20-21,61-72,79,109,121-122
+internal/scheduler/scheduler.go
+  s_53ee15f3b8bfde::t_0eb6612702915d 1-79
+internal/storage/sqlite.go
+  s_4dab1980034d65::t_0f02ed170ff8e9 20-22,27-29,338-480,853-905,1293-1796
+internal/storage/sqlite_test.go
+  s_4dab1980034d65::t_ad0fd6c4d08aeb 379-602
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "b20108b7c4ad395eb0944ae5ce85781d19460c47",
+  "prompts": {},
+  "sessions": {
+    "s_4dab1980034d65": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6f159049-9068-4ae4-974b-88c3bf8b63ed",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_53ee15f3b8bfde": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f70176a7-1d4c-4a1d-a23e-27d819016936",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_6a9f1c04854135": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fd2cd430dffeWOgs3RQG91HVQu",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
