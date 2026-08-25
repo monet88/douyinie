@@ -1,0 +1,14 @@
+.gitignore
+  h_17f2fa2b92da6a 11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "e29df904d2ce5f621aae7b17ea423b0566949e80",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
