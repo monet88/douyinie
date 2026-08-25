@@ -17,13 +17,16 @@ import (
 )
 
 var (
-	ErrNotFound = errors.New("record not found")
+	ErrNotFound            = errors.New("record not found")
+	ErrNotActiveQueueEntry = errors.New("run is not an active queue entry")
+	ErrSlotBusy            = errors.New("another run is already running (active_run_slots=1)")
 )
 
 // DB wraps a SQLite database connection with helper methods and single-writer concurrency management.
 type DB struct {
-	db *sql.DB
-	mu sync.RWMutex
+	db   *sql.DB
+	mu   sync.RWMutex
+	txMu sync.Mutex // serializes explicit multi-statement transactions (reorder, recovery)
 }
 
 // Open initializes SQLite database with foreign keys and WAL mode.
@@ -329,6 +332,149 @@ func (s *DB) migrate(ctx context.Context) error {
 
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit migration v3: %w", err)
+		}
+	}
+
+	// 5. Schema migration v4 (Persisted Queue + Stage Executions)
+	var countV4 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 4`).Scan(&countV4)
+	if err != nil {
+		return fmt.Errorf("check migration version 4: %w", err)
+	}
+
+	if countV4 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v4 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		schemaV4SQL := `
+		CREATE TABLE IF NOT EXISTS queue_entries (
+			id          TEXT PRIMARY KEY,
+			run_id      TEXT NOT NULL REFERENCES localization_runs(id),
+			job_id      TEXT NOT NULL REFERENCES localization_jobs(id),
+			position    INTEGER,          -- NULL for terminal entries (cancelled/completed/interrupted); active entries own 1..N
+			status      TEXT NOT NULL,
+			inserted_at TEXT NOT NULL,
+			updated_at  TEXT NOT NULL
+		);
+
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_entries_position ON queue_entries(position);
+
+		CREATE TABLE IF NOT EXISTS stage_executions (
+			id              TEXT PRIMARY KEY,
+			run_id          TEXT NOT NULL REFERENCES localization_runs(id),
+			stage           TEXT NOT NULL,
+			status          TEXT NOT NULL,
+			started_at      TEXT,
+			completed_at    TEXT,
+			artifact_sha256 TEXT,
+			error_message   TEXT,
+			created_at      TEXT NOT NULL,
+			updated_at      TEXT NOT NULL
+		);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (4, datetime('now'));
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaV4SQL); err != nil {
+			return fmt.Errorf("execute migration v4: %w", err)
+		}
+
+		// Backfill queue_entries for pre-existing localization_runs from pre-T03/v3 databases.
+		// Without this, upgrade + restart/recovery would strand old runs: they'd be invisible
+		// to MarkAllActiveInterrupted, NextQueuedEntry, and every queue operation.
+		//
+		// Guard on the table existing: an ancient pre-v1 hand-built DB may never have had
+		// localization_runs created (migration v1 creates it in its own transaction), so the
+		// backfill must be a no-op when the table is absent.
+		var runTableCount int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='localization_runs'`).Scan(&runTableCount); err != nil {
+			return fmt.Errorf("check localization_runs table for backfill: %w", err)
+		}
+		if runTableCount == 0 {
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit migration v4: %w", err)
+			}
+			return nil
+		}
+
+		rows, err := tx.QueryContext(ctx, `SELECT id, job_id, status FROM localization_runs ORDER BY created_at ASC, id ASC`)
+		if err != nil {
+			return fmt.Errorf("query existing runs for backfill: %w", err)
+		}
+		type runRow struct {
+			id, jobID, status string
+		}
+		var existingRuns []runRow
+		for rows.Next() {
+			var r runRow
+			if err := rows.Scan(&r.id, &r.jobID, &r.status); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan backfill run: %w", err)
+			}
+			existingRuns = append(existingRuns, r)
+		}
+		rows.Close()
+
+		// Determine the next sequential position for active entries.
+		var maxPos sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT MAX(position) FROM queue_entries`).Scan(&maxPos); err != nil {
+			return fmt.Errorf("query max position for backfill: %w", err)
+		}
+		nextPos := 1
+		if maxPos.Valid {
+			nextPos = int(maxPos.Int64) + 1
+		}
+
+		nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+		for _, r := range existingRuns {
+			// Skip runs that already have a queue entry (shouldn't happen on v3→v4 but safe).
+			var existingCount int
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM queue_entries WHERE run_id = ?`, r.id).Scan(&existingCount); err != nil {
+				return fmt.Errorf("check existing queue entry for run %s: %w", r.id, err)
+			}
+			if existingCount > 0 {
+				continue
+			}
+
+			// Map old status names to the new queue statuses.
+			// Old set: "queued", "running", "succeeded", "failed", "interrupted"
+			// New set: "queued", "running", "paused", "cancelled", "completed", "interrupted"
+			queueStatus := r.status
+			var pos sql.NullInt64
+			switch r.status {
+			case "succeeded":
+				queueStatus = domain.RunStatusCompleted
+			case "failed":
+				queueStatus = domain.RunStatusInterrupted
+			case "queued", "running":
+				pos = sql.NullInt64{Int64: int64(nextPos), Valid: true}
+				nextPos++
+			}
+
+			entryID := uuid.NewString()
+			if _, err := tx.ExecContext(ctx, `INSERT INTO queue_entries (id, run_id, job_id, position, status, inserted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				entryID, r.id, r.jobID, pos, queueStatus, nowStr, nowStr,
+			); err != nil {
+				return fmt.Errorf("backfill queue entry for run %s: %w", r.id, err)
+			}
+
+			// Keep the run row itself consistent with the new status set. Old names that
+			// map to a different new status (succeeded->completed, failed->interrupted)
+			// must be rewritten here; without this the run row would carry a status value
+			// that no longer exists in the new enum and readers like GET /runs/{id} would
+			// report an invalid status forever.
+			if queueStatus != r.status {
+				if _, err := tx.ExecContext(ctx, `UPDATE localization_runs SET status = ? WHERE id = ?`, queueStatus, r.id); err != nil {
+					return fmt.Errorf("update run %s status during backfill: %w", r.id, err)
+				}
+			}
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v4: %w", err)
 		}
 	}
 
@@ -702,6 +848,59 @@ func (s *DB) GetRun(ctx context.Context, id string) (*domain.LocalizationRun, er
 		r.CompletedAt = &t
 	}
 	return &r, nil
+}
+
+// CreateRunEnqueued creates a run and its queue entry in a single transaction,
+// so a partial failure never leaves an orphaned run without a queue entry.
+func (s *DB) CreateRunEnqueued(ctx context.Context, run domain.LocalizationRun, jobID string) (int, error) {
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin create-run+enqueue tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var compStr sql.NullString
+	if run.CompletedAt != nil {
+		compStr = sql.NullString{String: run.CompletedAt.Format(time.RFC3339Nano), Valid: true}
+	}
+	query := `
+		INSERT INTO localization_runs (id, job_id, status, config_snapshot_json, created_at, completed_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`
+	if _, err := tx.ExecContext(ctx, query,
+		run.ID, run.JobID, run.Status, run.ConfigSnapshotJSON,
+		run.CreatedAt.Format(time.RFC3339Nano), compStr,
+	); err != nil {
+		return 0, fmt.Errorf("insert localization_run: %w", err)
+	}
+
+	var maxPos sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT MAX(position) FROM queue_entries`).Scan(&maxPos); err != nil {
+		return 0, fmt.Errorf("query max queue position: %w", err)
+	}
+	pos := 1
+	if maxPos.Valid {
+		pos = int(maxPos.Int64) + 1
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	entryID := uuid.NewString()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO queue_entries (id, run_id, job_id, position, status, inserted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		entryID, run.ID, jobID, pos, domain.RunStatusQueued, now, now,
+	); err != nil {
+		return 0, fmt.Errorf("insert queue_entry: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit create-run+enqueue tx: %w", err)
+	}
+	return pos, nil
 }
 
 // SaveLicenseManifest stores an immutable versioned license manifest entry.
@@ -1090,4 +1289,508 @@ func (s *DB) ListSelectionDecisions(ctx context.Context, runID string, stage str
 		list = append(list, d)
 	}
 	return list, nil
+}
+
+// ---- Queue (persisted run ordering) ----
+
+func scanQueueEntry(row *sql.Row) (*domain.QueueEntry, error) {
+	var e domain.QueueEntry
+	var pos sql.NullInt64
+	var insStr, updStr string
+	if err := row.Scan(&e.ID, &e.RunID, &e.JobID, &pos, &e.Status, &insStr, &updStr); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query queue_entry: %w", err)
+	}
+	if pos.Valid {
+		e.Position = int(pos.Int64)
+	}
+	e.InsertedAt, _ = time.Parse(time.RFC3339Nano, insStr)
+	e.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updStr)
+	return &e, nil
+}
+
+func scanQueueEntries(rows *sql.Rows) ([]domain.QueueEntry, error) {
+	var list []domain.QueueEntry
+	for rows.Next() {
+		var e domain.QueueEntry
+		var pos sql.NullInt64
+		var insStr, updStr string
+		if err := rows.Scan(&e.ID, &e.RunID, &e.JobID, &pos, &e.Status, &insStr, &updStr); err != nil {
+			return nil, fmt.Errorf("scan queue_entry: %w", err)
+		}
+		if pos.Valid {
+			e.Position = int(pos.Int64)
+		}
+		e.InsertedAt, _ = time.Parse(time.RFC3339Nano, insStr)
+		e.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updStr)
+		list = append(list, e)
+	}
+	return list, nil
+}
+
+const queueEntryColumns = `id, run_id, job_id, position, status, inserted_at, updated_at`
+
+// CreateQueueEntry appends a queue entry at the next position.
+func (s *DB) CreateQueueEntry(ctx context.Context, e domain.QueueEntry) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var maxPos sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT MAX(position) FROM queue_entries`).Scan(&maxPos); err != nil {
+		return 0, fmt.Errorf("query max queue position: %w", err)
+	}
+	pos := 1
+	if maxPos.Valid {
+		pos = int(maxPos.Int64) + 1
+	}
+	e.Position = pos
+
+	query := `INSERT INTO queue_entries (id, run_id, job_id, position, status, inserted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
+	_, err := s.db.ExecContext(ctx, query,
+		e.ID, e.RunID, e.JobID, e.Position, e.Status,
+		e.InsertedAt.Format(time.RFC3339Nano), e.UpdatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("insert queue_entry: %w", err)
+	}
+	return pos, nil
+}
+
+// GetQueueEntryByRunID retrieves the queue entry for a run.
+func (s *DB) GetQueueEntryByRunID(ctx context.Context, runID string) (*domain.QueueEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	row := s.db.QueryRowContext(ctx, `SELECT `+queueEntryColumns+` FROM queue_entries WHERE run_id = ?`, runID)
+	return scanQueueEntry(row)
+}
+
+// ListQueueEntries returns all queue entries ordered by position.
+func (s *DB) ListQueueEntries(ctx context.Context) ([]domain.QueueEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.QueryContext(ctx, `SELECT `+queueEntryColumns+` FROM queue_entries ORDER BY position ASC, id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("query queue_entries: %w", err)
+	}
+	defer rows.Close()
+	return scanQueueEntries(rows)
+}
+
+// NextQueuedEntry returns the lowest-position entry with status 'queued'.
+func (s *DB) NextQueuedEntry(ctx context.Context) (*domain.QueueEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	row := s.db.QueryRowContext(ctx, `SELECT `+queueEntryColumns+` FROM queue_entries WHERE status = 'queued' ORDER BY position ASC, id ASC LIMIT 1`)
+	return scanQueueEntry(row)
+}
+
+// UpdateQueueStatus updates the status of a queue entry (and its linked run status) atomically.
+// Terminal transitions (cancelled/completed/interrupted) release the entry's position (set NULL)
+// so active entries always own positions 1..N, and completed_at is set only on terminal transitions.
+//
+// Stage execution alignment: because active stage states are QUEUED/RUNNING/CANCELLING
+// (locked #13/#16), a run that stops actively executing must never leave its stages in the
+// active set. Pause returns running/cancelling stages to queued (reversible); cancel and
+// interrupted terminalize running/cancelling stages to interrupted. Both happen in the same
+// transaction so the run and its stages always agree.
+func (s *DB) UpdateQueueStatus(ctx context.Context, runID, queueStatus, runStatus string) error {
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin queue status tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	isTerminal := queueStatus == domain.RunStatusCancelled || queueStatus == domain.RunStatusCompleted || queueStatus == domain.RunStatusInterrupted
+
+	if isTerminal {
+		// Release the position so active entries keep an unbroken 1..N position space.
+		if _, err := tx.ExecContext(ctx, `UPDATE queue_entries SET status = ?, position = NULL, updated_at = ? WHERE run_id = ?`,
+			queueStatus, time.Now().UTC().Format(time.RFC3339Nano), runID); err != nil {
+			return fmt.Errorf("update queue_entry status: %w", err)
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `UPDATE queue_entries SET status = ?, updated_at = ? WHERE run_id = ?`,
+			queueStatus, time.Now().UTC().Format(time.RFC3339Nano), runID); err != nil {
+			return fmt.Errorf("update queue_entry status: %w", err)
+		}
+	}
+
+	// Align the run's stage executions with the new run state (see doc comment).
+	stageSnapSQL := `UPDATE stage_executions SET status = ?, updated_at = ? WHERE run_id = ? AND status IN ('running','cancelling')`
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	switch queueStatus {
+	case domain.RunStatusPaused:
+		// Paused runs are not actively executing; return in-flight stages to queued so resume can restart them.
+		if _, err := tx.ExecContext(ctx, stageSnapSQL, domain.StageStatusQueued, nowStr, runID); err != nil {
+			return fmt.Errorf("snap stages to queued on pause: %w", err)
+		}
+	case domain.RunStatusCancelled:
+		// Deliberate termination mid-execution is interrupted (same as crash recovery).
+		if _, err := tx.ExecContext(ctx, stageSnapSQL, domain.StageStatusInterrupted, nowStr, runID); err != nil {
+			return fmt.Errorf("snap stages to interrupted on cancel: %w", err)
+		}
+	}
+
+	// Set completed_at only for terminal statuses; preserve it otherwise (pass SQL NULL).
+	var completedExpr any
+	if runStatus == domain.RunStatusCompleted || runStatus == domain.RunStatusInterrupted {
+		completedExpr = time.Now().UTC().Format(time.RFC3339Nano)
+	} else {
+		completedExpr = nil // SQL NULL -> COALESCE(NULL, completed_at) preserves prior value
+	}
+	if runStatus != "" {
+		query := `UPDATE localization_runs SET status = ?, completed_at = COALESCE(?, completed_at) WHERE id = ?`
+		if _, err := tx.ExecContext(ctx, query, runStatus, completedExpr, runID); err != nil {
+			return fmt.Errorf("update localization_run status: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit queue status tx: %w", err)
+	}
+	return nil
+}
+
+// ReorderQueueEntries reassigns positions within a single transaction (append-only: never deletes).
+func (s *DB) ReorderQueueEntries(ctx context.Context, runID string, newPosition int) error {
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin reorder tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Fetch current entry + all active entries (queued/running/paused), excluding cancelled/completed/interrupted.
+	rows, err := tx.QueryContext(ctx, `SELECT run_id, position FROM queue_entries WHERE status IN ('queued','running','paused') ORDER BY position ASC, id ASC`)
+	if err != nil {
+		return fmt.Errorf("query reorder entries: %w", err)
+	}
+	type rowT struct {
+		runID string
+		pos   int
+	}
+	var entries []rowT
+	for rows.Next() {
+		var r rowT
+		if err := rows.Scan(&r.runID, &r.pos); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan reorder entry: %w", err)
+		}
+		entries = append(entries, r)
+	}
+	rows.Close()
+
+	targetIdx := -1
+	for i, e := range entries {
+		if e.runID == runID {
+			targetIdx = i
+			break
+		}
+	}
+	if targetIdx == -1 {
+		return fmt.Errorf("%w: run %s", ErrNotActiveQueueEntry, runID)
+	}
+	if newPosition < 1 || newPosition > len(entries) {
+		return fmt.Errorf("new position %d out of range [1, %d]", newPosition, len(entries))
+	}
+
+	// Remove target, re-insert at newPosition-1, reassign sequential positions.
+	moved := entries[targetIdx]
+	entries = append(entries[:targetIdx], entries[targetIdx+1:]...)
+	entries = append(entries, rowT{}) // grow
+	copy(entries[newPosition:], entries[newPosition-1:])
+	entries[newPosition-1] = moved
+
+	// Two-phase update to avoid transient UNIQUE(position) collisions during a swap:
+	// 1) shift every active entry to a temporary negative position, 2) set final positions.
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	for i, e := range entries {
+		if _, err := tx.ExecContext(ctx, `UPDATE queue_entries SET position = ?, updated_at = ? WHERE run_id = ?`,
+			-(i + 1), nowStr, e.runID); err != nil {
+			return fmt.Errorf("phase-1 shift queue position: %w", err)
+		}
+	}
+	for i, e := range entries {
+		if _, err := tx.ExecContext(ctx, `UPDATE queue_entries SET position = ?, updated_at = ? WHERE run_id = ?`,
+			i+1, nowStr, e.runID); err != nil {
+			return fmt.Errorf("update queue position: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit reorder tx: %w", err)
+	}
+	return nil
+}
+
+// MarkAllActiveInterrupted transitions every running queue entry (and only running
+// runs) to interrupted at daemon startup. Queued never-started runs survive restart
+// as queued; paused runs stay paused. Only stages that were actively executing
+// (running or cancelling) are interrupted — queued stages stay queued and terminal
+// (succeeded/failed) stage outcomes are left untouched so crash recovery never
+// conflates active and terminal stage states.
+func (s *DB) MarkAllActiveInterrupted(ctx context.Context) ([]string, error) {
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin recovery tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `SELECT run_id FROM queue_entries WHERE status = 'running'`)
+	if err != nil {
+		return nil, fmt.Errorf("query active queue entries: %w", err)
+	}
+	var runIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan active queue entry: %w", err)
+		}
+		runIDs = append(runIDs, id)
+	}
+	rows.Close()
+
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, rid := range runIDs {
+		if _, err := tx.ExecContext(ctx, `UPDATE queue_entries SET status = 'interrupted', position = NULL, updated_at = ? WHERE run_id = ?`, nowStr, rid); err != nil {
+			return nil, fmt.Errorf("mark queue entry interrupted: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE localization_runs SET status = 'interrupted', completed_at = ? WHERE id = ?`, nowStr, rid); err != nil {
+			return nil, fmt.Errorf("mark run interrupted: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE stage_executions SET status = 'interrupted', updated_at = ? WHERE run_id = ? AND status IN ('running','cancelling')`, nowStr, rid); err != nil {
+			return nil, fmt.Errorf("mark stage interrupted: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit recovery tx: %w", err)
+	}
+	return runIDs, nil
+}
+
+// MarkRunRunning atomically transitions a queued run to running while enforcing
+// active_run_slots=1 in persisted state: it fails if the target run is not queued,
+// or if any other run is already running. All transitions to 'running' must go
+// through here so the single-active-run invariant holds even across a concurrent
+// caller that bypasses the in-memory scheduler lease.
+func (s *DB) MarkRunRunning(ctx context.Context, runID string) error {
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin mark-running tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var targetStatus string
+	err = tx.QueryRowContext(ctx, `SELECT status FROM queue_entries WHERE run_id = ?`, runID).Scan(&targetStatus)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: run %s not found", ErrNotActiveQueueEntry, runID)
+		}
+		return fmt.Errorf("query target queue entry: %w", err)
+	}
+	if targetStatus != domain.RunStatusQueued {
+		return fmt.Errorf("%w: status is %s", ErrNotActiveQueueEntry, targetStatus)
+	}
+
+	var runningCount int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM queue_entries WHERE status = 'running' AND run_id != ?`, runID).Scan(&runningCount); err != nil {
+		return fmt.Errorf("count running entries: %w", err)
+	}
+	if runningCount > 0 {
+		return ErrSlotBusy
+	}
+
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `UPDATE queue_entries SET status = 'running', updated_at = ? WHERE run_id = ?`, nowStr, runID); err != nil {
+		return fmt.Errorf("mark queue entry running: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE localization_runs SET status = 'running' WHERE id = ?`, runID); err != nil {
+		return fmt.Errorf("mark run running: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit mark-running tx: %w", err)
+	}
+	return nil
+}
+
+// ---- Stage Executions ----
+
+const stageExecutionColumns = `id, run_id, stage, status, started_at, completed_at, artifact_sha256, error_message, created_at, updated_at`
+
+func nullableTime(t *time.Time) sql.NullString {
+	if t == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: t.Format(time.RFC3339Nano), Valid: true}
+}
+
+func parseNullableTime(v sql.NullString) *time.Time {
+	if !v.Valid || v.String == "" {
+		return nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, v.String)
+	if err != nil {
+		return nil
+	}
+	return &t
+}
+
+func scanStageExecution(row *sql.Row) (*domain.StageExecution, error) {
+	var se domain.StageExecution
+	var started, completed, created, updated sql.NullString
+	var art sql.NullString
+	var errMsg sql.NullString
+	if err := row.Scan(&se.ID, &se.RunID, &se.Stage, &se.Status, &started, &completed, &art, &errMsg, &created, &updated); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query stage_execution: %w", err)
+	}
+	se.StartedAt = parseNullableTime(started)
+	se.CompletedAt = parseNullableTime(completed)
+	se.ArtifactSHA256 = art.String
+	se.ErrorMessage = errMsg.String
+	if created.Valid {
+		se.CreatedAt, _ = time.Parse(time.RFC3339Nano, created.String)
+	}
+	if updated.Valid {
+		se.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated.String)
+	}
+	return &se, nil
+}
+
+func scanStageExecutions(rows *sql.Rows) ([]domain.StageExecution, error) {
+	var list []domain.StageExecution
+	for rows.Next() {
+		var se domain.StageExecution
+		var started, completed, created, updated sql.NullString
+		var art sql.NullString
+		var errMsg sql.NullString
+		if err := rows.Scan(&se.ID, &se.RunID, &se.Stage, &se.Status, &started, &completed, &art, &errMsg, &created, &updated); err != nil {
+			return nil, fmt.Errorf("scan stage_execution: %w", err)
+		}
+		se.StartedAt = parseNullableTime(started)
+		se.CompletedAt = parseNullableTime(completed)
+		se.ArtifactSHA256 = art.String
+		se.ErrorMessage = errMsg.String
+		if created.Valid {
+			se.CreatedAt, _ = time.Parse(time.RFC3339Nano, created.String)
+		}
+		if updated.Valid {
+			se.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated.String)
+		}
+		list = append(list, se)
+	}
+	return list, nil
+}
+
+// CreateStageExecution records a new stage execution in queued (not-yet-started) state.
+func (s *DB) CreateStageExecution(ctx context.Context, se domain.StageExecution) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `INSERT INTO stage_executions (id, run_id, stage, status, started_at, completed_at, artifact_sha256, error_message, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err := s.db.ExecContext(ctx, query,
+		se.ID, se.RunID, se.Stage, se.Status,
+		nullableTime(se.StartedAt), nullableTime(se.CompletedAt),
+		sql.NullString{String: se.ArtifactSHA256, Valid: se.ArtifactSHA256 != ""},
+		sql.NullString{String: se.ErrorMessage, Valid: se.ErrorMessage != ""},
+		se.CreatedAt.Format(time.RFC3339Nano), se.UpdatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("insert stage_execution: %w", err)
+	}
+	return nil
+}
+
+// UpdateStageExecution updates status and lifecycle timestamps of a stage execution.
+func (s *DB) UpdateStageExecution(ctx context.Context, se domain.StageExecution) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `UPDATE stage_executions SET status = ?, started_at = ?, completed_at = ?, artifact_sha256 = ?, error_message = ?, updated_at = ? WHERE id = ?`
+	res, err := s.db.ExecContext(ctx, query,
+		se.Status,
+		nullableTime(se.StartedAt), nullableTime(se.CompletedAt),
+		sql.NullString{String: se.ArtifactSHA256, Valid: se.ArtifactSHA256 != ""},
+		sql.NullString{String: se.ErrorMessage, Valid: se.ErrorMessage != ""},
+		se.UpdatedAt.Format(time.RFC3339Nano),
+		se.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("update stage_execution: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err == nil && n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListStageExecutions returns stage executions for a run, ordered by creation.
+func (s *DB) ListStageExecutions(ctx context.Context, runID string) ([]domain.StageExecution, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.QueryContext(ctx, `SELECT `+stageExecutionColumns+` FROM stage_executions WHERE run_id = ? ORDER BY created_at ASC, id ASC`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("query stage_executions: %w", err)
+	}
+	defer rows.Close()
+	return scanStageExecutions(rows)
+}
+
+// RunStateSnapshot loads a run with its stage executions for crash recovery projection.
+func (s *DB) RunStateSnapshot(ctx context.Context, runID string) (*domain.RunStateSnapshot, error) {
+	run, err := s.GetRun(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	stages, err := s.ListStageExecutions(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	snap := &domain.RunStateSnapshot{
+		ID:              run.ID,
+		JobID:           run.JobID,
+		Status:          run.Status,
+		StageExecutions: stages,
+		CreatedAt:       run.CreatedAt,
+		CompletedAt:     run.CompletedAt,
+	}
+	if snap.StageExecutions == nil {
+		snap.StageExecutions = []domain.StageExecution{}
+	}
+	return snap, nil
 }

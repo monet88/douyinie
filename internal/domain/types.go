@@ -87,10 +87,74 @@ type LocalizationJob struct {
 type LocalizationRun struct {
 	ID                 string     `json:"id"`
 	JobID              string     `json:"job_id"`
-	Status             string     `json:"status"` // "queued", "running", "succeeded", "failed", "interrupted"
+	Status             string     `json:"status"` // "queued", "running", "paused", "cancelled", "completed", "interrupted"
 	ConfigSnapshotJSON string     `json:"config_snapshot_json"`
 	CreatedAt          time.Time  `json:"created_at"`
 	CompletedAt        *time.Time `json:"completed_at,omitempty"`
+}
+
+// Run/queue lifecycle statuses (persisted in SQLite queue_entries + localization_runs).
+const (
+	RunStatusQueued      = "queued"
+	RunStatusRunning     = "running"
+	RunStatusPaused      = "paused"
+	RunStatusCancelled   = "cancelled"
+	RunStatusCompleted   = "completed"
+	RunStatusInterrupted = "interrupted"
+)
+
+// Stage execution statuses (persisted in SQLite stage_executions).
+// Active states are QUEUED -> RUNNING -> CANCELLING per locked #13/#16; terminal
+// states are SUCCEEDED / FAILED / INTERRUPTED. 'queued' is the not-yet-started
+// active state (replacing the former pending-as-queued conflation), and
+// 'cancelling' is the mid-cancellation active state before a terminal outcome.
+const (
+	StageStatusQueued      = "queued"
+	StageStatusRunning     = "running"
+	StageStatusCancelling  = "cancelling"
+	StageStatusSucceeded   = "succeeded"
+	StageStatusFailed      = "failed"
+	StageStatusInterrupted = "interrupted"
+)
+
+// StageStatusActive reports whether a stage status is an active (non-terminal) state.
+func StageStatusActive(s string) bool {
+	return s == StageStatusQueued || s == StageStatusRunning || s == StageStatusCancelling
+}
+
+// QueueEntry is a persisted job ordering record in the runtime queue.
+type QueueEntry struct {
+	ID         string    `json:"id"`
+	RunID      string    `json:"run_id"`
+	JobID      string    `json:"job_id"`
+	Position   int       `json:"position"`
+	Status     string    `json:"status"` // queued | running | paused | cancelled | completed | interrupted
+	InsertedAt time.Time `json:"inserted_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// StageExecution records the persisted lifecycle state of a single pipeline stage within a run.
+type StageExecution struct {
+	ID             string     `json:"id"`
+	RunID          string     `json:"run_id"`
+	Stage          string     `json:"stage"`  // asr | aligner | tts | separator | ocr | translation | render
+	Status         string     `json:"status"` // queued | running | cancelling | succeeded | failed | interrupted
+	StartedAt      *time.Time `json:"started_at,omitempty"`
+	CompletedAt    *time.Time `json:"completed_at,omitempty"`
+	ArtifactSHA256 string     `json:"artifact_sha256,omitempty"`
+	ErrorMessage   string     `json:"error_message,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+}
+
+// RunStateSnapshot is the crash-recovery payload: a run plus its persisted stage execution state.
+type RunStateSnapshot struct {
+	ID              string           `json:"id"`
+	JobID           string           `json:"job_id"`
+	Status          string           `json:"status"`
+	StageExecutions []StageExecution `json:"stage_executions"`
+	CreatedAt       time.Time        `json:"created_at"`
+	CompletedAt     *time.Time       `json:"completed_at,omitempty"`
 }
 
 // Valid target languages for Phase 1.

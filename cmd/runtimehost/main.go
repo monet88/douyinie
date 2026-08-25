@@ -17,6 +17,8 @@ import (
 	"github.com/monet88/douyinie/internal/governance"
 	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/provider"
+	"github.com/monet88/douyinie/internal/queue"
+	"github.com/monet88/douyinie/internal/scheduler"
 	"github.com/monet88/douyinie/internal/server"
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
@@ -56,14 +58,25 @@ func main() {
 	prober := media.NewFFprobeProber(*ffprobePath)
 	ingestSvc := service.NewIngestService(db, casStore, prober)
 
-	// 4. Initialize Provider Registry with Governance
+	// 4. Initialize Persisted Queue + ResourceScheduler + Crash Recovery
+	queueSvc := queue.NewService(db)
+	resScheduler := scheduler.New()
+	recovered, err := queueSvc.Recover(context.Background())
+	if err != nil {
+		log.Fatalf("[RuntimeHost] crash recovery failed: %v", err)
+	}
+	if len(recovered) > 0 {
+		log.Printf("[RuntimeHost] Crash recovery: %d interrupted run(s): %v", len(recovered), recovered)
+	}
+
+	// 5. Initialize Provider Registry with Governance
 	fakeRegistry := provider.NewSeam1FakeRegistry()
 	polSvc := governance.NewPolicyService(db)
 	licSvc := governance.NewLicenseService(db)
 	credSvc := governance.NewCredentialService(db)
 	router := provider.NewRouter(fakeRegistry, polSvc, licSvc, credSvc, nil, db)
 
-	// 5. Optional Demo Ingestion
+	// 6. Optional Demo Ingestion
 	if *demoFile != "" {
 		log.Printf("[RuntimeHost] Running DEMO ingestion on: %s", *demoFile)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -93,7 +106,7 @@ func main() {
 		}
 	}
 
-	// 6. Start HTTP Server
+	// 7. Start HTTP Server
 	addr := fmt.Sprintf("127.0.0.1:%d", *port)
 	srv := server.New(server.Config{
 		Addr:       addr,
@@ -105,6 +118,8 @@ func main() {
 		LicenseSvc: licSvc,
 		CredSvc:    credSvc,
 		Router:     router,
+		QueueSvc:   queueSvc,
+		Scheduler:  resScheduler,
 	})
 
 	go func() {

@@ -19,19 +19,23 @@ import (
 	"github.com/monet88/douyinie/internal/governance"
 	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/provider"
+	"github.com/monet88/douyinie/internal/queue"
+	"github.com/monet88/douyinie/internal/scheduler"
 	"github.com/monet88/douyinie/internal/server"
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
 )
 
 type testHarness struct {
-	server   *httptest.Server
-	srv      *server.Server
-	db       *storage.DB
-	casStore *cas.Store
-	registry *provider.Registry
-	router   *provider.Router
-	dir      string
+	server    *httptest.Server
+	srv       *server.Server
+	db        *storage.DB
+	casStore  *cas.Store
+	registry  *provider.Registry
+	router    *provider.Router
+	queueSvc  *queue.Service
+	scheduler *scheduler.Scheduler
+	dir       string
 }
 
 func (h *testHarness) SetExecutor(exec server.Executor) {
@@ -52,6 +56,37 @@ func setupHarness(t *testing.T) *testHarness {
 	if err != nil {
 		t.Fatalf("setup SQLite: %v", err)
 	}
+
+	queueSvc := queue.NewService(db)
+	resScheduler := scheduler.New()
+	srv, registry, router := newRuntimeHost(t, db, casStore, queueSvc, resScheduler)
+
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() {
+		ts.Close()
+		_ = db.Close()
+	})
+
+	return &testHarness{
+		server:    ts,
+		srv:       srv,
+		db:        db,
+		casStore:  casStore,
+		registry:  registry,
+		router:    router,
+		queueSvc:  queueSvc,
+		scheduler: resScheduler,
+		dir:       tmpDir,
+	}
+}
+
+// newRuntimeHost constructs a Seam-1 RuntimeHost server over the given open DB and
+// CAS store, returning the server plus its registry and router. It is used both for
+// the initial harness and to reconstruct a fresh RuntimeHost over reopened persisted
+// state (restart simulation), so the surviving queue/recovery result is observed
+// through the same public HTTP API surface.
+func newRuntimeHost(t *testing.T, db *storage.DB, casStore *cas.Store, queueSvc *queue.Service, resScheduler *scheduler.Scheduler) (*server.Server, *provider.Registry, *provider.Router) {
+	t.Helper()
 
 	var prober media.Prober
 	if _, err := exec.LookPath("ffprobe"); err == nil {
@@ -86,7 +121,7 @@ func setupHarness(t *testing.T) *testHarness {
 	}
 	router := provider.NewRouter(fakeRegistry, polSvc, licSvc, credSvc, nil, db)
 
-	srv := server.New(server.Config{
+	return server.New(server.Config{
 		Addr:       "127.0.0.1:0",
 		DB:         db,
 		CASStore:   casStore,
@@ -96,23 +131,9 @@ func setupHarness(t *testing.T) *testHarness {
 		LicenseSvc: licSvc,
 		CredSvc:    credSvc,
 		Router:     router,
-	})
-
-	ts := httptest.NewServer(srv.Handler())
-	t.Cleanup(func() {
-		ts.Close()
-		_ = db.Close()
-	})
-
-	return &testHarness{
-		server:   ts,
-		srv:      srv,
-		db:       db,
-		casStore: casStore,
-		registry: fakeRegistry,
-		router:   router,
-		dir:      tmpDir,
-	}
+		QueueSvc:   queueSvc,
+		Scheduler:  resScheduler,
+	}), fakeRegistry, router
 }
 
 // createSyntheticMedia creates a valid MP4 file if ffmpeg is available, or a fallback synthetic file.

@@ -15,6 +15,8 @@ import (
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/governance"
 	"github.com/monet88/douyinie/internal/provider"
+	"github.com/monet88/douyinie/internal/queue"
+	"github.com/monet88/douyinie/internal/scheduler"
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
 )
@@ -32,6 +34,8 @@ type Server struct {
 	licenseSvc *governance.LicenseService
 	credSvc    *governance.CredentialService
 	router     *provider.Router
+	queueSvc   *queue.Service
+	scheduler  *scheduler.Scheduler
 	executor   Executor
 	mux        *http.ServeMux
 	server     *http.Server
@@ -48,6 +52,8 @@ type Config struct {
 	LicenseSvc *governance.LicenseService
 	CredSvc    *governance.CredentialService
 	Router     *provider.Router
+	QueueSvc   *queue.Service
+	Scheduler  *scheduler.Scheduler
 	Executor   Executor // Injected execution seam for testing and custom worker dispatch
 }
 
@@ -65,6 +71,12 @@ func New(cfg Config) *Server {
 	if cfg.Router == nil && cfg.Registry != nil {
 		cfg.Router = provider.NewRouter(cfg.Registry, cfg.PolicySvc, cfg.LicenseSvc, cfg.CredSvc, nil, cfg.DB)
 	}
+	if cfg.QueueSvc == nil && cfg.DB != nil {
+		cfg.QueueSvc = queue.NewService(cfg.DB)
+	}
+	if cfg.Scheduler == nil {
+		cfg.Scheduler = scheduler.New()
+	}
 
 	s := &Server{
 		db:         cfg.DB,
@@ -75,6 +87,8 @@ func New(cfg Config) *Server {
 		licenseSvc: cfg.LicenseSvc,
 		credSvc:    cfg.CredSvc,
 		router:     cfg.Router,
+		queueSvc:   cfg.QueueSvc,
+		scheduler:  cfg.Scheduler,
 		executor:   cfg.Executor,
 		mux:        http.NewServeMux(),
 	}
@@ -131,6 +145,19 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/jobs/{id}", s.handleGetJob)
 	s.mux.HandleFunc("POST /api/v1/jobs/{id}/runs", s.handleCreateRun)
 	s.mux.HandleFunc("GET /api/v1/runs/{id}", s.handleGetRun)
+	s.mux.HandleFunc("POST /api/v1/runs/{id}/pause", s.handlePauseRun)
+	s.mux.HandleFunc("POST /api/v1/runs/{id}/cancel", s.handleCancelRun)
+	s.mux.HandleFunc("POST /api/v1/runs/{id}/resume", s.handleResumeRun)
+	s.mux.HandleFunc("GET /api/v1/runs/{id}/stages", s.handleListRunStages)
+
+	// Persisted Queue
+	s.mux.HandleFunc("GET /api/v1/queue", s.handleListQueue)
+	s.mux.HandleFunc("POST /api/v1/queue/reorder", s.handleReorderQueue)
+
+	// ResourceScheduler (single GPU lease)
+	s.mux.HandleFunc("POST /api/v1/scheduler/acquire", s.handleSchedulerAcquire)
+	s.mux.HandleFunc("POST /api/v1/scheduler/release", s.handleSchedulerRelease)
+	s.mux.HandleFunc("GET /api/v1/scheduler/lease", s.handleSchedulerLease)
 
 	// Provider Registry Inspection
 	s.mux.HandleFunc("GET /api/v1/providers", s.handleListProviders)
@@ -387,8 +414,9 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:          time.Now().UTC(),
 	}
 
-	if err := s.db.CreateRun(r.Context(), run); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to create run: "+err.Error())
+	// Create the run and enqueue it atomically so a partial failure never orphans a run.
+	if _, err := s.db.CreateRunEnqueued(r.Context(), run, jobID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create and enqueue run: "+err.Error())
 		return
 	}
 
@@ -408,6 +436,172 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"run": run})
+}
+
+func (s *Server) handlePauseRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.queueSvc == nil {
+		writeError(w, http.StatusInternalServerError, "queue service is not configured")
+		return
+	}
+	if err := s.queueSvc.Pause(r.Context(), id); err != nil {
+		if errors.Is(err, queue.ErrNotQueued) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"run_id": id, "status": domain.RunStatusPaused})
+}
+
+func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.queueSvc == nil {
+		writeError(w, http.StatusInternalServerError, "queue service is not configured")
+		return
+	}
+	if err := s.queueSvc.Cancel(r.Context(), id); err != nil {
+		if errors.Is(err, queue.ErrNotQueued) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"run_id": id, "status": domain.RunStatusCancelled})
+}
+
+func (s *Server) handleResumeRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.queueSvc == nil {
+		writeError(w, http.StatusInternalServerError, "queue service is not configured")
+		return
+	}
+	if err := s.queueSvc.Resume(r.Context(), id); err != nil {
+		if errors.Is(err, queue.ErrNotQueued) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"run_id": id, "status": domain.RunStatusQueued})
+}
+
+func (s *Server) handleListRunStages(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.db == nil {
+		writeError(w, http.StatusInternalServerError, "database is not configured")
+		return
+	}
+	stages, err := s.db.ListStageExecutions(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if stages == nil {
+		stages = []domain.StageExecution{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"stages": stages})
+}
+
+func (s *Server) handleListQueue(w http.ResponseWriter, r *http.Request) {
+	if s.queueSvc == nil {
+		writeError(w, http.StatusInternalServerError, "queue service is not configured")
+		return
+	}
+	entries, err := s.queueSvc.List(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"queue": entries})
+}
+
+func (s *Server) handleReorderQueue(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		RunID    string `json:"run_id"`
+		Position int    `json:"position"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	if s.queueSvc == nil {
+		writeError(w, http.StatusInternalServerError, "queue service is not configured")
+		return
+	}
+	if err := s.queueSvc.Reorder(r.Context(), body.RunID, body.Position); err != nil {
+		if errors.Is(err, queue.ErrNotQueued) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"run_id": body.RunID, "position": body.Position})
+}
+
+func (s *Server) handleSchedulerAcquire(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Family string `json:"family"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	if s.scheduler == nil {
+		writeError(w, http.StatusInternalServerError, "resource scheduler is not configured")
+		return
+	}
+	leaseID, err := s.scheduler.Acquire(r.Context(), body.Family)
+	if err != nil {
+		if errors.Is(err, scheduler.ErrLeaseBusy) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":  err.Error(),
+				"holder": s.scheduler.Holder(),
+			})
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"lease_id": leaseID,
+		"family":   body.Family,
+		"profile":  scheduler.Profile(),
+	})
+}
+
+func (s *Server) handleSchedulerRelease(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		LeaseID string `json:"lease_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	if s.scheduler == nil {
+		writeError(w, http.StatusInternalServerError, "resource scheduler is not configured")
+		return
+	}
+	if err := s.scheduler.Release(r.Context(), body.LeaseID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"released": true})
+}
+
+func (s *Server) handleSchedulerLease(w http.ResponseWriter, r *http.Request) {
+	if s.scheduler == nil {
+		writeError(w, http.StatusInternalServerError, "resource scheduler is not configured")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"holder":  s.scheduler.Holder(),
+		"profile": scheduler.Profile(),
+	})
 }
 
 func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {

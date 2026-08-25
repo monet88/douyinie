@@ -376,3 +376,227 @@ func TestStorage_MigrationV2ToV3_ForwardSafeAndPreservesData(t *testing.T) {
 		t.Fatalf("expected error when inserting duplicate (dependency_name, version), got nil")
 	}
 }
+
+func TestStorage_MigrationV3ToV4_BackfillsPreExistingRuns(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "migration_v4_backfill.db")
+
+	// 1. Manually initialize a database at migration version 3 with pre-existing
+	// localization_runs from a pre-T03/v3 database.
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+
+	initSQL := `
+	CREATE TABLE schema_migrations (
+		version INTEGER PRIMARY KEY,
+		applied_at TEXT NOT NULL
+	);
+	INSERT INTO schema_migrations (version, applied_at) VALUES (1, datetime('now'));
+	INSERT INTO schema_migrations (version, applied_at) VALUES (2, datetime('now'));
+	INSERT INTO schema_migrations (version, applied_at) VALUES (3, datetime('now'));
+
+	CREATE TABLE rights_attestations (
+		id TEXT PRIMARY KEY,
+		attestation_type TEXT NOT NULL,
+		declared_by TEXT NOT NULL,
+		terms_accepted INTEGER NOT NULL,
+		notes TEXT,
+		confirmed_at TEXT NOT NULL
+	);
+
+	CREATE TABLE source_assets (
+		id TEXT PRIMARY KEY,
+		sha256 TEXT NOT NULL UNIQUE,
+		byte_size INTEGER NOT NULL,
+		mime_type TEXT NOT NULL,
+		original_filename TEXT NOT NULL,
+		rights_attestation_id TEXT NOT NULL REFERENCES rights_attestations(id),
+		cas_path TEXT NOT NULL,
+		created_at TEXT NOT NULL
+	);
+
+	CREATE TABLE localization_jobs (
+		id TEXT PRIMARY KEY,
+		source_asset_id TEXT NOT NULL REFERENCES source_assets(id),
+		target_language TEXT NOT NULL,
+		status TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	);
+
+	CREATE TABLE localization_runs (
+		id TEXT PRIMARY KEY,
+		job_id TEXT NOT NULL REFERENCES localization_jobs(id),
+		status TEXT NOT NULL,
+		config_snapshot_json TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		completed_at TEXT
+	);
+
+	CREATE TABLE license_manifests (
+		id TEXT PRIMARY KEY,
+		dependency_name TEXT NOT NULL,
+		version TEXT NOT NULL DEFAULT 'v1',
+		sha256 TEXT NOT NULL,
+		source_repo TEXT NOT NULL,
+		code_license TEXT NOT NULL,
+		model_license TEXT NOT NULL,
+		data_license TEXT NOT NULL,
+		service_terms TEXT NOT NULL,
+		verified INTEGER NOT NULL,
+		created_at TEXT NOT NULL
+	);
+	INSERT INTO license_manifests (id, dependency_name, version, sha256, source_repo, code_license, model_license, data_license, service_terms, verified, created_at)
+	VALUES ('manifest_v1', 'existing_manifest', '1.0.0', 'sha256_existing', 'repo', 'MIT', 'Apache-2.0', 'OpenData', 'Standard', 1, '2026-01-01T00:00:00Z');
+
+	INSERT INTO rights_attestations (id, attestation_type, declared_by, terms_accepted, notes, confirmed_at)
+	VALUES ('attest_v1', 'OPERATOR_EXPLICIT_CONFIRMATION', 'migration-tester', 1, 'migration test', '2026-01-01T00:00:00Z');
+
+	INSERT INTO source_assets (id, sha256, byte_size, mime_type, original_filename, rights_attestation_id, cas_path, created_at)
+	VALUES ('asset_v1', 'aaaa', 1024, 'video/mp4', 'test.mp4', 'attest_v1', 'cas/aa/aa/aaaa', '2026-01-01T00:00:00Z');
+
+	INSERT INTO localization_jobs (id, source_asset_id, target_language, status, created_at, updated_at)
+	VALUES ('job_v1', 'asset_v1', 'vi', 'completed', '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z');
+
+	INSERT INTO localization_jobs (id, source_asset_id, target_language, status, created_at, updated_at)
+	VALUES ('job_v2', 'asset_v1', 'en', 'pending', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z');
+
+	INSERT INTO localization_jobs (id, source_asset_id, target_language, status, created_at, updated_at)
+	VALUES ('job_v3', 'asset_v1', 'vi', 'pending', '2026-01-03T00:00:00Z', '2026-01-03T00:00:00Z');
+
+	-- Run A: completed (succeeded in old status system)
+	INSERT INTO localization_runs (id, job_id, status, config_snapshot_json, created_at, completed_at)
+	VALUES ('run_a', 'job_v1', 'succeeded', '{}', '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z');
+
+	-- Run B: failed (maps to interrupted in new system)
+	INSERT INTO localization_runs (id, job_id, status, config_snapshot_json, created_at, completed_at)
+	VALUES ('run_b', 'job_v1', 'failed', '{}', '2026-01-01T01:30:00Z', '2026-01-01T01:35:00Z');
+
+	-- Run C: queued (never started, should be backfilled as queued with a position)
+	INSERT INTO localization_runs (id, job_id, status, config_snapshot_json, created_at, completed_at)
+	VALUES ('run_c', 'job_v2', 'queued', '{}', '2026-01-02T00:00:00Z', NULL);
+
+	-- Run D: running (mid-execution, must be backfilled so MarkAllActiveInterrupted can catch it)
+	INSERT INTO localization_runs (id, job_id, status, config_snapshot_json, created_at, completed_at)
+	VALUES ('run_d', 'job_v3', 'running', '{}', '2026-01-03T00:00:00Z', NULL);
+
+	-- Run E: queued (second never-started run, keeps position after run C)
+	INSERT INTO localization_runs (id, job_id, status, config_snapshot_json, created_at, completed_at)
+	VALUES ('run_e', 'job_v3', 'queued', '{}', '2026-01-03T01:00:00Z', NULL);
+	`
+	if _, err := rawDB.Exec(initSQL); err != nil {
+		rawDB.Close()
+		t.Fatalf("init legacy v3 db failed: %v", err)
+	}
+	rawDB.Close()
+
+	// 2. Open via storage.Open which executes migrate() forward to v4 with backfill.
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("storage.Open failed on legacy v3 db: %v", err)
+	}
+	defer db.Close()
+
+	// 3. Verify migration version 4 was recorded.
+	var v4Count int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 4`).Scan(&v4Count); err != nil || v4Count != 1 {
+		t.Fatalf("expected migration version 4 recorded, got count=%d, err=%v", v4Count, err)
+	}
+
+	// 4. Verify immutable v1-v3 history is preserved (no rewrite).
+	for _, v := range []int{1, 2, 3} {
+		var c int
+		if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, v).Scan(&c); err != nil || c != 1 {
+			t.Errorf("migration version %d history row lost: count=%d err=%v", v, c, err)
+		}
+	}
+
+	// 5. Verify pre-existing license manifest record is intact.
+	existing, err := db.GetLicenseManifest(ctx, "existing_manifest", "1.0.0")
+	if err != nil {
+		t.Fatalf("GetLicenseManifest for existing record failed: %v", err)
+	}
+	if existing.SHA256 != "sha256_existing" || existing.Verified != true {
+		t.Errorf("existing manifest data corrupted during migration v4: %+v", existing)
+	}
+
+	// 6. Verify backfill: every pre-existing run has a queue entry with correct status.
+	for _, tc := range []struct {
+		runID, wantStatus string
+		wantPos           int // 0 = NULL (terminal)
+	}{
+		{"run_a", domain.RunStatusCompleted, 0},   // old "succeeded" -> "completed"
+		{"run_b", domain.RunStatusInterrupted, 0}, // old "failed" -> "interrupted"
+		{"run_c", domain.RunStatusQueued, 1},      // old "queued" -> "queued", position 1
+		{"run_d", domain.RunStatusRunning, 2},     // old "running" -> "running", position 2
+		{"run_e", domain.RunStatusQueued, 3},      // old "queued" -> "queued", position 3
+	} {
+		entry, err := db.GetQueueEntryByRunID(ctx, tc.runID)
+		if err != nil {
+			t.Errorf("GetQueueEntryByRunID(%s) failed: %v", tc.runID, err)
+			continue
+		}
+		if entry.Status != tc.wantStatus {
+			t.Errorf("run %s: expected status %s, got %s", tc.runID, tc.wantStatus, entry.Status)
+		}
+		if tc.wantPos == 0 {
+			if entry.Position != 0 {
+				t.Errorf("run %s: expected NULL position (terminal), got %d", tc.runID, entry.Position)
+			}
+		} else {
+			if entry.Position != tc.wantPos {
+				t.Errorf("run %s: expected position %d, got %d", tc.runID, tc.wantPos, entry.Position)
+			}
+		}
+		// Verify FK: run_id references localization_runs, and the run row itself was
+		// rewritten to the new status set when the old name mapped to a different status
+		// (succeeded->completed, failed->interrupted). Runs already in the new set keep it.
+		run, err := db.GetRun(ctx, tc.runID)
+		if err != nil {
+			t.Errorf("localization_run %s not accessible after migration: %v", tc.runID, err)
+			continue
+		}
+		if run.Status != tc.wantStatus {
+			t.Errorf("run %s: expected run status %s after backfill, got %s", tc.runID, tc.wantStatus, run.Status)
+		}
+	}
+
+	// 7. Verify crash recovery can catch the old running run (run_d) via its backfilled queue entry.
+	// Reopen and run recovery to simulate daemon restart.
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	reopened, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen db after migration: %v", err)
+	}
+	defer reopened.Close()
+
+	recovered, err := reopened.MarkAllActiveInterrupted(ctx)
+	if err != nil {
+		t.Fatalf("crash recovery failed: %v", err)
+	}
+	if len(recovered) != 1 || recovered[0] != "run_d" {
+		t.Fatalf("expected 1 interrupted run (run_d), got %v", recovered)
+	}
+
+	// Verify run_d is now interrupted and run_c (queued) survived recovery as queued.
+	runD, err := reopened.GetRun(ctx, "run_d")
+	if err != nil {
+		t.Fatalf("get run_d after recovery: %v", err)
+	}
+	if runD.Status != domain.RunStatusInterrupted {
+		t.Errorf("run_d: expected interrupted after recovery, got %s", runD.Status)
+	}
+
+	runC, err := reopened.GetRun(ctx, "run_c")
+	if err != nil {
+		t.Fatalf("get run_c after recovery: %v", err)
+	}
+	if runC.Status != domain.RunStatusQueued {
+		t.Errorf("run_c: expected queued (never started), got %s", runC.Status)
+	}
+}
