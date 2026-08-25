@@ -1,0 +1,26 @@
+internal/domain/types.go
+  h_17f2fa2b92da6a 15,171-196
+internal/provider/router.go
+  h_17f2fa2b92da6a 89-191,481-484
+internal/provider/router_test.go
+  h_17f2fa2b92da6a 62,67-68,70,89-90,92,102,109-110,112,122-123,125,230,256,319,420,422-423,425,454,456-457,459,487,564,597,619-620,622,633-699
+internal/server/server.go
+  h_17f2fa2b92da6a 7,142-143,321-383,742-748,758-762,765-767,771,844-846
+internal/storage/sqlite.go
+  h_17f2fa2b92da6a 481-514,832-925
+test/seam1/audio_role_test.go
+  h_17f2fa2b92da6a 1-546
+test/seam1/governance_test.go
+  h_17f2fa2b92da6a 24,284,413,623,646,897,927,1111,1189-1214
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "59377e818516dd28faccd0814b2bd63093d4d155",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
