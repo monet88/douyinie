@@ -1,0 +1,45 @@
+internal/worker/validate.go
+  s_a51f249817c45d::t_af6afa2f7fa348 1-150
+cmd/stageworker/main.go
+  s_3d0cc3e89ee8fa::t_6cd5a317165554 1-326
+internal/worker/client.go
+  s_3d0cc3e89ee8fa::t_02add3dcd2fc02 1-367
+internal/worker/jobobject_stub.go
+  s_3d0cc3e89ee8fa::t_eb3f03b157c73e 1-36
+internal/worker/jobobject_windows.go
+  s_3d0cc3e89ee8fa::t_2c1b72279bfecf 1-158
+internal/worker/lease.go
+  s_3d0cc3e89ee8fa::t_0c59d0838230a2 1-131
+internal/worker/protocol.go
+  s_3d0cc3e89ee8fa::t_ee2bcbb2e7c977 1-272
+internal/worker/recovery.go
+  s_3d0cc3e89ee8fa::t_5902ea2f0bb276 1-246
+internal/worker/supervisor.go
+  s_3d0cc3e89ee8fa::t_81e3ed810d8b94 1-257
+test/seam2/seam2_test.go
+  s_3d0cc3e89ee8fa::t_13ef5f0f4a3af0 1-585
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "f2a461d90b2995447b8d7023b9a2aa62be21ced0",
+  "prompts": {},
+  "sessions": {
+    "s_3d0cc3e89ee8fa": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a03773-8fc7-7bd0-bb77-436d800dd993",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_a51f249817c45d": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a0377f-3636-7b03-bf2d-13f2e6e75a82",
+        "model": "deepseek-v4-flash"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
