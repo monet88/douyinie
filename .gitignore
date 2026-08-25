@@ -8,6 +8,7 @@
 /.orca-worktree-trash/
 /.claude/settings.local.json
 /prototype-operator-review-workflow/
+.scratch
 
 # User-supplied root media test fixtures
 /background music + voice + subtitles.mp4
