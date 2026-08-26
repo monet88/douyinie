@@ -478,6 +478,40 @@ func (s *DB) migrate(ctx context.Context) error {
 		}
 	}
 
+	// 6. Schema migration v5 (Audio Role Plans)
+	var countV5 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 5`).Scan(&countV5)
+	if err != nil {
+		return fmt.Errorf("check migration version 5: %w", err)
+	}
+
+	if countV5 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v5 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		schemaV5SQL := `
+		CREATE TABLE IF NOT EXISTS audio_role_plans (
+			id TEXT PRIMARY KEY,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			plan_json TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (5, datetime('now'));
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaV5SQL); err != nil {
+			return fmt.Errorf("execute migration v5: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v5: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -793,6 +827,100 @@ func (s *DB) ListJobs(ctx context.Context) ([]domain.LocalizationJob, error) {
 		jobs = append(jobs, j)
 	}
 	return jobs, nil
+}
+
+// UpdateJobStatus updates the status of a job.
+func (s *DB) UpdateJobStatus(ctx context.Context, id string, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `UPDATE localization_jobs SET status = ?, updated_at = ? WHERE id = ?`
+	_, err := s.db.ExecContext(ctx, query, status, time.Now().UTC().Format(time.RFC3339Nano), id)
+	if err != nil {
+		return fmt.Errorf("update job status: %w", err)
+	}
+	return nil
+}
+
+// SaveAudioRolePlan saves or replaces an audio role plan.
+func (s *DB) SaveAudioRolePlan(ctx context.Context, plan domain.AudioRolePlan) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, seg := range plan.Segments {
+		switch seg.Role {
+		case domain.AudioRoleNarrationDialogue,
+			domain.AudioRoleSingingMusicVocal,
+			domain.AudioRoleInstrumentalBgm,
+			domain.AudioRoleAmbienceSFX,
+			domain.AudioRoleUncertain:
+			// valid
+		default:
+			return fmt.Errorf("invalid audio role value: %q", seg.Role)
+		}
+	}
+
+	segmentsJSON, err := json.Marshal(plan.Segments)
+	if err != nil {
+		return fmt.Errorf("marshal audio segments: %w", err)
+	}
+
+	createdAtStr := plan.CreatedAt.Format(time.RFC3339Nano)
+
+	// Check if a plan for this asset_id already exists to update it
+	var existingID string
+	err = s.db.QueryRowContext(ctx, `SELECT id FROM audio_role_plans WHERE asset_id = ?`, plan.AssetID).Scan(&existingID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("check existing audio role plan: %w", err)
+	}
+
+	if existingID != "" {
+		// Update existing plan, retaining its ID (or update ID to match plan.ID to be consistent with client request)
+		query := `UPDATE audio_role_plans SET id = ?, plan_json = ?, created_at = ? WHERE asset_id = ?`
+		_, err = s.db.ExecContext(ctx, query, plan.ID, string(segmentsJSON), createdAtStr, plan.AssetID)
+		if err != nil {
+			return fmt.Errorf("update audio role plan: %w", err)
+		}
+	} else {
+		// Insert new plan
+		query := `INSERT INTO audio_role_plans (id, asset_id, plan_json, created_at) VALUES (?, ?, ?, ?)`
+		_, err = s.db.ExecContext(ctx, query, plan.ID, plan.AssetID, string(segmentsJSON), createdAtStr)
+		if err != nil {
+			return fmt.Errorf("save audio role plan: %w", err)
+		}
+	}
+	return nil
+}
+
+// GetAudioRolePlan retrieves an audio role plan by asset ID.
+func (s *DB) GetAudioRolePlan(ctx context.Context, assetID string) (*domain.AudioRolePlan, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var plan domain.AudioRolePlan
+	var planJSON string
+	var createdAtStr string
+
+	query := `SELECT id, asset_id, plan_json, created_at FROM audio_role_plans WHERE asset_id = ?`
+	err := s.db.QueryRowContext(ctx, query, assetID).Scan(&plan.ID, &plan.AssetID, &planJSON, &createdAtStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query audio role plan: %w", err)
+	}
+
+	if err := json.Unmarshal([]byte(planJSON), &plan.Segments); err != nil {
+		return nil, fmt.Errorf("unmarshal audio segments: %w", err)
+	}
+
+	t, err := time.Parse(time.RFC3339Nano, createdAtStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse created_at time: %w", err)
+	}
+	plan.CreatedAt = t
+
+	return &plan, nil
 }
 
 // CreateRun creates a new localization run.

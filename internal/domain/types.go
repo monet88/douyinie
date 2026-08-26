@@ -12,6 +12,7 @@ var (
 	ErrInvalidTargetLanguage     = errors.New("target language must be 'vi' or 'en'")
 	ErrCorruptMedia              = errors.New("media container failed integrity verification")
 	ErrFingerprintMismatch       = errors.New("computed hash does not match expected CAS fingerprint")
+	ErrUncertainRole             = errors.New("uncertain audio role: review required")
 )
 
 // RightsAttestation records legal and operator authorization before media asset ingestion.
@@ -166,4 +167,30 @@ const (
 // IsValidTargetLanguage checks if the language is supported in Phase 1.
 func IsValidTargetLanguage(lang string) bool {
 	return lang == TargetLanguageVI || lang == TargetLanguageEN
+}
+
+// AudioRole represents the temporal classification of an audio channel/segment.
+type AudioRole string
+
+const (
+	AudioRoleNarrationDialogue AudioRole = "narration/dialogue"
+	AudioRoleSingingMusicVocal AudioRole = "singing/music-vocal"
+	AudioRoleInstrumentalBgm   AudioRole = "instrumental/background"
+	AudioRoleAmbienceSFX       AudioRole = "ambience/SFX"
+	AudioRoleUncertain         AudioRole = "uncertain"
+)
+
+// AudioSegment represents a temporal slice of audio with a classified role.
+type AudioSegment struct {
+	StartMs int64     `json:"start_ms"`
+	EndMs   int64     `json:"end_ms"`
+	Role    AudioRole `json:"role"`
+}
+
+// AudioRolePlan is the temporal classification plan of source audio.
+type AudioRolePlan struct {
+	ID        string         `json:"id"`
+	AssetID   string         `json:"asset_id"`
+	Segments  []AudioSegment `json:"segments"`
+	CreatedAt time.Time      `json:"created_at"`
 }
