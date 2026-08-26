@@ -1,0 +1,19 @@
+AGENTS.md
+  s_fc393794a43864::t_d611f3bd99818d 37-48
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "513d3a7ecdca758a05ce217a13451d9653f0bc85",
+  "prompts": {},
+  "sessions": {
+    "s_fc393794a43864": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "53502eb6-5951-4a14-b9da-23d4c0e7c655",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
