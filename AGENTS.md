@@ -34,3 +34,15 @@ Five default triage labels, strings equal to role names. See `docs/agents/triage
 
 ### Domain Docs
 Single-context layout — root `CONTEXT.md` + `docs/adr/`; Phase 1 architecture is materialized in `docs/architecture/phase1-architecture.md`. See `docs/agents/domain.md`.
+
+
+## Agent Orchestration
+
+When coordinating multiple coding agents:
+
+- Honor the exact supervisor, implementation-worker, and reviewer families selected by the user/coordinator. Never substitute another agent family without explicit authorization.
+- A supervisor is control-plane only unless explicitly assigned implementation or review work.
+- Explicit workflow Skill invocation must be the first characters of the actual agent-visible prompt; do not prepend lifecycle prose or transport markers.
+- Before launching AGY, OpenCode, Pi, or another agent with a documented transport workaround, read [`docs/agents/orca-orchestration.md`](docs/agents/orca-orchestration.md) and follow its current repo-local launch policy.
+- Preserve one editing owner for overlapping mutable scope and use fresh, read-only reviewer sessions.
+- Agent completion claims are evidence, not proof. Verify repository state, required tests/checks, and acceptance criteria before declaring PASS.
