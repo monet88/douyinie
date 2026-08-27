@@ -171,7 +171,7 @@ func TestRouter_CredentialBackedAuthorization(t *testing.T) {
 
 	// Block standard ASR so only authorization-required provider remains
 	_ = polSvc.SetPolicy(ctx, "fake_qwen3_asr", domain.PolicyBlocked, "disabled")
-
+	_ = polSvc.SetPolicy(ctx, "fake_qwen3_asr_06b", domain.PolicyBlocked, "disabled")
 	// 1. Passing provider ID directly without valid credential reference -> Fail-closed
 	_, err := router.Route(ctx, provider.RouteRequest{
 		RunID:                 uuid.NewString(),

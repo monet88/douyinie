@@ -141,7 +141,7 @@ func TestSeam2_SubprocessLifecycleAndComplete(t *testing.T) {
 	cmd := worker.Command{
 		ID:         "cmd-1",
 		Family:     "asr",
-		Stage:      "asr",
+		Stage:      "generic",
 		AttemptID:  "attempt-1",
 		RunID:      "run-1",
 		OutputPath: outPath,
@@ -575,6 +575,81 @@ func TestSeam2_EncoderRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+// TestSeam2_ASRAdapterFailsClosedWhenBinaryMissing verifies the production
+// StageWorker ASR adapter fails closed with a structured error when a real
+// invocation (with input artifacts) is requested but the model binary is not
+// available on PATH. It must never silently fake model output.
+func TestSeam2_ASRAdapterFailsClosedWhenBinaryMissing(t *testing.T) {
+	exe := buildStageWorker(t)
+	sup := worker.NewSupervisor()
+	if err := sup.Spawn(context.Background(), "asr", exe, "-family", "asr", "-heartbeat-ms", "1000"); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	client := worker.NewClient(sup)
+	if _, err := client.Handshake(context.Background(), 5*time.Second); err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("handshake: %v", err)
+	}
+
+	// A real ASR invocation carries an input audio artifact.
+	cmd := worker.Command{
+		ID:        "cmd-asr-real",
+		Family:    "asr",
+		Stage:     "asr",
+		AttemptID: "attempt-asr-real",
+		RunID:     "run-asr-real",
+		Inputs:    []worker.ArtifactRef{{SHA256: "audio", Path: filepath.Join(t.TempDir(), "audio.wav")}},
+		Config:    map[string]any{},
+	}
+	_, err := client.Run(context.Background(), cmd, 5*time.Second, 5*time.Second)
+	if err == nil {
+		_ = sup.Terminate()
+		t.Fatal("expected ASR invocation to fail closed when binary is missing")
+	}
+	if !strings.Contains(err.Error(), "ASR_BINARY_NOT_FOUND") {
+		_ = sup.Terminate()
+		t.Fatalf("expected ASR_BINARY_NOT_FOUND error, got %v", err)
+	}
+	_ = client.Shutdown()
+}
+
+// TestSeam2_AlignerAdapterFailsClosedWhenBinaryMissing verifies the production
+// StageWorker aligner adapter fails closed with a structured error when a real
+// alignment invocation (with input artifacts) is requested but the model binary
+// is not available on PATH.
+func TestSeam2_AlignerAdapterFailsClosedWhenBinaryMissing(t *testing.T) {
+	exe := buildStageWorker(t)
+	sup := worker.NewSupervisor()
+	if err := sup.Spawn(context.Background(), "aligner", exe, "-family", "aligner", "-heartbeat-ms", "1000"); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	client := worker.NewClient(sup)
+	if _, err := client.Handshake(context.Background(), 5*time.Second); err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("handshake: %v", err)
+	}
+
+	cmd := worker.Command{
+		ID:        "cmd-align-real",
+		Family:    "aligner",
+		Stage:     "aligner",
+		AttemptID: "attempt-align-real",
+		RunID:     "run-align-real",
+		Inputs:    []worker.ArtifactRef{{SHA256: "text", Path: filepath.Join(t.TempDir(), "transcript.txt")}},
+		Config:    map[string]any{},
+	}
+	_, err := client.Run(context.Background(), cmd, 5*time.Second, 5*time.Second)
+	if err == nil {
+		_ = sup.Terminate()
+		t.Fatal("expected alignment invocation to fail closed when binary is missing")
+	}
+	if !strings.Contains(err.Error(), "ALIGNER_BINARY_NOT_FOUND") {
+		_ = sup.Terminate()
+		t.Fatalf("expected ALIGNER_BINARY_NOT_FOUND error, got %v", err)
+	}
+	_ = client.Shutdown()
+}
+
 func mustJSON(t *testing.T, v any) json.RawMessage {
 	t.Helper()
 	b, err := json.Marshal(v)
@@ -582,4 +657,208 @@ func mustJSON(t *testing.T, v any) json.RawMessage {
 		t.Fatalf("marshal: %v", err)
 	}
 	return b
+}
+
+// buildFakeModel builds the fakemodel fixture binary under the given name.
+// It returns the directory containing the binary (which must be prepended to
+// PATH for LookPath to resolve the binary name).
+func buildFakeModel(t *testing.T, name string) string {
+	t.Helper()
+	binDir := t.TempDir()
+	binPath := filepath.Join(binDir, name)
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+	cmd := exec.Command("go", "build", "-o", binPath, "github.com/monet88/douyinie/test/fixtures/fakemodel")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build fakemodel %s: %v\n%s", name, err, out)
+	}
+	return binDir
+}
+
+// TestSeam2_ASRAdapterInvokeAndParseSuccess verifies the real invocation seam:
+// a fake model binary on PATH receives stdin JSON, emits stdout JSON, and the
+// adapter parses segments and returns a real SHA-256 artifact.
+func TestSeam2_ASRAdapterInvokeAndParseSuccess(t *testing.T) {
+	binDir := buildFakeModel(t, "qwen3-asr")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	exe := buildStageWorker(t)
+	sup := worker.NewSupervisor()
+	if err := sup.Spawn(context.Background(), "asr", exe, "-family", "asr", "-heartbeat-ms", "1000"); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	client := worker.NewClient(sup)
+	if _, err := client.Handshake(context.Background(), 5*time.Second); err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("handshake: %v", err)
+	}
+
+	// A real ASR invocation with an input audio artifact.
+	audioPath := filepath.Join(t.TempDir(), "audio.wav")
+	_ = os.WriteFile(audioPath, []byte("fake audio data"), 0644)
+	outPath := filepath.Join(t.TempDir(), "out.json")
+	cmd := worker.Command{
+		ID:         "cmd-asr-real",
+		Family:     "asr",
+		Stage:      "asr",
+		AttemptID:  "attempt-asr-real",
+		RunID:      "run-asr-real",
+		Inputs:     []worker.ArtifactRef{{SHA256: "audio", Path: audioPath}},
+		OutputPath: outPath,
+		Config:     map[string]any{},
+	}
+	artifact, err := client.Run(context.Background(), cmd, 5*time.Second, 5*time.Second)
+	if err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("ASR invocation failed: %v", err)
+	}
+
+	// Verify real SHA-256 (not placeholder).
+	if artifact.SHA256 == "" || strings.Contains(artifact.SHA256, "placeholder") {
+		t.Fatalf("expected real SHA-256, got %q", artifact.SHA256)
+	}
+	if artifact.Path != outPath {
+		t.Fatalf("unexpected artifact path %q", artifact.Path)
+	}
+
+	// Verify output file exists and contains valid segments.
+	if _, err := os.Stat(outPath); err != nil {
+		t.Fatalf("output artifact missing: %v", err)
+	}
+	_ = client.Shutdown()
+}
+
+// TestSeam2_ASRAdapterGarbageOutputFailsClosed verifies the adapter fails closed
+// when the model binary emits invalid/malformed JSON on stdout.
+func TestSeam2_ASRAdapterGarbageOutputFailsClosed(t *testing.T) {
+	binDir := buildFakeModel(t, "qwen3-asr")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKEMODEL_GARBAGE", "1")
+
+	exe := buildStageWorker(t)
+	sup := worker.NewSupervisor()
+	if err := sup.Spawn(context.Background(), "asr", exe, "-family", "asr", "-heartbeat-ms", "1000"); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	client := worker.NewClient(sup)
+	if _, err := client.Handshake(context.Background(), 5*time.Second); err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("handshake: %v", err)
+	}
+
+	audioPath := filepath.Join(t.TempDir(), "audio.wav")
+	_ = os.WriteFile(audioPath, []byte("fake audio data"), 0644)
+	outPath := filepath.Join(t.TempDir(), "out.json")
+	cmd := worker.Command{
+		ID:         "cmd-asr-garbage",
+		Family:     "asr",
+		Stage:      "asr",
+		AttemptID:  "attempt-asr-garbage",
+		RunID:      "run-asr-garbage",
+		Inputs:     []worker.ArtifactRef{{SHA256: "audio", Path: audioPath}},
+		OutputPath: outPath,
+		Config:     map[string]any{},
+	}
+	_, err := client.Run(context.Background(), cmd, 5*time.Second, 5*time.Second)
+	if err == nil {
+		_ = sup.Terminate()
+		t.Fatal("expected ASR invocation to fail on garbage output")
+	}
+	if !strings.Contains(err.Error(), "ASR_OUTPUT_INVALID") {
+		_ = sup.Terminate()
+		t.Fatalf("expected ASR_OUTPUT_INVALID, got %v", err)
+	}
+	_ = client.Shutdown()
+}
+
+// TestSeam2_AlignerAdapterInvokeAndParseSuccess verifies the aligner invocation
+// seam: a fake model binary on PATH, text from Config, parsed word timings.
+func TestSeam2_AlignerAdapterInvokeAndParseSuccess(t *testing.T) {
+	binDir := buildFakeModel(t, "qwen3-aligner")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	exe := buildStageWorker(t)
+	sup := worker.NewSupervisor()
+	if err := sup.Spawn(context.Background(), "aligner", exe, "-family", "aligner", "-heartbeat-ms", "1000"); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	client := worker.NewClient(sup)
+	if _, err := client.Handshake(context.Background(), 5*time.Second); err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("handshake: %v", err)
+	}
+
+	// A real alignment invocation with an input audio artifact and accepted text.
+	audioPath := filepath.Join(t.TempDir(), "audio.wav")
+	_ = os.WriteFile(audioPath, []byte("fake audio data"), 0644)
+	outPath := filepath.Join(t.TempDir(), "out.json")
+	cmd := worker.Command{
+		ID:         "cmd-align-real",
+		Family:     "aligner",
+		Stage:      "aligner",
+		AttemptID:  "attempt-align-real",
+		RunID:      "run-align-real",
+		Inputs:     []worker.ArtifactRef{{SHA256: "audio", Path: audioPath}},
+		OutputPath: outPath,
+		Config:     map[string]any{"text": "今天天气很好 我们去公园散步吧"},
+	}
+	artifact, err := client.Run(context.Background(), cmd, 5*time.Second, 5*time.Second)
+	if err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("alignment invocation failed: %v", err)
+	}
+
+	// Verify real SHA-256.
+	if artifact.SHA256 == "" || strings.Contains(artifact.SHA256, "placeholder") {
+		t.Fatalf("expected real SHA-256, got %q", artifact.SHA256)
+	}
+	if _, err := os.Stat(outPath); err != nil {
+		t.Fatalf("output artifact missing: %v", err)
+	}
+	_ = client.Shutdown()
+}
+
+// TestSeam2_AlignerAdapterGarbageFailsClosed verifies the aligner adapter fails
+// closed when the model binary emits invalid JSON on stdout.
+func TestSeam2_AlignerAdapterGarbageFailsClosed(t *testing.T) {
+	binDir := buildFakeModel(t, "qwen3-aligner")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKEMODEL_GARBAGE", "1")
+
+	exe := buildStageWorker(t)
+	sup := worker.NewSupervisor()
+	if err := sup.Spawn(context.Background(), "aligner", exe, "-family", "aligner", "-heartbeat-ms", "1000"); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	client := worker.NewClient(sup)
+	if _, err := client.Handshake(context.Background(), 5*time.Second); err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("handshake: %v", err)
+	}
+
+	audioPath := filepath.Join(t.TempDir(), "audio.wav")
+	_ = os.WriteFile(audioPath, []byte("fake audio data"), 0644)
+	outPath := filepath.Join(t.TempDir(), "out.json")
+	cmd := worker.Command{
+		ID:         "cmd-align-garbage",
+		Family:     "aligner",
+		Stage:      "aligner",
+		AttemptID:  "attempt-align-garbage",
+		RunID:      "run-align-garbage",
+		Inputs:     []worker.ArtifactRef{{SHA256: "audio", Path: audioPath}},
+		OutputPath: outPath,
+		Config:     map[string]any{"text": "今天天气很好"},
+	}
+	_, err := client.Run(context.Background(), cmd, 5*time.Second, 5*time.Second)
+	if err == nil {
+		_ = sup.Terminate()
+		t.Fatal("expected alignment to fail on garbage output")
+	}
+	if !strings.Contains(err.Error(), "ALIGNER_OUTPUT_INVALID") {
+		_ = sup.Terminate()
+		t.Fatalf("expected ALIGNER_OUTPUT_INVALID, got %v", err)
+	}
+	_ = client.Shutdown()
 }

@@ -38,6 +38,7 @@ type Server struct {
 	queueSvc   *queue.Service
 	scheduler  *scheduler.Scheduler
 	executor   Executor
+	speechSvc  *service.SpeechService
 	mux        *http.ServeMux
 	server     *http.Server
 }
@@ -55,7 +56,8 @@ type Config struct {
 	Router     *provider.Router
 	QueueSvc   *queue.Service
 	Scheduler  *scheduler.Scheduler
-	Executor   Executor // Injected execution seam for testing and custom worker dispatch
+	Executor   Executor               // Injected execution seam for testing and custom worker dispatch
+	SpeechSvc  *service.SpeechService // Speech understanding pipeline (T08)
 }
 
 // New creates a new RuntimeHost Server instance.
@@ -79,6 +81,13 @@ func New(cfg Config) *Server {
 		cfg.Scheduler = scheduler.New()
 	}
 
+	// Wire router-backed speech defaults when both are available.
+	// Speech service defaults are set here so main.go does not need to
+	// manage the SpeechService ↔ Router dependency explicitly.
+	if cfg.SpeechSvc != nil && cfg.Router != nil {
+		cfg.SpeechSvc.ConfigureRouter(cfg.Router)
+	}
+
 	s := &Server{
 		db:         cfg.DB,
 		casStore:   cfg.CASStore,
@@ -91,6 +100,7 @@ func New(cfg Config) *Server {
 		queueSvc:   cfg.QueueSvc,
 		scheduler:  cfg.Scheduler,
 		executor:   cfg.Executor,
+		speechSvc:  cfg.SpeechSvc,
 		mux:        http.NewServeMux(),
 	}
 
@@ -109,6 +119,17 @@ func New(cfg Config) *Server {
 // SetExecutor sets or replaces the injected execution seam (e.g. for Seam 1 retry/fallback testing).
 func (s *Server) SetExecutor(exec Executor) {
 	s.executor = exec
+}
+
+// SetSpeechService sets or replaces the injected speech understanding pipeline (T08).
+// It also wires router-backed defaults for any hooks the service left nil,
+// so a replacement service always gets router-backed defaults regardless of
+// the order in which SpeechService, Router, and SetSpeechService are called.
+func (s *Server) SetSpeechService(svc *service.SpeechService) {
+	s.speechSvc = svc
+	if svc != nil && s.router != nil {
+		svc.ConfigureRouter(s.router)
+	}
 }
 
 // Handler returns the underlying http.Handler for in-memory / testing purposes.
@@ -183,6 +204,11 @@ func (s *Server) routes() {
 
 	// Layered Configuration
 	s.mux.HandleFunc("GET /api/v1/config/layered", s.handleGetLayeredConfig)
+
+	// Speech Understanding (T08: ASR + forced alignment + conditional diarization + canonical SpeechBlocks)
+	// The pipeline persists its own immutable TranscriptArtifact; only GET is public.
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/speech-understand", s.handleRunSpeechUnderstand)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/transcript", s.handleGetTranscript)
 }
 
 // JSON helpers
@@ -379,6 +405,109 @@ func (s *Server) handleGetAudioRolePlan(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"audio_role_plan": plan})
+}
+
+func (s *Server) handleRunSpeechUnderstand(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	asset, err := s.db.GetSourceAsset(r.Context(), assetID)
+	if err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.speechSvc == nil {
+		writeError(w, http.StatusInternalServerError, "speech service is not configured")
+		return
+	}
+
+	var body struct {
+		RunID    string `json:"run_id"`
+		Language string `json:"language,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	if body.RunID == "" {
+		writeError(w, http.StatusBadRequest, "run_id is required")
+		return
+	}
+
+	// Load the audio role plan from the asset's CAS metadata. The pipeline
+	// fails closed when the plan is missing (ErrAudioRolePlanRequired).
+	var rolePlan *domain.AudioRolePlan
+	plan, err := s.db.GetAudioRolePlan(r.Context(), assetID)
+	if err == nil {
+		rolePlan = plan
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// Resolve the source media from the asset's CAS metadata on the RuntimeHost
+	// side. This is the original source-media object (possibly video), not a
+	// normalized WAV — audio extraction/normalization is the worker adapter's
+	// responsibility. The localhost API never trusts client-supplied paths.
+	if strings.TrimSpace(asset.CASPath) == "" {
+		writeError(w, http.StatusUnprocessableEntity, "asset has no source media in CAS to process")
+		return
+	}
+	in := domain.SpeechPipelineInput{
+		RunID:         body.RunID,
+		AssetID:       assetID,
+		AudioPath:     asset.CASPath,
+		AudioRolePlan: rolePlan,
+	}
+	artifact, err := s.speechSvc.RunPipeline(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, domain.ErrNoDubEligibleSpeech) ||
+			errors.Is(err, domain.ErrAudioRolePlanRequired) ||
+			errors.Is(err, domain.ErrNoEligibleProvider) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"transcript_artifact": artifact})
+}
+
+func (s *Server) handleGetTranscript(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	idx, err := s.db.GetTranscriptArtifactIndex(r.Context(), assetID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "transcript not found for asset")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.casStore == nil {
+		writeError(w, http.StatusInternalServerError, "CAS store not configured")
+		return
+	}
+	rc, err := s.casStore.Get(idx.CASHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "read transcript artifact from CAS: "+err.Error())
+		return
+	}
+	defer rc.Close()
+	var artifact domain.TranscriptArtifact
+	if err := json.NewDecoder(rc).Decode(&artifact); err != nil {
+		writeError(w, http.StatusInternalServerError, "decode transcript artifact: "+err.Error())
+		return
+	}
+	artifact.CASHash = idx.CASHash
+	artifact.ProvenanceHash = idx.ProvenanceHash
+	writeJSON(w, http.StatusOK, map[string]any{"transcript_artifact": artifact})
 }
 
 func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {

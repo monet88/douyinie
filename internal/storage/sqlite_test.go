@@ -600,3 +600,126 @@ func TestStorage_MigrationV3ToV4_BackfillsPreExistingRuns(t *testing.T) {
 		t.Errorf("run_c: expected queued (never started), got %s", runC.Status)
 	}
 }
+
+// TestStorage_TranscriptArtifactProvenance verifies CAS-indexed provenance:
+// the index is keyed by deterministic provenance identity, repeated saves
+// with identical provenance are idempotent, and a changed provider/model
+// yields a new artifact row instead of a permanent write-once failure.
+func TestStorage_TranscriptArtifactProvenance(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(t.TempDir() + "/transcript_provenance.db")
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	// transcript_artifacts.asset_id references source_assets, which references
+	// rights_attestations, so create the full parent chain first.
+	raID := uuid.NewString()
+	if err := db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              raID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		DeclaredBy:      "operator-tester",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("CreateRightsAttestation failed: %v", err)
+	}
+
+	assetID := uuid.NewString()
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		SHA256:              "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		OriginalFilename:    "test_video.mp4",
+		RightsAttestationID: raID,
+		CASPath:             "cas/e3/b0/" + assetID,
+		CreatedAt:           time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("CreateSourceAsset failed: %v", err)
+	}
+
+	now := time.Now().UTC()
+	idx1 := TranscriptArtifactIndex{
+		ID:                  "art-1",
+		AssetID:             assetID,
+		RunID:               "run-1",
+		CASHash:             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		ProvenanceHash:      "prov-v1",
+		ASRProviderID:       "fake_qwen3_asr",
+		ASRModelName:        "qwen3-asr",
+		ASRModelVersion:     "1.7b",
+		AlignerProviderID:   "fake_qwen3_aligner",
+		AlignerModelName:    "qwen3-aligner",
+		AlignerModelVersion: "1.0.0",
+		SegmentCfgJSON:      "{}",
+		CreatedAt:           now,
+	}
+
+	// First save succeeds.
+	if err := db.SaveTranscriptArtifactIndex(ctx, idx1); err != nil {
+		t.Fatalf("first SaveTranscriptArtifactIndex failed: %v", err)
+	}
+
+	// Re-saving identical provenance is idempotent (no error, no duplicate row).
+	idx1b := idx1
+	idx1b.ID = "art-1-redup"
+	if err := db.SaveTranscriptArtifactIndex(ctx, idx1b); err != nil {
+		t.Fatalf("idempotent re-save failed: %v", err)
+	}
+	byProv, err := db.GetTranscriptArtifactByProvenance(ctx, "prov-v1")
+	if err != nil {
+		t.Fatalf("GetTranscriptArtifactByProvenance failed: %v", err)
+	}
+	if byProv.ID != "art-1" {
+		t.Errorf("idempotent re-save must keep the original row, got %q", byProv.ID)
+	}
+
+	// A changed model version yields a NEW provenance -> new row, no failure.
+	idx2 := idx1
+	idx2.ID = "art-2"
+	idx2.CASHash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	idx2.ProvenanceHash = "prov-v2"
+	idx2.ASRModelVersion = "0.6b"
+	if err := db.SaveTranscriptArtifactIndex(ctx, idx2); err != nil {
+		t.Fatalf("save changed-provenance artifact failed: %v", err)
+	}
+
+	// The latest row for the asset is the changed-provenance artifact.
+	latest, err := db.GetTranscriptArtifactIndex(ctx, assetID)
+	if err != nil {
+		t.Fatalf("GetTranscriptArtifactIndex failed: %v", err)
+	}
+	if latest.ID != "art-2" || latest.ProvenanceHash != "prov-v2" {
+		t.Errorf("expected latest artifact art-2/prov-v2, got %s/%s", latest.ID, latest.ProvenanceHash)
+	}
+}
+
+// TestTranscriptProvenance_HashDeterminism verifies the provenance hash is
+// deterministic over identical inputs and changes when any input changes.
+func TestTranscriptProvenance_HashDeterminism(t *testing.T) {
+	cfg := domain.DefaultSegmentRuleConfig()
+	a := domain.TranscriptProvenance{
+		AssetSHA256:         "sha-a",
+		ASRProviderID:       "p1",
+		ASRModelName:        "qwen3-asr",
+		ASRModelVersion:     "1.7b",
+		AlignerProviderID:   "p2",
+		AlignerModelName:    "qwen3-aligner",
+		AlignerModelVersion: "1.0.0",
+		SegmentConfig:       cfg,
+		SchemaVersion:       domain.TranscriptSchemaVersion,
+	}
+	b := a
+	if a.Hash() != b.Hash() {
+		t.Error("identical provenance must produce identical hash")
+	}
+	if a.Hash() == "" {
+		t.Error("provenance hash must not be empty")
+	}
+	b.ASRModelVersion = "0.6b"
+	if a.Hash() == b.Hash() {
+		t.Error("changed model version must change the provenance hash")
+	}
+}

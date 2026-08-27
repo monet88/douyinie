@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -512,6 +513,52 @@ func (s *DB) migrate(ctx context.Context) error {
 		}
 	}
 
+	// 7. Schema migration v6 (Transcript Artifacts - Speech Understanding T08)
+	var countV6 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 6`).Scan(&countV6)
+	if err != nil {
+		return fmt.Errorf("check migration version 6: %w", err)
+	}
+
+	if countV6 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v6 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		schemaV6SQL := `
+		CREATE TABLE IF NOT EXISTS transcript_artifacts (
+			id TEXT PRIMARY KEY,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			run_id TEXT NOT NULL,
+			cas_hash TEXT NOT NULL,
+			provenance_hash TEXT NOT NULL,
+			asr_provider_id TEXT NOT NULL,
+			asr_model_name TEXT NOT NULL,
+			asr_model_version TEXT NOT NULL,
+			aligner_provider_id TEXT NOT NULL,
+			aligner_model_name TEXT NOT NULL,
+			aligner_model_version TEXT NOT NULL,
+			segment_cfg_json TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_transcript_artifacts_provenance ON transcript_artifacts(provenance_hash);
+		CREATE INDEX IF NOT EXISTS idx_transcript_artifacts_asset ON transcript_artifacts(asset_id);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (6, datetime('now'));
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaV6SQL); err != nil {
+			return fmt.Errorf("execute migration v6: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v6: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -921,6 +968,105 @@ func (s *DB) GetAudioRolePlan(ctx context.Context, assetID string) (*domain.Audi
 	plan.CreatedAt = t
 
 	return &plan, nil
+}
+
+// TranscriptArtifactIndex is the SQLite index row for a content-addressed
+// TranscriptArtifact. The artifact JSON blob itself lives in the CAS store;
+// SQLite indexes it by asset and by deterministic provenance identity.
+type TranscriptArtifactIndex struct {
+	ID                  string
+	AssetID             string
+	RunID               string
+	CASHash             string
+	ProvenanceHash      string
+	ASRProviderID       string
+	ASRModelName        string
+	ASRModelVersion     string
+	AlignerProviderID   string
+	AlignerModelName    string
+	AlignerModelVersion string
+	SegmentCfgJSON      string
+	CreatedAt           time.Time
+}
+
+// SaveTranscriptArtifactIndex records the index row for a CAS-stored
+// TranscriptArtifact. The provenance hash is the deterministic cache identity:
+// re-deriving the same pipeline inputs produces the same provenance hash, so
+// the write is idempotent (a repeated save for identical provenance is a no-op
+// rather than a permanent write-once failure). A changed provider/model/config
+// yields a different provenance hash and thus a new artifact row.
+func (s *DB) SaveTranscriptArtifactIndex(ctx context.Context, idx TranscriptArtifactIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if strings.TrimSpace(idx.AssetID) == "" || strings.TrimSpace(idx.CASHash) == "" || strings.TrimSpace(idx.ProvenanceHash) == "" {
+		return errors.New("transcript artifact index requires asset_id, cas_hash, and provenance_hash")
+	}
+
+	createdAtStr := idx.CreatedAt.Format(time.RFC3339Nano)
+	query := `
+		INSERT INTO transcript_artifacts (id, asset_id, run_id, cas_hash, provenance_hash, asr_provider_id, asr_model_name, asr_model_version, aligner_provider_id, aligner_model_name, aligner_model_version, segment_cfg_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provenance_hash) DO NOTHING
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID, idx.AssetID, idx.RunID, idx.CASHash, idx.ProvenanceHash,
+		idx.ASRProviderID, idx.ASRModelName, idx.ASRModelVersion,
+		idx.AlignerProviderID, idx.AlignerModelName, idx.AlignerModelVersion,
+		idx.SegmentCfgJSON, createdAtStr)
+	if err != nil {
+		return fmt.Errorf("save transcript artifact index: %w", err)
+	}
+	return nil
+}
+
+// GetTranscriptArtifactIndex retrieves the latest index row for an asset.
+func (s *DB) GetTranscriptArtifactIndex(ctx context.Context, assetID string) (*TranscriptArtifactIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx TranscriptArtifactIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, cas_hash, provenance_hash, asr_provider_id, asr_model_name, asr_model_version, aligner_provider_id, aligner_model_name, aligner_model_version, segment_cfg_json, created_at
+		FROM transcript_artifacts WHERE asset_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`
+	err := s.db.QueryRowContext(ctx, query, assetID).Scan(
+		&idx.ID, &idx.AssetID, &idx.RunID, &idx.CASHash, &idx.ProvenanceHash,
+		&idx.ASRProviderID, &idx.ASRModelName, &idx.ASRModelVersion,
+		&idx.AlignerProviderID, &idx.AlignerModelName, &idx.AlignerModelVersion,
+		&idx.SegmentCfgJSON, &createdStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query transcript artifact index: %w", err)
+	}
+	idx.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	return &idx, nil
+}
+
+// GetTranscriptArtifactByProvenance retrieves the index row for a deterministic
+// provenance identity, enabling idempotent re-derivation of unchanged inputs.
+func (s *DB) GetTranscriptArtifactByProvenance(ctx context.Context, provenanceHash string) (*TranscriptArtifactIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx TranscriptArtifactIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, cas_hash, provenance_hash, asr_provider_id, asr_model_name, asr_model_version, aligner_provider_id, aligner_model_name, aligner_model_version, segment_cfg_json, created_at
+		FROM transcript_artifacts WHERE provenance_hash = ? LIMIT 1`
+	err := s.db.QueryRowContext(ctx, query, provenanceHash).Scan(
+		&idx.ID, &idx.AssetID, &idx.RunID, &idx.CASHash, &idx.ProvenanceHash,
+		&idx.ASRProviderID, &idx.ASRModelName, &idx.ASRModelVersion,
+		&idx.AlignerProviderID, &idx.AlignerModelName, &idx.AlignerModelVersion,
+		&idx.SegmentCfgJSON, &createdStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query transcript artifact by provenance: %w", err)
+	}
+	idx.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	return &idx, nil
 }
 
 // CreateRun creates a new localization run.

@@ -145,6 +145,15 @@ func TestSeam1_CredentialBackedAuthorization_NoSelfAuthorization(t *testing.T) {
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
 
+	// Also block the 0.6B ASR fallback so only fake_auth_cloud_asr remains eligible.
+	blockBody06B, _ := json.Marshal(map[string]string{
+		"policy_state": "BLOCKED",
+		"reason":       "isolation test",
+	})
+	req06B, _ := http.NewRequest(http.MethodPut, h.server.URL+"/api/v1/policies/fake_qwen3_asr_06b", bytes.NewReader(blockBody06B))
+	req06B.Header.Set("Content-Type", "application/json")
+	resp06B, _ := http.DefaultClient.Do(req06B)
+	resp06B.Body.Close()
 	// 1. Caller attempts to self-authorize merely by passing the provider ID string in authorized_credentials -> Fails 422
 	selfAuthPayload := map[string]any{
 		"run_id":                 uuid.NewString(),

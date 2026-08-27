@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,10 +15,12 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/worker"
 )
 
@@ -297,18 +302,10 @@ func executeStage(ctx context.Context, cmd worker.Command, enc *worker.Encoder) 
 		}
 	}
 
-	// For v1, the worker writes a stage marker artifact to the output path.
-	if cmd.OutputPath != "" {
-		marker := map[string]any{
-			"command_id": cmd.ID,
-			"stage":      cmd.Stage,
-			"family":     cmd.Family,
-			"status":     "executed",
-		}
-		b, _ := json.MarshalIndent(marker, "", "  ")
-		if err := os.WriteFile(cmd.OutputPath, b, 0644); err != nil {
-			return stageResult{err: fmt.Errorf("write output artifact: %w", err)}
-		}
+	// Dispatch to the appropriate stage adapter.
+	result, err := dispatchStage(ctx, cmd, enc)
+	if err != nil {
+		return stageResult{err: err}
 	}
 
 	_ = enc.Encode(worker.MessageTypeProgress, worker.ProgressPayload{
@@ -318,9 +315,179 @@ func executeStage(ctx context.Context, cmd worker.Command, enc *worker.Encoder) 
 	})
 
 	return stageResult{
-		artifact: worker.ArtifactRef{
-			SHA256: cmd.ID + "-sha256-placeholder",
-			Path:   cmd.OutputPath,
-		},
+		artifact: result,
 	}
+}
+
+// dispatchStage routes the stage command to the appropriate adapter function.
+// Each adapter is a real production path that checks for available model binaries;
+// if a binary is not found, it fails closed with a structured error rather than
+// silently faking model output. This is the smallest architecture-compliant
+// production StageWorker/provider-adapter path.
+func dispatchStage(ctx context.Context, cmd worker.Command, enc *worker.Encoder) (worker.ArtifactRef, error) {
+	switch cmd.Stage {
+	case "asr":
+		return runASRAdapter(ctx, cmd, enc)
+	case "aligner":
+		return runAlignerAdapter(ctx, cmd, enc)
+	default:
+		// For unrecognized stages, fall back to the marker artifact placeholder.
+		return writeMarkerArtifact(cmd)
+	}
+}
+
+// runASRAdapter runs the Qwen3-ASR adapter. A real invocation carries an
+// input audio artifact; a missing input fails closed (ASR_MISSING_INPUT).
+// The model binary is invoked over a stdin JSON request / stdout JSON response
+// contract, and its parsed output is written to the output path with a real
+// SHA-256. Binary absence, exec failure, invalid output, or empty output each
+// fail closed with a structured error — never a fabricated transcript.
+func runASRAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder) (worker.ArtifactRef, error) {
+	if len(cmd.Inputs) == 0 {
+		return worker.ArtifactRef{}, worker.NewError("ASR_MISSING_INPUT",
+			"ASR command has no input audio artifact",
+			map[string]any{"stage": "asr", "command_id": cmd.ID})
+	}
+	if _, err := exec.LookPath("qwen3-asr"); err != nil {
+		return worker.ArtifactRef{}, worker.NewError("ASR_BINARY_NOT_FOUND",
+			"qwen3-asr binary not available on PATH: install Qwen3-ASR 1.7B/0.6B to enable ASR stage",
+			map[string]any{"stage": "asr", "command_id": cmd.ID})
+	}
+
+	// stdin JSON request: audio_path is the machine-local input artifact path.
+	req := map[string]any{
+		"audio_path": cmd.Inputs[0].Path,
+		"run_id":     cmd.RunID,
+		"attempt_id": cmd.AttemptID,
+	}
+	var out struct {
+		Segments []domain.ASRRawSegment `json:"segments"`
+	}
+	if err := invokeModel(ctx, "qwen3-asr", req, &out); err != nil {
+		return worker.ArtifactRef{}, err
+	}
+	if len(out.Segments) == 0 {
+		return worker.ArtifactRef{}, worker.NewError("ASR_NO_SEGMENTS",
+			"Qwen3-ASR produced no transcript segments",
+			map[string]any{"stage": "asr", "command_id": cmd.ID})
+	}
+	return writeOutputArtifact(cmd, out)
+}
+
+// runAlignerAdapter runs the Qwen3-ForcedAligner adapter. A real invocation
+// carries an input audio artifact and the accepted text (cmd.Config["text"]).
+// Fail-closed behavior mirrors the ASR adapter: missing input, missing binary,
+// exec failure, invalid/empty output all produce structured errors.
+func runAlignerAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder) (worker.ArtifactRef, error) {
+	if len(cmd.Inputs) == 0 {
+		return worker.ArtifactRef{}, worker.NewError("ALIGNER_MISSING_INPUT",
+			"aligner command has no input audio artifact",
+			map[string]any{"stage": "aligner", "command_id": cmd.ID})
+	}
+	if _, err := exec.LookPath("qwen3-aligner"); err != nil {
+		return worker.ArtifactRef{}, worker.NewError("ALIGNER_BINARY_NOT_FOUND",
+			"qwen3-aligner binary not available on PATH: install Qwen3-ForcedAligner to enable alignment stage",
+			map[string]any{"stage": "aligner", "command_id": cmd.ID})
+	}
+	text, _ := cmd.Config["text"].(string)
+	if strings.TrimSpace(text) == "" {
+		return worker.ArtifactRef{}, worker.NewError("ALIGNER_MISSING_TEXT",
+			"aligner command has no accepted text in config",
+			map[string]any{"stage": "aligner", "command_id": cmd.ID})
+	}
+
+	// stdin JSON request: audio_path + the accepted text to align.
+	req := map[string]any{
+		"audio_path": cmd.Inputs[0].Path,
+		"text":       text,
+		"run_id":     cmd.RunID,
+		"attempt_id": cmd.AttemptID,
+	}
+	var out struct {
+		WordTimings []domain.WordTiming `json:"word_timings"`
+	}
+	if err := invokeModel(ctx, "qwen3-aligner", req, &out); err != nil {
+		return worker.ArtifactRef{}, err
+	}
+	if len(out.WordTimings) == 0 {
+		return worker.ArtifactRef{}, worker.NewError("ALIGNER_NO_TIMINGS",
+			"Qwen3-ForcedAligner produced no word timings",
+			map[string]any{"stage": "aligner", "command_id": cmd.ID})
+	}
+	return writeOutputArtifact(cmd, out)
+}
+
+// invokeModel executes the model binary with a stdin JSON request and decodes
+// the stdout JSON response into out. Non-zero exit, decode failure, or a
+// structured error response all fail closed.
+func invokeModel(ctx context.Context, binary string, req any, out any) error {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal model request: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, binary)
+	cmd.Stdin = bytes.NewReader(body)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		code := "EXEC_FAILED"
+		if strings.HasPrefix(binary, "qwen3-asr") {
+			code = "ASR_EXEC_FAILED"
+		} else {
+			code = "ALIGNER_EXEC_FAILED"
+		}
+		return worker.NewError(code, fmt.Sprintf("%s exited with error: %v; stderr: %s", binary, err, strings.TrimSpace(stderr.String())), nil)
+	}
+	if err := json.Unmarshal(stdout.Bytes(), out); err != nil {
+		code := "OUTPUT_INVALID"
+		if strings.HasPrefix(binary, "qwen3-asr") {
+			code = "ASR_OUTPUT_INVALID"
+		} else {
+			code = "ALIGNER_OUTPUT_INVALID"
+		}
+		return worker.NewError(code, fmt.Sprintf("%s returned invalid JSON: %v", binary, err), nil)
+	}
+	return nil
+}
+
+// writeOutputArtifact writes the model's parsed response as JSON to the command
+// output path and returns an ArtifactRef carrying the real SHA-256 of the bytes.
+func writeOutputArtifact(cmd worker.Command, v any) (worker.ArtifactRef, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return worker.ArtifactRef{}, fmt.Errorf("marshal output artifact: %w", err)
+	}
+	if cmd.OutputPath != "" {
+		if err := os.WriteFile(cmd.OutputPath, b, 0644); err != nil {
+			return worker.ArtifactRef{}, fmt.Errorf("write output artifact: %w", err)
+		}
+	}
+	sum := sha256.Sum256(b)
+	return worker.ArtifactRef{
+		SHA256: hex.EncodeToString(sum[:]),
+		Path:   cmd.OutputPath,
+	}, nil
+}
+
+// writeMarkerArtifact writes a stage marker to the output path. It is only
+// used for unrecognized/neutral stages to preserve protocol lifecycle
+// compatibility; real ASR/aligner stages never produce placeholder artifacts.
+func writeMarkerArtifact(cmd worker.Command) (worker.ArtifactRef, error) {
+	if cmd.OutputPath != "" {
+		marker := map[string]any{
+			"command_id": cmd.ID,
+			"stage":      cmd.Stage,
+			"family":     cmd.Family,
+			"status":     "executed",
+		}
+		b, _ := json.MarshalIndent(marker, "", "  ")
+		if err := os.WriteFile(cmd.OutputPath, b, 0644); err != nil {
+			return worker.ArtifactRef{}, fmt.Errorf("write output artifact: %w", err)
+		}
+	}
+	return worker.ArtifactRef{
+		SHA256: cmd.ID + "-sha256-placeholder",
+		Path:   cmd.OutputPath,
+	}, nil
 }

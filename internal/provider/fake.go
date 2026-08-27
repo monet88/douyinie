@@ -1,6 +1,12 @@
 package provider
 
-import "github.com/monet88/douyinie/internal/domain"
+import (
+	"context"
+	"errors"
+	"strings"
+
+	"github.com/monet88/douyinie/internal/domain"
+)
 
 // BaseFakeProvider provides shared fields for fake providers.
 type BaseFakeProvider struct {
@@ -20,10 +26,13 @@ func (b *BaseFakeProvider) IsHealthy() bool                       { return b.Hea
 func (b *BaseFakeProvider) Capability() domain.ProviderCapability { return b.Cap }
 func (b *BaseFakeProvider) ModelInfo() (string, string)           { return b.ModelName, b.ModelVersion }
 
-// FakeASRProvider simulates Qwen3-ASR.
+// FakeASRProvider simulates Qwen3-ASR (1.7B quality attempt / 0.6B fallback).
+// Output is controllable per test: RawSegments overrides the default single
+// short segment so Seam 1 can drive a long multi-sentence VAD turn.
 type FakeASRProvider struct {
 	BaseFakeProvider
 	TranscribedText string
+	RawSegments     []domain.ASRRawSegment
 }
 
 func NewFakeASRProvider(id string) *FakeASRProvider {
@@ -49,9 +58,84 @@ func NewFakeASRProvider(id string) *FakeASRProvider {
 	}
 }
 
+// ProduceTranscript implements provider.ASRTranscriptProvider.
+// It returns the controllable RawSegments when set; otherwise a single
+// VAD-turn segment over TranscribedText (the default short-unit path).
+func (p *FakeASRProvider) ProduceTranscript(ctx context.Context, audioPath string) ([]domain.ASRRawSegment, error) {
+	if ctx == nil {
+		return nil, errors.New("nil context")
+	}
+	if len(p.RawSegments) > 0 {
+		return p.RawSegments, nil
+	}
+	text := strings.TrimSpace(p.TranscribedText)
+	if text == "" {
+		return nil, domain.ErrQualityRejected
+	}
+	return []domain.ASRRawSegment{{
+		StartMs:      0,
+		EndMs:        2000,
+		Text:         text,
+		Confidence:   0.90,
+		LanguageCode: "zh",
+	}}, nil
+}
+
+// produceAlignmentHelper produces a synthetic word-timing alignment for the
+// given accepted text when no explicit WordTimings were supplied. It splits
+// the text on whitespace into words with a fixed per-word cadence so the
+// forced-alignment contract (word timings) is honored deterministically.
+func produceAlignmentHelper(text string) []domain.WordTiming {
+	tokens := strings.Fields(text)
+	if len(tokens) == 0 {
+		return nil
+	}
+	words := make([]domain.WordTiming, 0, len(tokens))
+	start := int64(0)
+	for _, tok := range tokens {
+		w := domain.WordTiming{
+			Word:       tok,
+			StartMs:    start,
+			EndMs:      start + 300,
+			Confidence: 0.9,
+		}
+		words = append(words, w)
+		start += 350
+	}
+	return words
+}
+
+// NewFakeASRProvider06B simulates the Qwen3-ASR 0.6B fallback model
+// (lower quality score, same stage contract) for policy-fallback routing tests.
+func NewFakeASRProvider06B(id string) *FakeASRProvider {
+	return &FakeASRProvider{
+		BaseFakeProvider: BaseFakeProvider{
+			ProviderID:   id,
+			ProviderType: TypeASR,
+			Policy:       PolicyAllowed,
+			Healthy:      true,
+			Cap: domain.ProviderCapability{
+				Stage:          string(TypeASR),
+				Languages:      []string{"zh", "en", "vi"},
+				ExecutionTier:  "local",
+				CostPerUnit:    0.0,
+				QualityScore:   0.88,
+				MaxConcurrency: 1,
+				Features:       []string{"vad_split", "timestamp_alignment"},
+			},
+			ModelName:    "qwen3-asr",
+			ModelVersion: "0.6b",
+		},
+		TranscribedText: "测试语音输入",
+	}
+}
+
 // FakeAlignerProvider simulates Qwen3-ForcedAligner.
+// WordTimings is controllable per test; when empty, a default synthetic
+// alignment is produced by the test driver.
 type FakeAlignerProvider struct {
 	BaseFakeProvider
+	WordTimings []domain.WordTiming
 }
 
 func NewFakeAlignerProvider(id string) *FakeAlignerProvider {
@@ -74,6 +158,23 @@ func NewFakeAlignerProvider(id string) *FakeAlignerProvider {
 			ModelVersion: "1.0.0",
 		},
 	}
+}
+
+// ProduceAlignment implements provider.AlignWordProvider.
+// It returns the controllable WordTimings when set; otherwise a synthetic
+// alignment derived from the accepted text via produceAlignmentHelper.
+func (p *FakeAlignerProvider) ProduceAlignment(ctx context.Context, audioPath string, text string) ([]domain.WordTiming, error) {
+	if ctx == nil {
+		return nil, errors.New("nil context")
+	}
+	if len(p.WordTimings) > 0 {
+		return p.WordTimings, nil
+	}
+	words := produceAlignmentHelper(text)
+	if len(words) == 0 {
+		return nil, domain.ErrQualityRejected
+	}
+	return words, nil
 }
 
 // FakeTTSProvider simulates VieNeu-TTS or CosyVoice3 with controllable duration.
@@ -194,6 +295,7 @@ func NewFakeTranslationProvider(id string) *FakeTranslationProvider {
 func NewSeam1FakeRegistry() *Registry {
 	reg := NewRegistry()
 	_ = reg.Register(NewFakeASRProvider("fake_qwen3_asr"))
+	_ = reg.Register(NewFakeASRProvider06B("fake_qwen3_asr_06b"))
 	_ = reg.Register(NewFakeAlignerProvider("fake_qwen3_aligner"))
 	_ = reg.Register(NewFakeTTSProvider("fake_vieneu_tts_vi", 1500))
 	_ = reg.Register(NewFakeTTSProvider("fake_kokoro_tts_en", 1400))

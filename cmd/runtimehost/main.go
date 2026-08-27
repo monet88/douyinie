@@ -61,6 +61,9 @@ func main() {
 	// 4. Initialize Persisted Queue + ResourceScheduler + Crash Recovery
 	queueSvc := queue.NewService(db)
 	resScheduler := scheduler.New()
+
+	// 4b. Initialize Speech Understanding service (T08)
+	speechSvc := service.NewSpeechService(db, casStore)
 	recovered, err := queueSvc.Recover(context.Background())
 	if err != nil {
 		log.Fatalf("[RuntimeHost] crash recovery failed: %v", err)
@@ -70,12 +73,13 @@ func main() {
 	}
 
 	// 5. Initialize Provider Registry with Governance
-	fakeRegistry := provider.NewSeam1FakeRegistry()
+	// Production registers no fake providers: the router fails closed with
+	// ErrNoEligibleProvider until real worker-backed providers are registered.
+	reg := provider.NewRegistry()
 	polSvc := governance.NewPolicyService(db)
 	licSvc := governance.NewLicenseService(db)
 	credSvc := governance.NewCredentialService(db)
-	router := provider.NewRouter(fakeRegistry, polSvc, licSvc, credSvc, nil, db)
-
+	router := provider.NewRouter(reg, polSvc, licSvc, credSvc, nil, db)
 	// 6. Optional Demo Ingestion
 	if *demoFile != "" {
 		log.Printf("[RuntimeHost] Running DEMO ingestion on: %s", *demoFile)
@@ -113,13 +117,14 @@ func main() {
 		DB:         db,
 		CASStore:   casStore,
 		Ingest:     ingestSvc,
-		Registry:   fakeRegistry,
+		Registry:   reg,
 		PolicySvc:  polSvc,
 		LicenseSvc: licSvc,
 		CredSvc:    credSvc,
 		Router:     router,
 		QueueSvc:   queueSvc,
 		Scheduler:  resScheduler,
+		SpeechSvc:  speechSvc,
 	})
 
 	go func() {
