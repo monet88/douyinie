@@ -267,6 +267,13 @@ func NewFakeOCRProvider(id string) *FakeOCRProvider {
 // FakeTranslationProvider simulates translation service into VI / EN.
 type FakeTranslationProvider struct {
 	BaseFakeProvider
+	CustomTranslations map[string]string
+	CustomSegments     []domain.TranslationSegment
+	InjectError        error
+	CorruptNumbers     bool
+	CorruptNegation    bool
+	CorruptNames       bool
+	CorruptFacts       bool
 }
 
 func NewFakeTranslationProvider(id string) *FakeTranslationProvider {
@@ -279,15 +286,167 @@ func NewFakeTranslationProvider(id string) *FakeTranslationProvider {
 			Cap: domain.ProviderCapability{
 				Stage:          string(TypeTranslation),
 				Languages:      []string{"vi", "en"},
-				ExecutionTier:  "hybrid",
-				CostPerUnit:    0.001,
-				QualityScore:   0.96,
+				ExecutionTier:  "local",
+				CostPerUnit:    0.0,
+				QualityScore:   0.98,
 				MaxConcurrency: 4,
 				Features:       []string{"shorten_first_adaptation", "contextual_translation"},
 			},
 			ModelName:    "llm-translator",
 			ModelVersion: "1.0",
 		},
+		CustomTranslations: make(map[string]string),
+	}
+}
+
+// NewFakeTranslationProviderFallback creates a fallback translation provider with lower quality score and local tier.
+func NewFakeTranslationProviderFallback(id string) *FakeTranslationProvider {
+	return &FakeTranslationProvider{
+		BaseFakeProvider: BaseFakeProvider{
+			ProviderID:   id,
+			ProviderType: TypeTranslation,
+			Policy:       PolicyAllowed,
+			Healthy:      true,
+			Cap: domain.ProviderCapability{
+				Stage:          string(TypeTranslation),
+				Languages:      []string{"vi", "en"},
+				ExecutionTier:  "local",
+				CostPerUnit:    0.0,
+				QualityScore:   0.85,
+				MaxConcurrency: 1,
+				Features:       []string{"rule_translation"},
+			},
+			ModelName:    "local-translator-fast",
+			ModelVersion: "0.5b",
+		},
+		CustomTranslations: make(map[string]string),
+	}
+}
+
+// TranslateText implements TextTranslationProvider.
+func (p *FakeTranslationProvider) TranslateText(ctx context.Context, req TranslationRequest) (*TranslationResult, error) {
+	if ctx == nil {
+		return nil, errors.New("nil context")
+	}
+	if p.InjectError != nil {
+		return nil, p.InjectError
+	}
+	if len(p.CustomSegments) > 0 {
+		return &TranslationResult{
+			ProviderID:   p.ProviderID,
+			ModelName:    p.ModelName,
+			ModelVersion: p.ModelVersion,
+			Segments:     p.CustomSegments,
+		}, nil
+	}
+
+	segments := make([]domain.TranslationSegment, 0, len(req.Segments))
+	for _, seg := range req.Segments {
+		srcText := seg.SourceText
+		var targetText string
+
+		if p.CustomTranslations != nil {
+			if t, ok := p.CustomTranslations[srcText]; ok {
+				targetText = t
+			} else if t, ok := p.CustomTranslations[req.TargetLanguage+":"+srcText]; ok {
+				targetText = t
+			}
+		}
+
+		if targetText == "" {
+			targetText = DefaultTranslateHelper(srcText, req.TargetLanguage)
+		}
+
+		if p.CorruptNumbers {
+			targetText = "Số lượng 999 độ bất thường"
+		}
+		if p.CorruptNegation {
+			if req.TargetLanguage == "vi" {
+				targetText = "Hãy cứ làm điều đó đi nhé"
+			} else {
+				targetText = "Please go ahead and do it"
+			}
+		}
+		if p.CorruptNames {
+			if req.TargetLanguage == "vi" {
+				targetText = "Người lạ nào đó làm việc này"
+			} else {
+				targetText = "Some stranger did this"
+			}
+		}
+		if p.CorruptFacts {
+			targetText = "   "
+		}
+
+		segments = append(segments, domain.TranslationSegment{
+			Index:      seg.Index,
+			SourceText: srcText,
+			TargetText: targetText,
+			SpeakerID:  seg.SpeakerID,
+			StartMs:    seg.StartMs,
+			EndMs:      seg.EndMs,
+		})
+	}
+
+	return &TranslationResult{
+		ProviderID:   p.ProviderID,
+		ModelName:    p.ModelName,
+		ModelVersion: p.ModelVersion,
+		Segments:     segments,
+	}, nil
+}
+
+// DefaultTranslateHelper provides deterministic translations for common phrases in test fixtures.
+func DefaultTranslateHelper(srcText, targetLang string) string {
+	trimmed := strings.TrimSpace(srcText)
+	isVI := strings.EqualFold(targetLang, "vi")
+
+	switch trimmed {
+	case "测试语音输入":
+		if isVI {
+			return "Kiểm tra đầu vào giọng nói"
+		}
+		return "Test voice input"
+	case "今天天气很好。":
+		if isVI {
+			return "Hôm nay thời tiết rất tốt."
+		}
+		return "The weather is very good today."
+	case "我们去公园散步吧。":
+		if isVI {
+			return "Chúng ta đi dạo công viên nhé."
+		}
+		return "Let's go for a walk in the park."
+	case "明天再继续工作。":
+		if isVI {
+			return "Ngày mai hãy tiếp tục làm việc."
+		}
+		return "Continue working tomorrow."
+	case "今天天气很好。我们去公园散步吧。明天再继续工作。":
+		if isVI {
+			return "Hôm nay thời tiết rất tốt. Chúng ta đi dạo công viên nhé. Ngày mai hãy tiếp tục làm việc."
+		}
+		return "The weather is very good today. Let's go for a walk in the park. Continue working tomorrow."
+	case "请将温度调至25度，张伟说不要打开窗户。":
+		if isVI {
+			return "Vui lòng điều chỉnh nhiệt độ đến 25 độ, Trương Vĩ nói không được mở cửa sổ."
+		}
+		return "Please set the temperature to 25 degrees, Zhang Wei said do not open the window."
+	case "SUPOR电饭煲拥有3升容量，煮饭不粘锅。":
+		if isVI {
+			return "Nồi cơm điện SUPOR có dung tích 3 lít, nấu cơm không dính nồi."
+		}
+		return "The SUPOR rice cooker has a 3-liter capacity and does not stick to the pot."
+	case "步骤1：准备抹茶粉20克，不要加糖。":
+		if isVI {
+			return "Bước 1: Chuẩn bị 20 gram bột matcha, đừng thêm đường."
+		}
+		return "Step 1: Prepare 20 grams of matcha powder, do not add sugar."
+	default:
+		if isVI {
+			return "Bản dịch: " + trimmed
+		}
+		return "Translation: " + trimmed
 	}
 }
 
@@ -394,6 +553,7 @@ func NewSeam1FakeRegistry() *Registry {
 	_ = reg.Register(NewFakeSeparatorProvider("fake_uvr_separator"))
 	_ = reg.Register(NewFakeOCRProvider("fake_paddle_ocr"))
 	_ = reg.Register(NewFakeTranslationProvider("fake_llm_translator"))
+	_ = reg.Register(NewFakeTranslationProviderFallback("fake_local_translator_fallback"))
 	_ = reg.Register(NewFakeDiarizationProvider("fake_campplus_diarizer"))
 
 	// Blocked provider (for testing policy-before-health: Healthy=true, but Policy=BLOCKED)

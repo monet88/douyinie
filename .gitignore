@@ -9,11 +9,13 @@
 /.claude/settings.local.json
 /prototype-operator-review-workflow/
 .scratch
+.claude/
 
 # User-supplied root media test fixtures
 /background music + voice + subtitles.mp4
 /background music audio and subtitles.mp4
-
+CLAUDE.md
+AGENTS.md
 # Python runtime outputs & test caches
 __pycache__/
 *.py[cod]

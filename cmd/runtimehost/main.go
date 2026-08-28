@@ -64,8 +64,9 @@ func main() {
 	resScheduler := scheduler.New()
 	gpuLeaseMgr := worker.NewGPULeaseManager(resScheduler)
 
-	// 4b. Initialize Speech Understanding service (T08)
+	// 4b. Initialize Speech Understanding & Translation services (T08, T06)
 	speechSvc := service.NewSpeechService(db, casStore)
+	translationSvc := service.NewTranslationService(db, casStore)
 	recovered, err := queueSvc.Recover(context.Background())
 	if err != nil {
 		log.Fatalf("[RuntimeHost] crash recovery failed: %v", err)
@@ -129,10 +130,9 @@ func main() {
 		CredSvc:    credSvc,
 		Router:     router,
 		QueueSvc:   queueSvc,
-		Scheduler:  resScheduler,
-		SpeechSvc:  speechSvc,
+		SpeechSvc:      speechSvc,
+		TranslationSvc: translationSvc,
 	})
-
 	go func() {
 		log.Printf("[RuntimeHost] API daemon listening on http://%s", addr)
 		if err := srv.Start(); err != nil && err != http.ErrServerClosed {

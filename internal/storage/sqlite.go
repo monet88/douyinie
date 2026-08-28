@@ -632,6 +632,52 @@ func (s *DB) migrate(ctx context.Context) error {
 		}
 	}
 
+	// 9. Schema migration v8 (Translation Variants - Meaning-First T06)
+	var countV8 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 8`).Scan(&countV8)
+	if err != nil {
+		return fmt.Errorf("check migration version 8: %w", err)
+	}
+
+	if countV8 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v8 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		schemaV8SQL := `
+		CREATE TABLE IF NOT EXISTS translation_variants (
+			id TEXT PRIMARY KEY,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			run_id TEXT NOT NULL,
+			job_id TEXT NOT NULL,
+			target_language TEXT NOT NULL,
+			cas_hash TEXT NOT NULL,
+			provenance_hash TEXT NOT NULL,
+			provider_id TEXT NOT NULL,
+			model_name TEXT NOT NULL,
+			model_version TEXT NOT NULL,
+			overall_qa_score REAL NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_translation_variants_provenance ON translation_variants(provenance_hash);
+		CREATE INDEX IF NOT EXISTS idx_translation_variants_asset_lang ON translation_variants(asset_id, target_language);
+		CREATE INDEX IF NOT EXISTS idx_translation_variants_run ON translation_variants(run_id);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (8, datetime('now'));
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaV8SQL); err != nil {
+			return fmt.Errorf("execute migration v8: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v8: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -2152,4 +2198,129 @@ func (s *DB) RunStateSnapshot(ctx context.Context, runID string) (*domain.RunSta
 		snap.StageExecutions = []domain.StageExecution{}
 	}
 	return snap, nil
+}
+
+// TranslationVariantIndex is the SQLite index row for a content-addressed
+// TranslationVariant. The full artifact JSON blob lives in CAS; SQLite indexes
+// it by asset, target language, run, and deterministic provenance identity.
+type TranslationVariantIndex struct {
+	ID             string
+	AssetID        string
+	RunID          string
+	JobID          string
+	TargetLanguage string
+	CASHash        string
+	ProvenanceHash string
+	ProviderID     string
+	ModelName      string
+	ModelVersion   string
+	OverallQAScore float64
+	CreatedAt      time.Time
+}
+
+// SaveTranslationVariantIndex records the index row for a CAS-stored TranslationVariant.
+func (s *DB) SaveTranslationVariantIndex(ctx context.Context, idx TranslationVariantIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO translation_variants (
+			id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+			provider_id, model_name, model_version, overall_qa_score, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provenance_hash) DO UPDATE SET
+			cas_hash = excluded.cas_hash,
+			overall_qa_score = excluded.overall_qa_score
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID,
+		idx.AssetID,
+		idx.RunID,
+		idx.JobID,
+		idx.TargetLanguage,
+		idx.CASHash,
+		idx.ProvenanceHash,
+		idx.ProviderID,
+		idx.ModelName,
+		idx.ModelVersion,
+		idx.OverallQAScore,
+		idx.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("save translation_variant index: %w", err)
+	}
+	return nil
+}
+
+// GetTranslationVariantIndex retrieves the latest index row for an asset and target language.
+func (s *DB) GetTranslationVariantIndex(ctx context.Context, assetID string, targetLang string) (*TranslationVariantIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx TranslationVariantIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+		provider_id, model_name, model_version, overall_qa_score, created_at
+		FROM translation_variants WHERE asset_id = ? AND target_language = ?
+		ORDER BY created_at DESC, rowid DESC LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, assetID, targetLang).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&idx.ProviderID,
+		&idx.ModelName,
+		&idx.ModelVersion,
+		&idx.OverallQAScore,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query translation_variant index: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// GetTranslationVariantByProvenance retrieves the index row for a deterministic provenance identity.
+func (s *DB) GetTranslationVariantByProvenance(ctx context.Context, provenanceHash string) (*TranslationVariantIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx TranslationVariantIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+		provider_id, model_name, model_version, overall_qa_score, created_at
+		FROM translation_variants WHERE provenance_hash = ? LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, provenanceHash).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&idx.ProviderID,
+		&idx.ModelName,
+		&idx.ModelVersion,
+		&idx.OverallQAScore,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query translation_variant by provenance: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
 }

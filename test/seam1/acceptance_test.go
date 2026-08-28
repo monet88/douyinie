@@ -150,8 +150,9 @@ func newRuntimeHost(t *testing.T, db *storage.DB, casStore *cas.Store, queueSvc 
 		CredSvc:    credSvc,
 		Router:     router,
 		QueueSvc:   queueSvc,
-		Scheduler:  resScheduler,
-		SpeechSvc:  service.NewSpeechService(db, casStore),
+		Scheduler:      resScheduler,
+		SpeechSvc:      service.NewSpeechService(db, casStore),
+		TranslationSvc: service.NewTranslationService(db, casStore),
 	}), fakeRegistry, router
 }
 

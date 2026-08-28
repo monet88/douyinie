@@ -38,9 +38,10 @@ type Server struct {
 	queueSvc   *queue.Service
 	scheduler  *scheduler.Scheduler
 	executor   Executor
-	speechSvc  *service.SpeechService
-	mux        *http.ServeMux
-	server     *http.Server
+	speechSvc      *service.SpeechService
+	translationSvc *service.TranslationService
+	mux            *http.ServeMux
+	server         *http.Server
 }
 
 // Config specifies initialization options for RuntimeHost Server.
@@ -57,7 +58,8 @@ type Config struct {
 	QueueSvc   *queue.Service
 	Scheduler  *scheduler.Scheduler
 	Executor   Executor               // Injected execution seam for testing and custom worker dispatch
-	SpeechSvc  *service.SpeechService // Speech understanding pipeline (T08)
+	SpeechSvc      *service.SpeechService      // Speech understanding pipeline (T08)
+	TranslationSvc *service.TranslationService // Translation & Meaning-First Localization pipeline (T06)
 }
 
 // New creates a new RuntimeHost Server instance.
@@ -87,6 +89,9 @@ func New(cfg Config) *Server {
 	if cfg.SpeechSvc != nil && cfg.Router != nil {
 		cfg.SpeechSvc.ConfigureRouter(cfg.Router)
 	}
+	if cfg.TranslationSvc != nil && cfg.Router != nil {
+		cfg.TranslationSvc.ConfigureRouter(cfg.Router)
+	}
 
 	s := &Server{
 		db:         cfg.DB,
@@ -100,8 +105,9 @@ func New(cfg Config) *Server {
 		queueSvc:   cfg.QueueSvc,
 		scheduler:  cfg.Scheduler,
 		executor:   cfg.Executor,
-		speechSvc:  cfg.SpeechSvc,
-		mux:        http.NewServeMux(),
+		speechSvc:      cfg.SpeechSvc,
+		translationSvc: cfg.TranslationSvc,
+		mux:            http.NewServeMux(),
 	}
 
 	s.routes()
@@ -127,6 +133,13 @@ func (s *Server) SetExecutor(exec Executor) {
 // the order in which SpeechService, Router, and SetSpeechService are called.
 func (s *Server) SetSpeechService(svc *service.SpeechService) {
 	s.speechSvc = svc
+	if svc != nil && s.router != nil {
+		svc.ConfigureRouter(s.router)
+	}
+}
+// SetTranslationService sets or replaces the injected translation pipeline (T06).
+func (s *Server) SetTranslationService(svc *service.TranslationService) {
+	s.translationSvc = svc
 	if svc != nil && s.router != nil {
 		svc.ConfigureRouter(s.router)
 	}
@@ -209,6 +222,11 @@ func (s *Server) routes() {
 	// The pipeline persists its own immutable TranscriptArtifact; only GET is public.
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/speech-understand", s.handleRunSpeechUnderstand)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/transcript", s.handleGetTranscript)
+
+	// Translation (T06: Meaning-First TranslationVariant)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/translate", s.handleRunTranslation)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/translation-variant", s.handleGetTranslationVariant)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/translation", s.handleGetTranslationVariant)
 }
 
 // JSON helpers
@@ -509,6 +527,118 @@ func (s *Server) handleGetTranscript(w http.ResponseWriter, r *http.Request) {
 	artifact.CASHash = idx.CASHash
 	artifact.ProvenanceHash = idx.ProvenanceHash
 	writeJSON(w, http.StatusOK, map[string]any{"transcript_artifact": artifact})
+}
+func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	asset, err := s.db.GetSourceAsset(r.Context(), assetID)
+	if err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) || errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.translationSvc == nil {
+		writeError(w, http.StatusInternalServerError, "translation service is not configured")
+		return
+	}
+
+	var body struct {
+		RunID                 string                           `json:"run_id"`
+		JobID                 string                           `json:"job_id,omitempty"`
+		TargetLanguage        string                           `json:"target_language"`
+		SourceLanguage        string                           `json:"source_language,omitempty"`
+		Segments              []domain.TranslationInputSegment `json:"segments,omitempty"`
+		ExecutionProfile      domain.ExecutionProfile          `json:"execution_profile,omitempty"`
+		AuthorizedCredentials []string                         `json:"authorized_credentials,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	if strings.TrimSpace(body.RunID) == "" {
+		writeError(w, http.StatusBadRequest, "run_id is required")
+		return
+	}
+	if strings.TrimSpace(body.TargetLanguage) == "" {
+		writeError(w, http.StatusBadRequest, "target_language is required")
+		return
+	}
+
+	in := domain.TranslationJobInput{
+		RunID:                 body.RunID,
+		AssetID:               asset.ID,
+		JobID:                 body.JobID,
+		SourceLanguage:        body.SourceLanguage,
+		TargetLanguage:        body.TargetLanguage,
+		Segments:              body.Segments,
+		ExecutionProfile:      body.ExecutionProfile,
+		AuthorizedCredentials: body.AuthorizedCredentials,
+	}
+
+	variant, err := s.translationSvc.Translate(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, domain.ErrMeaningPreservationFailed) ||
+			errors.Is(err, domain.ErrFactCorrupted) ||
+			errors.Is(err, domain.ErrNameCorrupted) ||
+			errors.Is(err, domain.ErrNumberCorrupted) ||
+			errors.Is(err, domain.ErrNegationInverted) {
+			writeError(w, http.StatusUnprocessableEntity, "translation QA gate rejected: "+err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrEmptyTranslationInput) {
+			writeError(w, http.StatusBadRequest, "empty translation input: "+err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrNoEligibleProvider) || strings.Contains(err.Error(), "no eligible provider") {
+			writeError(w, http.StatusServiceUnavailable, "no eligible provider: "+err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"translation_variant": variant})
+}
+
+func (s *Server) handleGetTranslationVariant(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	targetLang := r.URL.Query().Get("target_language")
+	if targetLang == "" {
+		targetLang = "vi" // default target language
+	}
+
+	idx, err := s.db.GetTranslationVariantIndex(r.Context(), assetID, targetLang)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("translation variant not found for asset %s in language %s", assetID, targetLang))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.casStore == nil {
+		writeError(w, http.StatusInternalServerError, "CAS store not configured")
+		return
+	}
+	rc, err := s.casStore.Get(idx.CASHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "read translation variant from CAS: "+err.Error())
+		return
+	}
+	defer rc.Close()
+	var variant domain.TranslationVariant
+	if err := json.NewDecoder(rc).Decode(&variant); err != nil {
+		writeError(w, http.StatusInternalServerError, "decode translation variant: "+err.Error())
+		return
+	}
+	variant.CASHash = idx.CASHash
+	variant.ProvenanceHash = idx.ProvenanceHash
+	writeJSON(w, http.StatusOK, map[string]any{"translation_variant": variant})
 }
 
 func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
