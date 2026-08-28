@@ -228,6 +228,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/translate", s.handleRunTranslation)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/translation-variant", s.handleGetTranslationVariant)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/translation", s.handleGetTranslationVariant)
+
+	// Dub Script Adaptation (T13: Duration-Adapted DubScriptVariant)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/dub-script", s.handleRunDubScript)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/dub-script-variant", s.handleGetDubScriptVariant)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/dub-script", s.handleGetDubScriptVariant)
 }
 
 // JSON helpers
@@ -640,6 +645,115 @@ func (s *Server) handleGetTranslationVariant(w http.ResponseWriter, r *http.Requ
 	variant.CASHash = idx.CASHash
 	variant.ProvenanceHash = idx.ProvenanceHash
 	writeJSON(w, http.StatusOK, map[string]any{"translation_variant": variant})
+}
+
+func (s *Server) handleRunDubScript(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	asset, err := s.db.GetSourceAsset(r.Context(), assetID)
+	if err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) || errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.translationSvc == nil {
+		writeError(w, http.StatusInternalServerError, "translation service is not configured")
+		return
+	}
+
+	var body struct {
+		RunID                 string                  `json:"run_id"`
+		JobID                 string                  `json:"job_id,omitempty"`
+		TargetLanguage        string                  `json:"target_language"`
+		SourceLanguage        string                  `json:"source_language,omitempty"`
+		TranslationVariantCAS string                  `json:"translation_variant_cas,omitempty"`
+		ExecutionProfile      domain.ExecutionProfile `json:"execution_profile,omitempty"`
+		AuthorizedCredentials []string                `json:"authorized_credentials,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	if strings.TrimSpace(body.RunID) == "" {
+		writeError(w, http.StatusBadRequest, "run_id is required")
+		return
+	}
+	if strings.TrimSpace(body.TargetLanguage) == "" {
+		writeError(w, http.StatusBadRequest, "target_language is required")
+		return
+	}
+
+	in := domain.DubScriptJobInput{
+		RunID:                 body.RunID,
+		AssetID:               asset.ID,
+		JobID:                 body.JobID,
+		SourceLanguage:        body.SourceLanguage,
+		TargetLanguage:        body.TargetLanguage,
+		TranslationVariantCAS: body.TranslationVariantCAS,
+		ExecutionProfile:      body.ExecutionProfile,
+		AuthorizedCredentials: body.AuthorizedCredentials,
+	}
+
+	variant, err := s.translationSvc.AdaptDubScript(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, domain.ErrMeaningPreservationFailed) ||
+			errors.Is(err, domain.ErrFactCorrupted) ||
+			errors.Is(err, domain.ErrNameCorrupted) ||
+			errors.Is(err, domain.ErrNumberCorrupted) ||
+			errors.Is(err, domain.ErrNegationInverted) {
+			writeError(w, http.StatusUnprocessableEntity, "dub script QA gate rejected: "+err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrDubScriptVariantNotFound) || errors.Is(err, domain.ErrTranslationVariantNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"dub_script_variant": variant})
+}
+
+func (s *Server) handleGetDubScriptVariant(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	targetLang := r.URL.Query().Get("target_language")
+	if targetLang == "" {
+		targetLang = "vi" // default target language
+	}
+
+	idx, err := s.db.GetDubScriptVariantIndex(r.Context(), assetID, targetLang)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("dub script variant not found for asset %s in language %s", assetID, targetLang))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.casStore == nil {
+		writeError(w, http.StatusInternalServerError, "CAS store not configured")
+		return
+	}
+	rc, err := s.casStore.Get(idx.CASHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "read dub script variant from CAS: "+err.Error())
+		return
+	}
+	defer rc.Close()
+	var variant domain.DubScriptVariant
+	if err := json.NewDecoder(rc).Decode(&variant); err != nil {
+		writeError(w, http.StatusInternalServerError, "decode dub script variant: "+err.Error())
+		return
+	}
+	variant.CASHash = idx.CASHash
+	variant.ProvenanceHash = idx.ProvenanceHash
+	writeJSON(w, http.StatusOK, map[string]any{"dub_script_variant": variant})
 }
 
 func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {

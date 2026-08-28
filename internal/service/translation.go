@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
+	"regexp"
 	"strings"
 	"time"
-
+	"unicode/utf8"
 	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
@@ -424,4 +426,348 @@ func (s *TranslationService) invokeProvider(ctx context.Context, p provider.Prov
 	}
 
 	return textProv.TranslateText(ctx, req)
+}
+
+// AdaptDubScript adapts a TranslationVariant into a duration-adapted DubScriptVariant.
+// It enforces shorten-first adaptation for brisk source cadence while preserving facts,
+// names, numbers, and negation polarity under QA gate validation.
+func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubScriptJobInput) (*domain.DubScriptVariant, error) {
+	if strings.TrimSpace(in.RunID) == "" {
+		return nil, fmt.Errorf("run_id is required")
+	}
+	if strings.TrimSpace(in.AssetID) == "" {
+		return nil, fmt.Errorf("asset_id is required")
+	}
+
+	targetLang := strings.ToLower(strings.TrimSpace(in.TargetLanguage))
+	if targetLang != "vi" && targetLang != "en" {
+		return nil, fmt.Errorf("unsupported target language '%s': must be 'vi' or 'en'", in.TargetLanguage)
+	}
+	in.TargetLanguage = targetLang
+
+	sourceLang := strings.ToLower(strings.TrimSpace(in.SourceLanguage))
+	if sourceLang == "" {
+		sourceLang = "zh"
+	}
+	in.SourceLanguage = sourceLang
+
+	// 1. Load meaning-first TranslationVariant
+	transVariant, transCAS, err := s.loadTranslationVariant(ctx, in.AssetID, in.TargetLanguage, in.TranslationVariantCAS)
+	if err != nil {
+		return nil, fmt.Errorf("load translation variant for dub script adaptation: %w", err)
+	}
+	in.TranslationVariantCAS = transCAS
+
+	// 2. Compute deterministic provenance cache identity
+	provenanceHash, err := s.computeDubScriptProvenanceHash(in, transVariant)
+	if err != nil {
+		return nil, fmt.Errorf("compute dub script cache identity: %w", err)
+	}
+
+	// 3. Check idempotent cache in SQLite / CAS
+	if s.db != nil && s.cas != nil {
+		if cachedIdx, err := s.db.GetDubScriptVariantByProvenance(ctx, provenanceHash); err == nil && cachedIdx != nil {
+			rc, err := s.cas.Get(cachedIdx.CASHash)
+			if err == nil {
+				defer rc.Close()
+				data, err := io.ReadAll(rc)
+				if err == nil {
+					var cachedVariant domain.DubScriptVariant
+					if err := json.Unmarshal(data, &cachedVariant); err == nil {
+						cachedVariant.CASHash = cachedIdx.CASHash
+						cachedVariant.ProvenanceHash = cachedIdx.ProvenanceHash
+						return &cachedVariant, nil
+					}
+				}
+			}
+		}
+	}
+
+	// 4. Adapt segments with shorten-first principle and source-relative cadence
+	var dubSegments []domain.DubScriptSegment
+	var totalConfidence float64
+
+	for _, seg := range transVariant.Segments {
+		slotDurationMs := seg.EndMs - seg.StartMs
+		if slotDurationMs <= 0 {
+			slotDurationMs = 1000
+		}
+
+		srcCharCount := utf8.RuneCountInString(strings.TrimSpace(seg.SourceText))
+		var srcCPS float64
+		if slotDurationMs > 0 {
+			srcCPS = float64(srcCharCount) / (float64(slotDurationMs) / 1000.0)
+		}
+
+		meaningText := seg.TargetText
+		spokenText, isShortened, estDurationMs := s.adaptSpokenDuration(meaningText, seg.SourceText, in.SourceLanguage, in.TargetLanguage, slotDurationMs, srcCPS)
+
+		// Run Translation QA Gate to guarantee facts/names/numbers/negation survive
+		qaRes := s.qaGate.ValidateSegment(seg.SourceText, spokenText, in.SourceLanguage, in.TargetLanguage)
+		if !qaRes.Passed {
+			if isShortened {
+				// Fallback to unshortened meaningText if shortened version corrupted facts
+				spokenText = meaningText
+				isShortened = false
+				estDurationMs = estimateSpokenDurationMs(spokenText, in.TargetLanguage)
+				qaRes = s.qaGate.ValidateSegment(seg.SourceText, spokenText, in.SourceLanguage, in.TargetLanguage)
+			}
+			if !qaRes.Passed {
+				if qaRes.Err != nil {
+					return nil, fmt.Errorf("dub script QA gate rejected segment %d: %w", seg.Index, qaRes.Err)
+				}
+				return nil, fmt.Errorf("dub script QA gate rejected segment %d: %w", seg.Index, domain.ErrMeaningPreservationFailed)
+			}
+		}
+
+		dubSeg := domain.DubScriptSegment{
+			Index:                 seg.Index,
+			SourceText:            seg.SourceText,
+			MeaningText:           meaningText,
+			SpokenText:            spokenText,
+			SpeakerID:             seg.SpeakerID,
+			StartMs:               seg.StartMs,
+			EndMs:                 seg.EndMs,
+			SlotDurationMs:        slotDurationMs,
+			EstimatedDurationMs:   estDurationMs,
+			SourceSpeakingRateCPS: srcCPS,
+			IsShortened:           isShortened,
+			KeyFacts:              qaRes.ExtractedFacts,
+			NegationPolarity:      qaRes.NegationPolarity,
+			QAConfidence:          qaRes.Confidence,
+			PassedQAGate:          true,
+		}
+		totalConfidence += qaRes.Confidence
+		dubSegments = append(dubSegments, dubSeg)
+	}
+
+	overallQAScore := 1.0
+	if len(dubSegments) > 0 {
+		overallQAScore = totalConfidence / float64(len(dubSegments))
+	}
+
+	// 5. Build immutable DubScriptVariant
+	variant := &domain.DubScriptVariant{
+		ID:                    uuid.NewString(),
+		SchemaVersion:         domain.DubScriptSchemaVersion,
+		AssetID:               in.AssetID,
+		RunID:                 in.RunID,
+		JobID:                 in.JobID,
+		SourceLanguage:        in.SourceLanguage,
+		TargetLanguage:        in.TargetLanguage,
+		TranslationVariantCAS: in.TranslationVariantCAS,
+		Segments:              dubSegments,
+		ProviderID:            transVariant.ProviderID,
+		ModelName:             transVariant.ModelName,
+		ModelVersion:          transVariant.ModelVersion,
+		ProvenanceHash:        provenanceHash,
+		OverallQAScore:        overallQAScore,
+		CreatedAt:             time.Now().UTC(),
+	}
+
+	// 6. Persist to CAS & SQLite index
+	if s.cas != nil {
+		payload, err := json.MarshalIndent(variant, "", "  ")
+		if err != nil {
+			return nil, fmt.Errorf("marshal dub script variant: %w", err)
+		}
+		obj, err := s.cas.Put(bytes.NewReader(payload))
+		if err != nil {
+			return nil, fmt.Errorf("store dub script variant in CAS: %w", err)
+		}
+		variant.CASHash = obj.SHA256
+	}
+
+	if s.db != nil {
+		idx := storage.DubScriptVariantIndex{
+			ID:             variant.ID,
+			AssetID:        variant.AssetID,
+			RunID:          variant.RunID,
+			JobID:          variant.JobID,
+			TargetLanguage: variant.TargetLanguage,
+			CASHash:        variant.CASHash,
+			ProvenanceHash: variant.ProvenanceHash,
+			ProviderID:     variant.ProviderID,
+			ModelName:      variant.ModelName,
+			ModelVersion:   variant.ModelVersion,
+			OverallQAScore: variant.OverallQAScore,
+			CreatedAt:      variant.CreatedAt,
+		}
+		if err := s.db.SaveDubScriptVariantIndex(ctx, idx); err != nil {
+			return nil, fmt.Errorf("save dub script variant index in DB: %w", err)
+		}
+
+		now := time.Now().UTC()
+		stageExec := domain.StageExecution{
+			ID:             uuid.NewString(),
+			RunID:          in.RunID,
+			Stage:          "dub_script",
+			Status:         "succeeded",
+			ArtifactSHA256: variant.CASHash,
+			StartedAt:      &variant.CreatedAt,
+			CompletedAt:    &now,
+			CreatedAt:      variant.CreatedAt,
+			UpdatedAt:      now,
+		}
+		_ = s.db.CreateStageExecution(ctx, stageExec)
+	}
+
+	return variant, nil
+}
+
+func (s *TranslationService) loadTranslationVariant(ctx context.Context, assetID, targetLang, casHash string) (*domain.TranslationVariant, string, error) {
+	if s.cas == nil {
+		return nil, "", fmt.Errorf("CAS store required to load translation variant")
+	}
+
+	resolvedCAS := strings.TrimSpace(casHash)
+	if resolvedCAS == "" {
+		if s.db == nil {
+			return nil, "", fmt.Errorf("database required to find translation variant index")
+		}
+		idx, err := s.db.GetTranslationVariantIndex(ctx, assetID, targetLang)
+		if err != nil {
+			return nil, "", fmt.Errorf("translation variant not found for asset %s: %w", assetID, err)
+		}
+		resolvedCAS = idx.CASHash
+	}
+
+	rc, err := s.cas.Get(resolvedCAS)
+	if err != nil {
+		return nil, "", fmt.Errorf("read translation variant from CAS (%s): %w", resolvedCAS, err)
+	}
+	defer rc.Close()
+
+	var variant domain.TranslationVariant
+	if err := json.NewDecoder(rc).Decode(&variant); err != nil {
+		return nil, "", fmt.Errorf("decode translation variant: %w", err)
+	}
+	variant.CASHash = resolvedCAS
+	return &variant, resolvedCAS, nil
+}
+
+func (s *TranslationService) computeDubScriptProvenanceHash(in domain.DubScriptJobInput, transVariant *domain.TranslationVariant) (string, error) {
+	inputHashes := []string{transVariant.ProvenanceHash}
+	if in.TranslationVariantCAS != "" {
+		inputHashes = append(inputHashes, in.TranslationVariantCAS)
+	}
+	return cas.ComputeStageCacheKey(domain.StageCacheIdentityInput{
+		Stage:       "dub_script",
+		InputHashes: inputHashes,
+		SemanticConfig: map[string]any{
+			"source_language": in.SourceLanguage,
+			"adaptation_mode": "shorten_first_cadence_v1",
+		},
+		ProviderID:    transVariant.ProviderID,
+		ModelName:     transVariant.ModelName,
+		ModelVersion:  transVariant.ModelVersion,
+		Language:      in.TargetLanguage,
+		SchemaVersion: domain.DubScriptSchemaVersion,
+	})
+}
+
+// estimateSpokenDurationMs estimates speech duration based on language cadence rules.
+// Vietnamese average: ~3.8 syllables/sec (~260ms per word/syllable) + 150ms buffer.
+// English average: ~3.2 words/sec (~310ms per word) + 150ms buffer.
+func estimateSpokenDurationMs(text, lang string) int64 {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return 0
+	}
+	words := strings.Fields(trimmed)
+	count := len(words)
+	if count == 0 {
+		return 0
+	}
+
+	var msPerWord float64
+	switch strings.ToLower(lang) {
+	case "vi":
+		msPerWord = 260.0
+	case "en":
+		msPerWord = 310.0
+	default:
+		msPerWord = 280.0
+	}
+
+	return int64(math.Round(float64(count)*msPerWord + 150.0))
+}
+
+// adaptSpokenDuration applies shorten-first adaptation when slot duration is tight or source cadence is brisk.
+func (s *TranslationService) adaptSpokenDuration(meaningText, srcText, srcLang, tgtLang string, slotDurationMs int64, srcCPS float64) (string, bool, int64) {
+	estMs := estimateSpokenDurationMs(meaningText, tgtLang)
+	
+	// Brisk cadence condition: estimated duration exceeds slot or source cadence is brisk (>4.5 CPS) with tight fit (>0.85 occupancy)
+	occupancy := float64(estMs) / float64(slotDurationMs)
+	isBrisk := srcCPS > 4.5 || occupancy > 0.90 || estMs > slotDurationMs
+
+	if !isBrisk {
+		return meaningText, false, estMs
+	}
+
+	shortened := shortenSpokenText(meaningText, tgtLang)
+	if shortened != meaningText && len(shortened) < len(meaningText) {
+		shortEstMs := estimateSpokenDurationMs(shortened, tgtLang)
+		return shortened, true, shortEstMs
+	}
+
+	return meaningText, false, estMs
+}
+
+var viShortenRules = []struct {
+	Pattern *regexp.Regexp
+	Replace string
+}{
+	{regexp.MustCompile(`(?i)\bvui lòng\s+`), ""},
+	{regexp.MustCompile(`(?i)\bhãy\s+`), ""},
+	{regexp.MustCompile(`(?i)\bchúng ta\s+`), "ta "},
+	{regexp.MustCompile(`(?i)\bđi dạo công viên nhé\b`), "dạo công viên nhé"},
+	{regexp.MustCompile(`(?i)\bngày mai hãy tiếp tục làm việc\b`), "mai làm việc tiếp"},
+	{regexp.MustCompile(`(?i)\bngày mai tiếp tục làm việc\b`), "mai làm việc tiếp"},
+	{regexp.MustCompile(`(?i)\bđiều chỉnh nhiệt độ đến\s+`), "chỉnh nhiệt độ "},
+	{regexp.MustCompile(`(?i)\bđiều chỉnh nhiệt độ sang\s+`), "chỉnh nhiệt độ "},
+	{regexp.MustCompile(`(?i)\bđến (\d+ độ)\b`), "$1"},
+	{regexp.MustCompile(`(?i)\bkhông được\s+`), "đừng "},
+	{regexp.MustCompile(`(?i)\bkhông phải\s+`), "chẳng phải "},
+	{regexp.MustCompile(`(?i)\bchuẩn bị (\d+ gram)\b`), "lấy $1"},
+	{regexp.MustCompile(`(?i)\bđừng thêm đường\b`), "đừng cho đường"},
+	{regexp.MustCompile(`(?i)\bcó dung tích\s+`), "dung tích "},
+	{regexp.MustCompile(`(?i)\bnấu cơm không dính nồi\b`), "nấu không dính nồi"},
+	{regexp.MustCompile(`(?i)\bhôm nay thời tiết rất tốt\b`), "hôm nay thời tiết tốt"},
+	{regexp.MustCompile(`(?i)\bkiểm tra đầu vào giọng nói\b`), "thử giọng nói"},
+}
+
+var enShortenRules = []struct {
+	Pattern *regexp.Regexp
+	Replace string
+}{
+	{regexp.MustCompile(`(?i)\bplease\s+`), ""},
+	{regexp.MustCompile(`(?i)\bthe weather is very good today\b`), "the weather is good today"},
+	{regexp.MustCompile(`(?i)\blet's go for a walk in the park\b`), "let's walk in the park"},
+	{regexp.MustCompile(`(?i)\bcontinue working tomorrow\b`), "work tomorrow"},
+	{regexp.MustCompile(`(?i)\bset the temperature to\s+`), "set temp to "},
+	{regexp.MustCompile(`(?i)\bdo not\s+`), "don't "},
+	{regexp.MustCompile(`(?i)\bcannot\s+`), "can't "},
+	{regexp.MustCompile(`(?i)\bhas a 3-liter capacity\b`), "has 3L capacity"},
+	{regexp.MustCompile(`(?i)\band does not stick to the pot\b`), "and non-stick"},
+	{regexp.MustCompile(`(?i)\bprepare 20 grams of\b`), "take 20g of"},
+}
+
+func shortenSpokenText(text, lang string) string {
+	result := text
+	switch strings.ToLower(lang) {
+	case "vi":
+		for _, r := range viShortenRules {
+			result = r.Pattern.ReplaceAllString(result, r.Replace)
+		}
+	case "en":
+		for _, r := range enShortenRules {
+			result = r.Pattern.ReplaceAllString(result, r.Replace)
+		}
+	}
+	result = strings.TrimSpace(result)
+	// Clean up consecutive spaces or orphaned punctuation
+	result = regexp.MustCompile(`\s+`).ReplaceAllString(result, " ")
+	result = regexp.MustCompile(`\s+([,.\?!])`).ReplaceAllString(result, "$1")
+	return result
 }

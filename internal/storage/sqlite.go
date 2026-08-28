@@ -678,6 +678,51 @@ func (s *DB) migrate(ctx context.Context) error {
 		}
 	}
 
+	// 10. Schema migration v9 (DubScript Variants - Duration Adaptation T13)
+	var countV9 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 9`).Scan(&countV9)
+	if err != nil {
+		return fmt.Errorf("check migration version 9: %w", err)
+	}
+
+	if countV9 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v9 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		schemaV9SQL := `
+		CREATE TABLE IF NOT EXISTS dub_script_variants (
+			id TEXT PRIMARY KEY,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			run_id TEXT NOT NULL,
+			job_id TEXT NOT NULL,
+			target_language TEXT NOT NULL,
+			cas_hash TEXT NOT NULL,
+			provenance_hash TEXT NOT NULL,
+			provider_id TEXT NOT NULL,
+			model_name TEXT NOT NULL,
+			model_version TEXT NOT NULL,
+			overall_qa_score REAL NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_dub_script_variants_provenance ON dub_script_variants(provenance_hash);
+		CREATE INDEX IF NOT EXISTS idx_dub_script_variants_asset_lang ON dub_script_variants(asset_id, target_language);
+		CREATE INDEX IF NOT EXISTS idx_dub_script_variants_run ON dub_script_variants(run_id);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (9, datetime('now'));
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaV9SQL); err != nil {
+			return fmt.Errorf("execute migration v9: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v9: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -2319,6 +2364,129 @@ func (s *DB) GetTranslationVariantByProvenance(ctx context.Context, provenanceHa
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("query translation_variant by provenance: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// DubScriptVariantIndex captures the SQLite indexing metadata for a persisted DubScriptVariant.
+type DubScriptVariantIndex struct {
+	ID             string
+	AssetID        string
+	RunID          string
+	JobID          string
+	TargetLanguage string
+	CASHash        string
+	ProvenanceHash string
+	ProviderID     string
+	ModelName      string
+	ModelVersion   string
+	OverallQAScore float64
+	CreatedAt      time.Time
+}
+
+// SaveDubScriptVariantIndex records the index row for a CAS-stored DubScriptVariant.
+func (s *DB) SaveDubScriptVariantIndex(ctx context.Context, idx DubScriptVariantIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO dub_script_variants (
+			id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+			provider_id, model_name, model_version, overall_qa_score, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provenance_hash) DO UPDATE SET
+			cas_hash = excluded.cas_hash,
+			overall_qa_score = excluded.overall_qa_score
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID,
+		idx.AssetID,
+		idx.RunID,
+		idx.JobID,
+		idx.TargetLanguage,
+		idx.CASHash,
+		idx.ProvenanceHash,
+		idx.ProviderID,
+		idx.ModelName,
+		idx.ModelVersion,
+		idx.OverallQAScore,
+		idx.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("save dub_script_variant index: %w", err)
+	}
+	return nil
+}
+
+// GetDubScriptVariantIndex retrieves the latest index row for an asset and target language.
+func (s *DB) GetDubScriptVariantIndex(ctx context.Context, assetID string, targetLang string) (*DubScriptVariantIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx DubScriptVariantIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+		provider_id, model_name, model_version, overall_qa_score, created_at
+		FROM dub_script_variants WHERE asset_id = ? AND target_language = ?
+		ORDER BY created_at DESC, rowid DESC LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, assetID, targetLang).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&idx.ProviderID,
+		&idx.ModelName,
+		&idx.ModelVersion,
+		&idx.OverallQAScore,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query dub_script_variant index: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// GetDubScriptVariantByProvenance retrieves the index row for a deterministic provenance identity.
+func (s *DB) GetDubScriptVariantByProvenance(ctx context.Context, provenanceHash string) (*DubScriptVariantIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx DubScriptVariantIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+		provider_id, model_name, model_version, overall_qa_score, created_at
+		FROM dub_script_variants WHERE provenance_hash = ? LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, provenanceHash).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&idx.ProviderID,
+		&idx.ModelName,
+		&idx.ModelVersion,
+		&idx.OverallQAScore,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query dub_script_variant by provenance: %w", err)
 	}
 	t, _ := time.Parse(time.RFC3339Nano, createdStr)
 	idx.CreatedAt = t

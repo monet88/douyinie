@@ -14,10 +14,13 @@ var (
 	ErrNegationInverted           = errors.New("negation polarity inverted in translation")
 	ErrTranslationVariantNotFound = errors.New("translation variant not found")
 	ErrEmptyTranslationInput      = errors.New("empty translation input")
+	ErrDubScriptVariantNotFound   = errors.New("dub script variant not found")
 )
 
-const TranslationSchemaVersion = 1
-
+const (
+	TranslationSchemaVersion = 1
+	DubScriptSchemaVersion   = 1
+)
 // TranslationSegment represents a single translated unit (typically mapped 1:1 to a SpeechBlock or visual text region).
 type TranslationSegment struct {
 	Index            int      `json:"index"`
@@ -72,4 +75,56 @@ type TranslationJobInput struct {
 	TranscriptArtifactCAS string                    `json:"transcript_artifact_cas,omitempty"`
 	ExecutionProfile      ExecutionProfile          `json:"execution_profile,omitempty"`
 	AuthorizedCredentials []string                  `json:"authorized_credentials,omitempty"`
+}
+
+// DubScriptSegment represents a duration-adapted spoken dialogue unit for TTS dubbing.
+type DubScriptSegment struct {
+	Index                 int      `json:"index"`
+	SourceText            string   `json:"source_text"`
+	MeaningText           string   `json:"meaning_text"`            // Original translation from TranslationVariant
+	SpokenText            string   `json:"spoken_text"`             // Duration-adapted, shorten-first phrasing
+	SpeakerID             string   `json:"speaker_id,omitempty"`
+	StartMs               int64    `json:"start_ms"`                // Immutable source window start
+	EndMs                 int64    `json:"end_ms"`                  // Immutable source window end
+	SlotDurationMs        int64    `json:"slot_duration_ms"`        // EndMs - StartMs
+	EstimatedDurationMs   int64    `json:"estimated_duration_ms"`   // Estimated spoken duration
+	SourceSpeakingRateCPS float64  `json:"source_speaking_rate_cps"`// Source characters/syllables per second
+	IsShortened           bool     `json:"is_shortened"`            // Whether shorten-first adaptation was applied
+	KeyFacts              []string `json:"key_facts,omitempty"`
+	NegationPolarity      bool     `json:"negation_polarity"`
+	QAConfidence          float64  `json:"qa_confidence"`
+	PassedQAGate          bool     `json:"passed_qa_gate"`
+}
+
+// DubScriptVariant is the immutable target-language duration-adapted spoken script artifact.
+// Produced by T13 and consumed explicitly by T14 (TTS & fit controller).
+type DubScriptVariant struct {
+	ID                    string             `json:"id"`
+	SchemaVersion         int                `json:"schema_version"`
+	AssetID               string             `json:"asset_id"`
+	RunID                 string             `json:"run_id"`
+	JobID                 string             `json:"job_id,omitempty"`
+	SourceLanguage        string             `json:"source_language"` // e.g. "zh"
+	TargetLanguage        string             `json:"target_language"` // "vi" or "en"
+	TranslationVariantCAS string             `json:"translation_variant_cas,omitempty"`
+	Segments              []DubScriptSegment `json:"segments"`
+	ProviderID            string             `json:"provider_id"`
+	ModelName             string             `json:"model_name"`
+	ModelVersion          string             `json:"model_version"`
+	CASHash               string             `json:"cas_hash,omitempty"`
+	ProvenanceHash        string             `json:"provenance_hash,omitempty"`
+	OverallQAScore        float64            `json:"overall_qa_score"`
+	CreatedAt             time.Time          `json:"created_at"`
+}
+
+// DubScriptJobInput encapsulates inputs required to generate a DubScriptVariant.
+type DubScriptJobInput struct {
+	RunID                 string           `json:"run_id"`
+	AssetID               string           `json:"asset_id"`
+	JobID                 string           `json:"job_id,omitempty"`
+	SourceLanguage        string           `json:"source_language"`
+	TargetLanguage        string           `json:"target_language"`
+	TranslationVariantCAS string           `json:"translation_variant_cas,omitempty"`
+	ExecutionProfile      ExecutionProfile `json:"execution_profile,omitempty"`
+	AuthorizedCredentials []string         `json:"authorized_credentials,omitempty"`
 }

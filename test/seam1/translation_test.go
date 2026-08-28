@@ -39,6 +39,32 @@ func runTranslation(t *testing.T, h *testHarness, assetID string, req map[string
 	return resp, nil
 }
 
+// runDubScript executes the dub script adaptation pipeline over the Seam 1 HTTP API.
+func runDubScript(t *testing.T, h *testHarness, assetID string, req map[string]any) (*http.Response, *domain.DubScriptVariant) {
+	t.Helper()
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal dub-script request: %v", err)
+	}
+
+	resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/dub-script", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("dub-script HTTP request failed: %v", err)
+	}
+
+	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
+		var result struct {
+			Variant domain.DubScriptVariant `json:"dub_script_variant"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatalf("decode dub-script response: %v", err)
+		}
+		return resp, &result.Variant
+	}
+
+	return resp, nil
+}
+
 func setupSpeechUnderstoodAsset(t *testing.T, h *testHarness) (string, string) {
 	t.Helper()
 
@@ -360,5 +386,113 @@ func TestSeam1_Translation_DeterministicCAS_Idempotency(t *testing.T) {
 	}
 	if variant1.CASHash != variant2.CASHash {
 		t.Errorf("expected identical CASHash, got %s vs %s", variant1.CASHash, variant2.CASHash)
+	}
+}
+
+// TestSeam1_DubScript_DurationAdaptation_ShortenFirst verifies that DubScript adaptation
+// produces an immutable, CAS-persisted DubScriptVariant where fast-cadence/tight slots
+// are shortened first while preserving facts, names, numbers, and negation polarity.
+func TestSeam1_DubScript_DurationAdaptation_ShortenFirst(t *testing.T) {
+	h := setupHarness(t)
+	assetID, runID := setupSpeechUnderstoodAsset(t, h)
+
+	// 1. First run meaning-first translation
+	transReq := map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	}
+	respTrans, transVariant := runTranslation(t, h, assetID, transReq)
+	if respTrans.StatusCode != http.StatusCreated || transVariant == nil {
+		t.Fatalf("meaning-first translation failed: status %d", respTrans.StatusCode)
+	}
+
+	// 2. Run DubScript adaptation over Seam 1 API
+	dubReq := map[string]any{
+		"run_id":                  runID,
+		"target_language":         "vi",
+		"translation_variant_cas": transVariant.CASHash,
+	}
+	respDub, dubVariant := runDubScript(t, h, assetID, dubReq)
+	if respDub.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created from dub-script API, got %d", respDub.StatusCode)
+	}
+	if dubVariant == nil {
+		t.Fatalf("expected non-nil dub script variant")
+	}
+	if dubVariant.TargetLanguage != "vi" {
+		t.Errorf("expected target language vi, got %s", dubVariant.TargetLanguage)
+	}
+	if dubVariant.CASHash == "" {
+		t.Errorf("expected non-empty CASHash for dub script variant")
+	}
+	if len(dubVariant.Segments) == 0 {
+		t.Fatalf("expected dub script segments, got 0")
+	}
+
+	for _, seg := range dubVariant.Segments {
+		if !seg.PassedQAGate {
+			t.Errorf("segment %d failed QA gate", seg.Index)
+		}
+		if seg.SpokenText == "" {
+			t.Errorf("segment %d has empty spoken text", seg.Index)
+		}
+		if seg.EstimatedDurationMs <= 0 {
+			t.Errorf("segment %d has non-positive estimated duration: %d", seg.Index, seg.EstimatedDurationMs)
+		}
+	}
+
+	// 3. Verify GET /api/v1/assets/{id}/dub-script-variant?target_language=vi
+	getResp, err := http.Get(h.server.URL + "/api/v1/assets/" + assetID + "/dub-script-variant?target_language=vi")
+	if err != nil {
+		t.Fatalf("GET dub-script-variant failed: %v", err)
+	}
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from GET dub-script-variant, got %d", getResp.StatusCode)
+	}
+	var getResult struct {
+		Variant domain.DubScriptVariant `json:"dub_script_variant"`
+	}
+	_ = json.NewDecoder(getResp.Body).Decode(&getResult)
+	if getResult.Variant.CASHash != dubVariant.CASHash {
+		t.Errorf("expected matching CASHash from GET, got %s vs %s", getResult.Variant.CASHash, dubVariant.CASHash)
+	}
+}
+
+// TestSeam1_DubScript_DeterministicCAS_Idempotency verifies that re-running DubScript
+// adaptation returns the cached variant without duplicate CAS writes.
+func TestSeam1_DubScript_DeterministicCAS_Idempotency(t *testing.T) {
+	h := setupHarness(t)
+	assetID, runID := setupSpeechUnderstoodAsset(t, h)
+
+	transReq := map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	}
+	_, transVariant := runTranslation(t, h, assetID, transReq)
+	if transVariant == nil {
+		t.Fatalf("translation failed")
+	}
+
+	dubReq := map[string]any{
+		"run_id":                  runID,
+		"target_language":         "vi",
+		"translation_variant_cas": transVariant.CASHash,
+	}
+
+	resp1, dub1 := runDubScript(t, h, assetID, dubReq)
+	if resp1.StatusCode != http.StatusCreated {
+		t.Fatalf("first dub-script failed: %d", resp1.StatusCode)
+	}
+
+	resp2, dub2 := runDubScript(t, h, assetID, dubReq)
+	if resp2.StatusCode != http.StatusCreated && resp2.StatusCode != http.StatusOK {
+		t.Fatalf("second dub-script failed: %d", resp2.StatusCode)
+	}
+
+	if dub1.ID != dub2.ID {
+		t.Errorf("expected identical cached variant ID, got %s vs %s", dub1.ID, dub2.ID)
+	}
+	if dub1.CASHash != dub2.CASHash {
+		t.Errorf("expected identical CASHash, got %s vs %s", dub1.CASHash, dub2.CASHash)
 	}
 }
