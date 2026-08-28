@@ -1,0 +1,14 @@
+AGENTS.md
+  h_17f2fa2b92da6a 53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "59aa774a52ab9fe7b9d12ae52e4de3c8fe79a409",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
