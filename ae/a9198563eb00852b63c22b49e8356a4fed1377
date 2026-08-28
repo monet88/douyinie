@@ -1,0 +1,29 @@
+cmd/runtimehost/main.go
+  s_eb30af10dfaae0::t_92872228134013 123-132
+internal/server/server.go
+  s_47f796c82f7084::t_bf76131a3c1aa3 30-40,49-60,97-107,140
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "aea9198563eb00852b63c22b49e8356a4fed1377",
+  "prompts": {},
+  "sessions": {
+    "s_47f796c82f7084": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a03d96-e2d7-7182-b389-6829538ec82a",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_eb30af10dfaae0": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a03e57-0f18-7064-adf4-85bc6b761560",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
