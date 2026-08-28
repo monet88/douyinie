@@ -1,0 +1,79 @@
+internal/storage/sqlite.go
+  s_47f796c82f7084::t_97d24ac0992b42 140-141,562-633,783-785,801-802,823-824,843-844,853,859,877-882
+test/seam1/acceptance_test.go
+  s_47f796c82f7084::t_5249f4b5024ed9 121-138
+test/seam1/speech_test.go
+  s_47f796c82f7084::t_cffd60b3c98b2c 9-13,16,18,20-25,28-29,142,242,255,318,533-1457
+test/seam2/seam2_test.go
+  s_3cf9f95b99f20b::t_f9d744e4cb0678 20-21,604,641,712,764,807,854,867-1824
+cmd/runtimehost/main.go
+  s_eb30af10dfaae0::t_40b76943046a03 25,62,65,77-84
+cmd/stageworker/main.go
+  s_eb30af10dfaae0::t_478ede3d08e964 17,28-51,358-361,380-386,389,391-397,399-403,406-408,410-412,433-437,440,448-453,455-460,463-465,467-469,480-483,488,493-498,501,503,505-506,512,514,516-517,524-854
+internal/domain/speech.go
+  s_eb30af10dfaae0::t_2517c3e8ff43c9 19-20,57-67,94-132,136-139,141-159,177-229,234-242
+internal/provider/fake.go
+  s_eb30af10dfaae0::t_da9826b86241a7 9,64,166,294-385,397
+internal/provider/router_test.go
+  s_e7ccc15d61a491::t_223a7478a3004d 49-67,437-519
+internal/provider/speech.go
+  s_eb30af10dfaae0::t_edd34250ea7b4e 7,16-20,27-47
+internal/server/server.go
+  s_47f796c82f7084::t_1aa2cb713a00b9 464
+internal/service/speech.go
+  s_16c10d6a3ee477::t_271d235098b4ad 11,21,67-68,72-106,117-120,125-136,146-149,176,181,189-205,211-215,217,223,225-231,244-261,279-308,310-313,322-325,332-338,346,355,361,425,431-432,435-442,444-462,518-524,530,535,537-539,545,548-554,567-573,577,579,586-588,594,597-602,605,612-714,732-811,838
+internal/service/speech_test.go
+  s_eb30af10dfaae0::t_bcbf6ef34ee321 4,6-9,14-20,42-72,92,107,141-144,168,226,247,250,252-267,273,280-314,320-1209
+internal/storage/sqlite_test.go
+  s_47f796c82f7084::t_227fae5cb146dd 726-782
+test/fixtures/fakemodel/main.go
+  s_eb30af10dfaae0::t_c97fa3d5daed1f 52-60,64-65,86,90-91,94,102-173
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "cd945fbb8903011609671012ec052d5a5f390fc6",
+  "prompts": {},
+  "sessions": {
+    "s_16c10d6a3ee477": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a03ce7-a7c6-749a-b998-fe988603890b",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_3cf9f95b99f20b": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a03d35-50b9-7aa5-9aa3-d39826031a9f",
+        "model": "deepseek-v4-flash-vision"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_47f796c82f7084": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a03d96-e2d7-7182-b389-6829538ec82a",
+        "model": "deepseek-v4-flash-vision"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_e7ccc15d61a491": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a03c13-1e76-7c23-aefb-6173411b13cd",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_eb30af10dfaae0": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a03e57-0f18-7064-adf4-85bc6b761560",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
