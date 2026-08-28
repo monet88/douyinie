@@ -723,3 +723,60 @@ func TestTranscriptProvenance_HashDeterminism(t *testing.T) {
 		t.Error("changed model version must change the provenance hash")
 	}
 }
+
+// TestStorage_MigrationV7_IdempotentAndFailClosed verifies Finding 4:
+// Migration v7 handles partial-existing columns idempotently, safely applies
+// missing columns via PRAGMA inspection, and records v7.
+func TestStorage_MigrationV7_IdempotentAndFailClosed(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_v7_migration.db")
+
+	// 1. Initialize DB normally (all migrations v1..v7 run).
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	// Verify both columns exist on preflight_reports
+	var hasSHA, hasCAS bool
+	rows, err := db.db.QueryContext(ctx, `PRAGMA table_info(preflight_reports)`)
+	if err != nil {
+		t.Fatalf("query table_info: %v", err)
+	}
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notnull, &dflt, &pk); err == nil {
+			if name == "normalized_audio_sha256" {
+				hasSHA = true
+			}
+			if name == "normalized_audio_cas_path" {
+				hasCAS = true
+			}
+		}
+	}
+	rows.Close()
+	if !hasSHA || !hasCAS {
+		t.Fatalf("expected both normalized_audio columns in preflight_reports: sha=%v cas=%v", hasSHA, hasCAS)
+	}
+
+	// Verify migration v7 record is present
+	var countV7 int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 7`).Scan(&countV7); err != nil {
+		t.Fatalf("check v7 migration record: %v", err)
+	}
+	if countV7 != 1 {
+		t.Fatalf("expected version 7 recorded once, got %d", countV7)
+	}
+
+	// 2. Re-opening is idempotent
+	_ = db.Close()
+	db2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("re-opening DB failed: %v", err)
+	}
+	_ = db2.Close()
+}

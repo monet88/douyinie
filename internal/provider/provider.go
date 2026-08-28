@@ -13,6 +13,7 @@ type ProviderType string
 const (
 	TypeASR         ProviderType = "asr"
 	TypeAligner     ProviderType = "aligner"
+	TypeDiarizer    ProviderType = "diarizer"
 	TypeTTS         ProviderType = "tts"
 	TypeSeparator   ProviderType = "separator"
 	TypeOCR         ProviderType = "ocr"
@@ -37,6 +38,18 @@ type Provider interface {
 	IsHealthy() bool
 	Capability() domain.ProviderCapability
 	ModelInfo() (name string, version string)
+}
+
+// ModelDependency declares an additional model checkpoint dependency used by a provider (e.g. VAD for Diarizer).
+type ModelDependency struct {
+	Name    string
+	Version string
+	Role    string
+}
+
+// DependentModelProvider is an optional interface for providers that depend on additional checkpoints.
+type DependentModelProvider interface {
+	ModelDependencies() []ModelDependency
 }
 
 // Registry maintains available providers indexed by ID and Type.

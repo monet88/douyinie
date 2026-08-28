@@ -16,6 +16,8 @@ var (
 	ErrASRNoCandidates = errors.New("no ASR results from any provider candidate")
 	// ErrAlignmentFailed is returned when forced alignment produced no word timings.
 	ErrAlignmentFailed = errors.New("forced alignment produced no word-level timings")
+	// ErrDiarizationNoCandidates is returned when no diarization provider produced speaker regions.
+	ErrDiarizationNoCandidates = errors.New("no diarization results from any provider candidate")
 	// ErrAudioRolePlanRequired is returned when no audio role plan exists for the asset.
 	ErrAudioRolePlanRequired = errors.New("audio role plan required before speech understanding")
 )
@@ -52,12 +54,17 @@ type SpeakerAssignment struct {
 
 // DiarizationPlan is the output of conditional diarization (runs only when speaker evidence warrants).
 type DiarizationPlan struct {
-	ID          string              `json:"id"`
-	RunID       string              `json:"run_id"`
-	ProviderID  string              `json:"provider_id,omitempty"` // diarizer/provider identity (empty for injected test plans)
-	Assignments []SpeakerAssignment `json:"assignments"`
-	Confidence  float64             `json:"confidence"`
-	CreatedAt   time.Time           `json:"created_at"`
+	ID              string              `json:"id"`
+	RunID           string              `json:"run_id"`
+	ProviderID      string              `json:"provider_id,omitempty"` // diarizer/provider identity (empty for injected test plans)
+	ModelName       string              `json:"model_name,omitempty"`
+	ModelVersion    string              `json:"model_version,omitempty"`
+	VADModelName    string              `json:"vad_model_name,omitempty"`
+	VADModelVersion string              `json:"vad_model_version,omitempty"`
+	Assignments     []SpeakerAssignment `json:"assignments"`
+	SpeakerEvidence *SpeakerEvidence    `json:"speaker_evidence,omitempty"`
+	Confidence      float64             `json:"confidence"`
+	CreatedAt       time.Time           `json:"created_at"`
 }
 
 // SpeechBlock is the canonical atomic speech unit derived after forced alignment
@@ -84,39 +91,72 @@ const (
 // TranscriptArtifact is the persisted output of the speech understanding pipeline:
 // ASR → accepted transcript → forced alignment → conditional diarization → canonical SpeechBlock segmentation.
 type TranscriptArtifact struct {
-	ID                    string              `json:"id"`
-	AssetID               string              `json:"asset_id"`
-	RunID                 string              `json:"run_id"`
-	RawSegments           []ASRRawSegment     `json:"raw_segments"`
-	WordTimings           []WordTiming        `json:"word_timings"`
-	SpeakerAssignments    []SpeakerAssignment `json:"speaker_assignments,omitempty"`
-	SpeechBlocks          []SpeechBlock       `json:"speech_blocks"`
-	ASRProviderID         string              `json:"asr_provider_id"`
-	AlignerProviderID     string              `json:"aligner_provider_id"`
-	DiarizationRan        bool                `json:"diarization_ran"`
-	DiarizationProviderID string              `json:"diarization_provider_id,omitempty"` // diarizer identity when evidence-gated diarization ran
-	SourceLanguage        string              `json:"source_language"`
-	CASHash               string              `json:"cas_hash,omitempty"`        // content-addressed store object hash
-	ProvenanceHash        string              `json:"provenance_hash,omitempty"` // deterministic identity over dependency/config/provider/model/schema inputs
-	CreatedAt             time.Time           `json:"created_at"`
+	ID                      string              `json:"id"`
+	AssetID                 string              `json:"asset_id"`
+	RunID                   string              `json:"run_id"`
+	RawSegments             []ASRRawSegment     `json:"raw_segments"`
+	WordTimings             []WordTiming        `json:"word_timings"`
+	SpeakerAssignments      []SpeakerAssignment `json:"speaker_assignments,omitempty"`
+	SpeakerEvidence         *SpeakerEvidence    `json:"speaker_evidence,omitempty"`
+	SpeechBlocks            []SpeechBlock       `json:"speech_blocks"`
+	ASRProviderID           string              `json:"asr_provider_id"`
+	AlignerProviderID       string              `json:"aligner_provider_id"`
+	DiarizationRan          bool                `json:"diarization_ran"`
+	DiarizationProviderID   string              `json:"diarization_provider_id,omitempty"` // diarizer identity when evidence-gated diarization ran
+	DiarizationModelName    string              `json:"diarization_model_name,omitempty"`
+	DiarizationModelVersion string              `json:"diarization_model_version,omitempty"`
+	DiarizationVADModel     string              `json:"diarization_vad_model,omitempty"`
+	DiarizationVADVersion   string              `json:"diarization_vad_version,omitempty"`
+	SourceLanguage          string              `json:"source_language"`
+	CASHash                 string              `json:"cas_hash,omitempty"`        // content-addressed store object hash
+	ProvenanceHash          string              `json:"provenance_hash,omitempty"` // deterministic identity over dependency/config/provider/model/schema inputs
+	CreatedAt               time.Time           `json:"created_at"`
+}
+
+// AudioNormalizationConfig captures the deterministic audio normalization parameters
+// (16 kHz, mono, 16-bit PCM WAV) applied during Acquisition/Preflight.
+type AudioNormalizationConfig struct {
+	SampleRate int    `json:"sample_rate"`
+	Channels   int    `json:"channels"`
+	Codec      string `json:"codec"`
+	Format     string `json:"format"`
+}
+
+// DefaultAudioNormalizationConfig returns the standard 16 kHz mono WAV configuration.
+func DefaultAudioNormalizationConfig() AudioNormalizationConfig {
+	return AudioNormalizationConfig{
+		SampleRate: 16000,
+		Channels:   1,
+		Codec:      "pcm_s16le",
+		Format:     "wav",
+	}
 }
 
 // TranscriptProvenance captures the deterministic inputs that determine a
-// transcript artifact's cache identity: source asset, providers, models,
-// segment rules, and the pipeline schema version. Changing any of these
-// yields a NEW artifact identity instead of a permanent write-once failure.
+// transcript artifact's cache identity: source asset, normalized audio identity,
+// normalization config, providers, models, segment rules, diarization identity
+// and semantic evidence config, and the pipeline schema version. Changing any of
+// these yields a NEW artifact identity instead of a permanent write-once failure.
 type TranscriptProvenance struct {
-	AssetSHA256           string            `json:"asset_sha256"`
-	ASRProviderID         string            `json:"asr_provider_id"`
-	ASRModelName          string            `json:"asr_model_name"`
-	ASRModelVersion       string            `json:"asr_model_version"`
-	AlignerProviderID     string            `json:"aligner_provider_id"`
-	AlignerModelName      string            `json:"aligner_model_name"`
-	AlignerModelVersion   string            `json:"aligner_model_version"`
-	SegmentConfig         SegmentRuleConfig `json:"segment_config"`
-	DiarizationProviderID string            `json:"diarization_provider_id,omitempty"`
-	DiarizationRan        bool              `json:"diarization_ran"`
-	SchemaVersion         int               `json:"schema_version"`
+	AssetSHA256             string                    `json:"asset_sha256"`
+	NormalizedAudioSHA256   string                    `json:"normalized_audio_sha256,omitempty"`
+	NormalizationConfig     AudioNormalizationConfig  `json:"normalization_config"`
+	ASRProviderID           string                    `json:"asr_provider_id"`
+	ASRModelName            string                    `json:"asr_model_name"`
+	ASRModelVersion         string                    `json:"asr_model_version"`
+	AlignerProviderID       string                    `json:"aligner_provider_id"`
+	AlignerModelName        string                    `json:"aligner_model_name"`
+	AlignerModelVersion     string                    `json:"aligner_model_version"`
+	SegmentConfig           SegmentRuleConfig         `json:"segment_config"`
+	DiarizationProviderID   string                    `json:"diarization_provider_id,omitempty"`
+	DiarizationModelName    string                    `json:"diarization_model_name,omitempty"`
+	DiarizationModelVersion string                    `json:"diarization_model_version,omitempty"`
+	DiarizationVADModel     string                    `json:"diarization_vad_model,omitempty"`
+	DiarizationVADVersion   string                    `json:"diarization_vad_version,omitempty"`
+	DiarizationRan          bool                      `json:"diarization_ran"`
+	DiarizationEvidence     DiarizationEvidenceConfig `json:"diarization_evidence"`
+	SpeakerEvidenceHash     string                    `json:"speaker_evidence_hash,omitempty"`
+	SchemaVersion           int                       `json:"schema_version"`
 }
 
 // Hash returns a deterministic SHA-256 identity over the canonical JSON of
@@ -134,16 +174,72 @@ func (p TranscriptProvenance) Hash() string {
 
 // TranscriptSchemaVersion is the canonical transcript pipeline schema version.
 // It participates in the provenance hash so schema changes re-derive artifacts.
-const TranscriptSchemaVersion = 1
+// v3: provenance carries normalized audio identity + normalization config + explicit embedding cosine threshold
+const TranscriptSchemaVersion = 3
+
+// SpeakerEvidence captures upstream pre-diarization evidence of multi-speaker content
+// (e.g. acoustic change points, multi-character metadata, or audio role cues).
+// Pauses alone are not multi-speaker proof without an upstream speaker-evidence signal.
+type SpeakerEvidence struct {
+	HasMultiSpeakerCues bool    `json:"has_multi_speaker_cues"`
+	SpeakerChangeCount  int     `json:"speaker_change_count"`
+	Confidence          float64 `json:"confidence"`
+	Source              string  `json:"source,omitempty"`
+}
+
+// Hash returns a deterministic SHA-256 identity over the canonical JSON of
+// the speaker evidence cues.
+func (e *SpeakerEvidence) Hash() string {
+	if e == nil {
+		return ""
+	}
+	b, err := json.Marshal(e)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// DiarizationEvidenceConfig captures the deterministic multi-speaker evidence
+// gate parameters used to decide whether conditional diarization runs. It
+// combines pre-diarization timing cues (pause gaps) with upstream speaker evidence
+// cues — never from SpeakerID labels the diarizer itself produces. It hashes
+// into TranscriptProvenance so a changed evidence policy yields new artifacts.
+type DiarizationEvidenceConfig struct {
+	MinTurnGapMs             int64   `json:"min_turn_gap_ms"`
+	MinDistinctTurns         int     `json:"min_distinct_turns"`
+	RequireSpeakerCues       bool    `json:"require_speaker_cues"`
+	MinEvidenceConfidence    float64 `json:"min_evidence_confidence"`
+	EmbeddingCosineThreshold float64 `json:"embedding_cosine_threshold"`
+}
+
+// DefaultDiarizationEvidenceConfig returns the default multi-speaker evidence
+// gate: at least MIN_DISTINCT_TURNS distinct speech turns separated by a pause
+// of at least MinTurnGapMs milliseconds, requiring upstream speaker cues,
+// and evaluated with an explicit embedding cosine change threshold of 0.65.
+func DefaultDiarizationEvidenceConfig() DiarizationEvidenceConfig {
+	return DiarizationEvidenceConfig{
+		MinTurnGapMs:             300,
+		MinDistinctTurns:         2,
+		RequireSpeakerCues:       true,
+		MinEvidenceConfidence:    0.0,
+		EmbeddingCosineThreshold: 0.65,
+	}
+}
 
 // SpeechPipelineInput captures the full input for the speech understanding pipeline run.
 // It bundles all needed references so the pipeline can be invoked atomically.
 type SpeechPipelineInput struct {
-	RunID         string
-	AssetID       string
-	JobID         string
-	AudioPath     string         // source-media CAS path, not a normalized audio artifact; resolved on RuntimeHost; never client-supplied
-	AudioRolePlan *AudioRolePlan // for determining if dub-eligible speech exists
+	RunID                 string
+	AssetID               string
+	JobID                 string
+	AudioPath             string           // source-media CAS path or preflight normalized audio path
+	AudioSHA256           string           // SHA-256 content identity
+	NormalizedAudioPath   string           // optional explicit preflight normalized audio CAS path
+	NormalizedAudioSHA256 string           // optional explicit preflight normalized audio SHA-256
+	SpeakerEvidence       *SpeakerEvidence // optional upstream speaker-evidence cues
+	AudioRolePlan         *AudioRolePlan   // for determining if dub-eligible speech exists
 }
 
 // SegmentRuleConfig defines the tunable parameters for canonical SpeechBlock segmentation.

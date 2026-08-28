@@ -45,24 +45,26 @@ type SourceAsset struct {
 
 // PreflightReport captures media stream metadata and integrity verification results.
 type PreflightReport struct {
-	ID               string    `json:"id"`
-	AssetID          string    `json:"asset_id"`
-	DurationSec      float64   `json:"duration_sec"`
-	DurationMs       int64     `json:"duration_ms"`
-	VideoCodec       string    `json:"video_codec,omitempty"`
-	AudioCodec       string    `json:"audio_codec,omitempty"`
-	Width            int       `json:"width,omitempty"`
-	Height           int       `json:"height,omitempty"`
-	FrameRate        float64   `json:"frame_rate,omitempty"`
-	AudioChannels    int       `json:"audio_channels,omitempty"`
-	AudioSampleRate  int       `json:"audio_sample_rate,omitempty"`
-	AudioBitRate     int64     `json:"audio_bit_rate,omitempty"`
-	VideoBitRate     int64     `json:"video_bit_rate,omitempty"`
-	ContainerFormat  string    `json:"container_format"`
-	ContainerValid   bool      `json:"container_valid"`
-	FingerprintMatch bool      `json:"fingerprint_match"`
-	Errors           []string  `json:"errors,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
+	ID                     string    `json:"id"`
+	AssetID                string    `json:"asset_id"`
+	DurationSec            float64   `json:"duration_sec"`
+	DurationMs             int64     `json:"duration_ms"`
+	VideoCodec             string    `json:"video_codec,omitempty"`
+	AudioCodec             string    `json:"audio_codec,omitempty"`
+	Width                  int       `json:"width,omitempty"`
+	Height                 int       `json:"height,omitempty"`
+	FrameRate              float64   `json:"frame_rate,omitempty"`
+	AudioChannels          int       `json:"audio_channels,omitempty"`
+	AudioSampleRate        int       `json:"audio_sample_rate,omitempty"`
+	AudioBitRate           int64     `json:"audio_bit_rate,omitempty"`
+	VideoBitRate           int64     `json:"video_bit_rate,omitempty"`
+	ContainerFormat        string    `json:"container_format"`
+	ContainerValid         bool      `json:"container_valid"`
+	FingerprintMatch       bool      `json:"fingerprint_match"`
+	NormalizedAudioSHA256  string    `json:"normalized_audio_sha256,omitempty"`
+	NormalizedAudioCASPath string    `json:"normalized_audio_cas_path,omitempty"`
+	Errors                 []string  `json:"errors,omitempty"`
+	CreatedAt              time.Time `json:"created_at"`
 }
 
 // SourceTimeline represents the immutable temporal coordinate system defined by a SourceAsset.

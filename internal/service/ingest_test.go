@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,16 @@ import (
 	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/storage"
 )
+
+func useFakeAudioNormalizer(t *testing.T, service *IngestService) {
+	t.Helper()
+	service.normalizeAudio = func(ctx context.Context, sourcePath, outPath string) error {
+		if sourcePath == "" || outPath == "" {
+			return errors.New("normalizer received empty path")
+		}
+		return os.WriteFile(outPath, []byte("RIFF-test-normalized-audio"), 0644)
+	}
+}
 
 func TestIngestService_Flow(t *testing.T) {
 	ctx := context.Background()
@@ -51,6 +62,7 @@ func TestIngestService_Flow(t *testing.T) {
 	}
 
 	service := NewIngestService(db, casStore, prober)
+	useFakeAudioNormalizer(t, service)
 
 	// Create a dummy source media file
 	mediaPath := filepath.Join(tmpDir, "sample_douyin.mp4")
@@ -106,6 +118,12 @@ func TestIngestService_Flow(t *testing.T) {
 	}
 	if persistedReport.DurationMs != 12400 || persistedReport.VideoCodec != "h264" {
 		t.Errorf("persisted preflight report mismatch: %+v", persistedReport)
+	}
+	if persistedReport.NormalizedAudioSHA256 == "" || persistedReport.NormalizedAudioCASPath == "" {
+		t.Fatalf("preflight report missing normalized audio identity: %+v", persistedReport)
+	}
+	if !casStore.Exists(persistedReport.NormalizedAudioSHA256) {
+		t.Fatalf("normalized audio artifact not found in CAS: %s", persistedReport.NormalizedAudioSHA256)
 	}
 
 	// 3. Ingest with pre-created AttestationID for a different file
@@ -163,6 +181,7 @@ func TestIngestService_PreflightFailure_LeavesNoSourceAsset(t *testing.T) {
 	}
 
 	service := NewIngestService(db, casStore, prober)
+	useFakeAudioNormalizer(t, service)
 
 	corruptPath := filepath.Join(tmpDir, "corrupt.mp4")
 	if err := os.WriteFile(corruptPath, []byte("corrupt container bytes"), 0644); err != nil {
@@ -223,6 +242,7 @@ func TestIngestService_SHADedup_NoOrphanAttestation(t *testing.T) {
 	}
 
 	service := NewIngestService(db, casStore, prober)
+	useFakeAudioNormalizer(t, service)
 
 	samplePath := filepath.Join(tmpDir, "identical_source.mp4")
 	if err := os.WriteFile(samplePath, []byte("identical media payload 12345"), 0644); err != nil {
@@ -288,6 +308,7 @@ func TestIngestService_UppercaseExtension_MimeFallback(t *testing.T) {
 	defer db.Close()
 
 	service := NewIngestService(db, casStore, &media.MockProber{})
+	useFakeAudioNormalizer(t, service)
 
 	upperFile := filepath.Join(tmpDir, "VIDEO_UPPERCASE.MP4")
 	_ = os.WriteFile(upperFile, []byte("fake mp4 content uppercase"), 0644)
@@ -305,5 +326,54 @@ func TestIngestService_UppercaseExtension_MimeFallback(t *testing.T) {
 
 	if res.Asset.MimeType != "video/mp4" {
 		t.Errorf("expected mime video/mp4, got %s", res.Asset.MimeType)
+	}
+}
+
+func TestIngestService_AudioNormalizationFailureFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	casStore, err := cas.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("NewStore failed: %v", err)
+	}
+	db, err := storage.Open(filepath.Join(tmpDir, "douyinie.db"))
+	if err != nil {
+		t.Fatalf("storage.Open failed: %v", err)
+	}
+	defer db.Close()
+
+	prober := &media.MockProber{
+		CustomReport: &domain.PreflightReport{
+			ContainerValid:   true,
+			FingerprintMatch: true,
+		},
+	}
+	service := NewIngestService(db, casStore, prober)
+	service.normalizeAudio = func(context.Context, string, string) error {
+		return errors.New("synthetic normalization failure")
+	}
+
+	mediaPath := filepath.Join(tmpDir, "normalization-fails.mp4")
+	if err := os.WriteFile(mediaPath, []byte("fake mp4 bytes"), 0644); err != nil {
+		t.Fatalf("write media: %v", err)
+	}
+
+	_, err = service.IngestLocalFile(ctx, IngestRequest{
+		FilePath: mediaPath,
+		Attestation: &domain.RightsAttestation{
+			DeclaredBy:    "operator",
+			TermsAccepted: true,
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "preflight audio normalization") {
+		t.Fatalf("expected fail-closed normalization error, got %v", err)
+	}
+
+	var assetCount, reportCount int
+	_ = db.QueryRow(ctx, "SELECT COUNT(*) FROM source_assets").Scan(&assetCount)
+	_ = db.QueryRow(ctx, "SELECT COUNT(*) FROM preflight_reports").Scan(&reportCount)
+	if assetCount != 0 || reportCount != 0 {
+		t.Fatalf("normalization failure must not persist canonical preflight state: assets=%d reports=%d", assetCount, reportCount)
 	}
 }

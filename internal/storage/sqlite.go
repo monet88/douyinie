@@ -137,10 +137,11 @@ func (s *DB) migrate(ctx context.Context) error {
 			container_format TEXT NOT NULL,
 			container_valid INTEGER NOT NULL,
 			fingerprint_match INTEGER NOT NULL,
+			normalized_audio_sha256 TEXT,
+			normalized_audio_cas_path TEXT,
 			errors_json TEXT,
 			created_at TEXT NOT NULL
 		);
-
 		CREATE TABLE IF NOT EXISTS localization_jobs (
 			id TEXT PRIMARY KEY,
 			source_asset_id TEXT NOT NULL REFERENCES source_assets(id),
@@ -558,6 +559,78 @@ func (s *DB) migrate(ctx context.Context) error {
 			return fmt.Errorf("commit migration v6: %w", err)
 		}
 	}
+	// 8. Schema migration v7 (Normalized Audio Preflight Artifacts)
+	var countV7 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 7`).Scan(&countV7)
+	if err != nil {
+		return fmt.Errorf("check migration version 7: %w", err)
+	}
+
+	if countV7 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v7 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		var tableCount int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='preflight_reports'`).Scan(&tableCount); err != nil {
+			return fmt.Errorf("check preflight_reports table for migration v7: %w", err)
+		}
+		if tableCount == 0 {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (7, datetime('now'));`); err != nil {
+				return fmt.Errorf("record migration v7: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit migration v7: %w", err)
+			}
+			return nil
+		}
+
+		var hasSHACol, hasCASCol bool
+		rows, err := tx.QueryContext(ctx, `PRAGMA table_info(preflight_reports)`)
+		if err != nil {
+			return fmt.Errorf("query table_info for preflight_reports: %w", err)
+		}
+		for rows.Next() {
+			var cid int
+			var name, colType string
+			var notnull, pk int
+			var dfltValue sql.NullString
+			if err := rows.Scan(&cid, &name, &colType, &notnull, &dfltValue, &pk); err == nil {
+				if name == "normalized_audio_sha256" {
+					hasSHACol = true
+				}
+				if name == "normalized_audio_cas_path" {
+					hasCASCol = true
+				}
+			}
+		}
+		rows.Close()
+
+		if !hasSHACol {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE preflight_reports ADD COLUMN normalized_audio_sha256 TEXT;`); err != nil {
+				if !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+					return fmt.Errorf("add normalized_audio_sha256 column: %w", err)
+				}
+			}
+		}
+		if !hasCASCol {
+			if _, err := tx.ExecContext(ctx, `ALTER TABLE preflight_reports ADD COLUMN normalized_audio_cas_path TEXT;`); err != nil {
+				if !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+					return fmt.Errorf("add normalized_audio_cas_path column: %w", err)
+				}
+			}
+		}
+
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (7, datetime('now'));`); err != nil {
+			return fmt.Errorf("record migration v7: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v7: %w", err)
+		}
+	}
 
 	return nil
 }
@@ -707,8 +780,9 @@ func (s *DB) SavePreflightReport(ctx context.Context, pr domain.PreflightReport)
 			id, asset_id, duration_sec, duration_ms, video_codec, audio_codec,
 			width, height, frame_rate, audio_channels, audio_sample_rate,
 			audio_bit_rate, video_bit_rate, container_format, container_valid,
-			fingerprint_match, errors_json, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			fingerprint_match, normalized_audio_sha256, normalized_audio_cas_path,
+			errors_json, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(asset_id) DO UPDATE SET
 			duration_sec=excluded.duration_sec,
 			duration_ms=excluded.duration_ms,
@@ -724,6 +798,8 @@ func (s *DB) SavePreflightReport(ctx context.Context, pr domain.PreflightReport)
 			container_format=excluded.container_format,
 			container_valid=excluded.container_valid,
 			fingerprint_match=excluded.fingerprint_match,
+			normalized_audio_sha256=excluded.normalized_audio_sha256,
+			normalized_audio_cas_path=excluded.normalized_audio_cas_path,
 			errors_json=excluded.errors_json,
 			created_at=excluded.created_at
 	`
@@ -744,6 +820,8 @@ func (s *DB) SavePreflightReport(ctx context.Context, pr domain.PreflightReport)
 		pr.ContainerFormat,
 		validInt,
 		fpInt,
+		pr.NormalizedAudioSHA256,
+		pr.NormalizedAudioCASPath,
 		string(errorsJSON),
 		pr.CreatedAt.Format(time.RFC3339Nano),
 	)
@@ -762,7 +840,8 @@ func (s *DB) GetPreflightReport(ctx context.Context, assetID string) (*domain.Pr
 		SELECT id, asset_id, duration_sec, duration_ms, video_codec, audio_codec,
 		       width, height, frame_rate, audio_channels, audio_sample_rate,
 		       audio_bit_rate, video_bit_rate, container_format, container_valid,
-		       fingerprint_match, errors_json, created_at
+		       fingerprint_match, normalized_audio_sha256, normalized_audio_cas_path,
+		       errors_json, created_at
 		FROM preflight_reports WHERE asset_id = ?
 	`
 	row := s.db.QueryRowContext(ctx, query, assetID)
@@ -771,13 +850,13 @@ func (s *DB) GetPreflightReport(ctx context.Context, assetID string) (*domain.Pr
 	var validInt, fpInt int
 	var errorsJSON sql.NullString
 	var createdStr string
-	var vCodec, aCodec, cFmt sql.NullString
+	var vCodec, aCodec, cFmt, normSHA, normPath sql.NullString
 
 	err := row.Scan(
 		&pr.ID, &pr.AssetID, &pr.DurationSec, &pr.DurationMs, &vCodec, &aCodec,
 		&pr.Width, &pr.Height, &pr.FrameRate, &pr.AudioChannels, &pr.AudioSampleRate,
 		&pr.AudioBitRate, &pr.VideoBitRate, &cFmt, &validInt,
-		&fpInt, &errorsJSON, &createdStr,
+		&fpInt, &normSHA, &normPath, &errorsJSON, &createdStr,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -794,6 +873,12 @@ func (s *DB) GetPreflightReport(ctx context.Context, assetID string) (*domain.Pr
 	}
 	if cFmt.Valid {
 		pr.ContainerFormat = cFmt.String
+	}
+	if normSHA.Valid {
+		pr.NormalizedAudioSHA256 = normSHA.String
+	}
+	if normPath.Valid {
+		pr.NormalizedAudioCASPath = normPath.String
 	}
 	pr.ContainerValid = validInt == 1
 	pr.FingerprintMatch = fpInt == 1

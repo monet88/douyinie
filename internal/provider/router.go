@@ -279,6 +279,35 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 			}
 		}
 
+		// Verify any dependent checkpoints (e.g. FSMN-VAD for diarizer) fail-closed
+		if r.licenseSvc != nil {
+			var deps []ModelDependency
+			if dmp, ok := p.(DependentModelProvider); ok {
+				deps = dmp.ModelDependencies()
+			} else if vip, ok := p.(interface{ VADModelInfo() (string, string) }); ok {
+				vName, vVer := vip.VADModelInfo()
+				if vName != "" {
+					deps = append(deps, ModelDependency{Name: vName, Version: vVer, Role: "vad"})
+				}
+			}
+			depMissing := false
+			for _, dep := range deps {
+				if dep.Name != "" {
+					if err := r.licenseSvc.VerifyCheckpoint(ctx, dep.Name, dep.Version, ""); err != nil {
+						eval.Eligible = false
+						eval.RejectionCode = "LICENSE_MANIFEST_MISSING"
+						eval.Reason = fmt.Sprintf("unmanifested or unverified dependency checkpoint %s (%s): %v", dep.Name, dep.Role, err)
+						evaluations = append(evaluations, eval)
+						depMissing = true
+						break
+					}
+				}
+			}
+			if depMissing {
+				continue
+			}
+		}
+
 		// 2. Declared Capability Check (Stage, Language, Required Features)
 		cap := p.Capability()
 		if req.Stage != "" && p.Type() != req.Stage {

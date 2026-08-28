@@ -46,8 +46,26 @@ func setupTestRouter(t *testing.T) (*provider.Router, *storage.DB, *provider.Reg
 				CreatedAt:      time.Now().UTC(),
 			})
 		}
+		if dmp, ok := p.(provider.DependentModelProvider); ok {
+			for _, dep := range dmp.ModelDependencies() {
+				if dep.Name != "" {
+					_ = licSvc.RegisterManifest(ctx, domain.LicenseManifestEntry{
+						ID:             uuid.NewString(),
+						DependencyName: dep.Name,
+						Version:        dep.Version,
+						SHA256:         "sha256_dummy_" + dep.Name,
+						SourceRepo:     "test/" + dep.Name,
+						CodeLicense:    "Apache-2.0",
+						ModelLicense:   "Apache-2.0",
+						DataLicense:    "OpenData",
+						ServiceTerms:   "Standard",
+						Verified:       true,
+						CreatedAt:      time.Now().UTC(),
+					})
+				}
+			}
+		}
 	}
-
 	circuit := provider.NewCircuitBreaker(provider.CircuitBreakerConfig{
 		FailureThreshold: 2,
 		CooldownDuration: 100 * time.Millisecond,
@@ -413,6 +431,89 @@ func TestRouter_UnmanifestedCheckpointFailClosed(t *testing.T) {
 	})
 	if !errors.Is(err, domain.ErrNoEligibleProvider) {
 		t.Fatalf("expected fail-closed ErrNoEligibleProvider for unmanifested checkpoint, got %v", err)
+	}
+}
+
+// TestRouter_DiarizerDependencyLicenseVerification tests BLOCKER 2:
+// Missing VAD manifest rejects diarization routing (fail-closed); both manifests verified allows routing.
+func TestRouter_DiarizerDependencyLicenseVerification(t *testing.T) {
+	tmpDir := t.TempDir()
+	db, err := storage.Open(filepath.Join(tmpDir, "test.db"))
+	if err != nil {
+		t.Fatalf("setup SQLite failed: %v", err)
+	}
+	defer db.Close()
+
+	diarizerProv := provider.NewFakeDiarizationProvider("fake_campplus_diarizer")
+	reg := provider.NewRegistry()
+	_ = reg.Register(diarizerProv)
+
+	polSvc := governance.NewPolicyService(db)
+	licSvc := governance.NewLicenseService(db)
+	credSvc := governance.NewCredentialService(db)
+	circuit := provider.NewCircuitBreaker(provider.CircuitBreakerConfig{})
+
+	router := provider.NewRouter(reg, polSvc, licSvc, credSvc, circuit, db)
+	ctx := context.Background()
+
+	// 1. Neither manifest registered -> Route must fail closed
+	_, err = router.Route(ctx, provider.RouteRequest{
+		Stage:    provider.TypeDiarizer,
+		Language: "zh",
+	})
+	if !errors.Is(err, domain.ErrNoEligibleProvider) {
+		t.Fatalf("expected ErrNoEligibleProvider when no manifests registered, got %v", err)
+	}
+
+	// 2. Only main CAM++ model manifest registered (missing VAD manifest) -> Route must still fail closed
+	mName, mVer := diarizerProv.ModelInfo()
+	_ = licSvc.RegisterManifest(ctx, domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: mName,
+		Version:        mVer,
+		SHA256:         "sha256_mock_" + mName,
+		SourceRepo:     "test/" + mName,
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Standard",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	_, err = router.Route(ctx, provider.RouteRequest{
+		Stage:    provider.TypeDiarizer,
+		Language: "zh",
+	})
+	if !errors.Is(err, domain.ErrNoEligibleProvider) {
+		t.Fatalf("expected fail-closed ErrNoEligibleProvider when VAD dependency is missing manifest, got %v", err)
+	}
+
+	// 3. Both CAM++ and FSMN-VAD manifests registered and verified -> Route must SUCCEED
+	vName, vVer := diarizerProv.VADModelInfo()
+	_ = licSvc.RegisterManifest(ctx, domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: vName,
+		Version:        vVer,
+		SHA256:         "sha256_mock_" + vName,
+		SourceRepo:     "test/" + vName,
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Standard",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	routeRes, err := router.Route(ctx, provider.RouteRequest{
+		Stage:    provider.TypeDiarizer,
+		Language: "zh",
+	})
+	if err != nil {
+		t.Fatalf("expected routing to succeed when both manifests verified, got %v", err)
+	}
+	if routeRes.SelectedProvider.ID() != diarizerProv.ID() {
+		t.Errorf("expected selected provider %s, got %s", diarizerProv.ID(), routeRes.SelectedProvider.ID())
 	}
 }
 

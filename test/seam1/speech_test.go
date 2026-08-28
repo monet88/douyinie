@@ -6,12 +6,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/governance"
+	"github.com/monet88/douyinie/internal/media"
+	"github.com/monet88/douyinie/internal/provider"
+	"github.com/monet88/douyinie/internal/queue"
+	"github.com/monet88/douyinie/internal/scheduler"
+	"github.com/monet88/douyinie/internal/server"
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/speech"
+	"github.com/monet88/douyinie/internal/storage"
+	"github.com/monet88/douyinie/internal/worker"
 )
 
 // ---- helpers ----
@@ -124,7 +139,7 @@ func TestSeam1_SpeechUnderstand_LongVADTurnCanonicalSegmentation(t *testing.T) {
 			WordTimings:  buildAlignedWords(),
 		}, nil
 	}
-	speechSvc.Diarize = func(ctx context.Context, words []domain.WordTiming) (*domain.DiarizationPlan, error) {
+	speechSvc.Diarize = func(ctx context.Context, words []domain.WordTiming, req service.SpeechDiarizationRequest) (*domain.DiarizationPlan, error) {
 		return &domain.DiarizationPlan{
 			ID:    "diarization_1",
 			RunID: runID,
@@ -224,7 +239,7 @@ func TestSeam1_SpeechUnderstand_RawASRBoundaryNotCanonical(t *testing.T) {
 	}
 
 	speechSvc := service.NewSpeechService(h.db, h.casStore)
-	speechSvc.Diarize = func(ctx context.Context, words []domain.WordTiming) (*domain.DiarizationPlan, error) {
+	speechSvc.Diarize = func(ctx context.Context, words []domain.WordTiming, req service.SpeechDiarizationRequest) (*domain.DiarizationPlan, error) {
 		return &domain.DiarizationPlan{
 			ID:    "diarization_2",
 			RunID: runID,
@@ -237,7 +252,7 @@ func TestSeam1_SpeechUnderstand_RawASRBoundaryNotCanonical(t *testing.T) {
 	}
 	h.srv.SetSpeechService(speechSvc)
 
-	artifact, err := speechSvc.BuildTranscriptFromInputs(asr, align, runID, assetID)
+	artifact, err := speechSvc.BuildTranscriptFromInputs(context.Background(), asr, align, runID, assetID)
 	if err != nil {
 		t.Fatalf("build transcript from inputs: %v", err)
 	}
@@ -300,7 +315,7 @@ func TestSeam1_SpeechUnderstand_PersistAndRetrieve(t *testing.T) {
 			WordTimings:  buildAlignedWords(),
 		}, nil
 	}
-	speechSvc.Diarize = func(ctx context.Context, words []domain.WordTiming) (*domain.DiarizationPlan, error) {
+	speechSvc.Diarize = func(ctx context.Context, words []domain.WordTiming, req service.SpeechDiarizationRequest) (*domain.DiarizationPlan, error) {
 		return &domain.DiarizationPlan{
 			ID:    "diarization_3",
 			RunID: runID,
@@ -513,5 +528,930 @@ func TestSeam1_SpeechUnderstand_MissingPlanFailsClosed(t *testing.T) {
 	}
 	if !strings.Contains(errResult.Error, "audio role plan required") {
 		t.Errorf("expected error mentioning audio role plan required, got %q", errResult.Error)
+	}
+}
+
+// helper to build fakemodel binary for seam1 production composition test
+func buildFakeModelForSeam1(t *testing.T, binDir, name string) {
+	t.Helper()
+	binPath := filepath.Join(binDir, name)
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+	cmd := exec.Command("go", "build", "-o", binPath, "github.com/monet88/douyinie/test/fixtures/fakemodel")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build fakemodel %s: %v\n%s", name, err, out)
+	}
+}
+
+// helper to build stageworker binary for seam1 production composition test
+func buildStageWorkerForSeam1(t *testing.T, binDir string) string {
+	t.Helper()
+	exe := filepath.Join(binDir, "stageworker")
+	if runtime.GOOS == "windows" {
+		exe += ".exe"
+	}
+	cmd := exec.Command("go", "build", "-o", exe, "github.com/monet88/douyinie/cmd/stageworker")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build stageworker: %v\n%s", err, out)
+	}
+	return exe
+}
+
+// TestSeam1_SpeechUnderstand_ProductionComposition_NoInjectedHooks proves that
+// the production composition works WITHOUT injected SpeechService.ASRInvoke /
+// AlignerInvoke / Diarize hooks:
+// 1. The registry is populated with concrete worker-backed providers.
+// 2. StageWorker and model binaries are resolved via PATH and executed end-to-end.
+// 3. Router.ExecuteWithRetry selects Qwen3-ASR 1.7B quality provider and Qwen3-ForcedAligner.
+// 4. The pipeline produces a valid TranscriptArtifact persisted to CAS and indexed in SQLite.
+func TestSeam1_SpeechUnderstand_ProductionComposition_NoInjectedHooks(t *testing.T) {
+	binDir := t.TempDir()
+	buildFakeModelForSeam1(t, binDir, "qwen3-asr")
+	buildFakeModelForSeam1(t, binDir, "qwen3-aligner")
+	buildFakeModelForSeam1(t, binDir, "campplus-diarizer")
+	workerExe := buildStageWorkerForSeam1(t, binDir)
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DOUYINIE_STAGEWORKER_BIN", workerExe)
+
+	tmpDir := t.TempDir()
+	casStore, err := cas.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("setup CAS store: %v", err)
+	}
+
+	dbPath := filepath.Join(tmpDir, "douyinie_prod_test.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("setup SQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	var prober media.Prober
+	if _, err := exec.LookPath("ffprobe"); err == nil {
+		prober = media.NewFFprobeProber()
+	} else {
+		prober = &media.MockProber{}
+	}
+
+	ingestSvc := service.NewIngestService(db, casStore, prober)
+	queueSvc := queue.NewService(db)
+	resScheduler := scheduler.New()
+	leaseMgr := worker.NewGPULeaseManager(resScheduler)
+
+	// Production registry (NO fake providers!)
+	prodRegistry, err := provider.NewProductionSpeechRegistry(leaseMgr)
+	if err != nil {
+		t.Fatalf("NewProductionSpeechRegistry: %v", err)
+	}
+
+	polSvc := governance.NewPolicyService(db)
+	licSvc := governance.NewLicenseService(db)
+	credSvc := governance.NewCredentialService(db)
+
+	initCtx := context.Background()
+	for _, p := range prodRegistry.ListAll() {
+		mName, mVer := p.ModelInfo()
+		if mName != "" {
+			_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+				DependencyName: mName,
+				Version:        mVer,
+				SHA256:         "sha256_mock_" + mName + "_" + mVer,
+				SourceRepo:     "github.com/monet88/douyinie/models/" + mName,
+				CodeLicense:    "Apache-2.0",
+				ModelLicense:   "Apache-2.0",
+				DataLicense:    "OpenData",
+				ServiceTerms:   "Standard",
+				Verified:       true,
+				CreatedAt:      time.Now().UTC(),
+			})
+		}
+		if dmp, ok := p.(provider.DependentModelProvider); ok {
+			for _, dep := range dmp.ModelDependencies() {
+				if dep.Name != "" {
+					_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+						DependencyName: dep.Name,
+						Version:        dep.Version,
+						SHA256:         "sha256_mock_" + dep.Name + "_" + dep.Version,
+						SourceRepo:     "github.com/monet88/douyinie/models/" + dep.Name,
+						CodeLicense:    "Apache-2.0",
+						ModelLicense:   "Apache-2.0",
+						DataLicense:    "OpenData",
+						ServiceTerms:   "Standard",
+						Verified:       true,
+						CreatedAt:      time.Now().UTC(),
+					})
+				}
+			}
+		}
+	}
+	router := provider.NewRouter(prodRegistry, polSvc, licSvc, credSvc, nil, db)
+
+	// Production SpeechService: NO INJECTED HOOKS!
+	speechSvc := service.NewSpeechService(db, casStore)
+	// ConfigureRouter is called automatically by server.New
+
+	srv := server.New(server.Config{
+		Addr:       "127.0.0.1:0",
+		DB:         db,
+		CASStore:   casStore,
+		Ingest:     ingestSvc,
+		Registry:   prodRegistry,
+		PolicySvc:  polSvc,
+		LicenseSvc: licSvc,
+		CredSvc:    credSvc,
+		Router:     router,
+		QueueSvc:   queueSvc,
+		Scheduler:  resScheduler,
+		SpeechSvc:  speechSvc,
+	})
+
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() { ts.Close() })
+
+	h := &testHarness{
+		server:    ts,
+		srv:       srv,
+		db:        db,
+		casStore:  casStore,
+		registry:  prodRegistry,
+		router:    router,
+		queueSvc:  queueSvc,
+		scheduler: resScheduler,
+		dir:       tmpDir,
+	}
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// Save dub-eligible audio role plan via API
+	planPayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 6000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	planBody, _ := json.Marshal(planPayload)
+	planResp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+	if err != nil {
+		t.Fatalf("save audio role plan failed: %v", err)
+	}
+	planResp.Body.Close()
+	if planResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 for audio role plan, got %d", planResp.StatusCode)
+	}
+
+	// Run speech-understand pipeline through public HTTP API
+	artifact := runSpeechUnderstand(t, h, runID, assetID)
+	if artifact == nil {
+		t.Fatal("expected non-nil transcript artifact from production pipeline")
+	}
+
+	// Verify worker-backed providers executed (Finding 1 & 2)
+	if artifact.ASRProviderID != "qwen3_asr_1_7b" {
+		t.Errorf("expected ASRProviderID qwen3_asr_1_7b, got %s", artifact.ASRProviderID)
+	}
+	if artifact.AlignerProviderID != "qwen3_forced_aligner" {
+		t.Errorf("expected AlignerProviderID qwen3_forced_aligner, got %s", artifact.AlignerProviderID)
+	}
+
+	// Verify source-derived speaker evidence triggered real diarization (Blocker 1 & 3)
+	if !artifact.DiarizationRan {
+		t.Errorf("expected DiarizationRan=true (source-derived speaker evidence triggered diarizer)")
+	}
+	if artifact.DiarizationProviderID != "campplus_diarizer" {
+		t.Errorf("expected DiarizationProviderID campplus_diarizer, got %s", artifact.DiarizationProviderID)
+	}
+	if artifact.DiarizationModelName != "iic/speech_campplus_sv_zh_en_16k-common_advanced" || artifact.DiarizationModelVersion != "v1.0.0" {
+		t.Errorf("expected diarizer model iic/speech_campplus_sv_zh_en_16k-common_advanced:v1.0.0, got %s:%s", artifact.DiarizationModelName, artifact.DiarizationModelVersion)
+	}
+	if len(artifact.SpeakerAssignments) != 2 {
+		t.Fatalf("expected 2 speaker assignments from diarization, got %d", len(artifact.SpeakerAssignments))
+	}
+	if artifact.SpeakerEvidence == nil || !artifact.SpeakerEvidence.HasMultiSpeakerCues {
+		t.Errorf("expected source-derived SpeakerEvidence with HasMultiSpeakerCues=true")
+	}
+
+	if len(artifact.SpeechBlocks) == 0 {
+		t.Fatal("expected speech blocks to be segmented")
+	}
+	speakers := make(map[string]bool)
+	for _, b := range artifact.SpeechBlocks {
+		if b.SegmentType == domain.SpeechBlockTypeSpeech {
+			if b.SpeakerID == "" {
+				t.Errorf("speech block %d missing speaker ID", b.Index)
+			}
+			speakers[b.SpeakerID] = true
+		}
+	}
+	if len(speakers) < 2 {
+		t.Errorf("expected distinct speaker labels in speech blocks, got %v", speakers)
+	}
+
+	// Verify immutable CAS + SQLite persistence
+	if artifact.CASHash == "" || artifact.ProvenanceHash == "" {
+		t.Errorf("artifact missing CAS/Provenance hash: cas=%s prov=%s", artifact.CASHash, artifact.ProvenanceHash)
+	}
+	indexed, err := db.GetTranscriptArtifactByProvenance(context.Background(), artifact.ProvenanceHash)
+	if err != nil || indexed == nil {
+		t.Fatalf("transcript index lookup failed: %v", err)
+	}
+	if indexed.CASHash != artifact.CASHash {
+		t.Errorf("CAS hash mismatch in index: got %s, want %s", indexed.CASHash, artifact.CASHash)
+	}
+}
+
+// TestSeam1_SpeechUnderstand_ProductionComposition_SingleSpeakerNoEvidence verifies
+// that single-speaker / no-evidence audio skips full diarization and defaults
+// to stable SPEAKER_00 without false positives (Issue #44 Blocker 1 requirement 2).
+func TestSeam1_SpeechUnderstand_ProductionComposition_SingleSpeakerNoEvidence(t *testing.T) {
+	binDir := t.TempDir()
+	buildFakeModelForSeam1(t, binDir, "qwen3-asr")
+	buildFakeModelForSeam1(t, binDir, "qwen3-aligner")
+	buildFakeModelForSeam1(t, binDir, "campplus-diarizer")
+	workerExe := buildStageWorkerForSeam1(t, binDir)
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DOUYINIE_STAGEWORKER_BIN", workerExe)
+	t.Setenv("FAKEMODEL_NO_SPEAKER_EVIDENCE", "1") // Probe returns HasMultiSpeakerCues=false
+
+	tmpDir := t.TempDir()
+	casStore, err := cas.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("setup CAS store: %v", err)
+	}
+
+	dbPath := filepath.Join(tmpDir, "douyinie_single_test.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("setup SQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	var prober media.Prober
+	if _, err := exec.LookPath("ffprobe"); err == nil {
+		prober = media.NewFFprobeProber()
+	} else {
+		prober = &media.MockProber{}
+	}
+
+	ingestSvc := service.NewIngestService(db, casStore, prober)
+	queueSvc := queue.NewService(db)
+	resScheduler := scheduler.New()
+	leaseMgr := worker.NewGPULeaseManager(resScheduler)
+
+	prodRegistry, err := provider.NewProductionSpeechRegistry(leaseMgr)
+	if err != nil {
+		t.Fatalf("NewProductionSpeechRegistry: %v", err)
+	}
+
+	polSvc := governance.NewPolicyService(db)
+	licSvc := governance.NewLicenseService(db)
+	credSvc := governance.NewCredentialService(db)
+
+	initCtx := context.Background()
+	for _, p := range prodRegistry.ListAll() {
+		mName, mVer := p.ModelInfo()
+		if mName != "" {
+			_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+				DependencyName: mName,
+				Version:        mVer,
+				SHA256:         "sha256_mock_" + mName + "_" + mVer,
+				SourceRepo:     "github.com/monet88/douyinie/models/" + mName,
+				CodeLicense:    "Apache-2.0",
+				ModelLicense:   "Apache-2.0",
+				DataLicense:    "OpenData",
+				ServiceTerms:   "Standard",
+				Verified:       true,
+				CreatedAt:      time.Now().UTC(),
+			})
+		}
+		if dmp, ok := p.(provider.DependentModelProvider); ok {
+			for _, dep := range dmp.ModelDependencies() {
+				if dep.Name != "" {
+					_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+						DependencyName: dep.Name,
+						Version:        dep.Version,
+						SHA256:         "sha256_mock_" + dep.Name + "_" + dep.Version,
+						SourceRepo:     "github.com/monet88/douyinie/models/" + dep.Name,
+						CodeLicense:    "Apache-2.0",
+						ModelLicense:   "Apache-2.0",
+						DataLicense:    "OpenData",
+						ServiceTerms:   "Standard",
+						Verified:       true,
+						CreatedAt:      time.Now().UTC(),
+					})
+				}
+			}
+		}
+	}
+	router := provider.NewRouter(prodRegistry, polSvc, licSvc, credSvc, nil, db)
+	speechSvc := service.NewSpeechService(db, casStore)
+
+	srv := server.New(server.Config{
+		Addr:       "127.0.0.1:0",
+		DB:         db,
+		CASStore:   casStore,
+		Ingest:     ingestSvc,
+		Registry:   prodRegistry,
+		PolicySvc:  polSvc,
+		LicenseSvc: licSvc,
+		CredSvc:    credSvc,
+		Router:     router,
+		QueueSvc:   queueSvc,
+		Scheduler:  resScheduler,
+		SpeechSvc:  speechSvc,
+	})
+
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() { ts.Close() })
+
+	h := &testHarness{
+		server:    ts,
+		srv:       srv,
+		db:        db,
+		casStore:  casStore,
+		registry:  prodRegistry,
+		router:    router,
+		queueSvc:  queueSvc,
+		scheduler: resScheduler,
+		dir:       tmpDir,
+	}
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	planPayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 6000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	planBody, _ := json.Marshal(planPayload)
+	planResp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+	if err != nil {
+		t.Fatalf("save audio role plan failed: %v", err)
+	}
+	planResp.Body.Close()
+
+	artifact := runSpeechUnderstand(t, h, runID, assetID)
+	if artifact == nil {
+		t.Fatal("expected non-nil transcript artifact")
+	}
+
+	// Single-speaker / no-evidence path must fail closed to stable SPEAKER_00:
+	if artifact.DiarizationRan {
+		t.Errorf("expected DiarizationRan=false when no speaker evidence")
+	}
+	if artifact.DiarizationProviderID != "default-single-speaker-fallback" {
+		t.Errorf("expected fallback provider ID, got %s", artifact.DiarizationProviderID)
+	}
+	for _, b := range artifact.SpeechBlocks {
+		if b.SegmentType == domain.SpeechBlockTypeSpeech && b.SpeakerID != "SPEAKER_00" {
+			t.Errorf("expected SPEAKER_00 for all blocks, got %s", b.SpeakerID)
+		}
+	}
+}
+
+// TestSeam1_SpeechUnderstand_ProductionComposition_TwoSpeakerTwoTurnEvidence verifies
+// that two-speaker / two-turn timing + independent valid speaker evidence triggers
+// the production conditional diarization path (Issue #44 Blocker 2).
+func TestSeam1_SpeechUnderstand_ProductionComposition_TwoSpeakerTwoTurnEvidence(t *testing.T) {
+	binDir := t.TempDir()
+	buildFakeModelForSeam1(t, binDir, "qwen3-asr")
+	buildFakeModelForSeam1(t, binDir, "qwen3-aligner")
+	buildFakeModelForSeam1(t, binDir, "campplus-diarizer")
+	workerExe := buildStageWorkerForSeam1(t, binDir)
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DOUYINIE_STAGEWORKER_BIN", workerExe)
+	// Two distinct sentences/turns
+	t.Setenv("FAKEMODEL_ASR_TEXT", "第一句话。 第二句话。")
+
+	tmpDir := t.TempDir()
+	casStore, err := cas.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("setup CAS store: %v", err)
+	}
+
+	dbPath := filepath.Join(tmpDir, "douyinie_twoturn_test.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("setup SQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	var prober media.Prober
+	if _, err := exec.LookPath("ffprobe"); err == nil {
+		prober = media.NewFFprobeProber()
+	} else {
+		prober = &media.MockProber{}
+	}
+
+	ingestSvc := service.NewIngestService(db, casStore, prober)
+	queueSvc := queue.NewService(db)
+	resScheduler := scheduler.New()
+	leaseMgr := worker.NewGPULeaseManager(resScheduler)
+
+	prodRegistry, err := provider.NewProductionSpeechRegistry(leaseMgr)
+	if err != nil {
+		t.Fatalf("NewProductionSpeechRegistry: %v", err)
+	}
+
+	polSvc := governance.NewPolicyService(db)
+	licSvc := governance.NewLicenseService(db)
+	credSvc := governance.NewCredentialService(db)
+
+	initCtx := context.Background()
+	for _, p := range prodRegistry.ListAll() {
+		mName, mVer := p.ModelInfo()
+		if mName != "" {
+			_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+				DependencyName: mName,
+				Version:        mVer,
+				SHA256:         "sha256_mock_" + mName + "_" + mVer,
+				SourceRepo:     "github.com/monet88/douyinie/models/" + mName,
+				CodeLicense:    "Apache-2.0",
+				ModelLicense:   "Apache-2.0",
+				DataLicense:    "OpenData",
+				ServiceTerms:   "Standard",
+				Verified:       true,
+				CreatedAt:      time.Now().UTC(),
+			})
+		}
+		if dmp, ok := p.(provider.DependentModelProvider); ok {
+			for _, dep := range dmp.ModelDependencies() {
+				if dep.Name != "" {
+					_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+						DependencyName: dep.Name,
+						Version:        dep.Version,
+						SHA256:         "sha256_mock_" + dep.Name + "_" + dep.Version,
+						SourceRepo:     "github.com/monet88/douyinie/models/" + dep.Name,
+						CodeLicense:    "Apache-2.0",
+						ModelLicense:   "Apache-2.0",
+						DataLicense:    "OpenData",
+						ServiceTerms:   "Standard",
+						Verified:       true,
+						CreatedAt:      time.Now().UTC(),
+					})
+				}
+			}
+		}
+	}
+	router := provider.NewRouter(prodRegistry, polSvc, licSvc, credSvc, nil, db)
+	speechSvc := service.NewSpeechService(db, casStore)
+
+	srv := server.New(server.Config{
+		Addr:       "127.0.0.1:0",
+		DB:         db,
+		CASStore:   casStore,
+		Ingest:     ingestSvc,
+		Registry:   prodRegistry,
+		PolicySvc:  polSvc,
+		LicenseSvc: licSvc,
+		CredSvc:    credSvc,
+		Router:     router,
+		QueueSvc:   queueSvc,
+		Scheduler:  resScheduler,
+		SpeechSvc:  speechSvc,
+	})
+
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() { ts.Close() })
+
+	h := &testHarness{
+		server:    ts,
+		srv:       srv,
+		db:        db,
+		casStore:  casStore,
+		registry:  prodRegistry,
+		router:    router,
+		queueSvc:  queueSvc,
+		scheduler: resScheduler,
+		dir:       tmpDir,
+	}
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	planPayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 6000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	planBody, _ := json.Marshal(planPayload)
+	planResp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+	if err != nil {
+		t.Fatalf("save audio role plan failed: %v", err)
+	}
+	planResp.Body.Close()
+
+	artifact := runSpeechUnderstand(t, h, runID, assetID)
+	if artifact == nil {
+		t.Fatal("expected non-nil transcript artifact")
+	}
+
+	// Two-turn source with evidence must trigger conditional diarization:
+	if !artifact.DiarizationRan {
+		t.Errorf("expected DiarizationRan=true for two-turn audio with speaker evidence")
+	}
+	if artifact.DiarizationProviderID != "campplus_diarizer" {
+		t.Errorf("expected DiarizationProviderID campplus_diarizer, got %s", artifact.DiarizationProviderID)
+	}
+	speakers := make(map[string]bool)
+	for _, b := range artifact.SpeechBlocks {
+		if b.SegmentType == domain.SpeechBlockTypeSpeech {
+			speakers[b.SpeakerID] = true
+		}
+	}
+	if len(speakers) < 2 {
+		t.Errorf("expected at least 2 distinct speaker labels in speech blocks, got %v", speakers)
+	}
+}
+
+// TestSeam1_SpeechUnderstand_ProductionComposition_ProbeErrorFailsClosed verifies
+// that a speaker evidence probe error in the production pipeline fails closed (500)
+// and is not converted to a successful single-speaker transcript (Issue #44 Blocker 1).
+func TestSeam1_SpeechUnderstand_ProductionComposition_ProbeErrorFailsClosed(t *testing.T) {
+	binDir := t.TempDir()
+	buildFakeModelForSeam1(t, binDir, "qwen3-asr")
+	buildFakeModelForSeam1(t, binDir, "qwen3-aligner")
+	buildFakeModelForSeam1(t, binDir, "campplus-diarizer")
+	workerExe := buildStageWorkerForSeam1(t, binDir)
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DOUYINIE_STAGEWORKER_BIN", workerExe)
+	t.Setenv("FAKEMODEL_DIARIZER_FAIL", "1") // Diarizer probe fails/crashes
+
+	tmpDir := t.TempDir()
+	casStore, err := cas.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("setup CAS store: %v", err)
+	}
+
+	dbPath := filepath.Join(tmpDir, "douyinie_fail_test.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("setup SQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	var prober media.Prober
+	if _, err := exec.LookPath("ffprobe"); err == nil {
+		prober = media.NewFFprobeProber()
+	} else {
+		prober = &media.MockProber{}
+	}
+
+	ingestSvc := service.NewIngestService(db, casStore, prober)
+	queueSvc := queue.NewService(db)
+	resScheduler := scheduler.New()
+	leaseMgr := worker.NewGPULeaseManager(resScheduler)
+
+	prodRegistry, err := provider.NewProductionSpeechRegistry(leaseMgr)
+	if err != nil {
+		t.Fatalf("NewProductionSpeechRegistry: %v", err)
+	}
+
+	polSvc := governance.NewPolicyService(db)
+	licSvc := governance.NewLicenseService(db)
+	credSvc := governance.NewCredentialService(db)
+
+	initCtx := context.Background()
+	for _, p := range prodRegistry.ListAll() {
+		mName, mVer := p.ModelInfo()
+		if mName != "" {
+			_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+				DependencyName: mName,
+				Version:        mVer,
+				SHA256:         "sha256_mock_" + mName + "_" + mVer,
+				SourceRepo:     "github.com/monet88/douyinie/models/" + mName,
+				CodeLicense:    "Apache-2.0",
+				ModelLicense:   "Apache-2.0",
+				DataLicense:    "OpenData",
+				ServiceTerms:   "Standard",
+				Verified:       true,
+				CreatedAt:      time.Now().UTC(),
+			})
+		}
+		if dmp, ok := p.(provider.DependentModelProvider); ok {
+			for _, dep := range dmp.ModelDependencies() {
+				if dep.Name != "" {
+					_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+						DependencyName: dep.Name,
+						Version:        dep.Version,
+						SHA256:         "sha256_mock_" + dep.Name + "_" + dep.Version,
+						SourceRepo:     "github.com/monet88/douyinie/models/" + dep.Name,
+						CodeLicense:    "Apache-2.0",
+						ModelLicense:   "Apache-2.0",
+						DataLicense:    "OpenData",
+						ServiceTerms:   "Standard",
+						Verified:       true,
+						CreatedAt:      time.Now().UTC(),
+					})
+				}
+			}
+		}
+	}
+	router := provider.NewRouter(prodRegistry, polSvc, licSvc, credSvc, nil, db)
+	speechSvc := service.NewSpeechService(db, casStore)
+
+	srv := server.New(server.Config{
+		Addr:       "127.0.0.1:0",
+		DB:         db,
+		CASStore:   casStore,
+		Ingest:     ingestSvc,
+		Registry:   prodRegistry,
+		PolicySvc:  polSvc,
+		LicenseSvc: licSvc,
+		CredSvc:    credSvc,
+		Router:     router,
+		QueueSvc:   queueSvc,
+		Scheduler:  resScheduler,
+		SpeechSvc:  speechSvc,
+	})
+
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() { ts.Close() })
+
+	h := &testHarness{
+		server:    ts,
+		srv:       srv,
+		db:        db,
+		casStore:  casStore,
+		registry:  prodRegistry,
+		router:    router,
+		queueSvc:  queueSvc,
+		scheduler: resScheduler,
+		dir:       tmpDir,
+	}
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	planPayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 6000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	planBody, _ := json.Marshal(planPayload)
+	planResp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+	if err != nil {
+		t.Fatalf("save audio role plan failed: %v", err)
+	}
+	planResp.Body.Close()
+
+	// Request speech-understand -> must fail (500)
+	payload := map[string]any{"run_id": runID}
+	reqBody, _ := json.Marshal(payload)
+	resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/speech-understand", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("speech-understand request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 on speaker evidence probe error, got %d", resp.StatusCode)
+	}
+
+	// Verify no transcript artifact was persisted
+	getResp, err := http.Get(h.server.URL + "/api/v1/assets/" + assetID + "/transcript")
+	if err != nil {
+		t.Fatalf("get transcript request failed: %v", err)
+	}
+	defer getResp.Body.Close()
+	if getResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for transcript when probe failed, got %d", getResp.StatusCode)
+	}
+}
+
+// TestSeam1_SpeechUnderstand_ProductionComposition_WithRealPythonAdapters proves that
+// StageWorker executes repo-owned Python adapters (asr_qwen3.py, aligner_qwen3.py, diarizer_3dspeaker.py)
+// over the official upstream Python API surface without fake binary executables on PATH.
+func TestSeam1_SpeechUnderstand_ProductionComposition_WithRealPythonAdapters(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Mock qwen_asr package
+	qwenPkgDir := filepath.Join(tmpDir, "qwen_asr")
+	if err := os.MkdirAll(qwenPkgDir, 0755); err != nil {
+		t.Fatalf("mkdir qwen_asr: %v", err)
+	}
+	qwenCode := `
+class Qwen3ASRModel:
+    def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        return cls(*args, **kwargs)
+
+    def transcribe(self, audio, **kwargs):
+        return [{
+            "segments": [
+                {"start_ms": 0, "end_ms": 1500, "text": "第一句话。", "confidence": 0.95, "language_code": "zh"},
+                {"start_ms": 2000, "end_ms": 3500, "text": "第二句话。", "confidence": 0.92, "language_code": "zh"},
+            ]
+        }]
+
+class Qwen3ForcedAligner:
+    def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        return cls(*args, **kwargs)
+
+    def align(self, audio, text, **kwargs):
+        return [[
+            {"word": "第一句话", "start_time": 0.0, "end_time": 1.5},
+            {"word": "第二句话", "start_time": 2.0, "end_time": 3.5},
+        ]]
+`
+	if err := os.WriteFile(filepath.Join(qwenPkgDir, "__init__.py"), []byte(qwenCode), 0644); err != nil {
+		t.Fatalf("write qwen_asr: %v", err)
+	}
+
+	// 2. Mock speakerlab package
+	speakerlabBinDir := filepath.Join(tmpDir, "speakerlab", "bin")
+	if err := os.MkdirAll(speakerlabBinDir, 0755); err != nil {
+		t.Fatalf("mkdir speakerlab: %v", err)
+	}
+	_ = os.WriteFile(filepath.Join(tmpDir, "speakerlab", "__init__.py"), []byte(""), 0644)
+	_ = os.WriteFile(filepath.Join(speakerlabBinDir, "__init__.py"), []byte(""), 0644)
+	speakerlabCode := `
+class Diarization3Dspeaker:
+    def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
+
+    def probe_evidence(self, audio_path):
+        return {
+            "has_multi_speaker_cues": True,
+            "speaker_change_count": 2,
+            "confidence": 0.0,
+            "source": "iic/speech_campplus_sv_zh_en_16k-common_advanced@v1.0.0+iic/speech_fsmn_vad_zh-cn-16k-common-pytorch@v2.0.4",
+        }
+
+    def __call__(self, audio_path):
+        return [
+            [0.0, 1.8, "SPEAKER_00"],
+            [1.8, 4.0, "SPEAKER_01"],
+        ]
+`
+	if err := os.WriteFile(filepath.Join(speakerlabBinDir, "infer_diarization.py"), []byte(speakerlabCode), 0644); err != nil {
+		t.Fatalf("write infer_diarization: %v", err)
+	}
+
+	// Locate repo adapters
+	asrAdapter, _ := filepath.Abs(filepath.Join("..", "..", "cmd", "stageworker", "adapters", "asr_qwen3.py"))
+	alignAdapter, _ := filepath.Abs(filepath.Join("..", "..", "cmd", "stageworker", "adapters", "aligner_qwen3.py"))
+	diarAdapter, _ := filepath.Abs(filepath.Join("..", "..", "cmd", "stageworker", "adapters", "diarizer_3dspeaker.py"))
+
+	t.Setenv("DOUYINIE_ASR_ADAPTER", asrAdapter)
+	t.Setenv("DOUYINIE_ALIGNER_ADAPTER", alignAdapter)
+	t.Setenv("DOUYINIE_DIARIZER_ADAPTER", diarAdapter)
+	t.Setenv("PYTHONPATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PYTHONPATH"))
+
+	workerExe := buildStageWorkerForSeam1(t, tmpDir)
+	t.Setenv("DOUYINIE_STAGEWORKER_BIN", workerExe)
+
+	casStore, err := cas.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("setup CAS: %v", err)
+	}
+	dbPath := filepath.Join(tmpDir, "seam1_python_test.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("setup DB: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	prober := &media.MockProber{
+		CustomReport: &domain.PreflightReport{
+			DurationSec:      4.0,
+			DurationMs:       4000,
+			ContainerFormat:  "mov,mp4,m4a,3gp,3g2,mj2",
+			ContainerValid:   true,
+			FingerprintMatch: true,
+		},
+	}
+	ingestSvc := service.NewIngestService(db, casStore, prober)
+	queueSvc := queue.NewService(db)
+	resScheduler := scheduler.New()
+	leaseMgr := worker.NewGPULeaseManager(resScheduler)
+
+	prodRegistry, err := provider.NewProductionSpeechRegistry(leaseMgr)
+	if err != nil {
+		t.Fatalf("NewProductionSpeechRegistry: %v", err)
+	}
+
+	polSvc := governance.NewPolicyService(db)
+	licSvc := governance.NewLicenseService(db)
+	credSvc := governance.NewCredentialService(db)
+
+	initCtx := context.Background()
+	for _, p := range prodRegistry.ListAll() {
+		mName, mVer := p.ModelInfo()
+		if mName != "" {
+			_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+				DependencyName: mName,
+				Version:        mVer,
+				SHA256:         "sha256_mock_" + mName + "_" + mVer,
+				SourceRepo:     "github.com/monet88/douyinie/models/" + mName,
+				CodeLicense:    "Apache-2.0",
+				ModelLicense:   "Apache-2.0",
+				DataLicense:    "OpenData",
+				ServiceTerms:   "Standard",
+				Verified:       true,
+				CreatedAt:      time.Now().UTC(),
+			})
+		}
+		if dmp, ok := p.(provider.DependentModelProvider); ok {
+			for _, dep := range dmp.ModelDependencies() {
+				if dep.Name != "" {
+					_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+						DependencyName: dep.Name,
+						Version:        dep.Version,
+						SHA256:         "sha256_mock_" + dep.Name + "_" + dep.Version,
+						SourceRepo:     "github.com/monet88/douyinie/models/" + dep.Name,
+						CodeLicense:    "Apache-2.0",
+						ModelLicense:   "Apache-2.0",
+						DataLicense:    "OpenData",
+						ServiceTerms:   "Standard",
+						Verified:       true,
+						CreatedAt:      time.Now().UTC(),
+					})
+				}
+			}
+		}
+	}
+	router := provider.NewRouter(prodRegistry, polSvc, licSvc, credSvc, nil, db)
+	speechSvc := service.NewSpeechService(db, casStore)
+
+	srv := server.New(server.Config{
+		Addr:       "127.0.0.1:0",
+		DB:         db,
+		CASStore:   casStore,
+		Ingest:     ingestSvc,
+		Registry:   prodRegistry,
+		PolicySvc:  polSvc,
+		LicenseSvc: licSvc,
+		CredSvc:    credSvc,
+		Router:     router,
+		QueueSvc:   queueSvc,
+		Scheduler:  resScheduler,
+		SpeechSvc:  speechSvc,
+	})
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() { ts.Close() })
+
+	h := &testHarness{
+		server:    ts,
+		srv:       srv,
+		db:        db,
+		casStore:  casStore,
+		registry:  prodRegistry,
+		router:    router,
+		queueSvc:  queueSvc,
+		scheduler: resScheduler,
+		dir:       tmpDir,
+	}
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// Save dub-eligible audio role plan
+	planPayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 4000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	planBody, _ := json.Marshal(planPayload)
+	planResp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+	if err != nil {
+		t.Fatalf("save audio role plan failed: %v", err)
+	}
+	planResp.Body.Close()
+
+	// Execute speech-understand via HTTP
+	artifact := runSpeechUnderstand(t, h, runID, assetID)
+	if artifact == nil {
+		t.Fatal("expected non-nil transcript artifact")
+	}
+	if artifact.ASRProviderID != "qwen3_asr_1_7b" {
+		t.Errorf("expected ASRProviderID qwen3_asr_1_7b, got %s", artifact.ASRProviderID)
+	}
+	if artifact.AlignerProviderID != "qwen3_forced_aligner" {
+		t.Errorf("expected AlignerProviderID qwen3_forced_aligner, got %s", artifact.AlignerProviderID)
+	}
+	if !artifact.DiarizationRan {
+		t.Errorf("expected DiarizationRan=true")
+	}
+	if len(artifact.SpeechBlocks) < 2 {
+		t.Fatalf("expected at least 2 speech blocks from 2-turn text, got %d", len(artifact.SpeechBlocks))
 	}
 }

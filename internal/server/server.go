@@ -461,6 +461,7 @@ func (s *Server) handleRunSpeechUnderstand(w http.ResponseWriter, r *http.Reques
 		RunID:         body.RunID,
 		AssetID:       assetID,
 		AudioPath:     asset.CASPath,
+		AudioSHA256:   asset.SHA256,
 		AudioRolePlan: rolePlan,
 	}
 	artifact, err := s.speechSvc.RunPipeline(r.Context(), in)

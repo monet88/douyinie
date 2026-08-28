@@ -6,9 +6,9 @@ import (
 	"strings"
 
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/worker"
 )
 
-// BaseFakeProvider provides shared fields for fake providers.
 type BaseFakeProvider struct {
 	ProviderID   string
 	ProviderType ProviderType
@@ -61,7 +61,7 @@ func NewFakeASRProvider(id string) *FakeASRProvider {
 // ProduceTranscript implements provider.ASRTranscriptProvider.
 // It returns the controllable RawSegments when set; otherwise a single
 // VAD-turn segment over TranscribedText (the default short-unit path).
-func (p *FakeASRProvider) ProduceTranscript(ctx context.Context, audioPath string) ([]domain.ASRRawSegment, error) {
+func (p *FakeASRProvider) ProduceTranscript(ctx context.Context, audio worker.ArtifactRef) ([]domain.ASRRawSegment, error) {
 	if ctx == nil {
 		return nil, errors.New("nil context")
 	}
@@ -163,7 +163,7 @@ func NewFakeAlignerProvider(id string) *FakeAlignerProvider {
 // ProduceAlignment implements provider.AlignWordProvider.
 // It returns the controllable WordTimings when set; otherwise a synthetic
 // alignment derived from the accepted text via produceAlignmentHelper.
-func (p *FakeAlignerProvider) ProduceAlignment(ctx context.Context, audioPath string, text string) ([]domain.WordTiming, error) {
+func (p *FakeAlignerProvider) ProduceAlignment(ctx context.Context, audio worker.ArtifactRef, text string) ([]domain.WordTiming, error) {
 	if ctx == nil {
 		return nil, errors.New("nil context")
 	}
@@ -291,6 +291,98 @@ func NewFakeTranslationProvider(id string) *FakeTranslationProvider {
 	}
 }
 
+// FakeDiarizationProvider simulates conditional speaker diarization with evidence probe.
+type FakeDiarizationProvider struct {
+	BaseFakeProvider
+	Evidence        *domain.SpeakerEvidence
+	ProbeErr        error
+	Assignments     []domain.SpeakerAssignment
+	VADModelName    string
+	VADModelVersion string
+}
+
+func NewFakeDiarizationProvider(id string) *FakeDiarizationProvider {
+	return &FakeDiarizationProvider{
+		BaseFakeProvider: BaseFakeProvider{
+			ProviderID:   id,
+			ProviderType: TypeDiarizer,
+			Policy:       PolicyAllowed,
+			Healthy:      true,
+			Cap: domain.ProviderCapability{
+				Stage:          string(TypeDiarizer),
+				Languages:      []string{"zh", "en", "vi"},
+				ExecutionTier:  "local",
+				CostPerUnit:    0.0,
+				QualityScore:   0.95,
+				MaxConcurrency: 1,
+				Features:       []string{"speaker_diarization", "speaker_evidence"},
+			},
+			ModelName:    "iic/speech_campplus_sv_zh_en_16k-common_advanced",
+			ModelVersion: "v1.0.0",
+		},
+		VADModelName:    "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+		VADModelVersion: "v2.0.4",
+	}
+}
+
+func (p *FakeDiarizationProvider) VADModelInfo() (string, string) {
+	return p.VADModelName, p.VADModelVersion
+}
+
+func (p *FakeDiarizationProvider) ModelDependencies() []ModelDependency {
+	if p.VADModelName != "" {
+		return []ModelDependency{{
+			Name:    p.VADModelName,
+			Version: p.VADModelVersion,
+			Role:    "vad",
+		}}
+	}
+	return nil
+}
+
+func (p *FakeDiarizationProvider) ProbeSpeakerEvidence(ctx context.Context, audio worker.ArtifactRef) (*domain.SpeakerEvidence, error) {
+	if ctx == nil {
+		return nil, errors.New("nil context")
+	}
+	if p.ProbeErr != nil {
+		return nil, p.ProbeErr
+	}
+	if p.Evidence != nil {
+		return p.Evidence, nil
+	}
+	return &domain.SpeakerEvidence{
+		HasMultiSpeakerCues: true,
+		SpeakerChangeCount:  2,
+		Confidence:          0.95,
+		Source:              p.ModelName + "@" + p.ModelVersion,
+	}, nil
+}
+
+func (p *FakeDiarizationProvider) ProduceDiarization(ctx context.Context, audio worker.ArtifactRef) ([]domain.SpeakerAssignment, error) {
+	if ctx == nil {
+		return nil, errors.New("nil context")
+	}
+	if p.Assignments != nil {
+		return p.Assignments, nil
+	}
+	return []domain.SpeakerAssignment{
+		{
+			SpeakerID:  "SPEAKER_00",
+			Label:      "SPEAKER_00",
+			StartMs:    0,
+			EndMs:      3200,
+			Confidence: 0.95,
+		},
+		{
+			SpeakerID:  "SPEAKER_01",
+			Label:      "SPEAKER_01",
+			StartMs:    3201,
+			EndMs:      5000,
+			Confidence: 0.94,
+		},
+	}, nil
+}
+
 // NewSeam1FakeRegistry sets up a deterministic mock provider registry for Seam 1 acceptance testing.
 func NewSeam1FakeRegistry() *Registry {
 	reg := NewRegistry()
@@ -302,6 +394,7 @@ func NewSeam1FakeRegistry() *Registry {
 	_ = reg.Register(NewFakeSeparatorProvider("fake_uvr_separator"))
 	_ = reg.Register(NewFakeOCRProvider("fake_paddle_ocr"))
 	_ = reg.Register(NewFakeTranslationProvider("fake_llm_translator"))
+	_ = reg.Register(NewFakeDiarizationProvider("fake_campplus_diarizer"))
 
 	// Blocked provider (for testing policy-before-health: Healthy=true, but Policy=BLOCKED)
 	_ = reg.Register(&FakeTTSProvider{

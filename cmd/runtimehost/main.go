@@ -22,6 +22,7 @@ import (
 	"github.com/monet88/douyinie/internal/server"
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
+	"github.com/monet88/douyinie/internal/worker"
 )
 
 func main() {
@@ -58,9 +59,10 @@ func main() {
 	prober := media.NewFFprobeProber(*ffprobePath)
 	ingestSvc := service.NewIngestService(db, casStore, prober)
 
-	// 4. Initialize Persisted Queue + ResourceScheduler + Crash Recovery
+	// 4. Initialize Persisted Queue + ResourceScheduler + GPU Lease Manager + Crash Recovery
 	queueSvc := queue.NewService(db)
 	resScheduler := scheduler.New()
+	gpuLeaseMgr := worker.NewGPULeaseManager(resScheduler)
 
 	// 4b. Initialize Speech Understanding service (T08)
 	speechSvc := service.NewSpeechService(db, casStore)
@@ -72,10 +74,14 @@ func main() {
 		log.Printf("[RuntimeHost] Crash recovery: %d interrupted run(s): %v", len(recovered), recovered)
 	}
 
-	// 5. Initialize Provider Registry with Governance
-	// Production registers no fake providers: the router fails closed with
-	// ErrNoEligibleProvider until real worker-backed providers are registered.
-	reg := provider.NewRegistry()
+	// 5. Initialize Provider Registry with Governance (Issue #44 Finding 1)
+	// Production registers concrete worker-backed providers (Qwen3-ASR 1.7B quality,
+	// Qwen3-ASR 0.6B fallback, Qwen3-ForcedAligner, and conditional Diarization)
+	// wired through the authoritative single-GPU lease path. No fake providers are registered.
+	reg, err := provider.NewProductionSpeechRegistry(gpuLeaseMgr)
+	if err != nil {
+		log.Fatalf("[RuntimeHost] failed to initialize production speech registry: %v", err)
+	}
 	polSvc := governance.NewPolicyService(db)
 	licSvc := governance.NewLicenseService(db)
 	credSvc := governance.NewCredentialService(db)

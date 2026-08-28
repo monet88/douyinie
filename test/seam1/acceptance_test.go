@@ -118,6 +118,24 @@ func newRuntimeHost(t *testing.T, db *storage.DB, casStore *cas.Store, queueSvc 
 				CreatedAt:      time.Now().UTC(),
 			})
 		}
+		if dmp, ok := p.(provider.DependentModelProvider); ok {
+			for _, dep := range dmp.ModelDependencies() {
+				if dep.Name != "" {
+					_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+						DependencyName: dep.Name,
+						Version:        dep.Version,
+						SHA256:         "sha256_mock_" + dep.Name,
+						SourceRepo:     "github.com/monet88/douyinie/models/" + dep.Name,
+						CodeLicense:    "Apache-2.0",
+						ModelLicense:   "Apache-2.0",
+						DataLicense:    "OpenData",
+						ServiceTerms:   "Standard",
+						Verified:       true,
+						CreatedAt:      time.Now().UTC(),
+					})
+				}
+			}
+		}
 	}
 	router := provider.NewRouter(fakeRegistry, polSvc, licSvc, credSvc, nil, db)
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"mime"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -18,18 +19,50 @@ import (
 
 // IngestService coordinates rights attestation, CAS commit, media preflight, and persistence.
 type IngestService struct {
-	db     *storage.DB
-	cas    *cas.Store
-	prober media.Prober
+	db             *storage.DB
+	cas            *cas.Store
+	prober         media.Prober
+	normalizeAudio func(context.Context, string, string) error
 }
 
 // NewIngestService creates a new IngestService.
 func NewIngestService(db *storage.DB, casStore *cas.Store, prober media.Prober) *IngestService {
 	return &IngestService{
-		db:     db,
-		cas:    casStore,
-		prober: prober,
+		db:             db,
+		cas:            casStore,
+		prober:         prober,
+		normalizeAudio: media.NormalizeAudio16kMono,
 	}
+}
+
+// normalizeAudioArtifact creates the canonical 16 kHz mono PCM WAV source-derived
+// artifact owned by Acquisition/Preflight and commits it into CAS. Any failure is
+// fatal: a successful ingest must never publish a PreflightReport without the
+// normalized audio identity required by downstream speech understanding.
+func (s *IngestService) normalizeAudioArtifact(ctx context.Context, sourcePath string) (cas.Object, error) {
+	if s.cas == nil {
+		return cas.Object{}, errors.New("CAS store is required for preflight audio normalization")
+	}
+	normalizer := s.normalizeAudio
+	if normalizer == nil {
+		normalizer = media.NormalizeAudio16kMono
+	}
+
+	tmpDir, err := os.MkdirTemp("", "douyinie-ingest-audio-*")
+	if err != nil {
+		return cas.Object{}, fmt.Errorf("create normalization temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	tmpWav := filepath.Join(tmpDir, "normalized_16k.wav")
+	if err := normalizer(ctx, sourcePath, tmpWav); err != nil {
+		return cas.Object{}, fmt.Errorf("normalize source audio to 16 kHz mono WAV: %w", err)
+	}
+	normObj, err := s.cas.PutFile(tmpWav)
+	if err != nil {
+		return cas.Object{}, fmt.Errorf("commit normalized audio into CAS: %w", err)
+	}
+	return normObj, nil
 }
 
 // IngestRequest defines the payload for local file ingestion.
@@ -85,6 +118,17 @@ func (s *IngestService) IngestLocalFile(ctx context.Context, req IngestRequest) 
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
 			return nil, fmt.Errorf("lookup existing asset preflight report: %w", err)
 		}
+		if report != nil && (report.NormalizedAudioSHA256 == "" || report.NormalizedAudioCASPath == "") {
+			normObj, err := s.normalizeAudioArtifact(ctx, existingAsset.CASPath)
+			if err != nil {
+				return nil, fmt.Errorf("repair existing asset preflight audio: %w", err)
+			}
+			report.NormalizedAudioSHA256 = normObj.SHA256
+			report.NormalizedAudioCASPath = normObj.Path
+			if err := s.db.SavePreflightReport(ctx, *report); err != nil {
+				return nil, fmt.Errorf("persist repaired preflight audio identity: %w", err)
+			}
+		}
 		return &IngestResult{
 			Asset:           existingAsset,
 			PreflightReport: report,
@@ -102,6 +146,15 @@ func (s *IngestService) IngestLocalFile(ctx context.Context, req IngestRequest) 
 	}
 	if !report.FingerprintMatch {
 		return nil, fmt.Errorf("%w: hash mismatch in preflight report", domain.ErrFingerprintMismatch)
+	}
+	// 5. Extract & normalize 16kHz mono WAV as source-derived Acquisition/Preflight CAS artifact
+	if report.NormalizedAudioSHA256 == "" || report.NormalizedAudioCASPath == "" {
+		normObj, err := s.normalizeAudioArtifact(ctx, casObj.Path)
+		if err != nil {
+			return nil, fmt.Errorf("preflight audio normalization: %w", err)
+		}
+		report.NormalizedAudioSHA256 = normObj.SHA256
+		report.NormalizedAudioCASPath = normObj.Path
 	}
 
 	// 5. Preflight passed: Record Rights Attestation before creating new SourceAsset
