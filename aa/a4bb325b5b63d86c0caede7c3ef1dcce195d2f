@@ -1,0 +1,35 @@
+internal/storage/sqlite.go
+  s_47f796c82f7084::t_f065b7ffdfc512 635-680,2202-2326
+test/seam1/acceptance_test.go
+  s_47f796c82f7084::t_7b7308cf78cdfe 153-155
+cmd/runtimehost/main.go
+  s_eb30af10dfaae0::t_e830ed9df8103e 67,69,133-134
+internal/provider/fake.go
+  s_eb30af10dfaae0::t_89fd8cffeb5286 270-276,289-291,298-449,556
+internal/server/server.go
+  s_47f796c82f7084::t_9abb8f2161b62f 41-44,61-62,92-94,108-110,140-146,225-229,531-642
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "aaa4bb325b5b63d86c0caede7c3ef1dcce195d2f",
+  "prompts": {},
+  "sessions": {
+    "s_47f796c82f7084": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a03d96-e2d7-7182-b389-6829538ec82a",
+        "model": "deepseek-v4-flash-vision"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_eb30af10dfaae0": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a03e57-0f18-7064-adf4-85bc6b761560",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
