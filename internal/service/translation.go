@@ -74,44 +74,75 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 	}
 	in.SourceLanguage = sourceLang
 
-	// 1. Resolve segments: if none provided, load SpeechBlocks from TranscriptArtifact
+	// 1. Resolve segments: if none provided, load SpeechBlocks from TranscriptArtifact.
+	// Preserve the transcript CAS hash as a content input to deterministic cache identity.
 	if len(in.Segments) == 0 {
-		segments, err := s.loadSegmentsFromTranscript(ctx, in.AssetID)
+		segments, transcriptCAS, err := s.loadSegmentsFromTranscript(ctx, in.AssetID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load source segments: %w", err)
 		}
 		in.Segments = segments
+		if strings.TrimSpace(in.TranscriptArtifactCAS) == "" {
+			in.TranscriptArtifactCAS = transcriptCAS
+		}
 	}
 
 	if len(in.Segments) == 0 {
 		return nil, domain.ErrEmptyTranslationInput
 	}
 
-	// 2. Compute deterministic provenance hash
-	provenanceHash := s.computeProvenanceHash(in)
+	// 2. Resolve provider policy/capability/health/profile ordering before cache lookup.
+	// Provider/model/version are part of the canonical stage cache identity.
+	var routeRes *provider.RouteResult
+	if s.TranslateInvoke == nil {
+		if s.router == nil {
+			return nil, fmt.Errorf("provider router is not configured")
+		}
+		var err error
+		routeRes, err = s.router.Route(ctx, translationRouteRequest(in))
+		if err != nil {
+			return nil, fmt.Errorf("routing translation provider failed: %w", err)
+		}
+		if routeRes.SelectedProvider == nil {
+			return nil, fmt.Errorf("routing translation provider returned no selected provider")
+		}
 
-	// 3. Check idempotent cache in SQLite / CAS
-	if s.db != nil && s.cas != nil {
-		if cachedIdx, err := s.db.GetTranslationVariantByProvenance(ctx, provenanceHash); err == nil && cachedIdx != nil {
-			rc, err := s.cas.Get(cachedIdx.CASHash)
-			if err == nil {
-				defer rc.Close()
-				data, err := io.ReadAll(rc)
+		provenanceHash, err := s.computeProvenanceHash(in, routeRes.SelectedProvider)
+		if err != nil {
+			return nil, fmt.Errorf("compute translation cache identity: %w", err)
+		}
+
+		// 3. Check idempotent cache in SQLite / CAS for the currently selected
+		// provider/model/version identity. A changed provider or model version must
+		// not reuse an artifact produced by the previous model.
+		if s.db != nil && s.cas != nil {
+			if cachedIdx, err := s.db.GetTranslationVariantByProvenance(ctx, provenanceHash); err == nil && cachedIdx != nil {
+				rc, err := s.cas.Get(cachedIdx.CASHash)
 				if err == nil {
-					var cachedVariant domain.TranslationVariant
-					if err := json.Unmarshal(data, &cachedVariant); err == nil {
-						cachedVariant.CASHash = cachedIdx.CASHash
-						cachedVariant.ProvenanceHash = cachedIdx.ProvenanceHash
-						return &cachedVariant, nil
+					defer rc.Close()
+					data, err := io.ReadAll(rc)
+					if err == nil {
+						var cachedVariant domain.TranslationVariant
+						if err := json.Unmarshal(data, &cachedVariant); err == nil {
+							cachedVariant.CASHash = cachedIdx.CASHash
+							cachedVariant.ProvenanceHash = cachedIdx.ProvenanceHash
+							return &cachedVariant, nil
+						}
 					}
 				}
 			}
 		}
 	}
-	// 4. Provider routing & invocation with fallback
-	result, selectedProv, err := s.invokeTranslationWithFallback(ctx, in)
+
+	// 4. Provider invocation uses Router-owned retry/fallback semantics so
+	// ProviderAttempt and alternate SelectionDecision provenance stay complete.
+	result, selectedProv, err := s.invokeTranslationWithFallback(ctx, in, routeRes)
 	if err != nil {
 		return nil, fmt.Errorf("translation provider execution failed: %w", err)
+	}
+	provenanceHash, err := s.computeProvenanceHash(in, selectedProv)
+	if err != nil {
+		return nil, fmt.Errorf("compute selected translation cache identity: %w", err)
 	}
 
 	// 5. Meaning-First QA Gate: Validate facts, names, numbers, negation
@@ -156,6 +187,7 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 	// 6. Build immutable TranslationVariant
 	variant := &domain.TranslationVariant{
 		ID:             uuid.NewString(),
+		SchemaVersion:  domain.TranslationSchemaVersion,
 		AssetID:        in.AssetID,
 		RunID:          in.RunID,
 		JobID:          in.JobID,
@@ -222,25 +254,25 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 }
 
 // loadSegmentsFromTranscript loads SpeechBlocks from TranscriptArtifact in CAS/DB.
-func (s *TranslationService) loadSegmentsFromTranscript(ctx context.Context, assetID string) ([]domain.TranslationInputSegment, error) {
+func (s *TranslationService) loadSegmentsFromTranscript(ctx context.Context, assetID string) ([]domain.TranslationInputSegment, string, error) {
 	if s.db == nil || s.cas == nil {
-		return nil, fmt.Errorf("database and CAS required to load transcript")
+		return nil, "", fmt.Errorf("database and CAS required to load transcript")
 	}
 
 	idx, err := s.db.GetTranscriptArtifactIndex(ctx, assetID)
 	if err != nil {
-		return nil, fmt.Errorf("transcript artifact not found for asset %s: %w", assetID, err)
+		return nil, "", fmt.Errorf("transcript artifact not found for asset %s: %w", assetID, err)
 	}
 
 	rc, err := s.cas.Get(idx.CASHash)
 	if err != nil {
-		return nil, fmt.Errorf("read transcript artifact from CAS: %w", err)
+		return nil, "", fmt.Errorf("read transcript artifact from CAS: %w", err)
 	}
 	defer rc.Close()
 
 	var transcript domain.TranscriptArtifact
 	if err := json.NewDecoder(rc).Decode(&transcript); err != nil {
-		return nil, fmt.Errorf("decode transcript artifact: %w", err)
+		return nil, "", fmt.Errorf("decode transcript artifact: %w", err)
 	}
 
 	var segments []domain.TranslationInputSegment
@@ -258,24 +290,60 @@ func (s *TranslationService) loadSegmentsFromTranscript(ctx context.Context, ass
 		})
 	}
 
-	return segments, nil
+	return segments, idx.CASHash, nil
 }
 
 // computeProvenanceHash computes deterministic cache identity for translation.
-func (s *TranslationService) computeProvenanceHash(in domain.TranslationJobInput) string {
-	h := sha256.New()
-	h.Write([]byte("stage:translation\n"))
-	h.Write([]byte("asset_id:" + in.AssetID + "\n"))
-	h.Write([]byte("src_lang:" + in.SourceLanguage + "\n"))
-	h.Write([]byte("tgt_lang:" + in.TargetLanguage + "\n"))
-	for _, seg := range in.Segments {
-		h.Write([]byte(fmt.Sprintf("seg:%d:%s:%s:%d:%d\n", seg.Index, seg.SpeakerID, seg.SourceText, seg.StartMs, seg.EndMs)))
+func (s *TranslationService) computeProvenanceHash(in domain.TranslationJobInput, p provider.Provider) (string, error) {
+	if p == nil {
+		return "", fmt.Errorf("translation provider is required for cache identity")
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	inputHash, err := s.computeTranslationInputHash(in)
+	if err != nil {
+		return "", err
+	}
+	inputHashes := []string{inputHash}
+	if transcriptCAS := strings.TrimSpace(in.TranscriptArtifactCAS); transcriptCAS != "" {
+		inputHashes = append(inputHashes, transcriptCAS)
+	}
+	modelName, modelVersion := p.ModelInfo()
+	return cas.ComputeStageCacheKey(domain.StageCacheIdentityInput{
+		Stage:       string(provider.TypeTranslation),
+		InputHashes: inputHashes,
+		SemanticConfig: map[string]any{
+			"source_language":  in.SourceLanguage,
+			"meaning_contract": "facts_names_numbers_negation_v1",
+		},
+		ProviderID:    p.ID(),
+		ModelName:     modelName,
+		ModelVersion:  modelVersion,
+		Language:      in.TargetLanguage,
+		SchemaVersion: domain.TranslationSchemaVersion,
+	})
+}
+
+// computeTranslationInputHash hashes only content/semantic translation inputs.
+// RunID, JobID, paths, mtimes, execution profile and credential references are
+// deliberately excluded from the reusable stage identity.
+func (s *TranslationService) computeTranslationInputHash(in domain.TranslationJobInput) (string, error) {
+	payload := struct {
+		SourceLanguage string                           `json:"source_language"`
+		Segments       []domain.TranslationInputSegment `json:"segments"`
+	}{
+		SourceLanguage: strings.ToLower(strings.TrimSpace(in.SourceLanguage)),
+		Segments:       in.Segments,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal translation input identity: %w", err)
+	}
+	h := sha256.New()
+	_, _ = h.Write(data)
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // invokeTranslationWithFallback routes and executes translation attempts with policy-checked fallback.
-func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, in domain.TranslationJobInput) (*provider.TranslationResult, provider.Provider, error) {
+func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, in domain.TranslationJobInput, routeRes *provider.RouteResult) (*provider.TranslationResult, provider.Provider, error) {
 	if s.TranslateInvoke != nil {
 		// Custom hook installed (e.g. for unit tests)
 		var p provider.Provider = &provider.BaseFakeProvider{
@@ -294,63 +362,51 @@ func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, 
 		return nil, nil, fmt.Errorf("provider router is not configured")
 	}
 
-	routeReq := provider.RouteRequest{
+	routeReq := translationRouteRequest(in)
+	if routeRes == nil {
+		var err error
+		routeRes, err = s.router.Route(ctx, routeReq)
+		if err != nil {
+			return nil, nil, fmt.Errorf("routing translation provider failed: %w", err)
+		}
+	}
+
+	inputHash, err := s.computeTranslationInputHash(in)
+	if err != nil {
+		return nil, nil, fmt.Errorf("compute translation input hash: %w", err)
+	}
+
+	var result *provider.TranslationResult
+	var selected provider.Provider
+	err = s.router.ExecuteRoutedWithRetry(ctx, routeReq, routeRes, inputHash, 1, func(cand provider.Provider, _ int) error {
+		res, invokeErr := s.invokeProvider(ctx, cand, in)
+		if invokeErr != nil {
+			return invokeErr
+		}
+		if res == nil {
+			return fmt.Errorf("translation provider %s returned nil result", cand.ID())
+		}
+		result = res
+		selected = cand
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if result == nil || selected == nil {
+		return nil, nil, fmt.Errorf("translation execution completed without a selected provider result")
+	}
+	return result, selected, nil
+}
+
+func translationRouteRequest(in domain.TranslationJobInput) provider.RouteRequest {
+	return provider.RouteRequest{
 		RunID:                 in.RunID,
 		Stage:                 provider.TypeTranslation,
 		Language:              in.TargetLanguage,
 		ExecutionProfile:      in.ExecutionProfile,
 		AuthorizedCredentials: in.AuthorizedCredentials,
 	}
-
-	routeRes, err := s.router.Route(ctx, routeReq)
-	if err != nil {
-		return nil, nil, fmt.Errorf("routing translation provider failed: %w", err)
-	}
-
-	candidates := append([]provider.Provider{routeRes.SelectedProvider}, routeRes.FallbackOrdered...)
-	var lastErr error
-
-	for attemptNum, cand := range candidates {
-		attemptID := uuid.NewString()
-		startTime := time.Now().UTC()
-		res, err := s.invokeProvider(ctx, cand, in)
-		endTime := time.Now().UTC()
-		durationMs := endTime.Sub(startTime).Milliseconds()
-
-		mName, mVer := cand.ModelInfo()
-		attempt := domain.ProviderAttempt{
-			ID:            attemptID,
-			RunID:         in.RunID,
-			Stage:         string(provider.TypeTranslation),
-			ProviderID:    cand.ID(),
-			ModelName:     mName,
-			ModelVersion:  mVer,
-			InputHash:     s.computeProvenanceHash(in),
-			AttemptNumber: attemptNum + 1,
-			LatencyMs:     durationMs,
-			CreatedAt:     startTime,
-		}
-
-		if err == nil {
-			attempt.Status = "succeeded"
-			if s.db != nil {
-				if errDB := s.db.RecordProviderAttempt(ctx, attempt); errDB != nil {
-					return nil, nil, fmt.Errorf("record provider attempt: %w", errDB)
-				}
-			}
-			return res, cand, nil
-		}
-
-		lastErr = err
-		attempt.Status = "failed"
-		attempt.ErrorMessage = err.Error()
-		if s.db != nil {
-			if errDB := s.db.RecordProviderAttempt(ctx, attempt); errDB != nil {
-				return nil, nil, fmt.Errorf("record provider attempt: %w", errDB)
-			}
-		}
-	}
-	return nil, nil, fmt.Errorf("all candidate translation providers exhausted, last error: %w", lastErr)
 }
 
 // invokeProvider calls the provider's translation method.

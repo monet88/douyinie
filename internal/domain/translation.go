@@ -16,6 +16,8 @@ var (
 	ErrEmptyTranslationInput      = errors.New("empty translation input")
 )
 
+const TranslationSchemaVersion = 1
+
 // TranslationSegment represents a single translated unit (typically mapped 1:1 to a SpeechBlock or visual text region).
 type TranslationSegment struct {
 	Index            int      `json:"index"`
@@ -24,9 +26,9 @@ type TranslationSegment struct {
 	SpeakerID        string   `json:"speaker_id,omitempty"`
 	StartMs          int64    `json:"start_ms,omitempty"`
 	EndMs            int64    `json:"end_ms,omitempty"`
-	KeyFacts         []string `json:"key_facts,omitempty"`        // Extracted facts, entities, numbers
-	NegationPolarity bool     `json:"negation_polarity"`           // true if negative statement
-	QAConfidence     float64  `json:"qa_confidence"`              // Meaning preservation QA score (0.0 - 1.0)
+	KeyFacts         []string `json:"key_facts,omitempty"` // Extracted facts, entities, numbers
+	NegationPolarity bool     `json:"negation_polarity"`   // true if negative statement
+	QAConfidence     float64  `json:"qa_confidence"`       // Meaning preservation QA score (0.0 - 1.0)
 	PassedQAGate     bool     `json:"passed_qa_gate"`
 }
 
@@ -34,6 +36,7 @@ type TranslationSegment struct {
 // Consumed explicitly by downstream stages: T10 (visual text localization) and T13 (dubbing translation).
 type TranslationVariant struct {
 	ID             string               `json:"id"`
+	SchemaVersion  int                  `json:"schema_version"`
 	AssetID        string               `json:"asset_id"`
 	RunID          string               `json:"run_id"`
 	JobID          string               `json:"job_id,omitempty"`

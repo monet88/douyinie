@@ -120,16 +120,16 @@ func main() {
 	// 7. Start HTTP Server
 	addr := fmt.Sprintf("127.0.0.1:%d", *port)
 	srv := server.New(server.Config{
-		Addr:       addr,
-		DB:         db,
-		CASStore:   casStore,
-		Ingest:     ingestSvc,
-		Registry:   reg,
-		PolicySvc:  polSvc,
-		LicenseSvc: licSvc,
-		CredSvc:    credSvc,
-		Router:     router,
-		QueueSvc:   queueSvc,
+		Addr:           addr,
+		DB:             db,
+		CASStore:       casStore,
+		Ingest:         ingestSvc,
+		Registry:       reg,
+		PolicySvc:      polSvc,
+		LicenseSvc:     licSvc,
+		CredSvc:        credSvc,
+		Router:         router,
+		QueueSvc:       queueSvc,
 		SpeechSvc:      speechSvc,
 		TranslationSvc: translationSvc,
 	})

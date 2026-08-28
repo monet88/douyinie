@@ -3,6 +3,7 @@ package service
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -36,26 +37,79 @@ var (
 	asciiNameRegex = regexp.MustCompile(`\b[A-Za-z0-9_-]{2,}\b`)
 )
 
-// Chinese number characters to integer value.
-var zhNumMap = map[rune]int64{
-	'零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4,
-	'五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10,
-	'百': 100, '千': 1000, '万': 10000,
+var zhDigitMap = map[rune]int64{
+	'零': 0, '〇': 0, '一': 1, '二': 2, '两': 2, '兩': 2, '三': 3, '四': 4,
+	'五': 5, '六': 6, '七': 7, '八': 8, '九': 9,
 }
 
-// Words to numbers in Vietnamese. "không" is excluded because it is primarily a negation marker.
-var viNumMap = map[string]int64{
-	"một": 1, "mốt": 1, "hai": 2, "ba": 3, "bốn": 4, "tư": 4,
-	"năm": 5, "lăm": 5, "sáu": 6, "bảy": 7, "tám": 8, "chín": 9, "mười": 10,
-	"trăm": 100, "nghìn": 1000, "ngàn": 1000, "triệu": 1000000,
+var zhUnitMap = map[rune]int64{
+	'十': 10,
+	'百': 100,
+	'千': 1000,
+	'万': 10000,
+	'萬': 10000,
 }
 
-// Words to numbers in English.
-var enNumMap = map[string]int64{
-	"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-	"six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-	"eleven": 11, "twelve": 12, "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
-	"hundred": 100, "thousand": 1000, "million": 1000000,
+var viNumberDigits = map[string]int64{
+	"không": 0,
+	"một":   1,
+	"mốt":   1,
+	"hai":   2,
+	"ba":    3,
+	"bốn":   4,
+	"tư":    4,
+	"năm":   5,
+	"lăm":   5,
+	"sáu":   6,
+	"bảy":   7,
+	"tám":   8,
+	"chín":  9,
+}
+
+var viNumberUnits = map[string]int64{
+	"mười":  10,
+	"mươi":  10,
+	"trăm":  100,
+	"nghìn": 1000,
+	"ngàn":  1000,
+	"triệu": 1000000,
+}
+
+var enNumberValues = map[string]int64{
+	"zero":      0,
+	"one":       1,
+	"two":       2,
+	"three":     3,
+	"four":      4,
+	"five":      5,
+	"six":       6,
+	"seven":     7,
+	"eight":     8,
+	"nine":      9,
+	"ten":       10,
+	"eleven":    11,
+	"twelve":    12,
+	"thirteen":  13,
+	"fourteen":  14,
+	"fifteen":   15,
+	"sixteen":   16,
+	"seventeen": 17,
+	"eighteen":  18,
+	"nineteen":  19,
+	"twenty":    20,
+	"thirty":    30,
+	"forty":     40,
+	"fifty":     50,
+	"sixty":     60,
+	"seventy":   70,
+	"eighty":    80,
+	"ninety":    90,
+}
+
+var enNumberUnits = map[string]int64{
+	"hundred":  100,
+	"thousand": 1000,
+	"million":  1000000,
 }
 
 // Chinese negation markers.
@@ -99,6 +153,64 @@ var knownEntities = []EntityMapping{
 	{ZH: "上海", VI: "Thượng Hải", EN: "Shanghai"},
 }
 
+// SemanticFactAnchor is a conservative multilingual lexical anchor for facts
+// that can be validated deterministically without asking the translation
+// provider to self-attest to its own output. It is intentionally a cheap gate:
+// richer semantic reflection can add coverage later without weakening these
+// deterministic corruption checks.
+type SemanticFactAnchor struct {
+	Key   string
+	Value string
+	ZH    []string
+	VI    []string
+	EN    []string
+}
+
+var semanticFactAnchors = []SemanticFactAnchor{
+	{
+		Key:   "weather_quality",
+		Value: "good",
+		ZH:    []string{"天气很好", "天气非常好", "好天气"},
+		VI:    []string{"thời tiết rất tốt", "thời tiết tốt", "thời tiết đẹp"},
+		EN:    []string{"weather is very good", "weather is good", "good weather"},
+	},
+	{
+		Key:   "weather_quality",
+		Value: "bad",
+		ZH:    []string{"天气很差", "天气非常差", "天气不好"},
+		VI:    []string{"thời tiết rất tệ", "thời tiết tệ", "thời tiết xấu"},
+		EN:    []string{"weather is very bad", "weather is bad", "bad weather"},
+	},
+	{
+		Key:   "window_action",
+		Value: "open",
+		ZH:    []string{"打开窗户", "开窗"},
+		VI:    []string{"mở cửa sổ"},
+		EN:    []string{"open the window", "open window"},
+	},
+	{
+		Key:   "window_action",
+		Value: "close",
+		ZH:    []string{"关闭窗户", "关上窗户", "关窗"},
+		VI:    []string{"đóng cửa sổ"},
+		EN:    []string{"close the window", "shut the window", "close window"},
+	},
+	{
+		Key:   "color",
+		Value: "red",
+		ZH:    []string{"红色", "红的"},
+		VI:    []string{"màu đỏ"},
+		EN:    []string{"red"},
+	},
+	{
+		Key:   "color",
+		Value: "blue",
+		ZH:    []string{"蓝色", "藍色", "蓝的", "藍的"},
+		VI:    []string{"màu xanh dương", "màu xanh lam"},
+		EN:    []string{"blue"},
+	},
+}
+
 // ValidateSegment evaluates a single source/target translation pair.
 func (g *MeaningFirstQAGate) ValidateSegment(source, target, srcLang, tgtLang string) QAResult {
 	src := strings.TrimSpace(source)
@@ -121,11 +233,37 @@ func (g *MeaningFirstQAGate) ValidateSegment(source, target, srcLang, tgtLang st
 	var facts []string
 	var violations []string
 
-	// 2. Number Preservation Check
+	// 2. Semantic Fact Preservation Check
+	srcSemanticFacts := extractSemanticFacts(src, srcLang)
+	tgtSemanticFacts := extractSemanticFacts(tgt, tgtLang)
+	semanticKeys := sortedStringKeys(srcSemanticFacts)
+	for _, key := range semanticKeys {
+		srcValue := srcSemanticFacts[key]
+		facts = append(facts, "fact:"+key+"="+srcValue)
+		tgtValue, ok := tgtSemanticFacts[key]
+		if !ok {
+			violations = append(violations, fmt.Sprintf("fact '%s=%s' in source missing from target", key, srcValue))
+			continue
+		}
+		if tgtValue != srcValue {
+			violations = append(violations, fmt.Sprintf("fact '%s' changed from '%s' to '%s'", key, srcValue, tgtValue))
+		}
+	}
+	if len(violations) > 0 {
+		return QAResult{
+			Passed:         false,
+			Confidence:     0.2,
+			ExtractedFacts: facts,
+			Violations:     violations,
+			Err:            fmt.Errorf("%w: %s", domain.ErrFactCorrupted, strings.Join(violations, "; ")),
+		}
+	}
+
+	// 3. Number Preservation Check
 	srcNums := extractNumbers(src, srcLang)
 	tgtNums := extractNumbers(tgt, tgtLang)
 
-	for numStr := range srcNums {
+	for _, numStr := range sortedBoolKeys(srcNums) {
 		facts = append(facts, "num:"+numStr)
 		if !tgtNums[numStr] {
 			// Number in source is missing from target
@@ -134,7 +272,7 @@ func (g *MeaningFirstQAGate) ValidateSegment(source, target, srcLang, tgtLang st
 	}
 
 	// Check if target introduced extraneous contradictory numbers
-	for numStr := range tgtNums {
+	for _, numStr := range sortedBoolKeys(tgtNums) {
 		if !srcNums[numStr] && len(srcNums) > 0 {
 			violations = append(violations, fmt.Sprintf("target contains unexpected number '%s' not in source", numStr))
 		}
@@ -150,7 +288,7 @@ func (g *MeaningFirstQAGate) ValidateSegment(source, target, srcLang, tgtLang st
 		}
 	}
 
-	// 3. Negation Polarity Check
+	// 4. Negation Polarity Check
 	srcNeg := detectNegation(src, srcLang)
 	tgtNeg := detectNegation(tgt, tgtLang)
 
@@ -176,7 +314,7 @@ func (g *MeaningFirstQAGate) ValidateSegment(source, target, srcLang, tgtLang st
 		facts = append(facts, "polarity:affirmative")
 	}
 
-	// 4. Named Entities / Brand Preservation Check
+	// 5. Named Entities / Brand Preservation Check
 	for _, ent := range knownEntities {
 		if strings.Contains(src, ent.ZH) {
 			facts = append(facts, "entity:"+ent.ZH)
@@ -256,30 +394,301 @@ func extractNumbers(text, lang string) map[string]bool {
 	lower := strings.ToLower(text)
 	switch strings.ToLower(lang) {
 	case "zh", "zh-cn", "zh-tw":
-		for _, r := range text {
-			if val, ok := zhNumMap[r]; ok {
+		for _, token := range extractChineseNumberTokens(text) {
+			if val, ok := parseChineseNumberToken(token); ok {
 				res[strconv.FormatInt(val, 10)] = true
 			}
 		}
 	case "vi":
-		words := strings.Fields(lower)
-		for _, w := range words {
-			w = strings.Trim(w, ",.?!;:'\"()[]{}")
-			if val, ok := viNumMap[w]; ok {
-				res[strconv.FormatInt(val, 10)] = true
-			}
+		for _, val := range extractVietnameseNumberWords(lower) {
+			res[strconv.FormatInt(val, 10)] = true
 		}
 	case "en":
-		words := strings.Fields(lower)
-		for _, w := range words {
-			w = strings.Trim(w, ",.?!;:'\"()[]{}")
-			if val, ok := enNumMap[w]; ok {
-				res[strconv.FormatInt(val, 10)] = true
-			}
+		for _, val := range extractEnglishNumberWords(lower) {
+			res[strconv.FormatInt(val, 10)] = true
 		}
 	}
 
 	return res
+}
+
+func extractSemanticFacts(text, lang string) map[string]string {
+	res := make(map[string]string)
+	lower := strings.ToLower(text)
+	for _, anchor := range semanticFactAnchors {
+		var phrases []string
+		switch strings.ToLower(lang) {
+		case "zh", "zh-cn", "zh-tw":
+			phrases = anchor.ZH
+		case "vi":
+			phrases = anchor.VI
+		case "en":
+			phrases = anchor.EN
+		default:
+			continue
+		}
+
+		for _, phrase := range phrases {
+			if strings.Contains(lower, strings.ToLower(phrase)) {
+				res[anchor.Key] = anchor.Value
+				break
+			}
+		}
+	}
+	return res
+}
+
+func sortedStringKeys(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedBoolKeys(values map[string]bool) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func extractChineseNumberTokens(text string) []string {
+	var tokens []string
+	var current []rune
+	flush := func() {
+		if len(current) == 0 {
+			return
+		}
+		tokens = append(tokens, string(current))
+		current = current[:0]
+	}
+
+	for _, r := range text {
+		if isChineseNumberRune(r) {
+			current = append(current, r)
+			continue
+		}
+		flush()
+	}
+	flush()
+	return tokens
+}
+
+func isChineseNumberRune(r rune) bool {
+	if _, ok := zhDigitMap[r]; ok {
+		return true
+	}
+	_, ok := zhUnitMap[r]
+	return ok
+}
+
+func parseChineseNumberToken(token string) (int64, bool) {
+	if token == "" {
+		return 0, false
+	}
+
+	hasUnit := false
+	for _, r := range token {
+		if _, ok := zhDigitMap[r]; ok {
+			continue
+		}
+		if _, ok := zhUnitMap[r]; ok {
+			hasUnit = true
+			continue
+		}
+		return 0, false
+	}
+
+	if !hasUnit {
+		var value int64
+		for _, r := range token {
+			value = value*10 + zhDigitMap[r]
+		}
+		return value, true
+	}
+
+	var total int64
+	var section int64
+	var number int64
+	for _, r := range token {
+		if digit, ok := zhDigitMap[r]; ok {
+			number = digit
+			continue
+		}
+
+		unit := zhUnitMap[r]
+		if unit == 10000 {
+			section += number
+			if section == 0 {
+				section = 1
+			}
+			total += section * unit
+			section = 0
+			number = 0
+			continue
+		}
+
+		if number == 0 {
+			number = 1
+		}
+		section += number * unit
+		number = 0
+	}
+
+	return total + section + number, true
+}
+
+func tokenizeNumberWords(text string) []string {
+	replacer := strings.NewReplacer(
+		"-", " ",
+		",", " ",
+		".", " ",
+		"?", " ",
+		"!", " ",
+		";", " ",
+		":", " ",
+		"'", " ",
+		"\"", " ",
+		"(", " ",
+		")", " ",
+		"[", " ",
+		"]", " ",
+		"{", " ",
+		"}", " ",
+	)
+	return strings.Fields(replacer.Replace(strings.ToLower(text)))
+}
+
+func extractEnglishNumberWords(text string) []int64 {
+	words := tokenizeNumberWords(text)
+	var values []int64
+	for i := 0; i < len(words); {
+		value, consumed, ok := parseEnglishNumberAt(words, i)
+		if !ok {
+			i++
+			continue
+		}
+		values = append(values, value)
+		i += consumed
+	}
+	return values
+}
+
+func parseEnglishNumberAt(words []string, start int) (int64, int, bool) {
+	var total int64
+	var current int64
+	consumed := 0
+	for i := start; i < len(words); i++ {
+		word := words[i]
+		if value, ok := enNumberValues[word]; ok {
+			current += value
+			consumed++
+			continue
+		}
+
+		unit, ok := enNumberUnits[word]
+		if !ok {
+			break
+		}
+		consumed++
+		if unit == 100 {
+			if current == 0 {
+				current = 1
+			}
+			current *= unit
+			continue
+		}
+		if current == 0 {
+			current = 1
+		}
+		total += current * unit
+		current = 0
+	}
+	if consumed == 0 {
+		return 0, 0, false
+	}
+	return total + current, consumed, true
+}
+
+func extractVietnameseNumberWords(text string) []int64 {
+	words := tokenizeNumberWords(text)
+	var values []int64
+	for i := 0; i < len(words); {
+		value, consumed, ok := parseVietnameseNumberAt(words, i)
+		if !ok {
+			i++
+			continue
+		}
+		values = append(values, value)
+		i += consumed
+	}
+	return values
+}
+
+func parseVietnameseNumberAt(words []string, start int) (int64, int, bool) {
+	// "không" is primarily a negation marker in Vietnamese. Do not start a
+	// numeric sequence from it; it is accepted only as an internal zero/filler
+	// once another numeric word has established numeric context.
+	if start >= len(words) || words[start] == "không" || words[start] == "linh" || words[start] == "lẻ" {
+		return 0, 0, false
+	}
+
+	var total int64
+	var section int64
+	var number int64
+	consumed := 0
+	hasNumber := false
+
+	for i := start; i < len(words); i++ {
+		word := words[i]
+		if word == "linh" || word == "lẻ" {
+			if !hasNumber {
+				break
+			}
+			consumed++
+			continue
+		}
+		if digit, ok := viNumberDigits[word]; ok {
+			if word == "không" && !hasNumber {
+				break
+			}
+			number = digit
+			hasNumber = true
+			consumed++
+			continue
+		}
+
+		unit, ok := viNumberUnits[word]
+		if !ok {
+			break
+		}
+		hasNumber = true
+		consumed++
+		if unit >= 1000 {
+			section += number
+			if section == 0 {
+				section = 1
+			}
+			total += section * unit
+			section = 0
+			number = 0
+			continue
+		}
+		if number == 0 {
+			number = 1
+		}
+		section += number * unit
+		number = 0
+	}
+
+	if consumed == 0 || !hasNumber {
+		return 0, 0, false
+	}
+	return total + section + number, consumed, true
 }
 
 // detectNegation checks if the text contains negation markers.

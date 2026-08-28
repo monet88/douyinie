@@ -27,17 +27,17 @@ type Executor func(ctx context.Context, p provider.Provider, attemptNumber int) 
 
 // Server encapsulates the RuntimeHost HTTP daemon.
 type Server struct {
-	db         *storage.DB
-	casStore   *cas.Store
-	ingest     *service.IngestService
-	registry   *provider.Registry
-	policySvc  *governance.PolicyService
-	licenseSvc *governance.LicenseService
-	credSvc    *governance.CredentialService
-	router     *provider.Router
-	queueSvc   *queue.Service
-	scheduler  *scheduler.Scheduler
-	executor   Executor
+	db             *storage.DB
+	casStore       *cas.Store
+	ingest         *service.IngestService
+	registry       *provider.Registry
+	policySvc      *governance.PolicyService
+	licenseSvc     *governance.LicenseService
+	credSvc        *governance.CredentialService
+	router         *provider.Router
+	queueSvc       *queue.Service
+	scheduler      *scheduler.Scheduler
+	executor       Executor
 	speechSvc      *service.SpeechService
 	translationSvc *service.TranslationService
 	mux            *http.ServeMux
@@ -46,18 +46,18 @@ type Server struct {
 
 // Config specifies initialization options for RuntimeHost Server.
 type Config struct {
-	Addr       string
-	DB         *storage.DB
-	CASStore   *cas.Store
-	Ingest     *service.IngestService
-	Registry   *provider.Registry
-	PolicySvc  *governance.PolicyService
-	LicenseSvc *governance.LicenseService
-	CredSvc    *governance.CredentialService
-	Router     *provider.Router
-	QueueSvc   *queue.Service
-	Scheduler  *scheduler.Scheduler
-	Executor   Executor               // Injected execution seam for testing and custom worker dispatch
+	Addr           string
+	DB             *storage.DB
+	CASStore       *cas.Store
+	Ingest         *service.IngestService
+	Registry       *provider.Registry
+	PolicySvc      *governance.PolicyService
+	LicenseSvc     *governance.LicenseService
+	CredSvc        *governance.CredentialService
+	Router         *provider.Router
+	QueueSvc       *queue.Service
+	Scheduler      *scheduler.Scheduler
+	Executor       Executor                    // Injected execution seam for testing and custom worker dispatch
 	SpeechSvc      *service.SpeechService      // Speech understanding pipeline (T08)
 	TranslationSvc *service.TranslationService // Translation & Meaning-First Localization pipeline (T06)
 }
@@ -94,17 +94,17 @@ func New(cfg Config) *Server {
 	}
 
 	s := &Server{
-		db:         cfg.DB,
-		casStore:   cfg.CASStore,
-		ingest:     cfg.Ingest,
-		registry:   cfg.Registry,
-		policySvc:  cfg.PolicySvc,
-		licenseSvc: cfg.LicenseSvc,
-		credSvc:    cfg.CredSvc,
-		router:     cfg.Router,
-		queueSvc:   cfg.QueueSvc,
-		scheduler:  cfg.Scheduler,
-		executor:   cfg.Executor,
+		db:             cfg.DB,
+		casStore:       cfg.CASStore,
+		ingest:         cfg.Ingest,
+		registry:       cfg.Registry,
+		policySvc:      cfg.PolicySvc,
+		licenseSvc:     cfg.LicenseSvc,
+		credSvc:        cfg.CredSvc,
+		router:         cfg.Router,
+		queueSvc:       cfg.QueueSvc,
+		scheduler:      cfg.Scheduler,
+		executor:       cfg.Executor,
 		speechSvc:      cfg.SpeechSvc,
 		translationSvc: cfg.TranslationSvc,
 		mux:            http.NewServeMux(),
@@ -137,6 +137,7 @@ func (s *Server) SetSpeechService(svc *service.SpeechService) {
 		svc.ConfigureRouter(s.router)
 	}
 }
+
 // SetTranslationService sets or replaces the injected translation pipeline (T06).
 func (s *Server) SetTranslationService(svc *service.TranslationService) {
 	s.translationSvc = svc

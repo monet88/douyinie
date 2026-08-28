@@ -498,13 +498,38 @@ func (r *Router) ExecuteWithRetry(
 	if executeFn == nil {
 		return errors.New("execute function is required")
 	}
-	if maxRetries <= 0 {
-		maxRetries = 1
-	}
 
 	routeRes, err := r.Route(ctx, req)
 	if err != nil {
 		return err
+	}
+	return r.ExecuteRoutedWithRetry(ctx, req, routeRes, inputHash, maxRetries, executeFn)
+}
+
+// ExecuteRoutedWithRetry executes a previously resolved RouteResult without
+// routing a second time. This lets callers inspect the selected provider for a
+// provider-specific cache lookup while preserving the Router's retry,
+// circuit-breaker, policy re-evaluation, ProviderAttempt, and fallback
+// SelectionDecision semantics for actual execution.
+func (r *Router) ExecuteRoutedWithRetry(
+	ctx context.Context,
+	req RouteRequest,
+	routeRes *RouteResult,
+	inputHash string,
+	maxRetries int,
+	executeFn func(p Provider, attemptNumber int) error,
+) error {
+	if strings.TrimSpace(inputHash) == "" {
+		return errors.New("input_hash is required")
+	}
+	if executeFn == nil {
+		return errors.New("execute function is required")
+	}
+	if routeRes == nil {
+		return errors.New("route result is required")
+	}
+	if maxRetries <= 0 {
+		maxRetries = 1
 	}
 
 	if routeRes.SelectedProvider == nil {
