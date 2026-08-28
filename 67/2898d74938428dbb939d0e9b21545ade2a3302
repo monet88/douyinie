@@ -1,0 +1,21 @@
+internal/storage/sqlite.go
+  s_47f796c82f7084::t_c8a10482277b7c 681-725,2372-2494
+internal/server/server.go
+  s_47f796c82f7084::t_c8d20ffe404d05 231-235,650-758
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "672898d74938428dbb939d0e9b21545ade2a3302",
+  "prompts": {},
+  "sessions": {
+    "s_47f796c82f7084": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a03d96-e2d7-7182-b389-6829538ec82a",
+        "model": "deepseek-v4-flash-vision"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
