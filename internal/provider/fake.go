@@ -371,6 +371,11 @@ func (p *FakeSeparatorProvider) SeparateStems(ctx context.Context, req Separatio
 // FakeOCRProvider simulates OCR text extraction and TextRegionPlan generation.
 type FakeOCRProvider struct {
 	BaseFakeProvider
+	CustomDetections  []RawTextDetection
+	FrameWidth        int
+	FrameHeight       int
+	FrameSampleStepMs int64
+	InjectError       error
 }
 
 func NewFakeOCRProvider(id string) *FakeOCRProvider {
@@ -382,7 +387,7 @@ func NewFakeOCRProvider(id string) *FakeOCRProvider {
 			Healthy:      true,
 			Cap: domain.ProviderCapability{
 				Stage:          string(TypeOCR),
-				Languages:      []string{"zh", "en", "vi"},
+				Languages:      []string{"*"},
 				ExecutionTier:  "local",
 				CostPerUnit:    0.0,
 				QualityScore:   0.90,
@@ -392,7 +397,106 @@ func NewFakeOCRProvider(id string) *FakeOCRProvider {
 			ModelName:    "paddleocr",
 			ModelVersion: "v4",
 		},
+		FrameWidth:        1080,
+		FrameHeight:       1920,
+		FrameSampleStepMs: 500,
 	}
+}
+
+func (p *FakeOCRProvider) DetectRegions(ctx context.Context, req OCRRequest) (*OCRResult, error) {
+	if p.InjectError != nil {
+		return nil, p.InjectError
+	}
+
+	w := p.FrameWidth
+	if w <= 0 {
+		w = 1080
+	}
+	h := p.FrameHeight
+	if h <= 0 {
+		h = 1920
+	}
+	stepMs := p.FrameSampleStepMs
+	if stepMs <= 0 {
+		stepMs = 500
+	}
+
+	dets := p.CustomDetections
+	if dets == nil {
+		// Default multi-role synthetic scenario for deterministic Seam 1 testing
+		dets = []RawTextDetection{
+			// Frame 0: Watermark + Brand + Subtitle line 1 + UI Export button
+			{
+				FrameIndex:  0,
+				TimestampMs: 0,
+				Text:        "抖音号: douyin888",
+				Confidence:  0.95,
+				Box:         domain.BoundingBox{X: 850, Y: 100, Width: 180, Height: 35},
+			},
+			{
+				FrameIndex:  0,
+				TimestampMs: 0,
+				Text:        "SUPOR",
+				Confidence:  0.98,
+				Box:         domain.BoundingBox{X: 50, Y: 60, Width: 120, Height: 40},
+			},
+			{
+				FrameIndex:  0,
+				TimestampMs: 0,
+				Text:        "导出",
+				Confidence:  0.94,
+				Box:         domain.BoundingBox{X: 960, Y: 80, Width: 70, Height: 35},
+			},
+			{
+				FrameIndex:  0,
+				TimestampMs: 0,
+				Text:        "Chào mừng bạn đến với kênh nấu ăn",
+				Confidence:  0.92,
+				Box:         domain.BoundingBox{X: 180, Y: 1550, Width: 720, Height: 65},
+			},
+			// Frame 1: Subtitle line 1 continues (tracking test) + Semantic step 1 badge
+			{
+				FrameIndex:  1,
+				TimestampMs: 500,
+				Text:        "Chào mừng bạn đến với kênh nấu ăn",
+				Confidence:  0.93,
+				Box:         domain.BoundingBox{X: 180, Y: 1550, Width: 720, Height: 65},
+			},
+			{
+				FrameIndex:  1,
+				TimestampMs: 500,
+				Text:        "Bước 1: Chuẩn bị nguyên liệu",
+				Confidence:  0.90,
+				Box:         domain.BoundingBox{X: 120, Y: 350, Width: 450, Height: 55},
+			},
+			// Frame 2: Subtitle missing on frame 2 to test interpolation; appears back on frame 3
+			{
+				FrameIndex:  2,
+				TimestampMs: 1000,
+				Text:        "Bước 1: Chuẩn bị nguyên liệu",
+				Confidence:  0.91,
+				Box:         domain.BoundingBox{X: 120, Y: 350, Width: 450, Height: 55},
+			},
+			// Frame 3: Subtitle line 1 tracked again (gap at Frame 2 should be interpolated)
+			{
+				FrameIndex:  3,
+				TimestampMs: 1500,
+				Text:        "Chào mừng bạn đến với kênh nấu ăn",
+				Confidence:  0.92,
+				Box:         domain.BoundingBox{X: 180, Y: 1550, Width: 720, Height: 65},
+			},
+		}
+	}
+
+	return &OCRResult{
+		ProviderID:        p.ProviderID,
+		ModelName:         p.ModelName,
+		ModelVersion:      p.ModelVersion,
+		FrameWidth:        w,
+		FrameHeight:       h,
+		FrameSampleStepMs: stepMs,
+		Detections:        dets,
+	}, nil
 }
 
 // FakeTranslationProvider simulates translation service into VI / EN.

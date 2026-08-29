@@ -69,6 +69,7 @@ func main() {
 	translationSvc := service.NewTranslationService(db, casStore)
 	dubbingSvc := service.NewDubbingService(db, casStore)
 	audioMixSvc := service.NewAudioMixService(db, casStore)
+	visualTextSvc := service.NewVisualTextService(db, casStore)
 	recovered, err := queueSvc.Recover(context.Background())
 	if err != nil {
 		log.Fatalf("[RuntimeHost] crash recovery failed: %v", err)
@@ -136,6 +137,7 @@ func main() {
 		TranslationSvc: translationSvc,
 		DubbingSvc:     dubbingSvc,
 		AudioMixSvc:    audioMixSvc,
+		VisualTextSvc:  visualTextSvc,
 	})
 	go func() {
 		log.Printf("[RuntimeHost] API daemon listening on http://%s", addr)

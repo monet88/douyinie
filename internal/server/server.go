@@ -43,6 +43,7 @@ type Server struct {
 	translationSvc *service.TranslationService
 	dubbingSvc     *service.DubbingService
 	audioMixSvc    *service.AudioMixService
+	visualTextSvc  *service.VisualTextService
 	mux            *http.ServeMux
 	server         *http.Server
 }
@@ -65,6 +66,7 @@ type Config struct {
 	TranslationSvc *service.TranslationService // Translation & Meaning-First Localization pipeline (T06)
 	DubbingSvc     *service.DubbingService     // TTS & Measured-Duration Dubbing pipeline (T14)
 	AudioMixSvc    *service.AudioMixService    // Audio stems + soundtrack preservation + dialogue-suppression mix (T15)
+	VisualTextSvc  *service.VisualTextService  // OCR detection, tracking, and TextRegionPlan (T09)
 }
 
 // New creates a new RuntimeHost Server instance.
@@ -103,7 +105,9 @@ func New(cfg Config) *Server {
 	if cfg.AudioMixSvc != nil && cfg.Router != nil {
 		cfg.AudioMixSvc.ConfigureRouter(cfg.Router)
 	}
-
+	if cfg.VisualTextSvc != nil && cfg.Router != nil {
+		cfg.VisualTextSvc.ConfigureRouter(cfg.Router)
+	}
 	s := &Server{
 		db:             cfg.DB,
 		casStore:       cfg.CASStore,
@@ -120,6 +124,7 @@ func New(cfg Config) *Server {
 		translationSvc: cfg.TranslationSvc,
 		dubbingSvc:     cfg.DubbingSvc,
 		audioMixSvc:    cfg.AudioMixSvc,
+		visualTextSvc:  cfg.VisualTextSvc,
 		mux:            http.NewServeMux(),
 	}
 	s.routes()
@@ -169,6 +174,14 @@ func (s *Server) SetDubbingService(svc *service.DubbingService) {
 // SetAudioMixService sets or replaces the injected audio mix pipeline (T15).
 func (s *Server) SetAudioMixService(svc *service.AudioMixService) {
 	s.audioMixSvc = svc
+	if svc != nil && s.router != nil {
+		svc.ConfigureRouter(s.router)
+	}
+}
+
+// SetVisualTextService sets or replaces the injected visual text pipeline (T09).
+func (s *Server) SetVisualTextService(svc *service.VisualTextService) {
+	s.visualTextSvc = svc
 	if svc != nil && s.router != nil {
 		svc.ConfigureRouter(s.router)
 	}
@@ -275,6 +288,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/audio-stems", s.handleGetAudioStems)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/audio-mix", s.handleRunAudioMix)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/dub-mix", s.handleGetDubMix)
+	// Visual Text Detection, Classification & Tracking (T09: TextRegionPlan)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/detect-text", s.handleRunDetectText)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/text-region-plan", s.handleRunDetectText)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/text-region-plan", s.handleGetTextRegionPlan)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/text-regions", s.handleGetTextRegionPlan)
 }
 
 // JSON helpers
@@ -1947,4 +1965,82 @@ func (s *Server) handleGetDubMix(w http.ResponseWriter, r *http.Request) {
 	mix.CASHash = idx.CASHash
 	mix.ProvenanceHash = idx.ProvenanceHash
 	writeJSON(w, http.StatusOK, map[string]any{"dub_mix": mix})
+}
+
+func (s *Server) handleRunDetectText(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	asset, err := s.db.GetSourceAsset(r.Context(), assetID)
+	if err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) || errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.visualTextSvc == nil {
+		writeError(w, http.StatusInternalServerError, "visual text service is not configured")
+		return
+	}
+
+	var body struct {
+		RunID                 string                  `json:"run_id"`
+		JobID                 string                  `json:"job_id,omitempty"`
+		FrameSampleStepMs     int64                   `json:"frame_sample_step_ms,omitempty"`
+		MaxFrames             int                     `json:"max_frames,omitempty"`
+		ExecutionProfile      domain.ExecutionProfile `json:"execution_profile,omitempty"`
+		AuthorizedCredentials []string                `json:"authorized_credentials,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in := service.VisualTextDetectionInput{
+		RunID:                 body.RunID,
+		AssetID:               asset.ID,
+		JobID:                 body.JobID,
+		FrameSampleStepMs:     body.FrameSampleStepMs,
+		MaxFrames:             body.MaxFrames,
+		ExecutionProfile:      body.ExecutionProfile,
+		AuthorizedCredentials: body.AuthorizedCredentials,
+	}
+
+	plan, err := s.visualTextSvc.DetectAndTrackText(r.Context(), in)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"text_region_plan": plan})
+}
+
+func (s *Server) handleGetTextRegionPlan(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	idx, err := s.db.GetTextRegionPlanIndex(r.Context(), assetID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "text region plan not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	reader, err := s.casStore.Get(idx.CASHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load text region plan from cas: "+err.Error())
+		return
+	}
+	defer reader.Close()
+
+	var plan domain.TextRegionPlan
+	if err := json.NewDecoder(reader).Decode(&plan); err != nil {
+		writeError(w, http.StatusInternalServerError, "decode text region plan: "+err.Error())
+		return
+	}
+	plan.CASHash = idx.CASHash
+	plan.ProvenanceHash = idx.ProvenanceHash
+	writeJSON(w, http.StatusOK, map[string]any{"text_region_plan": plan})
 }

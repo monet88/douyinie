@@ -40,6 +40,7 @@ const (
 	stageWorkerFamilyDiarizer  = "diarizer"
 	stageWorkerFamilyTTS       = "tts"
 	stageWorkerFamilySeparator = "separator"
+	stageWorkerFamilyOCR       = "ocr"
 )
 
 // resolveStageWorkerBinary locates the StageWorker executable: explicit
@@ -324,6 +325,16 @@ func NewProductionSpeechRegistry(leaseManager ...*worker.GPULeaseManager) (*Regi
 	}
 	demucs.SetLeaseManager(mgr)
 	if err := reg.Register(demucs); err != nil {
+		return nil, err
+	}
+
+	// 7. OCR PP-OCRv6 baseline
+	ppocr, err := NewWorkerOCRProvider("ppocr_v6", "paddleocr-v6", "v6", 0.92)
+	if err != nil {
+		return nil, err
+	}
+	ppocr.SetLeaseManager(mgr)
+	if err := reg.Register(ppocr); err != nil {
 		return nil, err
 	}
 
@@ -758,5 +769,71 @@ func (p *WorkerSeparatorProvider) SeparateStems(ctx context.Context, req Separat
 		DurationMs:    durMs,
 		SampleRate:    art.SampleRate,
 		Channels:      art.Channels,
+	}, nil
+}
+
+// WorkerOCRProvider is a StageWorker-backed OCRRegionProvider.
+type WorkerOCRProvider struct {
+	workerProviderBase
+}
+
+func NewWorkerOCRProvider(id, modelName, modelVer string, qualityScore float64) (*WorkerOCRProvider, error) {
+	if id == "" || modelName == "" || modelVer == "" {
+		return nil, fmt.Errorf("worker ocr provider requires id, model_name and model_version")
+	}
+	if qualityScore <= 0 {
+		qualityScore = 0.92
+	}
+	return &WorkerOCRProvider{workerProviderBase{
+		id:        id,
+		modelName: modelName,
+		modelVer:  modelVer,
+		capability: domain.ProviderCapability{
+			Stage:          string(TypeOCR),
+			Languages:      []string{"*"},
+			ExecutionTier:  "local",
+			CostPerUnit:    0,
+			QualityScore:   qualityScore,
+			MaxConcurrency: 1,
+			Features:       []string{"region_classification", "fit_content_geometry"},
+		},
+	}}, nil
+}
+
+type ocrArtifact struct {
+	FrameWidth        int                `json:"frame_width"`
+	FrameHeight       int                `json:"frame_height"`
+	FrameSampleStepMs int64              `json:"frame_sample_step_ms"`
+	Detections        []RawTextDetection `json:"detections"`
+}
+
+func (p *WorkerOCRProvider) DetectRegions(ctx context.Context, req OCRRequest) (*OCRResult, error) {
+	bridge, err := newWorkerBridge(p.leaseManager)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrNoEligibleProvider, err)
+	}
+	cmd := newCommand("ocr", stageWorkerFamilyOCR, req.SourceVideo, p.modelName, p.modelVer)
+	cmd.Config["frame_sample_step_ms"] = req.FrameSampleStepMs
+	cmd.Config["max_frames"] = req.MaxFrames
+	cmd.OutputPath = filepath.Join(os.TempDir(), fmt.Sprintf("douyinie-ocr-%s.json", cmd.ID))
+	defer os.Remove(cmd.OutputPath)
+
+	data, err := bridge.run(ctx, cmd)
+	if err != nil {
+		return nil, err
+	}
+	var art ocrArtifact
+	if err := json.Unmarshal(data, &art); err != nil {
+		return nil, fmt.Errorf("%w: invalid ocr artifact JSON: %v", domain.ErrQualityRejected, err)
+	}
+
+	return &OCRResult{
+		ProviderID:        p.id,
+		ModelName:         p.modelName,
+		ModelVersion:      p.modelVer,
+		FrameWidth:        art.FrameWidth,
+		FrameHeight:       art.FrameHeight,
+		FrameSampleStepMs: art.FrameSampleStepMs,
+		Detections:        art.Detections,
 	}, nil
 }

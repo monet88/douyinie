@@ -841,6 +841,47 @@ func (s *DB) migrate(ctx context.Context) error {
 			return fmt.Errorf("commit migration v11: %w", err)
 		}
 	}
+
+	// 13. Schema migration v12 (TextRegionPlan artifacts - T09)
+	var countV12 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 12`).Scan(&countV12)
+	if err != nil {
+		return fmt.Errorf("check migration version 12: %w", err)
+	}
+
+	if countV12 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v12 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		schemaV12SQL := `
+		CREATE TABLE IF NOT EXISTS text_region_plans (
+			id TEXT PRIMARY KEY,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			provider_id TEXT NOT NULL,
+			model_name TEXT NOT NULL,
+			model_version TEXT NOT NULL,
+			cas_hash TEXT NOT NULL,
+			provenance_hash TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_text_region_plans_provenance ON text_region_plans(provenance_hash);
+		CREATE INDEX IF NOT EXISTS idx_text_region_plans_asset ON text_region_plans(asset_id);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (12, datetime('now'));
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaV12SQL); err != nil {
+			return fmt.Errorf("execute migration v12: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v12: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -3120,6 +3161,114 @@ func (s *DB) GetDubMixArtifactByProvenance(ctx context.Context, provenanceHash s
 	}
 	if refusalReason.Valid {
 		idx.RefusalReason = refusalReason.String
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// TextRegionPlanIndex captures the SQLite indexing metadata for a persisted TextRegionPlan.
+type TextRegionPlanIndex struct {
+	ID             string
+	AssetID        string
+	ProviderID     string
+	ModelName      string
+	ModelVersion   string
+	CASHash        string
+	ProvenanceHash string
+	CreatedAt      time.Time
+}
+
+// SaveTextRegionPlanIndex records the index row for a CAS-stored TextRegionPlan.
+func (s *DB) SaveTextRegionPlanIndex(ctx context.Context, idx TextRegionPlanIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO text_region_plans (
+			id, asset_id, provider_id, model_name, model_version, cas_hash, provenance_hash, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provenance_hash) DO UPDATE SET
+			cas_hash = excluded.cas_hash
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID,
+		idx.AssetID,
+		idx.ProviderID,
+		idx.ModelName,
+		idx.ModelVersion,
+		idx.CASHash,
+		idx.ProvenanceHash,
+		func() string {
+			if idx.CreatedAt.IsZero() {
+				return time.Now().UTC().Format(time.RFC3339Nano)
+			}
+			return idx.CreatedAt.Format(time.RFC3339Nano)
+		}(),
+	)
+	if err != nil {
+		return fmt.Errorf("save text_region_plans index: %w", err)
+	}
+	return nil
+}
+
+// GetTextRegionPlanIndex retrieves the latest index row for an asset.
+func (s *DB) GetTextRegionPlanIndex(ctx context.Context, assetID string) (*TextRegionPlanIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx TextRegionPlanIndex
+	var createdStr string
+	query := `SELECT id, asset_id, provider_id, model_name, model_version, cas_hash, provenance_hash, created_at
+		FROM text_region_plans WHERE asset_id = ?
+		ORDER BY created_at DESC, rowid DESC LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, assetID).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.ProviderID,
+		&idx.ModelName,
+		&idx.ModelVersion,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query text_region_plans index: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// GetTextRegionPlanByProvenance retrieves the index row by provenance hash.
+func (s *DB) GetTextRegionPlanByProvenance(ctx context.Context, provenanceHash string) (*TextRegionPlanIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx TextRegionPlanIndex
+	var createdStr string
+	query := `SELECT id, asset_id, provider_id, model_name, model_version, cas_hash, provenance_hash, created_at
+		FROM text_region_plans WHERE provenance_hash = ? LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, provenanceHash).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.ProviderID,
+		&idx.ModelName,
+		&idx.ModelVersion,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query text_region_plans by provenance: %w", err)
 	}
 	t, _ := time.Parse(time.RFC3339Nano, createdStr)
 	idx.CreatedAt = t

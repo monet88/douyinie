@@ -22,6 +22,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/worker"
 )
 
@@ -363,6 +364,8 @@ func dispatchStage(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 		return runTTSAdapter(ctx, cmd, enc)
 	case "separator":
 		return runSeparatorAdapter(ctx, cmd, enc)
+	case "ocr":
+		return runOCRAdapter(ctx, cmd, enc)
 	default:
 		// For unrecognized stages, fall back to the marker artifact placeholder.
 		return writeMarkerArtifact(cmd)
@@ -941,6 +944,119 @@ func runSeparatorAdapter(ctx context.Context, cmd worker.Command, enc *worker.En
 	}
 
 	return writeOutputArtifact(cmd, out)
+}
+
+func resolveOCRRunner() (commandRunner, error) {
+	if bin := os.Getenv("DOUYINIE_OCR_BIN"); bin != "" {
+		if path, err := exec.LookPath(bin); err == nil {
+			return commandRunner{binary: path}, nil
+		}
+		return commandRunner{}, worker.NewError("OCR_BINARY_NOT_FOUND",
+			fmt.Sprintf("DOUYINIE_OCR_BIN %q not found", bin), nil)
+	}
+
+	if script := os.Getenv("DOUYINIE_OCR_ADAPTER"); script != "" {
+		if _, err := os.Stat(script); err == nil {
+			pyBin := resolveOCRPythonBinary()
+			if pyBin != "" {
+				return commandRunner{binary: pyBin, args: []string{script}}, nil
+			}
+			return commandRunner{}, worker.NewError("OCR_BINARY_NOT_FOUND",
+				"python runtime not found to execute DOUYINIE_OCR_ADAPTER", nil)
+		}
+	}
+	// Repo-owned Python adapter cmd/stageworker/adapters/ocr.py
+	adapterPaths := []string{
+		filepath.Join("cmd", "stageworker", "adapters", "ocr.py"),
+		filepath.Join("adapters", "ocr.py"),
+		filepath.Join("..", "..", "cmd", "stageworker", "adapters", "ocr.py"),
+		filepath.Join("..", "cmd", "stageworker", "adapters", "ocr.py"),
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		adapterPaths = append(adapterPaths,
+			filepath.Join(exeDir, "adapters", "ocr.py"),
+			filepath.Join(exeDir, "..", "cmd", "stageworker", "adapters", "ocr.py"),
+			filepath.Join(exeDir, "..", "..", "cmd", "stageworker", "adapters", "ocr.py"),
+		)
+	}
+
+	for _, p := range adapterPaths {
+		if absP, err := filepath.Abs(p); err == nil {
+			if _, err := os.Stat(absP); err == nil {
+				pyBin := resolveOCRPythonBinary()
+				if pyBin != "" {
+					return commandRunner{binary: pyBin, args: []string{absP}}, nil
+				}
+			}
+		}
+	}
+	return commandRunner{}, worker.NewError("OCR_BINARY_NOT_FOUND",
+		"visual OCR adapter or binary not available: configure DOUYINIE_OCR_ADAPTER/DOUYINIE_OCR_BIN or install paddleocr/ppocr",
+		nil)
+}
+
+func runOCRAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder) (worker.ArtifactRef, error) {
+	if len(cmd.Inputs) == 0 {
+		return worker.ArtifactRef{}, worker.NewError("OCR_MISSING_INPUT",
+			"ocr command has no input media artifact",
+			map[string]any{"stage": "ocr", "command_id": cmd.ID})
+	}
+
+	modelName, _ := cmd.Config[cfgModelName].(string)
+	if modelName == "" {
+		modelName = "paddleocr-v6"
+	}
+	modelVersion, _ := cmd.Config[cfgModelVersion].(string)
+	if modelVersion == "" {
+		modelVersion = "v6"
+	}
+
+	runner, err := resolveOCRRunner()
+	if err != nil {
+		return worker.ArtifactRef{}, err
+	}
+
+	req := map[string]any{
+		"media_path":           cmd.Inputs[0].Path,
+		"run_id":               cmd.RunID,
+		"attempt_id":           cmd.AttemptID,
+		"frame_sample_step_ms": cmd.Config["frame_sample_step_ms"],
+		"max_frames":           cmd.Config["max_frames"],
+		cfgModelName:           modelName,
+		cfgModelVersion:        modelVersion,
+	}
+
+	var out struct {
+		FrameWidth        int                         `json:"frame_width"`
+		FrameHeight       int                         `json:"frame_height"`
+		FrameSampleStepMs int64                       `json:"frame_sample_step_ms"`
+		Detections        []provider.RawTextDetection `json:"detections"`
+		ModelName         string                      `json:"model_name"`
+		ModelVersion      string                      `json:"model_version"`
+	}
+
+	if err := invokeCommand(ctx, runner.binary, runner.args, req, &out); err != nil {
+		return worker.ArtifactRef{}, err
+	}
+
+	if out.ModelName == "" {
+		out.ModelName = modelName
+	}
+	if out.ModelVersion == "" {
+		out.ModelVersion = modelVersion
+	}
+
+	return writeOutputArtifact(cmd, out)
+}
+
+func resolveOCRPythonBinary() string {
+	if py := os.Getenv("DOUYINIE_OCR_PYTHON_BIN"); py != "" {
+		if path, err := exec.LookPath(py); err == nil {
+			return path
+		}
+	}
+	return resolvePythonBinary()
 }
 
 func resolvePythonBinary() string {
