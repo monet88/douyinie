@@ -1,0 +1,237 @@
+package domain
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"time"
+)
+
+var (
+	// ErrEngineHoppingForbidden is returned when different providers/engines are mixed across sentences for a single speaker.
+	ErrEngineHoppingForbidden = errors.New("engine hopping across sentences for a single speaker is strictly prohibited")
+	// ErrTTSDurationOverrun is returned when synthesized audio exceeds its immutable source window.
+	ErrTTSDurationOverrun = errors.New("tts synthesized duration overruns immutable source window")
+	// ErrOverlongCandidateNotSelectable is returned when an overlong measured candidate is rejected from selection.
+	ErrOverlongCandidateNotSelectable = errors.New("overlong measured candidate cannot be selected into final dub")
+	// ErrVoiceAssignmentFrozen is returned when attempting to mutate an already frozen VoiceAssignment.
+	ErrVoiceAssignmentFrozen = errors.New("voice assignment is frozen for this run")
+	// ErrNoEligibleTTSProvider is returned when no policy-eligible TTS provider is available.
+	ErrNoEligibleTTSProvider = errors.New("no eligible TTS provider found for voice assignment")
+	// ErrDubSegmentCollision is returned when adjacent dub segments would collide on the timeline.
+	ErrDubSegmentCollision = errors.New("adjacent speech collision detected between dub segments")
+	// ErrVoiceProfileNotFound is returned when a speaker has no assigned voice profile.
+	ErrVoiceProfileNotFound = errors.New("voice profile not found for speaker")
+	// ErrDubScriptRequiredForDubbing is returned when DubScriptVariant is missing.
+	ErrDubScriptRequiredForDubbing = errors.New("dub script variant required before TTS synthesis")
+	// ErrVoiceAssignmentRequired is returned when VoiceAssignment is missing.
+	ErrVoiceAssignmentRequired = errors.New("voice assignment required before TTS synthesis")
+	// ErrVoiceAssignmentNotFound is returned when VoiceAssignment is not found in storage.
+	ErrVoiceAssignmentNotFound = errors.New("voice assignment not found")
+	// ErrDubSegmentsVariantNotFound is returned when DubSegmentsVariant is not found in storage.
+	ErrDubSegmentsVariantNotFound = errors.New("dub segments variant not found")
+)
+
+const (
+	VoiceAssignmentSchemaVersion = 1
+	DubSegmentsSchemaVersion     = 1
+)
+
+// VoiceProfile represents a preset or cloned voice configuration.
+type VoiceProfile struct {
+	ID                string  `json:"id"`                            // Unique profile identifier (e.g. "vieneu_vi_female_1")
+	ProviderID        string  `json:"provider_id"`                   // Provider owning this voice (e.g. "vieneu_tts_vi", "cosyvoice3_tts")
+	VoiceID           string  `json:"voice_id"`                      // Engine internal voice identifier
+	Name              string  `json:"name"`                          // Human-readable display name
+	Language          string  `json:"language"`                      // "vi", "en", "zh"
+	Gender            string  `json:"gender,omitempty"`              // "female", "male", "neutral"
+	Pitch             float64 `json:"pitch,omitempty"`               // Pitch adjustment multiplier (1.0 default)
+	Speed             float64 `json:"speed,omitempty"`               // Base speaking speed multiplier (1.0 default)
+	Timbre            string  `json:"timbre,omitempty"`              // Timbre description (e.g. "warm", "crisp")
+	IsClone           bool    `json:"is_clone,omitempty"`            // True if source-cloned voice
+	ReferenceAudioCAS string  `json:"reference_audio_cas,omitempty"` // CAS hash of reference audio if cloned
+}
+
+// VoiceAssignment is the frozen, run-scoped mapping of speaker_id -> VoiceProfile.
+// Engine hopping across sentences for a single speaker is strictly prohibited.
+type VoiceAssignment struct {
+	ID                 string                  `json:"id"`
+	SchemaVersion      int                     `json:"schema_version"`
+	AssetID            string                  `json:"asset_id"`
+	RunID              string                  `json:"run_id"`
+	JobID              string                  `json:"job_id,omitempty"`
+	TargetLanguage     string                  `json:"target_language"` // "vi" or "en"
+	Assignments        map[string]VoiceProfile `json:"assignments"`     // speaker_id -> VoiceProfile
+	UseSameVoiceForAll bool                    `json:"use_same_voice_for_all"`
+	CASHash            string                  `json:"cas_hash,omitempty"`
+	ProvenanceHash     string                  `json:"provenance_hash,omitempty"`
+	FrozenAt           time.Time               `json:"frozen_at"`
+	CreatedAt          time.Time               `json:"created_at"`
+}
+
+// FitAction represents the outcome of evaluating a candidate synthesized media against the immutable source window.
+type FitAction string
+
+const (
+	FitActionAccept  FitAction = "ACCEPT"
+	FitActionResynth FitAction = "RESYNTH"
+	FitActionRewrite FitAction = "REWRITE"
+	FitActionRegroup FitAction = "REGROUP"
+	FitActionReview  FitAction = "REVIEW"
+)
+
+// DubbingFitPlan captures the cadence and duration fit analysis for one segment.
+type DubbingFitPlan struct {
+	SegmentIndex       int       `json:"segment_index"`
+	SpeakerID          string    `json:"speaker_id"`
+	SlotDurationMs     int64     `json:"slot_duration_ms"`
+	UsableSlotMs       int64     `json:"usable_slot_ms"`
+	MeasuredDurationMs int64     `json:"measured_duration_ms"`
+	DurationDeltaMs    int64     `json:"duration_delta_ms"` // MeasuredDurationMs - UsableSlotMs (>0 means overrun)
+	SpeedFactor        float64   `json:"speed_factor"`      // Speed adjustment multiplier applied
+	NaturalGapMs       int64     `json:"natural_gap_ms"`    // Inter-turn silence preserved
+	Decision           FitAction `json:"decision"`          // ACCEPT | RESYNTH | REWRITE | REGROUP | REVIEW
+	DecisionReason     string    `json:"decision_reason,omitempty"`
+	AttemptCount       int       `json:"attempt_count"`
+}
+
+// TTSCandidate represents a synthesized candidate waveform.
+type TTSCandidate struct {
+	CandidateID         string       `json:"candidate_id"`
+	SegmentIndex        int          `json:"segment_index"`
+	SpeakerID           string       `json:"speaker_id"`
+	Text                string       `json:"text"`
+	Voice               VoiceProfile `json:"voice"`
+	AudioCASPath        string       `json:"audio_cas_path"`
+	AudioSHA256         string       `json:"audio_sha256"`
+	PredictedDurationMs int64        `json:"predicted_duration_ms"`
+	MeasuredDurationMs  int64        `json:"measured_duration_ms"`
+	SpeedFactor         float64      `json:"speed_factor"`
+	AttemptNumber       int          `json:"attempt_number"`
+	ProbedAt            time.Time    `json:"probed_at"`
+}
+
+// DubSegment is the selected audio candidate for a speech segment.
+// It covers 1..N same-speaker SpeechBlocks and is strictly fit-gated (zero overrun).
+type DubSegment struct {
+	Index              int          `json:"index"`
+	SpeechBlockIndices []int        `json:"speech_block_indices,omitempty"`
+	SpeakerID          string       `json:"speaker_id"`
+	StartMs            int64        `json:"start_ms"`         // Immutable source window start
+	EndMs              int64        `json:"end_ms"`           // Immutable source window end
+	SlotDurationMs     int64        `json:"slot_duration_ms"` // EndMs - StartMs
+	SourceText         string       `json:"source_text"`
+	SpokenText         string       `json:"spoken_text"` // Synthesized target text
+	AudioCASPath       string       `json:"audio_cas_path"`
+	AudioSHA256        string       `json:"audio_sha256"`
+	MeasuredDurationMs int64        `json:"measured_duration_ms"` // Probed true duration
+	Voice              VoiceProfile `json:"voice"`
+	FitDecision        FitAction    `json:"fit_decision"`
+	ReviewReason       string       `json:"review_reason,omitempty"`
+	RequiresReview     bool         `json:"requires_review,omitempty"`
+	NaturalGapAfterMs  int64        `json:"natural_gap_after_ms"`
+}
+
+// DubSegmentReview records an unselected candidate or segment flagged for operator review.
+type DubSegmentReview struct {
+	Index              int          `json:"index"`
+	SpeakerID          string       `json:"speaker_id"`
+	StartMs            int64        `json:"start_ms"`
+	EndMs              int64        `json:"end_ms"`
+	SlotDurationMs     int64        `json:"slot_duration_ms"`
+	SourceText         string       `json:"source_text"`
+	SpokenText         string       `json:"spoken_text"`
+	AudioCASPath       string       `json:"audio_cas_path"`
+	AudioSHA256        string       `json:"audio_sha256"`
+	MeasuredDurationMs int64        `json:"measured_duration_ms"`
+	Voice              VoiceProfile `json:"voice"`
+	FitDecision        FitAction    `json:"fit_decision"`
+	ReviewReason       string       `json:"review_reason"`
+	AttemptCount       int          `json:"attempt_count"`
+}
+
+// DubSegmentsVariant is the immutable target-language dubbing artifact containing all selected DubSegments.
+type DubSegmentsVariant struct {
+	ID                  string             `json:"id"`
+	SchemaVersion       int                `json:"schema_version"`
+	AssetID             string             `json:"asset_id"`
+	RunID               string             `json:"run_id"`
+	JobID               string             `json:"job_id,omitempty"`
+	TargetLanguage      string             `json:"target_language"` // "vi" or "en"
+	DubScriptVariantCAS string             `json:"dub_script_variant_cas,omitempty"`
+	VoiceAssignmentCAS  string             `json:"voice_assignment_cas,omitempty"`
+	Segments            []DubSegment       `json:"segments"`                  // Strictly ACCEPTED fit-gated segments (mixer inputs)
+	ReviewSegments      []DubSegmentReview `json:"review_segments,omitempty"` // Flagged unselected candidates requiring review
+	FitPlans            []DubbingFitPlan   `json:"fit_plans,omitempty"`
+	CASHash             string             `json:"cas_hash,omitempty"`
+	ProvenanceHash      string             `json:"provenance_hash,omitempty"`
+	OverallStatus       string             `json:"overall_status"` // "PASS", "REVIEW_REQUIRED", "FAIL"
+	CreatedAt           time.Time          `json:"created_at"`
+}
+
+// VoiceAssignmentInput defines input parameters for generating/freezing a VoiceAssignment.
+type VoiceAssignmentInput struct {
+	RunID              string                  `json:"run_id"`
+	AssetID            string                  `json:"asset_id"`
+	JobID              string                  `json:"job_id,omitempty"`
+	TargetLanguage     string                  `json:"target_language"` // "vi" or "en"
+	CustomAssignments  map[string]VoiceProfile `json:"custom_assignments,omitempty"`
+	UseSameVoiceForAll bool                    `json:"use_same_voice_for_all"`
+	ExecutionProfile   ExecutionProfile        `json:"execution_profile,omitempty"`
+}
+
+// VoiceAuditionInput defines input parameters for pre-dub voice audition.
+type VoiceAuditionInput struct {
+	RunID          string       `json:"run_id"`
+	AssetID        string       `json:"asset_id"`
+	TargetLanguage string       `json:"target_language"` // "vi" or "en"
+	Voice          VoiceProfile `json:"voice"`
+	SampleText     string       `json:"sample_text,omitempty"`
+	IsContextual   bool         `json:"is_contextual"` // True for 10s contextual audition mixed with BGM
+	SegmentIndex   int          `json:"segment_index,omitempty"`
+}
+
+// VoiceAuditionResult represents the result of a voice audition probe.
+type VoiceAuditionResult struct {
+	Voice              VoiceProfile `json:"voice"`
+	AudioCASHash       string       `json:"audio_cas_hash"`
+	AudioCASPath       string       `json:"audio_cas_path"`
+	MeasuredDurationMs int64        `json:"measured_duration_ms"`
+	IsContextual       bool         `json:"is_contextual"`
+	SampleText         string       `json:"sample_text"`
+}
+
+// DubbingJobInput defines the inputs required to run the TTS synthesis & fit controller pipeline.
+type DubbingJobInput struct {
+	RunID                 string           `json:"run_id"`
+	AssetID               string           `json:"asset_id"`
+	JobID                 string           `json:"job_id,omitempty"`
+	TargetLanguage        string           `json:"target_language"` // "vi" or "en"
+	DubScriptVariantCAS   string           `json:"dub_script_variant_cas,omitempty"`
+	VoiceAssignmentCAS    string           `json:"voice_assignment_cas,omitempty"`
+	ExecutionProfile      ExecutionProfile `json:"execution_profile,omitempty"`
+	AuthorizedCredentials []string         `json:"authorized_credentials,omitempty"`
+}
+
+// ComputeVoiceAssignmentInputHash creates a deterministic hash for VoiceAssignment input.
+func ComputeVoiceAssignmentInputHash(assetID, targetLang string, assignments map[string]VoiceProfile, sameVoice bool) (string, error) {
+	payload := struct {
+		AssetID        string                  `json:"asset_id"`
+		TargetLanguage string                  `json:"target_language"`
+		Assignments    map[string]VoiceProfile `json:"assignments"`
+		SameVoice      bool                    `json:"same_voice"`
+	}{
+		AssetID:        assetID,
+		TargetLanguage: targetLang,
+		Assignments:    assignments,
+		SameVoice:      sameVoice,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	_, _ = h.Write(data)
+	return hex.EncodeToString(h.Sum(nil)), nil
+}

@@ -10,14 +10,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/google/uuid"
-	"github.com/monet88/douyinie/internal/domain"
-	"github.com/monet88/douyinie/internal/worker"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/media"
+	"github.com/monet88/douyinie/internal/worker"
 )
 
 // StageWorker env/config keys (Finding 2: manifest/config-driven identity).
@@ -35,6 +37,7 @@ const (
 	stageWorkerFamilyASR      = "asr"
 	stageWorkerFamilyAligner  = "aligner"
 	stageWorkerFamilyDiarizer = "diarizer"
+	stageWorkerFamilyTTS      = "tts"
 )
 
 // resolveStageWorkerBinary locates the StageWorker executable: explicit
@@ -258,6 +261,47 @@ func NewProductionSpeechRegistry(leaseManager ...*worker.GPULeaseManager) (*Regi
 	}
 	diarizer.SetLeaseManager(mgr)
 	if err := reg.Register(diarizer); err != nil {
+		return nil, err
+	}
+
+	// Production TTS worker adapters per policy & benchmark #21
+	// 1. VieNeu VI baseline
+	vieneu, err := NewWorkerTTSProvider("vieneu_tts_vi", "vieneu-tts", "1.0.0", []string{"vi"}, 0.95)
+	if err != nil {
+		return nil, err
+	}
+	vieneu.SetLeaseManager(mgr)
+	if err := reg.Register(vieneu); err != nil {
+		return nil, err
+	}
+
+	// 2. CosyVoice3 measured-duration speed-fit lane
+	cosyvoice, err := NewWorkerTTSProvider("cosyvoice3_tts", "cosyvoice3", "3.0.0", []string{"vi", "en"}, 0.98, "measured_duration_speed_fit")
+	if err != nil {
+		return nil, err
+	}
+	cosyvoice.SetLeaseManager(mgr)
+	if err := reg.Register(cosyvoice); err != nil {
+		return nil, err
+	}
+
+	// 3. Kokoro EN baseline
+	kokoro, err := NewWorkerTTSProvider("kokoro_tts_en", "kokoro-tts", "1.0.0", []string{"en"}, 0.95)
+	if err != nil {
+		return nil, err
+	}
+	kokoro.SetLeaseManager(mgr)
+	if err := reg.Register(kokoro); err != nil {
+		return nil, err
+	}
+
+	// 4. Chatterbox clone fallback (lower-VRAM clone fallback)
+	chatterbox, err := NewWorkerTTSProvider("chatterbox_tts", "chatterbox-tts", "1.0.0", []string{"vi", "en"}, 0.85)
+	if err != nil {
+		return nil, err
+	}
+	chatterbox.SetLeaseManager(mgr)
+	if err := reg.Register(chatterbox); err != nil {
 		return nil, err
 	}
 
@@ -485,4 +529,120 @@ func (p *WorkerDiarizationProvider) ProduceDiarization(ctx context.Context, audi
 		return nil, fmt.Errorf("%w: invalid diarizer artifact JSON: %v", domain.ErrQualityRejected, err)
 	}
 	return art.SpeakerAssignments, nil
+}
+
+// ---------------------------------------------------------------------------
+// TTS adapter
+// ---------------------------------------------------------------------------
+
+// WorkerTTSProvider executes text-to-speech synthesis through the tts StageWorker stage.
+type WorkerTTSProvider struct {
+	workerProviderBase
+	customVoices []domain.VoiceProfile
+}
+
+var _ interface {
+	Provider
+	TTSProvider
+} = (*WorkerTTSProvider)(nil)
+
+// NewWorkerTTSProvider builds a worker-backed TTS provider adapter.
+func NewWorkerTTSProvider(id, modelName, modelVersion string, languages []string, qualityScore float64, features ...string) (*WorkerTTSProvider, error) {
+	if id == "" || modelName == "" || modelVersion == "" {
+		return nil, fmt.Errorf("worker tts provider requires id, model_name and model_version")
+	}
+	if len(languages) == 0 {
+		languages = []string{"vi", "en"}
+	}
+	if qualityScore <= 0 {
+		qualityScore = 0.9
+	}
+	feats := []string{"measured_duration_fit", "streaming"}
+	if len(features) > 0 {
+		feats = append(feats, features...)
+	}
+	return &WorkerTTSProvider{
+		workerProviderBase: workerProviderBase{
+			id:        id,
+			modelName: modelName,
+			modelVer:  modelVersion,
+			capability: domain.ProviderCapability{
+				Stage:          "tts",
+				Languages:      languages,
+				ExecutionTier:  "local",
+				CostPerUnit:    0,
+				QualityScore:   qualityScore,
+				MaxConcurrency: 1,
+				Features:       feats,
+			},
+		},
+	}, nil
+}
+
+// VoiceCatalog implements TTSProvider.
+func (p *WorkerTTSProvider) VoiceCatalog() []domain.VoiceProfile {
+	if len(p.customVoices) > 0 {
+		return p.customVoices
+	}
+	var voices []domain.VoiceProfile
+	for _, l := range p.capability.Languages {
+		voices = append(voices, DefaultPresetVoices(l)...)
+	}
+	return voices
+}
+
+type ttsArtifact struct {
+	AudioData           []byte `json:"audio_data"`
+	AudioPath           string `json:"audio_path"`
+	AudioSHA256         string `json:"audio_sha256"`
+	MeasuredDurationMs  int64  `json:"measured_duration_ms"`
+	PredictedDurationMs int64  `json:"predicted_duration_ms"`
+}
+
+func (p *WorkerTTSProvider) SynthesizeSpeech(ctx context.Context, req TTSSynthesisRequest) (*TTSSynthesisResult, error) {
+	bridge, err := newWorkerBridge(p.leaseManager)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrNoEligibleProvider, err)
+	}
+	cmd := newCommand("tts", stageWorkerFamilyTTS, worker.ArtifactRef{SHA256: req.AssetID}, p.modelName, p.modelVer)
+	cmd.Config["text"] = req.Text
+	cmd.Config["language"] = req.Language
+	cmd.Config["voice_id"] = req.Voice.VoiceID
+	cmd.Config["speed"] = fmt.Sprintf("%.2f", req.Speed)
+	cmd.Config["slot_duration_ms"] = fmt.Sprintf("%d", req.SlotDurationMs)
+	cmd.OutputPath = filepath.Join(os.TempDir(), fmt.Sprintf("douyinie-tts-%s.json", cmd.ID))
+	defer os.Remove(cmd.OutputPath)
+
+	data, err := bridge.run(ctx, cmd)
+	if err != nil {
+		return nil, err
+	}
+	var art ttsArtifact
+	if err := json.Unmarshal(data, &art); err != nil {
+		return nil, fmt.Errorf("%w: invalid TTS artifact JSON: %v", domain.ErrQualityRejected, err)
+	}
+
+	audioBytes := art.AudioData
+	if len(audioBytes) == 0 && art.AudioPath != "" {
+		audioBytes, _ = os.ReadFile(art.AudioPath)
+	}
+
+	durMs := art.MeasuredDurationMs
+	if durMs <= 0 && len(audioBytes) > 0 {
+		durMs, _ = media.ProbeWAVBytes(audioBytes)
+	}
+
+	return &TTSSynthesisResult{
+		AudioData:           audioBytes,
+		AudioSHA256:         art.AudioSHA256,
+		AudioCASPath:        art.AudioPath,
+		SampleRate:          16000,
+		Channels:            1,
+		Format:              "wav",
+		ProviderID:          p.id,
+		ModelName:           p.modelName,
+		ModelVersion:        p.modelVer,
+		PredictedDurationMs: art.PredictedDurationMs,
+		MeasuredDurationMs:  durMs,
+	}, nil
 }

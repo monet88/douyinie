@@ -359,6 +359,8 @@ func dispatchStage(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 		return runDiarizerAdapter(ctx, cmd, enc)
 	case "diarize_evidence":
 		return runDiarizerEvidenceAdapter(ctx, cmd, enc)
+	case "tts":
+		return runTTSAdapter(ctx, cmd, enc)
 	default:
 		// For unrecognized stages, fall back to the marker artifact placeholder.
 		return writeMarkerArtifact(cmd)
@@ -477,9 +479,73 @@ func runAlignerAdapter(ctx context.Context, cmd worker.Command, enc *worker.Enco
 	return writeOutputArtifact(cmd, out)
 }
 
-// invokeCommand executes the model binary or script with args, passing a stdin
-// JSON request and decoding the stdout JSON response into out. Non-zero exit,
-// decode failure, or a structured error response all fail closed.
+// runTTSAdapter runs the worker-backed TTS adapter (VieNeu, CosyVoice3, Kokoro, Chatterbox).
+// Missing text, missing model identity, runner absence, or execution failures fail closed.
+func runTTSAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder) (worker.ArtifactRef, error) {
+	text, _ := cmd.Config["text"].(string)
+	if strings.TrimSpace(text) == "" {
+		return worker.ArtifactRef{}, worker.NewError("TTS_MISSING_TEXT",
+			"tts command has no text in config",
+			map[string]any{"stage": "tts", "command_id": cmd.ID})
+	}
+	modelName, err := requireConfigString(cmd.Config, cfgModelName)
+	if err != nil {
+		return worker.ArtifactRef{}, worker.NewError("TTS_MISSING_MODEL_IDENTITY",
+			"tts command is missing required config 'model_name' (manifest/model registry driven)",
+			map[string]any{"stage": "tts", "command_id": cmd.ID})
+	}
+	modelVersion, _ := cmd.Config[cfgModelVersion].(string)
+	lang, _ := cmd.Config["language"].(string)
+	voiceID, _ := cmd.Config["voice_id"].(string)
+	speed, _ := cmd.Config["speed"].(string)
+	slotDur, _ := cmd.Config["slot_duration_ms"].(string)
+
+	runner, err := resolveTTSRunner()
+	if err != nil {
+		return worker.ArtifactRef{}, err
+	}
+
+	req := map[string]any{
+		"text":             text,
+		"language":         lang,
+		"voice_id":         voiceID,
+		"speed":            speed,
+		"slot_duration_ms": slotDur,
+		"run_id":           cmd.RunID,
+		"attempt_id":       cmd.AttemptID,
+		cfgModelName:       modelName,
+		cfgModelVersion:    modelVersion,
+	}
+
+	var out struct {
+		AudioData           []byte `json:"audio_data"`
+		AudioPath           string `json:"audio_path"`
+		AudioSHA256         string `json:"audio_sha256"`
+		MeasuredDurationMs  int64  `json:"measured_duration_ms"`
+		PredictedDurationMs int64  `json:"predicted_duration_ms"`
+		ModelName           string `json:"model_name"`
+		ModelVersion        string `json:"model_version"`
+	}
+
+	if err := invokeCommand(ctx, runner.binary, runner.args, req, &out); err != nil {
+		return worker.ArtifactRef{}, err
+	}
+
+	if out.ModelName == "" {
+		out.ModelName = modelName
+	}
+	if out.ModelVersion == "" {
+		out.ModelVersion = modelVersion
+	}
+
+	if len(out.AudioData) == 0 && out.AudioPath == "" {
+		return worker.ArtifactRef{}, worker.NewError("TTS_NO_AUDIO",
+			"TTS synthesis produced no audio data",
+			map[string]any{"stage": "tts", "command_id": cmd.ID})
+	}
+
+	return writeOutputArtifact(cmd, out)
+}
 func invokeCommand(ctx context.Context, binary string, args []string, req any, out any) error {
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -490,31 +556,34 @@ func invokeCommand(ctx context.Context, binary string, args []string, req any, o
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	target := strings.ToLower(binary)
+	stageTarget := strings.ToLower(filepath.Base(binary))
 	if len(args) > 0 {
-		target += " " + strings.ToLower(strings.Join(args, " "))
+		stageTarget = strings.ToLower(filepath.Base(args[0]))
 	}
-	base := strings.ToLower(filepath.Base(binary))
 
 	if err := cmd.Run(); err != nil {
 		code := "EXEC_FAILED"
-		if strings.Contains(target, "asr") || strings.Contains(base, "asr") {
-			code = "ASR_EXEC_FAILED"
-		} else if strings.Contains(target, "align") || strings.Contains(base, "align") {
+		if strings.Contains(stageTarget, "tts") || strings.Contains(stageTarget, "vieneu") || strings.Contains(stageTarget, "cosyvoice") || strings.Contains(stageTarget, "kokoro") || strings.Contains(stageTarget, "chatterbox") {
+			code = "TTS_EXEC_FAILED"
+		} else if strings.Contains(stageTarget, "align") {
 			code = "ALIGNER_EXEC_FAILED"
-		} else if strings.Contains(target, "diariz") || strings.Contains(target, "3dspeaker") || strings.Contains(target, "python") {
+		} else if strings.Contains(stageTarget, "diariz") || strings.Contains(stageTarget, "3dspeaker") || strings.Contains(stageTarget, "campplus") {
 			code = "DIARIZER_EXEC_FAILED"
+		} else if strings.Contains(stageTarget, "asr") || strings.Contains(stageTarget, "qwen3") {
+			code = "ASR_EXEC_FAILED"
 		}
 		return worker.NewError(code, fmt.Sprintf("%s exited with error: %v; stderr: %s", binary, err, strings.TrimSpace(stderr.String())), nil)
 	}
 	if err := json.Unmarshal(stdout.Bytes(), out); err != nil {
 		code := "OUTPUT_INVALID"
-		if strings.Contains(target, "asr") || strings.Contains(base, "asr") {
-			code = "ASR_OUTPUT_INVALID"
-		} else if strings.Contains(target, "align") || strings.Contains(base, "align") {
+		if strings.Contains(stageTarget, "tts") || strings.Contains(stageTarget, "vieneu") || strings.Contains(stageTarget, "cosyvoice") || strings.Contains(stageTarget, "kokoro") || strings.Contains(stageTarget, "chatterbox") {
+			code = "TTS_OUTPUT_INVALID"
+		} else if strings.Contains(stageTarget, "align") {
 			code = "ALIGNER_OUTPUT_INVALID"
-		} else if strings.Contains(target, "diariz") || strings.Contains(target, "3dspeaker") || strings.Contains(target, "python") {
+		} else if strings.Contains(stageTarget, "diariz") || strings.Contains(stageTarget, "3dspeaker") || strings.Contains(stageTarget, "campplus") {
 			code = "DIARIZER_OUTPUT_INVALID"
+		} else if strings.Contains(stageTarget, "asr") || strings.Contains(stageTarget, "qwen3") {
+			code = "ASR_OUTPUT_INVALID"
 		}
 		return worker.NewError(code, fmt.Sprintf("%s returned invalid JSON: %v", binary, err), nil)
 	}
@@ -701,7 +770,65 @@ func resolveDiarizerRunner() (commandRunner, error) {
 	}
 
 	return commandRunner{}, worker.NewError("DIARIZER_BINARY_NOT_FOUND",
-		"3D-Speaker diarizer adapter or binary not available: install ModelScope 3D-Speaker (iic/speech_campplus_sv_zh_en_16k-common_advanced@v1.0.0 and FSMN-VAD v2.0.4) to enable the diarize stage",
+		"3D-Speaker/CAM++ diarization adapter or binary not available: install 3D-Speaker/modelscope or configure DOUYINIE_DIARIZER_ADAPTER/DOUYINIE_DIARIZER_BIN",
+		nil)
+}
+
+func resolveTTSRunner() (commandRunner, error) {
+	if bin := os.Getenv("DOUYINIE_TTS_BIN"); bin != "" {
+		if path, err := exec.LookPath(bin); err == nil {
+			return commandRunner{binary: path}, nil
+		}
+		return commandRunner{}, worker.NewError("TTS_BINARY_NOT_FOUND",
+			fmt.Sprintf("DOUYINIE_TTS_BIN %q not found", bin), nil)
+	}
+
+	if script := os.Getenv("DOUYINIE_TTS_ADAPTER"); script != "" {
+		if _, err := os.Stat(script); err == nil {
+			pyBin := resolveTTSPythonBinary()
+			if pyBin != "" {
+				return commandRunner{binary: pyBin, args: []string{script}}, nil
+			}
+			return commandRunner{}, worker.NewError("TTS_BINARY_NOT_FOUND",
+				"python runtime not found to execute DOUYINIE_TTS_ADAPTER", nil)
+		}
+	}
+
+	// Direct binaries on PATH
+	for _, name := range []string{"vieneu-tts", "cosyvoice-tts", "kokoro-tts"} {
+		if path, err := exec.LookPath(name); err == nil {
+			return commandRunner{binary: path}, nil
+		}
+	}
+
+	// Repo-owned Python adapter cmd/stageworker/adapters/tts_engine.py
+	adapterPaths := []string{
+		filepath.Join("cmd", "stageworker", "adapters", "tts_engine.py"),
+		filepath.Join("adapters", "tts_engine.py"),
+		filepath.Join("..", "..", "cmd", "stageworker", "adapters", "tts_engine.py"),
+		filepath.Join("..", "cmd", "stageworker", "adapters", "tts_engine.py"),
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		adapterPaths = append(adapterPaths,
+			filepath.Join(exeDir, "adapters", "tts_engine.py"),
+			filepath.Join(exeDir, "..", "cmd", "stageworker", "adapters", "tts_engine.py"),
+			filepath.Join(exeDir, "..", "..", "cmd", "stageworker", "adapters", "tts_engine.py"),
+		)
+	}
+
+	for _, p := range adapterPaths {
+		if absP, err := filepath.Abs(p); err == nil {
+			if _, err := os.Stat(absP); err == nil {
+				pyBin := resolveTTSPythonBinary()
+				if pyBin != "" {
+					return commandRunner{binary: pyBin, args: []string{absP}}, nil
+				}
+			}
+		}
+	}
+	return commandRunner{}, worker.NewError("TTS_BINARY_NOT_FOUND",
+		"TTS adapter or binary not available: configure DOUYINIE_TTS_ADAPTER/DOUYINIE_TTS_BIN or ensure tts_engine.py dependencies are installed",
 		nil)
 }
 
@@ -717,6 +844,14 @@ func resolvePythonBinary() string {
 		}
 	}
 	return ""
+}
+func resolveTTSPythonBinary() string {
+	if py := os.Getenv("DOUYINIE_TTS_PYTHON_BIN"); py != "" {
+		if path, err := exec.LookPath(py); err == nil {
+			return path
+		}
+	}
+	return resolvePythonBinary()
 }
 
 // runDiarizerAdapter runs the speaker-diarization adapter (Issue #44 Finding

@@ -2,10 +2,13 @@ package provider
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/worker"
 )
 
@@ -180,15 +183,26 @@ func (p *FakeAlignerProvider) ProduceAlignment(ctx context.Context, audio worker
 // FakeTTSProvider simulates VieNeu-TTS or CosyVoice3 with controllable duration.
 type FakeTTSProvider struct {
 	BaseFakeProvider
-	DurationMs int64
+	DurationMs        int64
+	CustomDurations   map[int]int64
+	SpeedFitEnabled   bool
+	InjectError       error
+	CustomPredictedMs int64
+	CustomVoices      []domain.VoiceProfile
+	Invocations       int
 }
 
 func NewFakeTTSProvider(id string, durationMs int64) *FakeTTSProvider {
 	lang := "vi"
-	if id == "fake_kokoro_tts_en" {
+	if strings.Contains(id, "_en") {
 		lang = "en"
 	}
-	return &FakeTTSProvider{
+	languages := []string{lang}
+	if strings.Contains(id, "cosyvoice3") || strings.Contains(id, "chatterbox") {
+		languages = []string{"vi", "en"}
+	}
+
+	p := &FakeTTSProvider{
 		BaseFakeProvider: BaseFakeProvider{
 			ProviderID:   id,
 			ProviderType: TypeTTS,
@@ -196,7 +210,7 @@ func NewFakeTTSProvider(id string, durationMs int64) *FakeTTSProvider {
 			Healthy:      true,
 			Cap: domain.ProviderCapability{
 				Stage:          string(TypeTTS),
-				Languages:      []string{lang},
+				Languages:      languages,
 				ExecutionTier:  "local",
 				CostPerUnit:    0.0,
 				QualityScore:   0.92,
@@ -206,8 +220,101 @@ func NewFakeTTSProvider(id string, durationMs int64) *FakeTTSProvider {
 			ModelName:    id,
 			ModelVersion: "1.0.0",
 		},
-		DurationMs: durationMs,
+		DurationMs:      durationMs,
+		CustomDurations: make(map[int]int64),
 	}
+	if strings.Contains(id, "cosyvoice3") {
+		p.SpeedFitEnabled = true
+		p.Cap.Features = append(p.Cap.Features, "measured_duration_speed_fit", "multi_pass_lane")
+	}
+	return p
+}
+
+// VoiceCatalog implements TTSProvider.
+func (p *FakeTTSProvider) VoiceCatalog() []domain.VoiceProfile {
+	if len(p.CustomVoices) > 0 {
+		return p.CustomVoices
+	}
+	var voices []domain.VoiceProfile
+	for _, l := range p.Cap.Languages {
+		for _, v := range DefaultPresetVoices(l) {
+			if v.ProviderID == p.ProviderID || (p.ProviderID == "fake_vieneu_tts_vi" && v.ProviderID == "vieneu_tts_vi") ||
+				(p.ProviderID == "fake_kokoro_tts_en" && v.ProviderID == "kokoro_tts_en") ||
+				(p.ProviderID == "fake_cosyvoice3_tts" && v.ProviderID == "cosyvoice3_tts") {
+				v.ProviderID = p.ProviderID
+				voices = append(voices, v)
+			}
+		}
+	}
+	if len(voices) == 0 {
+		voices = append(voices, domain.VoiceProfile{
+			ID:         p.ProviderID + "_voice_1",
+			ProviderID: p.ProviderID,
+			VoiceID:    "voice_1",
+			Name:       p.ProviderID + " Voice 1",
+			Language:   p.Cap.Languages[0],
+			Gender:     "female",
+			Pitch:      1.0,
+			Speed:      1.0,
+		})
+	}
+	return voices
+}
+
+// SynthesizeSpeech implements TTSProvider.
+func (p *FakeTTSProvider) SynthesizeSpeech(ctx context.Context, req TTSSynthesisRequest) (*TTSSynthesisResult, error) {
+	p.Invocations++
+	if ctx == nil {
+		return nil, errors.New("nil context")
+	}
+	if p.InjectError != nil {
+		return nil, p.InjectError
+	}
+	durMs := p.DurationMs
+	if p.CustomDurations != nil {
+		if d, ok := p.CustomDurations[req.SegmentIndex]; ok && d > 0 {
+			durMs = d
+		}
+	}
+	if durMs <= 0 {
+		// default based on text length (~200ms per word or 1000ms base)
+		words := strings.Fields(req.Text)
+		if len(words) > 0 {
+			durMs = int64(len(words) * 220)
+		} else {
+			durMs = 1000
+		}
+	}
+
+	// Speed adjustment
+	if req.Speed > 0 && req.Speed != 1.0 {
+		durMs = int64(float64(durMs) / req.Speed)
+		if durMs < 100 {
+			durMs = 100
+		}
+	}
+
+	wavBytes := media.GeneratePCM16WAV(16000, 1, durMs)
+	sum := sha256.Sum256(wavBytes)
+	shaStr := hex.EncodeToString(sum[:])
+
+	predictedMs := durMs
+	if p.CustomPredictedMs > 0 {
+		predictedMs = p.CustomPredictedMs
+	}
+
+	return &TTSSynthesisResult{
+		AudioData:           wavBytes,
+		AudioSHA256:         shaStr,
+		SampleRate:          16000,
+		Channels:            1,
+		Format:              "wav",
+		ProviderID:          p.ProviderID,
+		ModelName:           p.ModelName,
+		ModelVersion:        p.ModelVersion,
+		PredictedDurationMs: predictedMs,
+		MeasuredDurationMs:  durMs,
+	}, nil
 }
 
 // FakeSeparatorProvider simulates python-audio-separator / UVR / Demucs.

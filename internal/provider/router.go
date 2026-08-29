@@ -24,6 +24,7 @@ type RouteRequest struct {
 	AuthorizedCredentials []string // Valid credential reference IDs or names
 	RequiredFeatures      []string
 	ExcludedProviders     []string
+	PreferredProviderID   string
 }
 
 // RouteResult returns the selected provider, fallback candidates, and the selection decision.
@@ -367,6 +368,13 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 
 		// 4. Profile / Quality / Cost Scoring
 		score := calculateScore(cap, req.ExecutionProfile)
+		if req.PreferredProviderID != "" {
+			pref := strings.ToLower(req.PreferredProviderID)
+			pid := strings.ToLower(p.ID())
+			if pid == pref || pid == "fake_"+pref || strings.TrimPrefix(pid, "fake_") == strings.TrimPrefix(pref, "fake_") {
+				score += 1000.0
+			}
+		}
 		eval.Eligible = true
 		eval.Score = score
 		eval.Reason = "eligible for execution"

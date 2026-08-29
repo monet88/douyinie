@@ -723,6 +723,66 @@ func (s *DB) migrate(ctx context.Context) error {
 			return fmt.Errorf("commit migration v9: %w", err)
 		}
 	}
+
+	// 11. Schema migration v10 (Voice Assignments + Dub Segments - T14)
+	var countV10 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 10`).Scan(&countV10)
+	if err != nil {
+		return fmt.Errorf("check migration version 10: %w", err)
+	}
+
+	if countV10 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v10 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		schemaV10SQL := `
+		CREATE TABLE IF NOT EXISTS voice_assignments (
+			id TEXT PRIMARY KEY,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			run_id TEXT NOT NULL,
+			job_id TEXT NOT NULL,
+			target_language TEXT NOT NULL,
+			cas_hash TEXT NOT NULL,
+			provenance_hash TEXT NOT NULL,
+			assignments_json TEXT NOT NULL,
+			use_same_voice_for_all INTEGER NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_assignments_asset_run_lang ON voice_assignments(asset_id, run_id, target_language);
+		CREATE INDEX IF NOT EXISTS idx_voice_assignments_provenance ON voice_assignments(provenance_hash);
+		CREATE INDEX IF NOT EXISTS idx_voice_assignments_asset_lang ON voice_assignments(asset_id, target_language);
+		CREATE INDEX IF NOT EXISTS idx_voice_assignments_run ON voice_assignments(run_id);
+		CREATE TABLE IF NOT EXISTS dub_segments_variants (
+			id TEXT PRIMARY KEY,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			run_id TEXT NOT NULL,
+			job_id TEXT NOT NULL,
+			target_language TEXT NOT NULL,
+			cas_hash TEXT NOT NULL,
+			provenance_hash TEXT NOT NULL,
+			overall_status TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_dub_segments_variants_provenance ON dub_segments_variants(provenance_hash);
+		CREATE INDEX IF NOT EXISTS idx_dub_segments_variants_asset_lang ON dub_segments_variants(asset_id, target_language);
+		CREATE INDEX IF NOT EXISTS idx_dub_segments_variants_run ON dub_segments_variants(run_id);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (10, datetime('now'));
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaV10SQL); err != nil {
+			return fmt.Errorf("execute migration v10: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v10: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -2487,6 +2547,284 @@ func (s *DB) GetDubScriptVariantByProvenance(ctx context.Context, provenanceHash
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("query dub_script_variant by provenance: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// VoiceAssignmentIndex captures the SQLite indexing metadata for a persisted VoiceAssignment.
+type VoiceAssignmentIndex struct {
+	ID                 string
+	AssetID            string
+	RunID              string
+	JobID              string
+	TargetLanguage     string
+	CASHash            string
+	ProvenanceHash     string
+	AssignmentsJSON    string
+	UseSameVoiceForAll bool
+	CreatedAt          time.Time
+}
+
+// SaveVoiceAssignmentIndex records the index row for a CAS-stored VoiceAssignment.
+func (s *DB) SaveVoiceAssignmentIndex(ctx context.Context, idx VoiceAssignmentIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sameVoiceInt := 0
+	if idx.UseSameVoiceForAll {
+		sameVoiceInt = 1
+	}
+	query := `
+		INSERT INTO voice_assignments (
+			id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+			assignments_json, use_same_voice_for_all, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(asset_id, run_id, target_language) DO UPDATE SET
+			cas_hash = excluded.cas_hash,
+			provenance_hash = excluded.provenance_hash,
+			assignments_json = excluded.assignments_json,
+			use_same_voice_for_all = excluded.use_same_voice_for_all
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID,
+		idx.AssetID,
+		idx.RunID,
+		idx.JobID,
+		idx.TargetLanguage,
+		idx.CASHash,
+		idx.ProvenanceHash,
+		idx.AssignmentsJSON,
+		sameVoiceInt,
+		idx.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("save voice_assignment index: %w", err)
+	}
+	return nil
+}
+
+// GetVoiceAssignmentIndexByRun retrieves the index row for a specific asset, run, and target language.
+func (s *DB) GetVoiceAssignmentIndexByRun(ctx context.Context, assetID, runID, targetLang string) (*VoiceAssignmentIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx VoiceAssignmentIndex
+	var createdStr string
+	var sameVoiceInt int
+	query := `SELECT id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+		assignments_json, use_same_voice_for_all, created_at
+		FROM voice_assignments WHERE asset_id = ? AND run_id = ? AND target_language = ?
+		ORDER BY created_at DESC, rowid DESC LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, assetID, runID, targetLang).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&idx.AssignmentsJSON,
+		&sameVoiceInt,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query voice_assignment index by run: %w", err)
+	}
+	idx.UseSameVoiceForAll = (sameVoiceInt == 1)
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// GetVoiceAssignmentIndex retrieves the latest index row for an asset and target language.
+func (s *DB) GetVoiceAssignmentIndex(ctx context.Context, assetID string, targetLang string) (*VoiceAssignmentIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx VoiceAssignmentIndex
+	var createdStr string
+	var sameVoiceInt int
+	query := `SELECT id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+		assignments_json, use_same_voice_for_all, created_at
+		FROM voice_assignments WHERE asset_id = ? AND target_language = ?
+		ORDER BY created_at DESC, rowid DESC LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, assetID, targetLang).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&idx.AssignmentsJSON,
+		&sameVoiceInt,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query voice_assignment index: %w", err)
+	}
+	idx.UseSameVoiceForAll = (sameVoiceInt == 1)
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// GetVoiceAssignmentByProvenance retrieves the index row for a deterministic provenance identity.
+func (s *DB) GetVoiceAssignmentByProvenance(ctx context.Context, provenanceHash string) (*VoiceAssignmentIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx VoiceAssignmentIndex
+	var createdStr string
+	var sameVoiceInt int
+	query := `SELECT id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+		assignments_json, use_same_voice_for_all, created_at
+		FROM voice_assignments WHERE provenance_hash = ? LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, provenanceHash).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&idx.AssignmentsJSON,
+		&sameVoiceInt,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query voice_assignment by provenance: %w", err)
+	}
+	idx.UseSameVoiceForAll = (sameVoiceInt == 1)
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// DubSegmentsVariantIndex captures the SQLite indexing metadata for a persisted DubSegmentsVariant.
+type DubSegmentsVariantIndex struct {
+	ID             string
+	AssetID        string
+	RunID          string
+	JobID          string
+	TargetLanguage string
+	CASHash        string
+	ProvenanceHash string
+	OverallStatus  string
+	CreatedAt      time.Time
+}
+
+// SaveDubSegmentsVariantIndex records the index row for a CAS-stored DubSegmentsVariant.
+func (s *DB) SaveDubSegmentsVariantIndex(ctx context.Context, idx DubSegmentsVariantIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO dub_segments_variants (
+			id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+			overall_status, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provenance_hash) DO UPDATE SET
+			cas_hash = excluded.cas_hash,
+			overall_status = excluded.overall_status
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID,
+		idx.AssetID,
+		idx.RunID,
+		idx.JobID,
+		idx.TargetLanguage,
+		idx.CASHash,
+		idx.ProvenanceHash,
+		idx.OverallStatus,
+		func() string {
+			if idx.CreatedAt.IsZero() {
+				return time.Now().UTC().Format(time.RFC3339Nano)
+			}
+			return idx.CreatedAt.Format(time.RFC3339Nano)
+		}(),
+	)
+	if err != nil {
+		return fmt.Errorf("save dub_segments_variant index: %w", err)
+	}
+	return nil
+}
+
+// GetDubSegmentsVariantIndex retrieves the latest index row for an asset and target language.
+func (s *DB) GetDubSegmentsVariantIndex(ctx context.Context, assetID string, targetLang string) (*DubSegmentsVariantIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx DubSegmentsVariantIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+		overall_status, created_at
+		FROM dub_segments_variants WHERE asset_id = ? AND target_language = ?
+		ORDER BY created_at DESC, rowid DESC LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, assetID, targetLang).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&idx.OverallStatus,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query dub_segments_variant index: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// GetDubSegmentsVariantByProvenance retrieves the index row for a deterministic provenance identity.
+func (s *DB) GetDubSegmentsVariantByProvenance(ctx context.Context, provenanceHash string) (*DubSegmentsVariantIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx DubSegmentsVariantIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+		overall_status, created_at
+		FROM dub_segments_variants WHERE provenance_hash = ? LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, provenanceHash).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&idx.OverallStatus,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query dub_segments_variant by provenance: %w", err)
 	}
 	t, _ := time.Parse(time.RFC3339Nano, createdStr)
 	idx.CreatedAt = t

@@ -40,6 +40,7 @@ type Server struct {
 	executor       Executor
 	speechSvc      *service.SpeechService
 	translationSvc *service.TranslationService
+	dubbingSvc     *service.DubbingService
 	mux            *http.ServeMux
 	server         *http.Server
 }
@@ -60,6 +61,7 @@ type Config struct {
 	Executor       Executor                    // Injected execution seam for testing and custom worker dispatch
 	SpeechSvc      *service.SpeechService      // Speech understanding pipeline (T08)
 	TranslationSvc *service.TranslationService // Translation & Meaning-First Localization pipeline (T06)
+	DubbingSvc     *service.DubbingService     // TTS & Measured-Duration Dubbing pipeline (T14)
 }
 
 // New creates a new RuntimeHost Server instance.
@@ -92,6 +94,9 @@ func New(cfg Config) *Server {
 	if cfg.TranslationSvc != nil && cfg.Router != nil {
 		cfg.TranslationSvc.ConfigureRouter(cfg.Router)
 	}
+	if cfg.DubbingSvc != nil && cfg.Router != nil {
+		cfg.DubbingSvc.ConfigureRouter(cfg.Router)
+	}
 
 	s := &Server{
 		db:             cfg.DB,
@@ -107,9 +112,9 @@ func New(cfg Config) *Server {
 		executor:       cfg.Executor,
 		speechSvc:      cfg.SpeechSvc,
 		translationSvc: cfg.TranslationSvc,
+		dubbingSvc:     cfg.DubbingSvc,
 		mux:            http.NewServeMux(),
 	}
-
 	s.routes()
 
 	s.server = &http.Server{
@@ -141,6 +146,14 @@ func (s *Server) SetSpeechService(svc *service.SpeechService) {
 // SetTranslationService sets or replaces the injected translation pipeline (T06).
 func (s *Server) SetTranslationService(svc *service.TranslationService) {
 	s.translationSvc = svc
+	if svc != nil && s.router != nil {
+		svc.ConfigureRouter(s.router)
+	}
+}
+
+// SetDubbingService sets or replaces the injected dubbing pipeline (T14).
+func (s *Server) SetDubbingService(svc *service.DubbingService) {
+	s.dubbingSvc = svc
 	if svc != nil && s.router != nil {
 		svc.ConfigureRouter(s.router)
 	}
@@ -233,6 +246,15 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/dub-script", s.handleRunDubScript)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/dub-script-variant", s.handleGetDubScriptVariant)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/dub-script", s.handleGetDubScriptVariant)
+
+	// Voice Assignment (T14: Frozen per-run VoiceAssignment)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/voice-assignment", s.handleAssignVoices)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/voice-assignment", s.handleGetVoiceAssignment)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/voice-audition", s.handleAuditionVoice)
+
+	// TTS Synthesis & Fit Controller (T14: Measured-duration DubSegmentsVariant)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/dub-synthesize", s.handleRunDubSynthesize)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/dub-segments", s.handleGetDubSegments)
 }
 
 // JSON helpers
@@ -754,6 +776,268 @@ func (s *Server) handleGetDubScriptVariant(w http.ResponseWriter, r *http.Reques
 	variant.CASHash = idx.CASHash
 	variant.ProvenanceHash = idx.ProvenanceHash
 	writeJSON(w, http.StatusOK, map[string]any{"dub_script_variant": variant})
+}
+
+func (s *Server) handleAssignVoices(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	asset, err := s.db.GetSourceAsset(r.Context(), assetID)
+	if err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) || errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.dubbingSvc == nil {
+		writeError(w, http.StatusInternalServerError, "dubbing service is not configured")
+		return
+	}
+
+	var body struct {
+		RunID              string                         `json:"run_id"`
+		JobID              string                         `json:"job_id,omitempty"`
+		TargetLanguage     string                         `json:"target_language"`
+		CustomAssignments  map[string]domain.VoiceProfile `json:"custom_assignments,omitempty"`
+		UseSameVoiceForAll bool                           `json:"use_same_voice_for_all"`
+		ExecutionProfile   domain.ExecutionProfile        `json:"execution_profile,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	if strings.TrimSpace(body.RunID) == "" {
+		writeError(w, http.StatusBadRequest, "run_id is required")
+		return
+	}
+	if strings.TrimSpace(body.TargetLanguage) == "" {
+		writeError(w, http.StatusBadRequest, "target_language is required")
+		return
+	}
+
+	in := domain.VoiceAssignmentInput{
+		RunID:              body.RunID,
+		AssetID:            asset.ID,
+		JobID:              body.JobID,
+		TargetLanguage:     body.TargetLanguage,
+		CustomAssignments:  body.CustomAssignments,
+		UseSameVoiceForAll: body.UseSameVoiceForAll,
+		ExecutionProfile:   body.ExecutionProfile,
+	}
+
+	assignment, err := s.dubbingSvc.AssignVoices(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, domain.ErrNoEligibleTTSProvider) {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrVoiceAssignmentFrozen) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"voice_assignment": assignment})
+}
+
+func (s *Server) handleGetVoiceAssignment(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	targetLang := r.URL.Query().Get("target_language")
+	if targetLang == "" {
+		targetLang = "vi" // default target language
+	}
+
+	idx, err := s.db.GetVoiceAssignmentIndex(r.Context(), assetID, targetLang)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("voice assignment not found for asset %s in language %s", assetID, targetLang))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.casStore == nil {
+		writeError(w, http.StatusInternalServerError, "CAS store not configured")
+		return
+	}
+	rc, err := s.casStore.Get(idx.CASHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "read voice assignment from CAS: "+err.Error())
+		return
+	}
+	defer rc.Close()
+	var assignment domain.VoiceAssignment
+	if err := json.NewDecoder(rc).Decode(&assignment); err != nil {
+		writeError(w, http.StatusInternalServerError, "decode voice assignment: "+err.Error())
+		return
+	}
+	assignment.CASHash = idx.CASHash
+	assignment.ProvenanceHash = idx.ProvenanceHash
+	writeJSON(w, http.StatusOK, map[string]any{"voice_assignment": assignment})
+}
+
+func (s *Server) handleAuditionVoice(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if s.db != nil {
+		_, err := s.db.GetSourceAsset(r.Context(), assetID)
+		if err != nil {
+			if errors.Is(err, domain.ErrAssetNotFound) || errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusNotFound, "asset not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
+	if s.dubbingSvc == nil {
+		writeError(w, http.StatusInternalServerError, "dubbing service is not configured")
+		return
+	}
+	var body struct {
+		RunID          string              `json:"run_id"`
+		TargetLanguage string              `json:"target_language"`
+		Voice          domain.VoiceProfile `json:"voice"`
+		SampleText     string              `json:"sample_text,omitempty"`
+		IsContextual   bool                `json:"is_contextual"`
+		SegmentIndex   int                 `json:"segment_index,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in := domain.VoiceAuditionInput{
+		RunID:          body.RunID,
+		AssetID:        assetID,
+		TargetLanguage: body.TargetLanguage,
+		Voice:          body.Voice,
+		SampleText:     body.SampleText,
+		IsContextual:   body.IsContextual,
+		SegmentIndex:   body.SegmentIndex,
+	}
+
+	res, err := s.dubbingSvc.AuditionVoice(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, domain.ErrNoEligibleTTSProvider) {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"audition_result": res})
+}
+
+func (s *Server) handleRunDubSynthesize(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	asset, err := s.db.GetSourceAsset(r.Context(), assetID)
+	if err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) || errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.dubbingSvc == nil {
+		writeError(w, http.StatusInternalServerError, "dubbing service is not configured")
+		return
+	}
+
+	var body struct {
+		RunID                 string                  `json:"run_id"`
+		JobID                 string                  `json:"job_id,omitempty"`
+		TargetLanguage        string                  `json:"target_language"`
+		DubScriptVariantCAS   string                  `json:"dub_script_variant_cas,omitempty"`
+		VoiceAssignmentCAS    string                  `json:"voice_assignment_cas,omitempty"`
+		ExecutionProfile      domain.ExecutionProfile `json:"execution_profile,omitempty"`
+		AuthorizedCredentials []string                `json:"authorized_credentials,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	if strings.TrimSpace(body.RunID) == "" {
+		writeError(w, http.StatusBadRequest, "run_id is required")
+		return
+	}
+	if strings.TrimSpace(body.TargetLanguage) == "" {
+		writeError(w, http.StatusBadRequest, "target_language is required")
+		return
+	}
+
+	in := domain.DubbingJobInput{
+		RunID:                 body.RunID,
+		AssetID:               asset.ID,
+		JobID:                 body.JobID,
+		TargetLanguage:        body.TargetLanguage,
+		DubScriptVariantCAS:   body.DubScriptVariantCAS,
+		VoiceAssignmentCAS:    body.VoiceAssignmentCAS,
+		ExecutionProfile:      body.ExecutionProfile,
+		AuthorizedCredentials: body.AuthorizedCredentials,
+	}
+
+	variant, err := s.dubbingSvc.SynthesizeAndFit(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, domain.ErrDubScriptRequiredForDubbing) || errors.Is(err, domain.ErrVoiceAssignmentRequired) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrNoEligibleTTSProvider) {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"dub_segments_variant": variant})
+}
+
+func (s *Server) handleGetDubSegments(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	targetLang := r.URL.Query().Get("target_language")
+	if targetLang == "" {
+		targetLang = "vi" // default target language
+	}
+
+	idx, err := s.db.GetDubSegmentsVariantIndex(r.Context(), assetID, targetLang)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("dub segments variant not found for asset %s in language %s", assetID, targetLang))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.casStore == nil {
+		writeError(w, http.StatusInternalServerError, "CAS store not configured")
+		return
+	}
+	rc, err := s.casStore.Get(idx.CASHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "read dub segments variant from CAS: "+err.Error())
+		return
+	}
+	defer rc.Close()
+	var variant domain.DubSegmentsVariant
+	if err := json.NewDecoder(rc).Decode(&variant); err != nil {
+		writeError(w, http.StatusInternalServerError, "decode dub segments variant: "+err.Error())
+		return
+	}
+	variant.CASHash = idx.CASHash
+	variant.ProvenanceHash = idx.ProvenanceHash
+	writeJSON(w, http.StatusOK, map[string]any{"dub_segments_variant": variant})
 }
 
 func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {

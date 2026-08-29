@@ -215,7 +215,7 @@ func TestSeam2_CooperativeCancelCompletesBeforeEscalation(t *testing.T) {
 	cmd2 := worker.Command{
 		ID:        "cmd-subsequent",
 		Family:    "tts",
-		Stage:     "tts",
+		Stage:     "generic",
 		AttemptID: "attempt-subsequent",
 		RunID:     "run-subsequent",
 	}
@@ -1821,4 +1821,222 @@ func TestSeam2_WorkerSpeechProvider_GPUProcessReapedBeforeLeaseReleasedOnCancel(
 		t.Fatalf("expected holder tts, got %s", leaseMgr.Holder())
 	}
 	_ = leaseMgr.Release(context.Background(), ttsLease)
+}
+
+// ---------------------------------------------------------------------------
+// TTS StageWorker Tests
+// ---------------------------------------------------------------------------
+
+func TestSeam2_TTSStage_MissingTextFailsClosed(t *testing.T) {
+	exe := buildStageWorker(t)
+	sup := worker.NewSupervisor()
+	if err := sup.Spawn(context.Background(), "tts", exe, "-family", "tts", "-heartbeat-ms", "1000"); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	client := worker.NewClient(sup)
+	if _, err := client.Handshake(context.Background(), 5*time.Second); err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("handshake: %v", err)
+	}
+	defer func() {
+		_ = client.Shutdown()
+	}()
+
+	cmd := worker.Command{
+		ID:        "cmd-tts-notext",
+		Family:    "tts",
+		Stage:     "tts",
+		AttemptID: "attempt-tts-notext",
+		RunID:     "run-tts-notext",
+		Config: map[string]any{
+			"model_name": "vieneu-tts",
+		},
+	}
+
+	_, err := client.Run(context.Background(), cmd, 5*time.Second, 5*time.Second)
+	if err == nil {
+		t.Fatal("expected TTS stage without text to fail closed")
+	}
+	if !strings.Contains(err.Error(), "TTS_MISSING_TEXT") {
+		t.Fatalf("expected TTS_MISSING_TEXT error, got %v", err)
+	}
+}
+
+func TestSeam2_TTSStage_MissingModelIdentityFailsClosed(t *testing.T) {
+	exe := buildStageWorker(t)
+	sup := worker.NewSupervisor()
+	if err := sup.Spawn(context.Background(), "tts", exe, "-family", "tts", "-heartbeat-ms", "1000"); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	client := worker.NewClient(sup)
+	if _, err := client.Handshake(context.Background(), 5*time.Second); err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("handshake: %v", err)
+	}
+	defer func() {
+		_ = client.Shutdown()
+	}()
+
+	cmd := worker.Command{
+		ID:        "cmd-tts-nomodel",
+		Family:    "tts",
+		Stage:     "tts",
+		AttemptID: "attempt-tts-nomodel",
+		RunID:     "run-tts-nomodel",
+		Config: map[string]any{
+			"text": "Xin chào thế giới",
+		},
+	}
+
+	_, err := client.Run(context.Background(), cmd, 5*time.Second, 5*time.Second)
+	if err == nil {
+		t.Fatal("expected TTS stage without model_name to fail closed")
+	}
+	if !strings.Contains(err.Error(), "TTS_MISSING_MODEL_IDENTITY") {
+		t.Fatalf("expected TTS_MISSING_MODEL_IDENTITY error, got %v", err)
+	}
+}
+func TestSeam2_TTSStage_AdapterErrorClassifiedAsTTSNotDiarizer(t *testing.T) {
+	// In the real test environment where TTS packages are not installed,
+	// invoking the python tts adapter must fail closed with TTS_EXEC_FAILED,
+	// and NEVER be misclassified as DIARIZER_EXEC_FAILED!
+	adapterPath, err := filepath.Abs(filepath.Join("..", "..", "cmd", "stageworker", "adapters", "tts_engine.py"))
+	if err != nil || !fileExists(adapterPath) {
+		adapterPath, _ = filepath.Abs(filepath.Join("cmd", "stageworker", "adapters", "tts_engine.py"))
+	}
+	if fileExists(adapterPath) {
+		t.Setenv("DOUYINIE_TTS_ADAPTER", adapterPath)
+	}
+
+	exe := buildStageWorker(t)
+	sup := worker.NewSupervisor()
+	if err := sup.Spawn(context.Background(), "tts", exe, "-family", "tts", "-heartbeat-ms", "1000"); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	client := worker.NewClient(sup)
+	if _, err := client.Handshake(context.Background(), 5*time.Second); err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("handshake: %v", err)
+	}
+	defer func() {
+		_ = client.Shutdown()
+	}()
+
+	cmd := worker.Command{
+		ID:        "cmd-tts-adapter-err",
+		Family:    "tts",
+		Stage:     "tts",
+		AttemptID: "attempt-tts-adapter-err",
+		RunID:     "run-tts-adapter-err",
+		Config: map[string]any{
+			"text":       "Xin chào thế giới",
+			"model_name": "vieneu-tts",
+		},
+	}
+
+	_, err = client.Run(context.Background(), cmd, 5*time.Second, 5*time.Second)
+	if err == nil {
+		t.Fatal("expected unconfigured TTS adapter to fail closed")
+	}
+	if strings.Contains(err.Error(), "DIARIZER") {
+		t.Fatalf("CRITICAL REGRESSION: TTS error was misclassified as DIARIZER error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "TTS_EXEC_FAILED") && !strings.Contains(err.Error(), "TTS_BINARY_NOT_FOUND") {
+		t.Fatalf("expected TTS_EXEC_FAILED or TTS_BINARY_NOT_FOUND, got %v", err)
+	}
+}
+
+func TestSeam2_TTSStage_PythonAdapterExecutionWithMockVieNeu(t *testing.T) {
+	tmpDir := t.TempDir()
+	mockModulePath := filepath.Join(tmpDir, "vieneu.py")
+	mockCode := `
+class Vieneu:
+    def __init__(self, mode="v3turbo"):
+        self.mode = mode
+
+    def get_preset_voice(self, voice_id):
+        return voice_id
+
+    def infer(self, text, voice=None):
+        return [0.01] * 48000
+`
+	if err := os.WriteFile(mockModulePath, []byte(mockCode), 0644); err != nil {
+		t.Fatalf("write mock vieneu.py: %v", err)
+	}
+
+	adapterPath, err := filepath.Abs(filepath.Join("..", "..", "cmd", "stageworker", "adapters", "tts_engine.py"))
+	if err != nil || !fileExists(adapterPath) {
+		adapterPath, _ = filepath.Abs(filepath.Join("cmd", "stageworker", "adapters", "tts_engine.py"))
+	}
+	if !fileExists(adapterPath) {
+		t.Fatalf("tts_engine.py adapter not found at %s", adapterPath)
+	}
+
+	t.Setenv("DOUYINIE_TTS_ADAPTER", adapterPath)
+	origPyPath := os.Getenv("PYTHONPATH")
+	t.Setenv("PYTHONPATH", tmpDir+string(os.PathListSeparator)+origPyPath)
+
+	exe := buildStageWorker(t)
+	sup := worker.NewSupervisor()
+	if err := sup.Spawn(context.Background(), "tts", exe, "-family", "tts", "-heartbeat-ms", "1000"); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	client := worker.NewClient(sup)
+	if _, err := client.Handshake(context.Background(), 5*time.Second); err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("handshake: %v", err)
+	}
+	defer func() {
+		_ = client.Shutdown()
+	}()
+
+	outPath := filepath.Join(t.TempDir(), "out-tts-py.json")
+	cmd := worker.Command{
+		ID:         "cmd-tts-py",
+		Family:     "tts",
+		Stage:      "tts",
+		AttemptID:  "attempt-tts-py",
+		RunID:      "run-tts-py",
+		OutputPath: outPath,
+		Config: map[string]any{
+			"text":             "Xin chào Việt Nam",
+			"model_name":       "vieneu-tts",
+			"model_version":    "1.0.0",
+			"language":         "vi",
+			"voice_id":         "vi_female_natural",
+			"speed":            "1.0",
+			"slot_duration_ms": "1500",
+		},
+	}
+
+	artifact, err := client.Run(context.Background(), cmd, 10*time.Second, 10*time.Second)
+	if err != nil {
+		t.Fatalf("python adapter tts invocation failed: %v", err)
+	}
+	if artifact.SHA256 == "" || strings.Contains(artifact.SHA256, "placeholder") {
+		t.Fatalf("expected real SHA-256 for TTS artifact, got %q", artifact.SHA256)
+	}
+
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read tts output artifact: %v", err)
+	}
+	var out struct {
+		AudioData          []byte `json:"audio_data"`
+		AudioSHA256        string `json:"audio_sha256"`
+		MeasuredDurationMs int64  `json:"measured_duration_ms"`
+		ModelName          string `json:"model_name"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("unmarshal tts json: %v", err)
+	}
+	if len(out.AudioData) == 0 {
+		t.Fatalf("expected non-empty audio data")
+	}
+	if out.MeasuredDurationMs != 1000 {
+		t.Errorf("expected 1000ms measured duration, got %d", out.MeasuredDurationMs)
+	}
+	if out.ModelName != "vieneu-tts" {
+		t.Errorf("expected model_name vieneu-tts, got %s", out.ModelName)
+	}
 }
