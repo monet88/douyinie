@@ -1,0 +1,32 @@
+cmd/runtimehost/main.go
+  h_17f2fa2b92da6a 73,142
+internal/domain/render.go
+  h_17f2fa2b92da6a 1-325
+internal/domain/render_test.go
+  h_17f2fa2b92da6a 1-119
+internal/media/render.go
+  h_17f2fa2b92da6a 1-448
+internal/media/render_test.go
+  h_17f2fa2b92da6a 1-148
+internal/server/server.go
+  h_17f2fa2b92da6a 47,71,130,193-197,304-310,2062-2316
+internal/service/render.go
+  h_17f2fa2b92da6a 1-664
+internal/storage/sqlite.go
+  h_17f2fa2b92da6a 885-944,3337-3578
+test/seam1/acceptance_test.go
+  h_17f2fa2b92da6a 159
+test/seam1/render_test.go
+  h_17f2fa2b92da6a 1-890
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "7d691f1b1c976ab5e1997135ac7acb8bae17c890",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
