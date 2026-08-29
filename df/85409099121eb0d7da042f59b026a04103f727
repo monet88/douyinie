@@ -1,0 +1,16 @@
+.gitattributes
+  h_17f2fa2b92da6a 1-2
+test/seam1/acceptance_test.go
+  h_17f2fa2b92da6a 143-152
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "df85409099121eb0d7da042f59b026a04103f727",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
