@@ -1,0 +1,45 @@
+internal/storage/sqlite.go
+  s_47f796c82f7084::t_c757ed5b19d4a3 786-843,2891-3127
+test/seam2/seam2_test.go
+  s_3cf9f95b99f20b::t_12f068b67c29d5 2043-2253
+cmd/runtimehost/main.go
+  s_eb30af10dfaae0::t_c9fcdce2c49c09 71,138
+internal/provider/fake.go
+  s_eb30af10dfaae0::t_576f168f2af00f 323,327-330,342,346-347,352-370,686
+internal/server/server.go
+  s_47f796c82f7084::t_c2ca79b0891dcb 8,45,67,103-105,122,169-176,273-277,1766-1950
+cmd/stageworker/main.go
+  s_eb30af10dfaae0::t_dc4e3edbe24de8 364-365,576-577,591-592,841-945,967-974
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "6b918bd49379c7583a8ef45ee1b859cb84342112",
+  "prompts": {},
+  "sessions": {
+    "s_3cf9f95b99f20b": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a03d35-50b9-7aa5-9aa3-d39826031a9f",
+        "model": "deepseek-v4-flash-vision"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_47f796c82f7084": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a03d96-e2d7-7182-b389-6829538ec82a",
+        "model": "deepseek-v4-flash-vision"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    },
+    "s_eb30af10dfaae0": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a03e57-0f18-7064-adf4-85bc6b761560",
+        "model": "unknown"
+      },
+      "human_author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
