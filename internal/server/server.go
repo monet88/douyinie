@@ -285,6 +285,7 @@ func (s *Server) routes() {
 
 	// Voice Assignment (T14: Frozen per-run VoiceAssignment)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/voice-assignment", s.handleAssignVoices)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/voice-assignment/reassign", s.handleReassignVoices)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/voice-assignment", s.handleGetVoiceAssignment)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/voice-audition", s.handleAuditionVoice)
 
@@ -895,6 +896,72 @@ func (s *Server) handleAssignVoices(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]any{"voice_assignment": assignment})
+}
+
+func (s *Server) handleReassignVoices(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	asset, err := s.db.GetSourceAsset(r.Context(), assetID)
+	if err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) || errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.dubbingSvc == nil {
+		writeError(w, http.StatusInternalServerError, "dubbing service is not configured")
+		return
+	}
+
+	var body struct {
+		RunID              string                         `json:"run_id"`
+		JobID              string                         `json:"job_id,omitempty"`
+		TargetLanguage     string                         `json:"target_language"`
+		CustomAssignments  map[string]domain.VoiceProfile `json:"custom_assignments,omitempty"`
+		UseSameVoiceForAll bool                           `json:"use_same_voice_for_all"`
+		ExecutionProfile   domain.ExecutionProfile        `json:"execution_profile,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	if strings.TrimSpace(body.RunID) == "" {
+		writeError(w, http.StatusBadRequest, "run_id is required")
+		return
+	}
+	if strings.TrimSpace(body.TargetLanguage) == "" {
+		writeError(w, http.StatusBadRequest, "target_language is required")
+		return
+	}
+
+	in := domain.VoiceAssignmentInput{
+		RunID:              body.RunID,
+		AssetID:            asset.ID,
+		JobID:              body.JobID,
+		TargetLanguage:     body.TargetLanguage,
+		CustomAssignments:  body.CustomAssignments,
+		UseSameVoiceForAll: body.UseSameVoiceForAll,
+		ExecutionProfile:   body.ExecutionProfile,
+	}
+
+	assignment, err := s.dubbingSvc.ReassignVoice(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, domain.ErrVoiceAssignmentNotFound) || errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "no frozen voice assignment found for run")
+			return
+		}
+		if errors.Is(err, domain.ErrNoEligibleTTSProvider) {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"voice_assignment": assignment})
 }
 
 func (s *Server) handleGetVoiceAssignment(w http.ResponseWriter, r *http.Request) {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -83,6 +84,7 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 	if len(speakers) == 0 {
 		speakers = []string{"SPEAKER_00"}
 	}
+	sort.Strings(speakers)
 
 	// 2. Build or validate assignments
 	assignments := make(map[string]domain.VoiceProfile)
@@ -91,17 +93,38 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 		return nil, domain.ErrNoEligibleTTSProvider
 	}
 
+	// Deduplicate preset voices by identity for distinct assignment
+	var distinctPresets []domain.VoiceProfile
+	seenPreset := make(map[string]bool)
+	for _, v := range presetVoices {
+		key := v.ProviderID + "/" + v.VoiceID
+		if !seenPreset[key] {
+			seenPreset[key] = true
+			distinctPresets = append(distinctPresets, v)
+		}
+	}
+	if len(distinctPresets) == 0 {
+		distinctPresets = presetVoices
+	}
+
 	if in.UseSameVoiceForAll {
-		// Single selected voice for all speakers
+		// Single selected voice for all speakers (deterministic: sorted speaker key)
 		var chosenVoice domain.VoiceProfile
 		if len(in.CustomAssignments) > 0 {
-			for _, v := range in.CustomAssignments {
-				chosenVoice = v
-				break
+			var customKeys []string
+			for k := range in.CustomAssignments {
+				customKeys = append(customKeys, k)
+			}
+			sort.Strings(customKeys)
+			for _, k := range customKeys {
+				if v := in.CustomAssignments[k]; v.ID != "" {
+					chosenVoice = v
+					break
+				}
 			}
 		}
 		if chosenVoice.ID == "" {
-			chosenVoice = presetVoices[0]
+			chosenVoice = distinctPresets[0]
 		}
 		for _, spk := range speakers {
 			assignments[spk] = chosenVoice
@@ -112,11 +135,12 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 			if custom, ok := in.CustomAssignments[spk]; ok && custom.ID != "" {
 				assignments[spk] = custom
 			} else {
-				presetIdx := i % len(presetVoices)
-				assignments[spk] = presetVoices[presetIdx]
+				presetIdx := i % len(distinctPresets)
+				assignments[spk] = distinctPresets[presetIdx]
 			}
 		}
 	}
+	distinguishabilityQC := domain.EvaluateVoiceDistinguishability(assignments, in.UseSameVoiceForAll)
 	// Check if a VoiceAssignment is already frozen for this exact run.
 	if s.db != nil {
 		if existingIdx, err := s.db.GetVoiceAssignmentIndexByRun(ctx, in.AssetID, in.RunID, targetLang); err == nil && existingIdx != nil {
@@ -199,11 +223,11 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 		TargetLanguage:     targetLang,
 		Assignments:        assignments,
 		UseSameVoiceForAll: in.UseSameVoiceForAll,
+		Distinguishability: distinguishabilityQC,
 		ProvenanceHash:     provenanceHash,
 		FrozenAt:           now,
 		CreatedAt:          now,
 	}
-
 	// 5. Commit to CAS and SQLite
 	if s.cas != nil && s.db != nil {
 		data, err := json.Marshal(assignment)
@@ -234,6 +258,142 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 	}
 
 	return assignment, nil
+}
+
+// ReassignVoice explicitly changes one or more speakers' frozen voices for a run (Issue #40),
+// recording the invalidation scope (only changed speakers' TTS/DubSegment/DubMix/FinalRender
+// descendants) and supersession provenance on the new immutable VoiceAssignment.
+func (s *DubbingService) ReassignVoice(ctx context.Context, in domain.VoiceAssignmentInput) (*domain.VoiceAssignment, error) {
+	if strings.TrimSpace(in.RunID) == "" {
+		return nil, fmt.Errorf("run_id is required")
+	}
+	if strings.TrimSpace(in.AssetID) == "" {
+		return nil, fmt.Errorf("asset_id is required")
+	}
+	targetLang := strings.ToLower(strings.TrimSpace(in.TargetLanguage))
+	if targetLang != "vi" && targetLang != "en" {
+		return nil, fmt.Errorf("unsupported target language '%s': must be 'vi' or 'en'", in.TargetLanguage)
+	}
+	in.TargetLanguage = targetLang
+
+	// 1. Existing frozen assignment must exist
+	existingIdx, err := s.db.GetVoiceAssignmentIndexByRun(ctx, in.AssetID, in.RunID, targetLang)
+	if err != nil || existingIdx == nil {
+		return nil, domain.ErrVoiceAssignmentNotFound
+	}
+	var existing domain.VoiceAssignment
+	loaded := false
+	if s.cas != nil && existingIdx.CASHash != "" {
+		if rc, err := s.cas.Get(existingIdx.CASHash); err == nil {
+			defer rc.Close()
+			if err := json.NewDecoder(rc).Decode(&existing); err == nil {
+				existing.CASHash = existingIdx.CASHash
+				loaded = true
+			}
+		}
+	}
+	if !loaded && existingIdx.AssignmentsJSON != "" {
+		if err := json.Unmarshal([]byte(existingIdx.AssignmentsJSON), &existing); err == nil {
+			existing.CASHash = existingIdx.CASHash
+			loaded = true
+		}
+	}
+	if !loaded {
+		return nil, fmt.Errorf("load existing frozen voice assignment: %w", domain.ErrVoiceAssignmentNotFound)
+	}
+
+	// 2. Build new assignments
+	newAssignments := make(map[string]domain.VoiceProfile)
+	for spk, prof := range existing.Assignments {
+		newAssignments[spk] = prof
+	}
+	if in.UseSameVoiceForAll && len(in.CustomAssignments) > 0 {
+		var customKeys []string
+		for k := range in.CustomAssignments {
+			customKeys = append(customKeys, k)
+		}
+		sort.Strings(customKeys)
+		var singleVoice domain.VoiceProfile
+		for _, k := range customKeys {
+			if v := in.CustomAssignments[k]; v.ID != "" {
+				singleVoice = v
+				break
+			}
+		}
+		if singleVoice.ID != "" {
+			for spk := range newAssignments {
+				newAssignments[spk] = singleVoice
+			}
+		}
+	} else {
+		for spk, custom := range in.CustomAssignments {
+			if _, ok := newAssignments[spk]; ok && custom.ID != "" {
+				newAssignments[spk] = custom
+			}
+		}
+	}
+	// 3. Compute affected speakers
+	affected := domain.AffectedSpeakers(existing.Assignments, newAssignments)
+	if len(affected) == 0 && existing.UseSameVoiceForAll == in.UseSameVoiceForAll {
+		// Idempotent: nothing changed
+		return &existing, nil
+	}
+
+	provenanceHash, err := s.computeVoiceAssignmentProvenanceHash(in, newAssignments)
+	if err != nil {
+		return nil, fmt.Errorf("compute reassignment cache identity: %w", err)
+	}
+
+	distinguishabilityQC := domain.EvaluateVoiceDistinguishability(newAssignments, in.UseSameVoiceForAll)
+	now := time.Now().UTC()
+	newAssignment := &domain.VoiceAssignment{
+		ID:                  uuid.NewString(),
+		SchemaVersion:       domain.VoiceAssignmentSchemaVersion,
+		AssetID:             in.AssetID,
+		RunID:               in.RunID,
+		JobID:               in.JobID,
+		TargetLanguage:      targetLang,
+		Assignments:         newAssignments,
+		UseSameVoiceForAll:  in.UseSameVoiceForAll,
+		SupersedesCAS:       existing.CASHash,
+		InvalidatedSpeakers: affected,
+		InvalidationScope:   domain.VoiceChangeInvalidationStages(),
+		Distinguishability:  distinguishabilityQC,
+		ProvenanceHash:      provenanceHash,
+		FrozenAt:            now,
+		CreatedAt:           now,
+	}
+
+	// 4. Commit new assignment to CAS and SQLite index
+	if s.cas != nil && s.db != nil {
+		data, err := json.Marshal(newAssignment)
+		if err != nil {
+			return nil, fmt.Errorf("marshal reassigned voice assignment: %w", err)
+		}
+		casObj, err := s.cas.Put(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("put reassigned voice assignment in CAS: %w", err)
+		}
+		newAssignment.CASHash = casObj.SHA256
+
+		idx := storage.VoiceAssignmentIndex{
+			ID:                 newAssignment.ID,
+			AssetID:            newAssignment.AssetID,
+			RunID:              newAssignment.RunID,
+			JobID:              newAssignment.JobID,
+			TargetLanguage:     newAssignment.TargetLanguage,
+			CASHash:            newAssignment.CASHash,
+			ProvenanceHash:     newAssignment.ProvenanceHash,
+			AssignmentsJSON:    string(data),
+			UseSameVoiceForAll: newAssignment.UseSameVoiceForAll,
+			CreatedAt:          newAssignment.CreatedAt,
+		}
+		if err := s.db.SaveVoiceAssignmentIndex(ctx, idx); err != nil {
+			return nil, fmt.Errorf("save reassigned voice assignment index: %w", err)
+		}
+	}
+
+	return newAssignment, nil
 }
 
 // AuditionVoice generates a short 5s standalone or 10s contextual audio clip to audition a voice profile.
@@ -358,7 +518,43 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 		}
 	}
 
-	// 5. Iterate through segments, synthesize speech, probe actual duration, drive FitController
+	// 5. Invalidation scope optimization: load superseded DubSegmentsVariant if current VoiceAssignment
+	// supersedes another assignment (Issue #40). Reuses prior selected DubSegments ONLY if the prior
+	// variant matches BOTH the superseded VoiceAssignmentCAS and the exact same DubScriptVariantCAS.
+	var priorVariant *domain.DubSegmentsVariant
+	invalidatedSpeakersSet := make(map[string]bool)
+	if voiceAssign.SupersedesCAS != "" {
+		for _, spk := range voiceAssign.InvalidatedSpeakers {
+			invalidatedSpeakersSet[spk] = true
+		}
+		if s.db != nil && s.cas != nil {
+			if prevIdx, err := s.db.GetDubSegmentsVariantIndex(ctx, in.AssetID, targetLang); err == nil && prevIdx != nil {
+				if rc, err := s.cas.Get(prevIdx.CASHash); err == nil {
+					defer rc.Close()
+					var prevVar domain.DubSegmentsVariant
+					if err := json.NewDecoder(rc).Decode(&prevVar); err == nil &&
+						prevVar.VoiceAssignmentCAS == voiceAssign.SupersedesCAS &&
+						prevVar.DubScriptVariantCAS != "" &&
+						prevVar.DubScriptVariantCAS == dubScriptCAS {
+						priorVariant = &prevVar
+					}
+				}
+			}
+		}
+	}
+
+	priorSegmentByIndex := make(map[int]domain.DubSegment)
+	priorFitPlanByIndex := make(map[int]domain.DubbingFitPlan)
+	if priorVariant != nil {
+		for _, seg := range priorVariant.Segments {
+			priorSegmentByIndex[seg.Index] = seg
+		}
+		for _, fp := range priorVariant.FitPlans {
+			priorFitPlanByIndex[fp.SegmentIndex] = fp
+		}
+	}
+
+	// 6. Iterate through segments, synthesize speech, probe actual duration, drive FitController
 	var selectedSegments []domain.DubSegment
 	var reviewSegments []domain.DubSegmentReview
 	var fitPlans []domain.DubbingFitPlan
@@ -382,6 +578,70 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 				voice = presets[0]
 			} else {
 				return nil, fmt.Errorf("%w: speaker %s", domain.ErrVoiceProfileNotFound, spkID)
+			}
+		}
+
+		// Fail-safe speaker-scoped invalidation check:
+		// If this VoiceAssignment supersedes a prior assignment and this speaker was NOT invalidated,
+		// reuse the prior validated DubSegment and FitPlan directly without re-synthesizing ONLY IF:
+		// 1) Matching prior segment is present and valid with non-empty audio and accepted status.
+		// 2) Corresponding prior DubbingFitPlan exists, has decision ACCEPT, no review, and satisfies zero-overrun fit.
+		// 3) Grouped SpeechBlockIndices / timing match the current dub script and speaker sequence.
+		if voiceAssign.SupersedesCAS != "" && !invalidatedSpeakersSet[spkID] && priorVariant != nil {
+			priorSeg, segExists := priorSegmentByIndex[seg.Index]
+			priorFP, fpExists := priorFitPlanByIndex[seg.Index]
+			if segExists && fpExists &&
+				priorSeg.SpeakerID == spkID &&
+				domain.VoiceProfileEquivalent(priorSeg.Voice, voice) &&
+				priorSeg.AudioSHA256 != "" && priorSeg.AudioCASPath != "" &&
+				priorSeg.FitDecision == domain.FitActionAccept &&
+				!priorSeg.RequiresReview &&
+				priorFP.Decision == domain.FitActionAccept &&
+				priorFP.DurationDeltaMs <= 0 &&
+				priorFP.MeasuredDurationMs > 0 &&
+				priorFP.MeasuredDurationMs <= priorFP.UsableSlotMs &&
+				priorSeg.StartMs == seg.StartMs {
+				validGrouping := true
+				groupCount := len(priorSeg.SpeechBlockIndices)
+				if groupCount <= 1 {
+					if groupCount == 1 && priorSeg.SpeechBlockIndices[0] != seg.Index {
+						validGrouping = false
+					}
+					if priorSeg.EndMs != seg.EndMs {
+						validGrouping = false
+					}
+				} else {
+					if i+groupCount > len(dubScript.Segments) {
+						validGrouping = false
+					} else {
+						for k := 0; k < groupCount; k++ {
+							currSegK := dubScript.Segments[i+k]
+							currSpkK := currSegK.SpeakerID
+							if currSpkK == "" {
+								currSpkK = "SPEAKER_00"
+							}
+							if currSegK.Index != priorSeg.SpeechBlockIndices[k] || currSpkK != spkID {
+								validGrouping = false
+								break
+							}
+						}
+						if validGrouping {
+							lastSeg := dubScript.Segments[i+groupCount-1]
+							if priorSeg.EndMs != lastSeg.EndMs {
+								validGrouping = false
+							}
+						}
+					}
+				}
+
+				if validGrouping {
+					selectedSegments = append(selectedSegments, priorSeg)
+					fitPlans = append(fitPlans, priorFP)
+					if groupCount > 1 {
+						i += groupCount - 1
+					}
+					continue
+				}
 			}
 		}
 
@@ -1183,7 +1443,6 @@ func (s *DubbingService) invokeTTSWithFallback(ctx context.Context, req provider
 	return result, selected, nil
 }
 
-// isVoiceAssignmentEquivalent checks if existing VoiceAssignment has identical speaker mappings and same-voice policy.
 func isVoiceAssignmentEquivalent(existing *domain.VoiceAssignment, newAssignments map[string]domain.VoiceProfile, useSameVoice bool) bool {
 	if existing == nil {
 		return false
@@ -1199,16 +1458,7 @@ func isVoiceAssignmentEquivalent(existing *domain.VoiceAssignment, newAssignment
 		if !ok {
 			return false
 		}
-		if existingProfile.ID != newProfile.ID ||
-			existingProfile.ProviderID != newProfile.ProviderID ||
-			existingProfile.VoiceID != newProfile.VoiceID ||
-			existingProfile.Language != newProfile.Language ||
-			existingProfile.Gender != newProfile.Gender ||
-			existingProfile.Pitch != newProfile.Pitch ||
-			existingProfile.Speed != newProfile.Speed ||
-			existingProfile.Timbre != newProfile.Timbre ||
-			existingProfile.IsClone != newProfile.IsClone ||
-			existingProfile.ReferenceAudioCAS != newProfile.ReferenceAudioCAS {
+		if !domain.VoiceProfileEquivalent(existingProfile, newProfile) {
 			return false
 		}
 	}

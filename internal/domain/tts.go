@@ -5,6 +5,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -56,18 +59,116 @@ type VoiceProfile struct {
 // VoiceAssignment is the frozen, run-scoped mapping of speaker_id -> VoiceProfile.
 // Engine hopping across sentences for a single speaker is strictly prohibited.
 type VoiceAssignment struct {
-	ID                 string                  `json:"id"`
-	SchemaVersion      int                     `json:"schema_version"`
-	AssetID            string                  `json:"asset_id"`
-	RunID              string                  `json:"run_id"`
-	JobID              string                  `json:"job_id,omitempty"`
-	TargetLanguage     string                  `json:"target_language"` // "vi" or "en"
-	Assignments        map[string]VoiceProfile `json:"assignments"`     // speaker_id -> VoiceProfile
-	UseSameVoiceForAll bool                    `json:"use_same_voice_for_all"`
-	CASHash            string                  `json:"cas_hash,omitempty"`
-	ProvenanceHash     string                  `json:"provenance_hash,omitempty"`
-	FrozenAt           time.Time               `json:"frozen_at"`
-	CreatedAt          time.Time               `json:"created_at"`
+	ID                  string                     `json:"id"`
+	SchemaVersion       int                        `json:"schema_version"`
+	AssetID             string                     `json:"asset_id"`
+	RunID               string                     `json:"run_id"`
+	JobID               string                     `json:"job_id,omitempty"`
+	TargetLanguage      string                     `json:"target_language"` // "vi" or "en"
+	Assignments         map[string]VoiceProfile    `json:"assignments"`     // speaker_id -> VoiceProfile
+	UseSameVoiceForAll  bool                       `json:"use_same_voice_for_all"`
+	SupersedesCAS       string                     `json:"supersedes_cas,omitempty"`
+	InvalidatedSpeakers []string                   `json:"invalidated_speakers,omitempty"`
+	InvalidationScope   []string                   `json:"invalidation_scope,omitempty"`
+	Distinguishability  *VoiceDistinguishabilityQC `json:"distinguishability,omitempty"`
+	CASHash             string                     `json:"cas_hash,omitempty"`
+	ProvenanceHash      string                     `json:"provenance_hash,omitempty"`
+	FrozenAt            time.Time                  `json:"frozen_at"`
+	CreatedAt           time.Time                  `json:"created_at"`
+}
+
+// VoiceDistinguishabilityQC captures quality-control evaluation of multi-speaker voice assignments.
+type VoiceDistinguishabilityQC struct {
+	MultiSpeaker     bool     `json:"multi_speaker"`
+	Status           string   `json:"status"` // "PASS" | "REVIEW_REQUIRED"
+	Issues           []string `json:"issues,omitempty"`
+	DistinctVoiceIDs int      `json:"distinct_voice_ids"`
+	SpeakerCount     int      `json:"speaker_count"`
+}
+
+// VoiceChangeInvalidationStages returns the declared descendant stage chain
+// regenerated when an operator edits a speaker's voice assignment (Issue #40).
+// RenderPlan sits between DubMix and FinalRender. Source-derived artifacts
+// (transcript, translation, dub script, stems) remain reusable.
+func VoiceChangeInvalidationStages() []string {
+	return []string{"tts", "dub_segments", "dub_mix", "render_plan", "final_render"}
+}
+
+// EvaluateVoiceDistinguishability checks that multi-speaker assignments keep voices
+// distinguishable. Distinct speakers sharing one identical voice profile without an
+// explicit same-voice-for-all convenience flag is flagged REVIEW_REQUIRED.
+func EvaluateVoiceDistinguishability(assignments map[string]VoiceProfile, useSameVoiceForAll bool) *VoiceDistinguishabilityQC {
+	qc := &VoiceDistinguishabilityQC{
+		MultiSpeaker: len(assignments) > 1,
+		SpeakerCount: len(assignments),
+	}
+	voiceIDs := make(map[string]bool)
+	for _, v := range assignments {
+		voiceIDs[v.ID] = true
+	}
+	qc.DistinctVoiceIDs = len(voiceIDs)
+
+	if !qc.MultiSpeaker {
+		qc.Status = "PASS"
+		return qc
+	}
+	if useSameVoiceForAll {
+		qc.Status = "PASS"
+		return qc
+	}
+	if qc.DistinctVoiceIDs < len(assignments) {
+		byVoice := make(map[string][]string)
+		for spk, v := range assignments {
+			byVoice[v.ID] = append(byVoice[v.ID], spk)
+		}
+		for vid, spks := range byVoice {
+			if len(spks) > 1 {
+				sort.Strings(spks)
+				qc.Issues = append(qc.Issues, fmt.Sprintf("speakers %s share voice %q without use_same_voice_for_all", strings.Join(spks, ","), vid))
+			}
+		}
+		sort.Strings(qc.Issues)
+		qc.Status = "REVIEW_REQUIRED"
+		return qc
+	}
+	qc.Status = "PASS"
+	return qc
+}
+
+// AffectedSpeakers returns the list of speaker IDs whose voice profile differs between old and new assignments.
+func AffectedSpeakers(oldAssignments, newAssignments map[string]VoiceProfile) []string {
+	affectedMap := make(map[string]bool)
+	for spk, newProf := range newAssignments {
+		oldProf, exists := oldAssignments[spk]
+		if !exists || !VoiceProfileEquivalent(oldProf, newProf) {
+			affectedMap[spk] = true
+		}
+	}
+	for spk := range oldAssignments {
+		if _, exists := newAssignments[spk]; !exists {
+			affectedMap[spk] = true
+		}
+	}
+	var res []string
+	for spk := range affectedMap {
+		res = append(res, spk)
+	}
+	sort.Strings(res)
+	return res
+}
+
+// VoiceProfileEquivalent checks if two voice profiles are semantically identical in all audio-affecting fields.
+func VoiceProfileEquivalent(a, b VoiceProfile) bool {
+	return a.ID == b.ID &&
+		a.ProviderID == b.ProviderID &&
+		a.VoiceID == b.VoiceID &&
+		a.Language == b.Language &&
+		a.Gender == b.Gender &&
+		a.Pitch == b.Pitch &&
+		a.Speed == b.Speed &&
+		a.Timbre == b.Timbre &&
+		a.IsClone == b.IsClone &&
+		a.ReferenceAudioCAS == b.ReferenceAudioCAS
 }
 
 // FitAction represents the outcome of evaluating a candidate synthesized media against the immutable source window.
