@@ -1,0 +1,42 @@
+cmd/runtimehost/main.go
+  h_17f2fa2b92da6a 72,140
+cmd/stageworker/adapters/ocr.py
+  h_17f2fa2b92da6a 1-83
+cmd/stageworker/adapters/test_ocr.py
+  h_17f2fa2b92da6a 1-57
+cmd/stageworker/main.go
+  h_17f2fa2b92da6a 25,367-368,949-1061
+internal/domain/textregion.go
+  h_17f2fa2b92da6a 1-260
+internal/domain/textregion_test.go
+  h_17f2fa2b92da6a 1-120
+internal/provider/fake.go
+  h_17f2fa2b92da6a 374-378,390,400-402,406-501
+internal/provider/ocr.go
+  h_17f2fa2b92da6a 1-42
+internal/provider/worker_adapters.go
+  h_17f2fa2b92da6a 43,331-340,774-839
+internal/server/server.go
+  h_17f2fa2b92da6a 46,69,108-110,127,182-189,291-295,1969-2046
+internal/service/visual_text.go
+  h_17f2fa2b92da6a 1-416
+internal/service/visual_text_test.go
+  h_17f2fa2b92da6a 1-203
+internal/storage/sqlite.go
+  h_17f2fa2b92da6a 844-884,3169-3276
+test/seam1/acceptance_test.go
+  h_17f2fa2b92da6a 158
+test/seam1/text_region_test.go
+  h_17f2fa2b92da6a 1-246
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "417eff89e44606dab7bc557df7708b0eea7c35a4",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
