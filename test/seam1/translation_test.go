@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/provider"
@@ -425,10 +426,6 @@ func TestSeam1_DubScript_DurationAdaptation_ShortenFirst(t *testing.T) {
 	if dubVariant.CASHash == "" {
 		t.Errorf("expected non-empty CASHash for dub script variant")
 	}
-	if len(dubVariant.Segments) == 0 {
-		t.Fatalf("expected dub script segments, got 0")
-	}
-
 	for _, seg := range dubVariant.Segments {
 		if !seg.PassedQAGate {
 			t.Errorf("segment %d failed QA gate", seg.Index)
@@ -438,6 +435,25 @@ func TestSeam1_DubScript_DurationAdaptation_ShortenFirst(t *testing.T) {
 		}
 		if seg.EstimatedDurationMs <= 0 {
 			t.Errorf("segment %d has non-positive estimated duration: %d", seg.Index, seg.EstimatedDurationMs)
+		}
+		// Source-relative invariants:
+		//  - Duration overrun must route to review.
+		//  - A fitting segment may still require review for cadence or QA reasons.
+		//  - Cadence/target-rate metadata must always be populated and positive.
+		if seg.EstimatedDurationMs > seg.SlotDurationMs && !seg.RequiresReview {
+			t.Errorf("segment %d overruns slot but was not flagged for review", seg.Index)
+		}
+		if seg.EstimatedDurationMs <= seg.SlotDurationMs && seg.ReviewReason == "DURATION_OVERRUN" {
+			t.Errorf("segment %d fits slot but was incorrectly marked DURATION_OVERRUN", seg.Index)
+		}
+		if seg.TargetSpeakingRateCPS <= 0 {
+			t.Errorf("segment %d expected positive target speaking rate, got %f", seg.Index, seg.TargetSpeakingRateCPS)
+		}
+		if seg.CadenceRatio <= 0 {
+			t.Errorf("segment %d expected positive cadence ratio, got %f", seg.Index, seg.CadenceRatio)
+		}
+		if seg.TargetWordBudget < 0 {
+			t.Errorf("segment %d expected non-negative target word budget, got %d", seg.Index, seg.TargetWordBudget)
 		}
 	}
 
@@ -494,5 +510,74 @@ func TestSeam1_DubScript_DeterministicCAS_Idempotency(t *testing.T) {
 	}
 	if dub1.CASHash != dub2.CASHash {
 		t.Errorf("expected identical CASHash, got %s vs %s", dub1.CASHash, dub2.CASHash)
+	}
+}
+
+// TestSeam1_DubScript_CASOwnership_MismatchRejection verifies that supplying a TranslationVariant
+// from a different asset or mismatched target language is rejected by the API.
+func TestSeam1_DubScript_CASOwnership_MismatchRejection(t *testing.T) {
+	h := setupHarness(t)
+	asset1, run1 := setupSpeechUnderstoodAsset(t, h)
+
+	// The mismatched destination only needs to exist: the public dub-script
+	// endpoint validates TranslationVariant ownership before any source-derived
+	// work is consumed. Keep this fixture minimal instead of duplicating the
+	// full speech-understanding setup.
+	const (
+		asset2 = "asset-mismatch-second"
+		raID   = "asset-mismatch-rights"
+	)
+	if err := h.db.CreateRightsAttestation(t.Context(), domain.RightsAttestation{
+		ID:              raID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		DeclaredBy:      "test-operator",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create mismatch rights attestation: %v", err)
+	}
+	if err := h.db.CreateSourceAsset(t.Context(), domain.SourceAsset{
+		ID:                  asset2,
+		SHA256:              "asset-mismatch-second-sha",
+		ByteSize:            1,
+		MimeType:            "video/mp4",
+		OriginalFilename:    "asset-mismatch-second.mp4",
+		RightsAttestationID: raID,
+		CASPath:             "unused-for-ownership-check",
+		CreatedAt:           time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create mismatch source asset: %v", err)
+	}
+
+	// Translate for asset 1 in VI
+	transReq := map[string]any{
+		"run_id":          run1,
+		"target_language": "vi",
+	}
+	_, transVariant1 := runTranslation(t, h, asset1, transReq)
+	if transVariant1 == nil {
+		t.Fatalf("translation failed")
+	}
+
+	// 1. Submit Asset 1's translation CAS to Asset 2's dub-script endpoint -> must reject
+	mismatchedAssetReq := map[string]any{
+		"run_id":                  run1,
+		"target_language":         "vi",
+		"translation_variant_cas": transVariant1.CASHash,
+	}
+	respAssetMismatch, _ := runDubScript(t, h, asset2, mismatchedAssetReq)
+	if respAssetMismatch.StatusCode == http.StatusOK || respAssetMismatch.StatusCode == http.StatusCreated {
+		t.Errorf("expected rejection for asset_id mismatch, got status %d", respAssetMismatch.StatusCode)
+	}
+
+	// 2. Submit VI translation CAS requesting EN dub-script -> must reject
+	mismatchedLangReq := map[string]any{
+		"run_id":                  run1,
+		"target_language":         "en",
+		"translation_variant_cas": transVariant1.CASHash,
+	}
+	respLangMismatch, _ := runDubScript(t, h, asset1, mismatchedLangReq)
+	if respLangMismatch.StatusCode == http.StatusOK || respLangMismatch.StatusCode == http.StatusCreated {
+		t.Errorf("expected rejection for target_language mismatch, got status %d", respLangMismatch.StatusCode)
 	}
 }

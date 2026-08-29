@@ -19,8 +19,9 @@ var (
 
 const (
 	TranslationSchemaVersion = 1
-	DubScriptSchemaVersion   = 1
+	DubScriptSchemaVersion   = 2
 )
+
 // TranslationSegment represents a single translated unit (typically mapped 1:1 to a SpeechBlock or visual text region).
 type TranslationSegment struct {
 	Index            int      `json:"index"`
@@ -77,19 +78,25 @@ type TranslationJobInput struct {
 	AuthorizedCredentials []string                  `json:"authorized_credentials,omitempty"`
 }
 
-// DubScriptSegment represents a duration-adapted spoken dialogue unit for TTS dubbing.
 type DubScriptSegment struct {
 	Index                 int      `json:"index"`
 	SourceText            string   `json:"source_text"`
-	MeaningText           string   `json:"meaning_text"`            // Original translation from TranslationVariant
-	SpokenText            string   `json:"spoken_text"`             // Duration-adapted, shorten-first phrasing
+	MeaningText           string   `json:"meaning_text"` // Original translation from TranslationVariant
+	SpokenText            string   `json:"spoken_text"`  // Duration-adapted, shorten-first phrasing
 	SpeakerID             string   `json:"speaker_id,omitempty"`
-	StartMs               int64    `json:"start_ms"`                // Immutable source window start
-	EndMs                 int64    `json:"end_ms"`                  // Immutable source window end
-	SlotDurationMs        int64    `json:"slot_duration_ms"`        // EndMs - StartMs
-	EstimatedDurationMs   int64    `json:"estimated_duration_ms"`   // Estimated spoken duration
-	SourceSpeakingRateCPS float64  `json:"source_speaking_rate_cps"`// Source characters/syllables per second
-	IsShortened           bool     `json:"is_shortened"`            // Whether shorten-first adaptation was applied
+	StartMs               int64    `json:"start_ms"`                  // Immutable source window start
+	EndMs                 int64    `json:"end_ms"`                    // Immutable source window end
+	SlotDurationMs        int64    `json:"slot_duration_ms"`          // EndMs - StartMs
+	EstimatedDurationMs   int64    `json:"estimated_duration_ms"`     // Estimated spoken duration
+	SourceSpeakingRateCPS float64  `json:"source_speaking_rate_cps"`  // Source syllable-like speech units per second (Han character ~= syllable)
+	TargetSpeakingRateCPS float64  `json:"target_speaking_rate_cps"`  // Target syllables per second
+	CadenceRatio          float64  `json:"cadence_ratio"`             // Target syllables/sec vs source syllables/sec (source-relative)
+	SourceGapAfterMs      int64    `json:"source_gap_after_ms"`       // Immutable source silence until the next speech turn
+	NaturalGapMs          int64    `json:"natural_gap_ms"`            // Predicted pause from estimated dub finish to the next source turn
+	TargetWordBudget      int      `json:"target_word_budget"`        // Source-relative max target words for the immutable speech slot
+	IsShortened           bool     `json:"is_shortened"`              // Whether shorten-first adaptation was applied
+	RequiresReview        bool     `json:"requires_review,omitempty"` // Flagged if unresolvable duration overrun or QA fallback
+	ReviewReason          string   `json:"review_reason,omitempty"`   // Reason code for operator review
 	KeyFacts              []string `json:"key_facts,omitempty"`
 	NegationPolarity      bool     `json:"negation_polarity"`
 	QAConfidence          float64  `json:"qa_confidence"`
@@ -114,6 +121,7 @@ type DubScriptVariant struct {
 	CASHash               string             `json:"cas_hash,omitempty"`
 	ProvenanceHash        string             `json:"provenance_hash,omitempty"`
 	OverallQAScore        float64            `json:"overall_qa_score"`
+	RequiresReview        bool               `json:"requires_review,omitempty"`
 	CreatedAt             time.Time          `json:"created_at"`
 }
 

@@ -7,17 +7,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"math"
-	"regexp"
-	"strings"
-	"time"
-	"unicode/utf8"
 	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/storage"
+	"io"
+	"strings"
+	"time"
 )
 
 // TranslationInvokeFunc executes one translation provider attempt.
@@ -31,10 +28,11 @@ type TranslationInvokeFunc func(ctx context.Context, p provider.Provider, req do
 //  5. Evaluates Translation QA Gate (facts, names, numbers, negation polarity).
 //  6. Emits immutable TranslationVariant artifact to CAS and indexes in SQLite.
 type TranslationService struct {
-	db     *storage.DB
-	cas    *cas.Store
-	router *provider.Router
-	qaGate *MeaningFirstQAGate
+	db            *storage.DB
+	cas           *cas.Store
+	router        *provider.Router
+	qaGate        *MeaningFirstQAGate
+	spokenAdapter provider.SpokenScriptAdapter
 
 	// TranslateInvoke executes one translation provider attempt. When nil,
 	// the router-backed default is used.
@@ -44,15 +42,21 @@ type TranslationService struct {
 // NewTranslationService creates a new TranslationService instance.
 func NewTranslationService(db *storage.DB, casStore *cas.Store) *TranslationService {
 	return &TranslationService{
-		db:     db,
-		cas:    casStore,
-		qaGate: NewMeaningFirstQAGate(),
+		db:            db,
+		cas:           casStore,
+		qaGate:        NewMeaningFirstQAGate(),
+		spokenAdapter: provider.NewDefaultSpokenScriptAdapter(),
 	}
 }
 
 // ConfigureRouter injects the provider router.
 func (s *TranslationService) ConfigureRouter(router *provider.Router) {
 	s.router = router
+}
+
+// ConfigureSpokenAdapter injects a custom spoken script adapter.
+func (s *TranslationService) ConfigureSpokenAdapter(adapter provider.SpokenScriptAdapter) {
+	s.spokenAdapter = adapter
 }
 
 // Translate executes the meaning-first translation pipeline and returns the immutable TranslationVariant.
@@ -486,21 +490,54 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 	// 4. Adapt segments with shorten-first principle and source-relative cadence
 	var dubSegments []domain.DubScriptSegment
 	var totalConfidence float64
+	variantRequiresReview := false
 
-	for _, seg := range transVariant.Segments {
+	adapter := s.spokenAdapter
+	if adapter == nil {
+		adapter = provider.NewDefaultSpokenScriptAdapter()
+	}
+
+	for i, seg := range transVariant.Segments {
 		slotDurationMs := seg.EndMs - seg.StartMs
 		if slotDurationMs <= 0 {
 			slotDurationMs = 1000
 		}
 
-		srcCharCount := utf8.RuneCountInString(strings.TrimSpace(seg.SourceText))
-		var srcCPS float64
-		if slotDurationMs > 0 {
-			srcCPS = float64(srcCharCount) / (float64(slotDurationMs) / 1000.0)
+		srcCPS := provider.EstimateSourceSpeakingRate(seg.SourceText, in.SourceLanguage, slotDurationMs)
+		hasNextTurn := i+1 < len(transVariant.Segments)
+		var sourceGapAfterMs int64
+		if hasNextTurn {
+			sourceGapAfterMs = transVariant.Segments[i+1].StartMs - seg.EndMs
+			if sourceGapAfterMs < 0 {
+				sourceGapAfterMs = 0
+			}
 		}
 
 		meaningText := seg.TargetText
-		spokenText, isShortened, estDurationMs := s.adaptSpokenDuration(meaningText, seg.SourceText, in.SourceLanguage, in.TargetLanguage, slotDurationMs, srcCPS)
+		adaptRes, err := adapter.AdaptSpokenScript(ctx, provider.SpokenScriptAdaptationRequest{
+			SourceText:            seg.SourceText,
+			SourceLanguage:        in.SourceLanguage,
+			MeaningText:           meaningText,
+			TargetLanguage:        in.TargetLanguage,
+			SlotDurationMs:        slotDurationMs,
+			SourceSpeakingRateCPS: srcCPS,
+			SourceGapAfterMs:      sourceGapAfterMs,
+			HasNextTurn:           hasNextTurn,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("adapt spoken script for segment %d: %w", seg.Index, err)
+		}
+
+		spokenText := adaptRes.SpokenText
+		isShortened := adaptRes.IsShortened
+		estDurationMs := adaptRes.EstimatedDurationMs
+		targetCPS := adaptRes.TargetSpeakingRateCPS
+		cadenceRatio := adaptRes.CadenceRatio
+		naturalGapMs := adaptRes.NaturalGapMs
+		usableSlotMs := adaptRes.UsableSlotMs
+		targetWordBudget := adaptRes.TargetWordBudget
+		requiresReview := adaptRes.RequiresReview
+		reviewReason := adaptRes.ReviewReason
 
 		// Run Translation QA Gate to guarantee facts/names/numbers/negation survive
 		qaRes := s.qaGate.ValidateSegment(seg.SourceText, spokenText, in.SourceLanguage, in.TargetLanguage)
@@ -509,7 +546,15 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 				// Fallback to unshortened meaningText if shortened version corrupted facts
 				spokenText = meaningText
 				isShortened = false
-				estDurationMs = estimateSpokenDurationMs(spokenText, in.TargetLanguage)
+				estDurationMs = provider.EstimateSpokenDurationMs(spokenText, in.TargetLanguage)
+				targetCPS = provider.EstimateSpokenRateCPS(spokenText, in.TargetLanguage)
+				if srcCPS > 0 {
+					cadenceRatio = targetCPS / srcCPS
+				}
+				naturalGapMs = provider.EstimatePauseToNextTurnMs(slotDurationMs, estDurationMs, sourceGapAfterMs, hasNextTurn)
+				requiresReview = true
+				reviewReason = "QA_GATE_FALLBACK_UNSHORTENED"
+
 				qaRes = s.qaGate.ValidateSegment(seg.SourceText, spokenText, in.SourceLanguage, in.TargetLanguage)
 			}
 			if !qaRes.Passed {
@@ -518,6 +563,19 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 				}
 				return nil, fmt.Errorf("dub script QA gate rejected segment %d: %w", seg.Index, domain.ErrMeaningPreservationFailed)
 			}
+		}
+
+		// Double-check the immutable source speech window. Inter-turn source
+		// silence lives outside this slot and is preserved by the fixed anchors.
+		if estDurationMs > usableSlotMs {
+			requiresReview = true
+			if reviewReason == "" {
+				reviewReason = "DURATION_OVERRUN"
+			}
+		}
+
+		if requiresReview {
+			variantRequiresReview = true
 		}
 
 		dubSeg := domain.DubScriptSegment{
@@ -531,7 +589,14 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 			SlotDurationMs:        slotDurationMs,
 			EstimatedDurationMs:   estDurationMs,
 			SourceSpeakingRateCPS: srcCPS,
+			TargetSpeakingRateCPS: targetCPS,
+			CadenceRatio:          cadenceRatio,
+			SourceGapAfterMs:      sourceGapAfterMs,
+			NaturalGapMs:          naturalGapMs,
+			TargetWordBudget:      targetWordBudget,
 			IsShortened:           isShortened,
+			RequiresReview:        requiresReview,
+			ReviewReason:          reviewReason,
 			KeyFacts:              qaRes.ExtractedFacts,
 			NegationPolarity:      qaRes.NegationPolarity,
 			QAConfidence:          qaRes.Confidence,
@@ -562,6 +627,7 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 		ModelVersion:          transVariant.ModelVersion,
 		ProvenanceHash:        provenanceHash,
 		OverallQAScore:        overallQAScore,
+		RequiresReview:        variantRequiresReview,
 		CreatedAt:             time.Now().UTC(),
 	}
 
@@ -642,6 +708,15 @@ func (s *TranslationService) loadTranslationVariant(ctx context.Context, assetID
 	if err := json.NewDecoder(rc).Decode(&variant); err != nil {
 		return nil, "", fmt.Errorf("decode translation variant: %w", err)
 	}
+
+	// Validate ownership against requested AssetID and TargetLanguage
+	if variant.AssetID != assetID {
+		return nil, "", fmt.Errorf("translation variant asset_id mismatch: expected %s, got %s", assetID, variant.AssetID)
+	}
+	if !strings.EqualFold(variant.TargetLanguage, targetLang) {
+		return nil, "", fmt.Errorf("translation variant target_language mismatch: expected %s, got %s", targetLang, variant.TargetLanguage)
+	}
+
 	variant.CASHash = resolvedCAS
 	return &variant, resolvedCAS, nil
 }
@@ -656,7 +731,7 @@ func (s *TranslationService) computeDubScriptProvenanceHash(in domain.DubScriptJ
 		InputHashes: inputHashes,
 		SemanticConfig: map[string]any{
 			"source_language": in.SourceLanguage,
-			"adaptation_mode": "shorten_first_cadence_v1",
+			"adaptation_mode": "shorten_first_source_relative_cadence_v2",
 		},
 		ProviderID:    transVariant.ProviderID,
 		ModelName:     transVariant.ModelName,
@@ -664,110 +739,4 @@ func (s *TranslationService) computeDubScriptProvenanceHash(in domain.DubScriptJ
 		Language:      in.TargetLanguage,
 		SchemaVersion: domain.DubScriptSchemaVersion,
 	})
-}
-
-// estimateSpokenDurationMs estimates speech duration based on language cadence rules.
-// Vietnamese average: ~3.8 syllables/sec (~260ms per word/syllable) + 150ms buffer.
-// English average: ~3.2 words/sec (~310ms per word) + 150ms buffer.
-func estimateSpokenDurationMs(text, lang string) int64 {
-	trimmed := strings.TrimSpace(text)
-	if trimmed == "" {
-		return 0
-	}
-	words := strings.Fields(trimmed)
-	count := len(words)
-	if count == 0 {
-		return 0
-	}
-
-	var msPerWord float64
-	switch strings.ToLower(lang) {
-	case "vi":
-		msPerWord = 260.0
-	case "en":
-		msPerWord = 310.0
-	default:
-		msPerWord = 280.0
-	}
-
-	return int64(math.Round(float64(count)*msPerWord + 150.0))
-}
-
-// adaptSpokenDuration applies shorten-first adaptation when slot duration is tight or source cadence is brisk.
-func (s *TranslationService) adaptSpokenDuration(meaningText, srcText, srcLang, tgtLang string, slotDurationMs int64, srcCPS float64) (string, bool, int64) {
-	estMs := estimateSpokenDurationMs(meaningText, tgtLang)
-	
-	// Brisk cadence condition: estimated duration exceeds slot or source cadence is brisk (>4.5 CPS) with tight fit (>0.85 occupancy)
-	occupancy := float64(estMs) / float64(slotDurationMs)
-	isBrisk := srcCPS > 4.5 || occupancy > 0.90 || estMs > slotDurationMs
-
-	if !isBrisk {
-		return meaningText, false, estMs
-	}
-
-	shortened := shortenSpokenText(meaningText, tgtLang)
-	if shortened != meaningText && len(shortened) < len(meaningText) {
-		shortEstMs := estimateSpokenDurationMs(shortened, tgtLang)
-		return shortened, true, shortEstMs
-	}
-
-	return meaningText, false, estMs
-}
-
-var viShortenRules = []struct {
-	Pattern *regexp.Regexp
-	Replace string
-}{
-	{regexp.MustCompile(`(?i)\bvui lòng\s+`), ""},
-	{regexp.MustCompile(`(?i)\bhãy\s+`), ""},
-	{regexp.MustCompile(`(?i)\bchúng ta\s+`), "ta "},
-	{regexp.MustCompile(`(?i)\bđi dạo công viên nhé\b`), "dạo công viên nhé"},
-	{regexp.MustCompile(`(?i)\bngày mai hãy tiếp tục làm việc\b`), "mai làm việc tiếp"},
-	{regexp.MustCompile(`(?i)\bngày mai tiếp tục làm việc\b`), "mai làm việc tiếp"},
-	{regexp.MustCompile(`(?i)\bđiều chỉnh nhiệt độ đến\s+`), "chỉnh nhiệt độ "},
-	{regexp.MustCompile(`(?i)\bđiều chỉnh nhiệt độ sang\s+`), "chỉnh nhiệt độ "},
-	{regexp.MustCompile(`(?i)\bđến (\d+ độ)\b`), "$1"},
-	{regexp.MustCompile(`(?i)\bkhông được\s+`), "đừng "},
-	{regexp.MustCompile(`(?i)\bkhông phải\s+`), "chẳng phải "},
-	{regexp.MustCompile(`(?i)\bchuẩn bị (\d+ gram)\b`), "lấy $1"},
-	{regexp.MustCompile(`(?i)\bđừng thêm đường\b`), "đừng cho đường"},
-	{regexp.MustCompile(`(?i)\bcó dung tích\s+`), "dung tích "},
-	{regexp.MustCompile(`(?i)\bnấu cơm không dính nồi\b`), "nấu không dính nồi"},
-	{regexp.MustCompile(`(?i)\bhôm nay thời tiết rất tốt\b`), "hôm nay thời tiết tốt"},
-	{regexp.MustCompile(`(?i)\bkiểm tra đầu vào giọng nói\b`), "thử giọng nói"},
-}
-
-var enShortenRules = []struct {
-	Pattern *regexp.Regexp
-	Replace string
-}{
-	{regexp.MustCompile(`(?i)\bplease\s+`), ""},
-	{regexp.MustCompile(`(?i)\bthe weather is very good today\b`), "the weather is good today"},
-	{regexp.MustCompile(`(?i)\blet's go for a walk in the park\b`), "let's walk in the park"},
-	{regexp.MustCompile(`(?i)\bcontinue working tomorrow\b`), "work tomorrow"},
-	{regexp.MustCompile(`(?i)\bset the temperature to\s+`), "set temp to "},
-	{regexp.MustCompile(`(?i)\bdo not\s+`), "don't "},
-	{regexp.MustCompile(`(?i)\bcannot\s+`), "can't "},
-	{regexp.MustCompile(`(?i)\bhas a 3-liter capacity\b`), "has 3L capacity"},
-	{regexp.MustCompile(`(?i)\band does not stick to the pot\b`), "and non-stick"},
-	{regexp.MustCompile(`(?i)\bprepare 20 grams of\b`), "take 20g of"},
-}
-
-func shortenSpokenText(text, lang string) string {
-	result := text
-	switch strings.ToLower(lang) {
-	case "vi":
-		for _, r := range viShortenRules {
-			result = r.Pattern.ReplaceAllString(result, r.Replace)
-		}
-	case "en":
-		for _, r := range enShortenRules {
-			result = r.Pattern.ReplaceAllString(result, r.Replace)
-		}
-	}
-	result = strings.TrimSpace(result)
-	// Clean up consecutive spaces or orphaned punctuation
-	result = regexp.MustCompile(`\s+`).ReplaceAllString(result, " ")
-	result = regexp.MustCompile(`\s+([,.\?!])`).ReplaceAllString(result, "$1")
-	return result
 }
