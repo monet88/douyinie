@@ -44,6 +44,7 @@ type Server struct {
 	dubbingSvc     *service.DubbingService
 	audioMixSvc    *service.AudioMixService
 	visualTextSvc  *service.VisualTextService
+	renderSvc      *service.RenderService
 	mux            *http.ServeMux
 	server         *http.Server
 }
@@ -67,6 +68,7 @@ type Config struct {
 	DubbingSvc     *service.DubbingService     // TTS & Measured-Duration Dubbing pipeline (T14)
 	AudioMixSvc    *service.AudioMixService    // Audio stems + soundtrack preservation + dialogue-suppression mix (T15)
 	VisualTextSvc  *service.VisualTextService  // OCR detection, tracking, and TextRegionPlan (T09)
+	RenderSvc      *service.RenderService      // NativeRenderBackend + frozen RenderPlan + preview/final parity (T11)
 }
 
 // New creates a new RuntimeHost Server instance.
@@ -125,6 +127,7 @@ func New(cfg Config) *Server {
 		dubbingSvc:     cfg.DubbingSvc,
 		audioMixSvc:    cfg.AudioMixSvc,
 		visualTextSvc:  cfg.VisualTextSvc,
+		renderSvc:      cfg.RenderSvc,
 		mux:            http.NewServeMux(),
 	}
 	s.routes()
@@ -185,6 +188,11 @@ func (s *Server) SetVisualTextService(svc *service.VisualTextService) {
 	if svc != nil && s.router != nil {
 		svc.ConfigureRouter(s.router)
 	}
+}
+
+// SetRenderService sets or replaces the injected render pipeline (T11).
+func (s *Server) SetRenderService(svc *service.RenderService) {
+	s.renderSvc = svc
 }
 
 // Handler returns the underlying http.Handler for in-memory / testing purposes.
@@ -293,6 +301,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/text-region-plan", s.handleRunDetectText)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/text-region-plan", s.handleGetTextRegionPlan)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/text-regions", s.handleGetTextRegionPlan)
+	// Render & Preview/Final Parity (T11)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/render-plan", s.handleFreezeRenderPlan)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/render-plan", s.handleGetRenderPlan)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/render/preview", s.handleRenderPreview)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/render/preview", s.handleGetRenderPreview)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/render/final", s.handleRenderFinal)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/render/final", s.handleGetRenderFinal)
 }
 
 // JSON helpers
@@ -2043,4 +2058,259 @@ func (s *Server) handleGetTextRegionPlan(w http.ResponseWriter, r *http.Request)
 	plan.CASHash = idx.CASHash
 	plan.ProvenanceHash = idx.ProvenanceHash
 	writeJSON(w, http.StatusOK, map[string]any{"text_region_plan": plan})
+}
+
+// Render endpoints (T11)
+
+func (s *Server) handleFreezeRenderPlan(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if s.renderSvc == nil {
+		writeError(w, http.StatusInternalServerError, "render service is not configured")
+		return
+	}
+
+	var body struct {
+		RunID                  string               `json:"run_id"`
+		JobID                  string               `json:"job_id,omitempty"`
+		TargetLanguage         string               `json:"target_language"`
+		DubMixCAS              string               `json:"dub_mix_cas,omitempty"`
+		SubtitlePlanCAS        string               `json:"subtitle_plan_cas,omitempty"`
+		SubtitlePlanArtifactID string               `json:"subtitle_plan_artifact_id,omitempty"`
+		SubtitleCues           []domain.SubtitleCue `json:"subtitle_cues,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in := service.RenderPlanInput{
+		RunID:                  body.RunID,
+		JobID:                  body.JobID,
+		AssetID:                assetID,
+		TargetLanguage:         body.TargetLanguage,
+		DubMixCAS:              body.DubMixCAS,
+		SubtitlePlanCAS:        body.SubtitlePlanCAS,
+		SubtitlePlanArtifactID: body.SubtitlePlanArtifactID,
+		SubtitleCues:           body.SubtitleCues,
+	}
+
+	plan, err := s.renderSvc.FreezeRenderPlan(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, domain.ErrRenderSourceNotFound) || errors.Is(err, domain.ErrDubMixNotRenderable) || errors.Is(err, domain.ErrSubtitlePlanNotFound) {
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrRenderSourceNotFound) || errors.Is(err, domain.ErrDubMixNotRenderable) {
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"render_plan": plan})
+}
+
+func (s *Server) handleGetRenderPlan(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	targetLang := r.URL.Query().Get("target_language")
+	if targetLang == "" {
+		targetLang = "vi"
+	}
+
+	idx, err := s.db.GetRenderPlanIndex(r.Context(), assetID, targetLang)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "render plan not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	reader, err := s.casStore.Get(idx.CASHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load render plan from cas: "+err.Error())
+		return
+	}
+	defer reader.Close()
+
+	var plan domain.RenderPlan
+	if err := json.NewDecoder(reader).Decode(&plan); err != nil {
+		writeError(w, http.StatusInternalServerError, "decode render plan: "+err.Error())
+		return
+	}
+	plan.CASHash = idx.CASHash
+	plan.ProvenanceHash = idx.ProvenanceHash
+	writeJSON(w, http.StatusOK, map[string]any{"render_plan": plan})
+}
+
+func (s *Server) handleRenderPreview(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if s.renderSvc == nil {
+		writeError(w, http.StatusInternalServerError, "render service is not configured")
+		return
+	}
+
+	var body struct {
+		RunID          string `json:"run_id"`
+		JobID          string `json:"job_id,omitempty"`
+		TargetLanguage string `json:"target_language"`
+		PlanProvenance string `json:"plan_provenance,omitempty"`
+		PlanCAS        string `json:"plan_cas,omitempty"`
+		FontFile       string `json:"font_file,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in := service.RenderExecutionInput{
+		RunID:          body.RunID,
+		JobID:          body.JobID,
+		AssetID:        assetID,
+		TargetLanguage: body.TargetLanguage,
+		PlanProvenance: body.PlanProvenance,
+		PlanCAS:        body.PlanCAS,
+		FontFile:       body.FontFile,
+	}
+
+	artifact, err := s.renderSvc.RenderPreview(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, domain.ErrRenderPlanNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrRenderPlanInvalid) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrRenderSourceNotFound) || errors.Is(err, domain.ErrRenderBackendUnavailable) || errors.Is(err, domain.ErrSubtitlePlanNotFound) {
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"preview_render": artifact})
+}
+
+func (s *Server) handleGetRenderPreview(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	targetLang := r.URL.Query().Get("target_language")
+	if targetLang == "" {
+		targetLang = "vi"
+	}
+
+	idx, err := s.db.GetLatestRenderArtifactIndex(r.Context(), assetID, targetLang, domain.RenderKindPreview)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "preview render artifact not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	reader, err := s.casStore.Get(idx.CASHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load preview render from cas: "+err.Error())
+		return
+	}
+	defer reader.Close()
+
+	var art domain.PreviewRenderArtifact
+	if err := json.NewDecoder(reader).Decode(&art); err != nil {
+		writeError(w, http.StatusInternalServerError, "decode preview render: "+err.Error())
+		return
+	}
+	art.CASHash = idx.CASHash
+	art.ProvenanceHash = idx.ProvenanceHash
+	writeJSON(w, http.StatusOK, map[string]any{"preview_render": art})
+}
+
+func (s *Server) handleRenderFinal(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if s.renderSvc == nil {
+		writeError(w, http.StatusInternalServerError, "render service is not configured")
+		return
+	}
+
+	var body struct {
+		RunID          string `json:"run_id"`
+		JobID          string `json:"job_id,omitempty"`
+		TargetLanguage string `json:"target_language"`
+		PlanProvenance string `json:"plan_provenance,omitempty"`
+		PlanCAS        string `json:"plan_cas,omitempty"`
+		FontFile       string `json:"font_file,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in := service.RenderExecutionInput{
+		RunID:          body.RunID,
+		JobID:          body.JobID,
+		AssetID:        assetID,
+		TargetLanguage: body.TargetLanguage,
+		PlanProvenance: body.PlanProvenance,
+		PlanCAS:        body.PlanCAS,
+		FontFile:       body.FontFile,
+	}
+
+	artifact, err := s.renderSvc.RenderFinal(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, domain.ErrRenderPlanNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrRenderPlanInvalid) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrRenderSourceNotFound) || errors.Is(err, domain.ErrRenderBackendUnavailable) || errors.Is(err, domain.ErrSubtitlePlanNotFound) {
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"final_render": artifact})
+}
+
+func (s *Server) handleGetRenderFinal(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	targetLang := r.URL.Query().Get("target_language")
+	if targetLang == "" {
+		targetLang = "vi"
+	}
+
+	idx, err := s.db.GetLatestRenderArtifactIndex(r.Context(), assetID, targetLang, domain.RenderKindFinal)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "final render artifact not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	reader, err := s.casStore.Get(idx.CASHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load final render from cas: "+err.Error())
+		return
+	}
+	defer reader.Close()
+
+	var art domain.FinalRenderArtifact
+	if err := json.NewDecoder(reader).Decode(&art); err != nil {
+		writeError(w, http.StatusInternalServerError, "decode final render: "+err.Error())
+		return
+	}
+	art.CASHash = idx.CASHash
+	art.ProvenanceHash = idx.ProvenanceHash
+	writeJSON(w, http.StatusOK, map[string]any{"final_render": art})
 }

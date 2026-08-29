@@ -882,6 +882,66 @@ func (s *DB) migrate(ctx context.Context) error {
 			return fmt.Errorf("commit migration v12: %w", err)
 		}
 	}
+	// 14. Schema migration v13 (Render Plans + Render Artifacts - T11)
+	var countV13 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 13`).Scan(&countV13)
+	if err != nil {
+		return fmt.Errorf("check migration version 12: %w", err)
+	}
+
+	if countV13 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v13 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		schemaV13SQL := `
+		CREATE TABLE IF NOT EXISTS render_plans (
+			id TEXT PRIMARY KEY,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			run_id TEXT NOT NULL,
+			job_id TEXT NOT NULL,
+			target_language TEXT NOT NULL,
+			cas_hash TEXT NOT NULL,
+			provenance_hash TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_render_plans_provenance ON render_plans(provenance_hash);
+		CREATE INDEX IF NOT EXISTS idx_render_plans_asset_lang ON render_plans(asset_id, target_language);
+		CREATE INDEX IF NOT EXISTS idx_render_plans_run ON render_plans(run_id);
+
+		CREATE TABLE IF NOT EXISTS render_artifacts (
+			id TEXT PRIMARY KEY,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			run_id TEXT NOT NULL,
+			job_id TEXT NOT NULL,
+			target_language TEXT NOT NULL,
+			kind TEXT NOT NULL CHECK(kind IN ('preview', 'final')),
+			plan_provenance TEXT NOT NULL,
+			plan_cas_hash TEXT NOT NULL,
+			output_cas_hash TEXT NOT NULL,
+			cas_hash TEXT NOT NULL,
+			provenance_hash TEXT NOT NULL,
+			overall_status TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_render_artifacts_provenance ON render_artifacts(provenance_hash);
+		CREATE INDEX IF NOT EXISTS idx_render_artifacts_asset_lang_kind ON render_artifacts(asset_id, target_language, kind);
+		CREATE INDEX IF NOT EXISTS idx_render_artifacts_run ON render_artifacts(run_id);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (13, datetime('now'));
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaV13SQL); err != nil {
+			return fmt.Errorf("execute migration v13: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v13: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -3269,6 +3329,248 @@ func (s *DB) GetTextRegionPlanByProvenance(ctx context.Context, provenanceHash s
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("query text_region_plans by provenance: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// RenderPlanIndex captures SQLite indexing metadata for a persisted RenderPlan.
+type RenderPlanIndex struct {
+	ID             string
+	AssetID        string
+	RunID          string
+	JobID          string
+	TargetLanguage string
+	CASHash        string
+	ProvenanceHash string
+	CreatedAt      time.Time
+}
+
+// SaveRenderPlanIndex records the index row for a CAS-stored RenderPlan.
+func (s *DB) SaveRenderPlanIndex(ctx context.Context, idx RenderPlanIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO render_plans (
+			id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provenance_hash) DO UPDATE SET
+			cas_hash = excluded.cas_hash
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID,
+		idx.AssetID,
+		idx.RunID,
+		idx.JobID,
+		idx.TargetLanguage,
+		idx.CASHash,
+		idx.ProvenanceHash,
+		func() string {
+			if idx.CreatedAt.IsZero() {
+				return time.Now().UTC().Format(time.RFC3339Nano)
+			}
+			return idx.CreatedAt.Format(time.RFC3339Nano)
+		}(),
+	)
+	if err != nil {
+		return fmt.Errorf("save render_plans index: %w", err)
+	}
+	return nil
+}
+
+// GetRenderPlanIndex retrieves the latest index row for an asset and target language.
+func (s *DB) GetRenderPlanIndex(ctx context.Context, assetID string, targetLang string) (*RenderPlanIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx RenderPlanIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash, created_at
+		FROM render_plans WHERE asset_id = ? AND target_language = ?
+		ORDER BY created_at DESC, rowid DESC LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, assetID, targetLang).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query render_plans index: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// GetRenderPlanByProvenance retrieves the index row by provenance hash.
+func (s *DB) GetRenderPlanByProvenance(ctx context.Context, provenanceHash string) (*RenderPlanIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx RenderPlanIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash, created_at
+		FROM render_plans WHERE provenance_hash = ? LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, provenanceHash).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query render_plans by provenance: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// RenderArtifactIndex captures SQLite indexing metadata for a persisted preview or final render artifact.
+type RenderArtifactIndex struct {
+	ID             string
+	AssetID        string
+	RunID          string
+	JobID          string
+	TargetLanguage string
+	Kind           string // "preview" | "final"
+	PlanProvenance string
+	PlanCASHash    string
+	OutputCASHash  string
+	CASHash        string
+	ProvenanceHash string
+	OverallStatus  string
+	CreatedAt      time.Time
+}
+
+// SaveRenderArtifactIndex records the index row for a CAS-stored render artifact.
+func (s *DB) SaveRenderArtifactIndex(ctx context.Context, idx RenderArtifactIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO render_artifacts (
+			id, asset_id, run_id, job_id, target_language, kind,
+			plan_provenance, plan_cas_hash, output_cas_hash, cas_hash, provenance_hash,
+			overall_status, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provenance_hash) DO UPDATE SET
+			output_cas_hash = excluded.output_cas_hash,
+			cas_hash = excluded.cas_hash,
+			overall_status = excluded.overall_status
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID,
+		idx.AssetID,
+		idx.RunID,
+		idx.JobID,
+		idx.TargetLanguage,
+		idx.Kind,
+		idx.PlanProvenance,
+		idx.PlanCASHash,
+		idx.OutputCASHash,
+		idx.CASHash,
+		idx.ProvenanceHash,
+		idx.OverallStatus,
+		func() string {
+			if idx.CreatedAt.IsZero() {
+				return time.Now().UTC().Format(time.RFC3339Nano)
+			}
+			return idx.CreatedAt.Format(time.RFC3339Nano)
+		}(),
+	)
+	if err != nil {
+		return fmt.Errorf("save render_artifacts index: %w", err)
+	}
+	return nil
+}
+
+// GetLatestRenderArtifactIndex retrieves the latest index row for an asset, target language, and kind.
+func (s *DB) GetLatestRenderArtifactIndex(ctx context.Context, assetID string, targetLang string, kind string) (*RenderArtifactIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx RenderArtifactIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, job_id, target_language, kind,
+		plan_provenance, plan_cas_hash, output_cas_hash, cas_hash, provenance_hash, overall_status, created_at
+		FROM render_artifacts WHERE asset_id = ? AND target_language = ? AND kind = ?
+		ORDER BY created_at DESC, rowid DESC LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, assetID, targetLang, kind).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.Kind,
+		&idx.PlanProvenance,
+		&idx.PlanCASHash,
+		&idx.OutputCASHash,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&idx.OverallStatus,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query render_artifacts index: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// GetRenderArtifactByProvenance retrieves the index row by provenance hash.
+func (s *DB) GetRenderArtifactByProvenance(ctx context.Context, provenanceHash string) (*RenderArtifactIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx RenderArtifactIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, job_id, target_language, kind,
+		plan_provenance, plan_cas_hash, output_cas_hash, cas_hash, provenance_hash, overall_status, created_at
+		FROM render_artifacts WHERE provenance_hash = ? LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, provenanceHash).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.Kind,
+		&idx.PlanProvenance,
+		&idx.PlanCASHash,
+		&idx.OutputCASHash,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&idx.OverallStatus,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query render_artifacts by provenance: %w", err)
 	}
 	t, _ := time.Parse(time.RFC3339Nano, createdStr)
 	idx.CreatedAt = t
