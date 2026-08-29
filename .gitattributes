@@ -1,0 +1,2 @@
+# Go source must remain LF so gofmt is stable on Windows even when global core.autocrlf=true.
+*.go text eol=lf
