@@ -1,0 +1,26 @@
+internal/domain/translation.go
+  h_17f2fa2b92da6a 22,24,84-85,87-99,124
+internal/provider/spoken_adapter.go
+  h_17f2fa2b92da6a 1-374
+internal/provider/spoken_adapter_test.go
+  h_17f2fa2b92da6a 1-124
+internal/service/dub_script_test.go
+  h_17f2fa2b92da6a 5,13,51-54,74-81,112-116,119-121,124-132,141-146,153-169,221,252-260,265-410
+internal/service/translation.go
+  h_17f2fa2b92da6a 15-17,31-35,45-48,57-61,493-498,500,506-513,517-540,549-557,568-580,592-596,598-599,630,711-719,734
+test/seam1/dub_script_regression_test.go
+  h_17f2fa2b92da6a 1-139
+test/seam1/translation_test.go
+  h_17f2fa2b92da6a 11,439-457,515-583
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "ee4cfe639b52b4c669f1b1c766b6a348de9ec37c",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
