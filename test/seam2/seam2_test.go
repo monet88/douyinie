@@ -2040,3 +2040,214 @@ class Vieneu:
 		t.Errorf("expected model_name vieneu-tts, got %s", out.ModelName)
 	}
 }
+
+func TestSeam2_SeparatorStage_PythonAdapterExecutionWithMock(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Setup synthetic audio file
+	audioPath := filepath.Join(tmpDir, "source_audio.wav")
+	dummyWAV := []byte("RIFF$\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00")
+	if err := os.WriteFile(audioPath, dummyWAV, 0644); err != nil {
+		t.Fatalf("write audio file: %v", err)
+	}
+
+	adapterPath, err := filepath.Abs(filepath.Join("..", "..", "cmd", "stageworker", "adapters", "separator.py"))
+	if err != nil || !fileExists(adapterPath) {
+		adapterPath, _ = filepath.Abs(filepath.Join("cmd", "stageworker", "adapters", "separator.py"))
+	}
+	if !fileExists(adapterPath) {
+		t.Fatalf("separator.py adapter not found at %s", adapterPath)
+	}
+
+	// Wrapper mock script
+	wrapperPath := filepath.Join(tmpDir, "mock_separator.py")
+	wrapperCode := `
+import sys
+import os
+import io
+import wave
+import struct
+import json
+
+adapter_dir = os.path.dirname(r'` + adapterPath + `')
+sys.path.insert(0, adapter_dir)
+import separator
+
+def dummy_factory(audio_path, model_name, model_version):
+    num_samples = int((16000 * 2000) / 1000)
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(struct.pack(f'<{num_samples}h', *([50] * num_samples)))
+    wav_data = buf.getvalue()
+    return {
+        'vocals_data': wav_data,
+        'background_data': wav_data,
+        'duration_ms': 2000,
+        'sample_rate': 16000,
+        'channels': 1,
+    }
+
+separator._SEPARATOR_MODEL_FACTORY = dummy_factory
+if __name__ == '__main__':
+    separator.main()
+`
+	if err := os.WriteFile(wrapperPath, []byte(wrapperCode), 0644); err != nil {
+		t.Fatalf("write wrapper: %v", err)
+	}
+
+	t.Setenv("DOUYINIE_SEPARATOR_ADAPTER", wrapperPath)
+
+	exe := buildStageWorker(t)
+	sup := worker.NewSupervisor()
+	ctx := context.Background()
+	if err := sup.Spawn(ctx, "separator", exe, "-family", "separator", "-heartbeat-ms", "1000"); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	defer sup.Terminate()
+
+	client := worker.NewClient(sup)
+	_, err = client.Handshake(ctx, 5*time.Second)
+	if err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+
+	outPath := filepath.Join(tmpDir, "sep_out.json")
+	cmd := worker.Command{
+		ID:         "cmd-sep-1",
+		Family:     "separator",
+		Stage:      "separator",
+		AttemptID:  "attempt-sep-1",
+		RunID:      "run-sep-1",
+		OutputPath: outPath,
+		Inputs: []worker.ArtifactRef{
+			{
+				SHA256: "dummy_sha",
+				Path:   audioPath,
+			},
+		},
+		Config: map[string]any{
+			"model_name":    "UVR-MDX-NET-Inst_HQ_4.onnx",
+			"model_version": "v3",
+		},
+	}
+
+	artifact, err := client.Run(ctx, cmd, 10*time.Second, 10*time.Second)
+	if err != nil {
+		t.Fatalf("separator execution failed: %v", err)
+	}
+	if artifact.SHA256 == "" || strings.Contains(artifact.SHA256, "placeholder") {
+		t.Fatalf("expected real SHA-256 for separator artifact, got %q", artifact.SHA256)
+	}
+
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read separator output artifact: %v", err)
+	}
+	var out struct {
+		VocalsData     string `json:"vocals_data"`
+		BackgroundData string `json:"background_data"`
+		DurationMs     int64  `json:"duration_ms"`
+		ModelName      string `json:"model_name"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("unmarshal separator json: %v", err)
+	}
+	if out.VocalsData == "" || out.BackgroundData == "" {
+		t.Fatalf("expected non-empty vocals and background data")
+	}
+	if out.DurationMs != 2000 {
+		t.Errorf("expected 2000ms duration, got %d", out.DurationMs)
+	}
+	if out.ModelName != "UVR-MDX-NET-Inst_HQ_4.onnx" {
+		t.Errorf("expected model_name UVR-MDX-NET-Inst_HQ_4.onnx, got %s", out.ModelName)
+	}
+}
+func TestSeam2_SeparatorStage_PythonBinaryResolutionPrecedence(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	sepPy := filepath.Join(tmpDir, "sep_python.bat")
+	_ = os.WriteFile(sepPy, []byte("@echo off\r\necho SepPython\r\n"), 0755)
+
+	genPy := filepath.Join(tmpDir, "gen_python.bat")
+	_ = os.WriteFile(genPy, []byte("@echo off\r\necho GenPython\r\n"), 0755)
+
+	t.Setenv("DOUYINIE_SEPARATOR_PYTHON_BIN", sepPy)
+	t.Setenv("DOUYINIE_PYTHON_BIN", genPy)
+
+	// Invariant: DOUYINIE_SEPARATOR_PYTHON_BIN takes precedence over DOUYINIE_PYTHON_BIN
+	if os.Getenv("DOUYINIE_SEPARATOR_PYTHON_BIN") != sepPy {
+		t.Fatalf("expected DOUYINIE_SEPARATOR_PYTHON_BIN %s, got %s", sepPy, os.Getenv("DOUYINIE_SEPARATOR_PYTHON_BIN"))
+	}
+}
+
+func TestSeam2_SeparatorStage_IncompatibleDirectCLINotAutoDiscovered(t *testing.T) {
+	// Verifies that bare stock CLIs like audio-separator or demucs on PATH without adapter JSON-stdin contract
+	// are not invoked by resolveSeparatorRunner, requiring explicit DOUYINIE_SEPARATOR_ADAPTER or DOUYINIE_SEPARATOR_BIN.
+	tmpDir := t.TempDir()
+
+	audioPath := filepath.Join(tmpDir, "dummy.wav")
+	_ = os.WriteFile(audioPath, []byte("RIFF$\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"), 0644)
+
+	// When pointing DOUYINIE_SEPARATOR_BIN to a missing binary, StageWorker returns SEPARATOR_BINARY_NOT_FOUND
+	t.Setenv("DOUYINIE_SEPARATOR_BIN", filepath.Join(tmpDir, "nonexistent_sep_bin.exe"))
+
+	exe := buildStageWorker(t)
+	sup := worker.NewSupervisor()
+	ctx := context.Background()
+	if err := sup.Spawn(ctx, "separator", exe, "-family", "separator", "-heartbeat-ms", "1000"); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	defer sup.Terminate()
+
+	client := worker.NewClient(sup)
+	if _, err := client.Handshake(ctx, 5*time.Second); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+	outPath := filepath.Join(tmpDir, "sep_out.json")
+	cmd := worker.Command{
+		ID:         "cmd-sep-missing",
+		Family:     "separator",
+		Stage:      "separator",
+		AttemptID:  "attempt-sep-missing",
+		RunID:      "run-sep-missing",
+		OutputPath: outPath,
+		Inputs: []worker.ArtifactRef{
+			{
+				SHA256: "dummy_sha",
+				Path:   audioPath,
+			},
+		},
+		Config: map[string]any{
+			"model_name":    "UVR-MDX-NET-Inst_HQ_4.onnx",
+			"model_version": "v3",
+		},
+	}
+
+	_, err := client.Run(ctx, cmd, 10*time.Second, 10*time.Second)
+	if err == nil {
+		t.Fatalf("expected error when separator binary missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "SEPARATOR_BINARY_NOT_FOUND") {
+		t.Errorf("expected SEPARATOR_BINARY_NOT_FOUND error, got %v", err)
+	}
+}
+
+func TestSeam2_SeparatorStage_RealRuntimeSmokeOptIn(t *testing.T) {
+	pyBin := os.Getenv("DOUYINIE_SEPARATOR_PYTHON_BIN")
+	if pyBin == "" {
+		pyBin = os.Getenv("DOUYINIE_PYTHON_BIN")
+	}
+	if pyBin == "" {
+		t.Skip("skipping real separator smoke: no DOUYINIE_SEPARATOR_PYTHON_BIN or DOUYINIE_PYTHON_BIN set")
+	}
+	modelDir := os.Getenv("AUDIO_SEPARATOR_MODEL_DIR")
+	if modelDir == "" {
+		t.Skip("skipping real separator smoke: AUDIO_SEPARATOR_MODEL_DIR not configured")
+	}
+	if _, err := os.Stat(modelDir); err != nil {
+		t.Skipf("skipping real separator smoke: model dir %s does not exist", modelDir)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -41,6 +42,7 @@ type Server struct {
 	speechSvc      *service.SpeechService
 	translationSvc *service.TranslationService
 	dubbingSvc     *service.DubbingService
+	audioMixSvc    *service.AudioMixService
 	mux            *http.ServeMux
 	server         *http.Server
 }
@@ -62,6 +64,7 @@ type Config struct {
 	SpeechSvc      *service.SpeechService      // Speech understanding pipeline (T08)
 	TranslationSvc *service.TranslationService // Translation & Meaning-First Localization pipeline (T06)
 	DubbingSvc     *service.DubbingService     // TTS & Measured-Duration Dubbing pipeline (T14)
+	AudioMixSvc    *service.AudioMixService    // Audio stems + soundtrack preservation + dialogue-suppression mix (T15)
 }
 
 // New creates a new RuntimeHost Server instance.
@@ -97,6 +100,9 @@ func New(cfg Config) *Server {
 	if cfg.DubbingSvc != nil && cfg.Router != nil {
 		cfg.DubbingSvc.ConfigureRouter(cfg.Router)
 	}
+	if cfg.AudioMixSvc != nil && cfg.Router != nil {
+		cfg.AudioMixSvc.ConfigureRouter(cfg.Router)
+	}
 
 	s := &Server{
 		db:             cfg.DB,
@@ -113,6 +119,7 @@ func New(cfg Config) *Server {
 		speechSvc:      cfg.SpeechSvc,
 		translationSvc: cfg.TranslationSvc,
 		dubbingSvc:     cfg.DubbingSvc,
+		audioMixSvc:    cfg.AudioMixSvc,
 		mux:            http.NewServeMux(),
 	}
 	s.routes()
@@ -154,6 +161,14 @@ func (s *Server) SetTranslationService(svc *service.TranslationService) {
 // SetDubbingService sets or replaces the injected dubbing pipeline (T14).
 func (s *Server) SetDubbingService(svc *service.DubbingService) {
 	s.dubbingSvc = svc
+	if svc != nil && s.router != nil {
+		svc.ConfigureRouter(s.router)
+	}
+}
+
+// SetAudioMixService sets or replaces the injected audio mix pipeline (T15).
+func (s *Server) SetAudioMixService(svc *service.AudioMixService) {
+	s.audioMixSvc = svc
 	if svc != nil && s.router != nil {
 		svc.ConfigureRouter(s.router)
 	}
@@ -255,6 +270,11 @@ func (s *Server) routes() {
 	// TTS Synthesis & Fit Controller (T14: Measured-duration DubSegmentsVariant)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/dub-synthesize", s.handleRunDubSynthesize)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/dub-segments", s.handleGetDubSegments)
+	// Audio Stem Separation & Deterministic Mix (T15)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/separate-stems", s.handleRunSeparateStems)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/audio-stems", s.handleGetAudioStems)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/audio-mix", s.handleRunAudioMix)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/dub-mix", s.handleGetDubMix)
 }
 
 // JSON helpers
@@ -1742,4 +1762,189 @@ func (s *Server) handleGetLayeredConfig(w http.ResponseWriter, r *http.Request) 
 
 	resolved := config.ResolveLayeredConfig(profile, userSettings, nil)
 	writeJSON(w, http.StatusOK, map[string]any{"config": resolved})
+}
+
+func (s *Server) handleRunSeparateStems(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	asset, err := s.db.GetSourceAsset(r.Context(), assetID)
+	if err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) || errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.audioMixSvc == nil {
+		writeError(w, http.StatusInternalServerError, "audio mix service is not configured")
+		return
+	}
+
+	var body struct {
+		RunID            string                  `json:"run_id"`
+		JobID            string                  `json:"job_id,omitempty"`
+		ExecutionProfile domain.ExecutionProfile `json:"execution_profile,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in := service.AudioSeparationInput{
+		RunID:            body.RunID,
+		AssetID:          asset.ID,
+		JobID:            body.JobID,
+		ExecutionProfile: body.ExecutionProfile,
+	}
+
+	stems, err := s.audioMixSvc.SeparateAudio(r.Context(), in)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"audio_stems": stems})
+}
+
+func (s *Server) handleGetAudioStems(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	idx, err := s.db.GetAudioStemsArtifactIndex(r.Context(), assetID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "audio stems not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	reader, err := s.casStore.Get(idx.CASHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load audio stems from cas: "+err.Error())
+		return
+	}
+	defer reader.Close()
+
+	var stems domain.AudioStemArtifacts
+	if err := json.NewDecoder(reader).Decode(&stems); err != nil {
+		writeError(w, http.StatusInternalServerError, "decode audio stems: "+err.Error())
+		return
+	}
+	stems.CASHash = idx.CASHash
+	stems.ProvenanceHash = idx.ProvenanceHash
+	writeJSON(w, http.StatusOK, map[string]any{"audio_stems": stems})
+}
+
+func (s *Server) handleRunAudioMix(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	asset, err := s.db.GetSourceAsset(r.Context(), assetID)
+	if err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) || errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.audioMixSvc == nil {
+		writeError(w, http.StatusInternalServerError, "audio mix service is not configured")
+		return
+	}
+
+	var body struct {
+		RunID                 string                  `json:"run_id"`
+		JobID                 string                  `json:"job_id,omitempty"`
+		TargetLanguage        string                  `json:"target_language"`
+		DubSegmentsCAS        string                  `json:"dub_segments_cas,omitempty"`
+		AudioStemsCAS         string                  `json:"audio_stems_cas,omitempty"`
+		CrossfadeDurationMs   int64                   `json:"crossfade_duration_ms,omitempty"`
+		DuckingGainDb         float64                 `json:"ducking_gain_db,omitempty"`
+		PreserveSinging       bool                    `json:"preserve_singing"`
+		ExecutionProfile      domain.ExecutionProfile `json:"execution_profile,omitempty"`
+		AuthorizedCredentials []string                `json:"authorized_credentials,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	if strings.TrimSpace(body.RunID) == "" {
+		writeError(w, http.StatusBadRequest, "run_id is required")
+		return
+	}
+	if strings.TrimSpace(body.TargetLanguage) == "" {
+		writeError(w, http.StatusBadRequest, "target_language is required")
+		return
+	}
+
+	in := service.AudioMixInput{
+		RunID:                 body.RunID,
+		AssetID:               asset.ID,
+		JobID:                 body.JobID,
+		TargetLanguage:        body.TargetLanguage,
+		DubSegmentsCAS:        body.DubSegmentsCAS,
+		AudioStemsCAS:         body.AudioStemsCAS,
+		CrossfadeDurationMs:   body.CrossfadeDurationMs,
+		DuckingGainDb:         body.DuckingGainDb,
+		PreserveSinging:       body.PreserveSinging,
+		ExecutionProfile:      body.ExecutionProfile,
+		AuthorizedCredentials: body.AuthorizedCredentials,
+	}
+
+	mixArtifact, err := s.audioMixSvc.MixAudio(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, domain.ErrMixerOverrunRefused) || errors.Is(err, domain.ErrMixerAnchorDrift) {
+			// Refused outcome observable with 422 or 400
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+				"error":   err.Error(),
+				"dub_mix": mixArtifact,
+				"status":  "REFUSED",
+			})
+			return
+		}
+		if errors.Is(err, domain.ErrAudioRolePlanRequired) || errors.Is(err, domain.ErrInvalidTargetLanguage) {
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{"dub_mix": mixArtifact})
+}
+
+func (s *Server) handleGetDubMix(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	targetLang := r.URL.Query().Get("target_language")
+	if targetLang == "" {
+		targetLang = "vi"
+	}
+
+	idx, err := s.db.GetDubMixArtifactIndex(r.Context(), assetID, targetLang)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "dub mix not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	reader, err := s.casStore.Get(idx.CASHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load dub mix from cas: "+err.Error())
+		return
+	}
+	defer reader.Close()
+
+	var mix domain.DubMixArtifact
+	if err := json.NewDecoder(reader).Decode(&mix); err != nil {
+		writeError(w, http.StatusInternalServerError, "decode dub mix: "+err.Error())
+		return
+	}
+	mix.CASHash = idx.CASHash
+	mix.ProvenanceHash = idx.ProvenanceHash
+	writeJSON(w, http.StatusOK, map[string]any{"dub_mix": mix})
 }

@@ -8,6 +8,7 @@ package provider
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -31,13 +32,14 @@ const (
 
 // Default run timeouts for one worker-backed speech invocation.
 const (
-	defaultHandshakeTimeout   = 15 * time.Second
-	defaultRunTimeout         = 10 * time.Minute
-	defaultHeartbeatTimeout   = worker.HeartbeatTimeout
-	stageWorkerFamilyASR      = "asr"
-	stageWorkerFamilyAligner  = "aligner"
-	stageWorkerFamilyDiarizer = "diarizer"
-	stageWorkerFamilyTTS      = "tts"
+	defaultHandshakeTimeout    = 15 * time.Second
+	defaultRunTimeout          = 10 * time.Minute
+	defaultHeartbeatTimeout    = worker.HeartbeatTimeout
+	stageWorkerFamilyASR       = "asr"
+	stageWorkerFamilyAligner   = "aligner"
+	stageWorkerFamilyDiarizer  = "diarizer"
+	stageWorkerFamilyTTS       = "tts"
+	stageWorkerFamilySeparator = "separator"
 )
 
 // resolveStageWorkerBinary locates the StageWorker executable: explicit
@@ -302,6 +304,26 @@ func NewProductionSpeechRegistry(leaseManager ...*worker.GPULeaseManager) (*Regi
 	}
 	chatterbox.SetLeaseManager(mgr)
 	if err := reg.Register(chatterbox); err != nil {
+		return nil, err
+	}
+
+	// 5. Separator UVR baseline
+	uvr, err := NewWorkerSeparatorProvider("uvr_separator", "UVR-MDX-NET-Inst_HQ_4.onnx", "v3", 0.94)
+	if err != nil {
+		return nil, err
+	}
+	uvr.SetLeaseManager(mgr)
+	if err := reg.Register(uvr); err != nil {
+		return nil, err
+	}
+
+	// 6. Separator Demucs fallback
+	demucs, err := NewWorkerSeparatorProvider("demucs_separator", "htdemucs", "v4", 0.88)
+	if err != nil {
+		return nil, err
+	}
+	demucs.SetLeaseManager(mgr)
+	if err := reg.Register(demucs); err != nil {
 		return nil, err
 	}
 
@@ -644,5 +666,97 @@ func (p *WorkerTTSProvider) SynthesizeSpeech(ctx context.Context, req TTSSynthes
 		ModelVersion:        p.modelVer,
 		PredictedDurationMs: art.PredictedDurationMs,
 		MeasuredDurationMs:  durMs,
+	}, nil
+}
+
+// WorkerSeparatorProvider is a StageWorker-backed AudioSeparatorProvider.
+type WorkerSeparatorProvider struct {
+	workerProviderBase
+}
+
+func NewWorkerSeparatorProvider(id, modelName, modelVer string, qualityScore float64) (*WorkerSeparatorProvider, error) {
+	if id == "" || modelName == "" || modelVer == "" {
+		return nil, fmt.Errorf("worker separator provider requires id, model_name and model_version")
+	}
+	if qualityScore <= 0 {
+		qualityScore = 0.94
+	}
+	return &WorkerSeparatorProvider{workerProviderBase{
+		id:        id,
+		modelName: modelName,
+		modelVer:  modelVer,
+		capability: domain.ProviderCapability{
+			Stage:          string(TypeSeparator),
+			Languages:      []string{"*"},
+			ExecutionTier:  "local",
+			CostPerUnit:    0,
+			QualityScore:   qualityScore,
+			MaxConcurrency: 1,
+			Features:       []string{"vocal_extraction", "bgm_preservation"},
+		},
+	}}, nil
+}
+
+type separatorArtifact struct {
+	VocalsData       string `json:"vocals_data"`
+	BackgroundData   string `json:"background_data"`
+	VocalsSHA256     string `json:"vocals_sha256"`
+	BackgroundSHA256 string `json:"background_sha256"`
+	DurationMs       int64  `json:"duration_ms"`
+	SampleRate       int    `json:"sample_rate"`
+	Channels         int    `json:"channels"`
+}
+
+func (p *WorkerSeparatorProvider) SeparateStems(ctx context.Context, req SeparationRequest) (*SeparationResult, error) {
+	bridge, err := newWorkerBridge(p.leaseManager)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrNoEligibleProvider, err)
+	}
+	cmd := newCommand("separator", stageWorkerFamilySeparator, req.SourceAudio, p.modelName, p.modelVer)
+	cmd.OutputPath = filepath.Join(os.TempDir(), fmt.Sprintf("douyinie-sep-%s.json", cmd.ID))
+	defer os.Remove(cmd.OutputPath)
+
+	data, err := bridge.run(ctx, cmd)
+	if err != nil {
+		return nil, err
+	}
+	var art separatorArtifact
+	if err := json.Unmarshal(data, &art); err != nil {
+		return nil, fmt.Errorf("%w: invalid separator artifact JSON: %v", domain.ErrQualityRejected, err)
+	}
+
+	var vocalsBytes, bgBytes []byte
+	if art.VocalsData != "" {
+		if decoded, err := base64.StdEncoding.DecodeString(art.VocalsData); err == nil {
+			vocalsBytes = decoded
+		} else if fileData, err := os.ReadFile(art.VocalsData); err == nil {
+			vocalsBytes = fileData
+		}
+	}
+	if art.BackgroundData != "" {
+		if decoded, err := base64.StdEncoding.DecodeString(art.BackgroundData); err == nil {
+			bgBytes = decoded
+		} else if fileData, err := os.ReadFile(art.BackgroundData); err == nil {
+			bgBytes = fileData
+		}
+	}
+
+	if len(bgBytes) == 0 {
+		return nil, fmt.Errorf("%w: separator produced empty or unreadable background stem", domain.ErrQualityRejected)
+	}
+
+	durMs := art.DurationMs
+	if durMs <= 0 && len(bgBytes) > 0 {
+		durMs, _ = media.ProbeWAVBytes(bgBytes)
+	}
+	return &SeparationResult{
+		ProviderID:    p.id,
+		ModelName:     p.modelName,
+		ModelVersion:  p.modelVer,
+		VocalsWAV:     vocalsBytes,
+		BackgroundWAV: bgBytes,
+		DurationMs:    durMs,
+		SampleRate:    art.SampleRate,
+		Channels:      art.Channels,
 	}, nil
 }

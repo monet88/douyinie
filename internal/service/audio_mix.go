@@ -1,0 +1,656 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/monet88/douyinie/internal/cas"
+	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/media"
+	"github.com/monet88/douyinie/internal/provider"
+	"github.com/monet88/douyinie/internal/storage"
+	"github.com/monet88/douyinie/internal/worker"
+)
+
+type SeparatorInvokeFunc func(ctx context.Context, p provider.Provider, req provider.SeparationRequest) (*provider.SeparationResult, error)
+
+// AudioMixService orchestrates vocal separation into stems, soundtrack preservation planning,
+// and deterministic audio mixing.
+//
+// Invariants (CapCap-derived, locked by #16 §5-§6, #18, #37):
+//  1. Mixer purity: AudioMixService is a deterministic executor of accepted timing/mix plans,
+//     not a timing-policy engine. It cannot alter source anchors, shift timings, or rescue overlong clips.
+//  2. Mixer refusal: Mixer strictly REFUSES any candidate whose measured duration exceeds its slot
+//     (measured end > slot end), never overlays across the next block, truncates words, or hides overlap.
+//  3. Soundtrack preservation: Background music (BGM), sound effects (Foley/SFX), ambience, and
+//     music-vocals/singing are preserved outside and through dialogue windows as separation/mix permits.
+//  4. Dialogue-only suppression: Inside active speech windows, source dialogue is suppressed while
+//     background stems remain preserved. Outside speech windows, original mix is preserved.
+//  5. Zero-speech / no-dub bypass: Audio with no dub-eligible speech passes through cleanly without TTS injection.
+//  6. Testable independently with fake accepted dub audio once SpeechBlocks are known.
+type AudioMixService struct {
+	db     *storage.DB
+	cas    *cas.Store
+	router *provider.Router
+
+	// SeparatorInvoke executes one audio separation attempt.
+	// When nil, router-backed invocation is used.
+	SeparatorInvoke SeparatorInvokeFunc
+}
+
+// NewAudioMixService creates a new AudioMixService instance.
+func NewAudioMixService(db *storage.DB, casStore *cas.Store) *AudioMixService {
+	return &AudioMixService{
+		db:  db,
+		cas: casStore,
+	}
+}
+
+// ConfigureRouter injects the provider router.
+func (s *AudioMixService) ConfigureRouter(router *provider.Router) {
+	s.router = router
+}
+
+// AudioSeparationInput defines the input parameters for audio stem separation.
+type AudioSeparationInput struct {
+	RunID            string                  `json:"run_id"`
+	AssetID          string                  `json:"asset_id"`
+	JobID            string                  `json:"job_id,omitempty"`
+	ExecutionProfile domain.ExecutionProfile `json:"execution_profile,omitempty"`
+}
+
+// AudioMixInput defines the input parameters for deterministic audio mixing.
+type AudioMixInput struct {
+	RunID                 string                  `json:"run_id"`
+	AssetID               string                  `json:"asset_id"`
+	JobID                 string                  `json:"job_id,omitempty"`
+	TargetLanguage        string                  `json:"target_language"`
+	DubSegmentsCAS        string                  `json:"dub_segments_cas,omitempty"`
+	AudioStemsCAS         string                  `json:"audio_stems_cas,omitempty"`
+	CrossfadeDurationMs   int64                   `json:"crossfade_duration_ms,omitempty"`
+	DuckingGainDb         float64                 `json:"ducking_gain_db,omitempty"`
+	PreserveSinging       bool                    `json:"preserve_singing"`
+	ExecutionProfile      domain.ExecutionProfile `json:"execution_profile,omitempty"`
+	AuthorizedCredentials []string                `json:"authorized_credentials,omitempty"`
+}
+
+// SeparateAudio isolates source vocals and background audio into immutable AudioStemArtifacts.
+func (s *AudioMixService) SeparateAudio(ctx context.Context, input AudioSeparationInput) (*domain.AudioStemArtifacts, error) {
+	if strings.TrimSpace(input.AssetID) == "" {
+		return nil, errors.New("asset_id is required")
+	}
+
+	asset, err := s.db.GetSourceAsset(ctx, input.AssetID)
+	if err != nil {
+		return nil, fmt.Errorf("load source asset: %w", err)
+	}
+
+	rolePlan, _ := s.db.GetAudioRolePlan(ctx, input.AssetID)
+
+	// If router is available, pre-route to check for cached artifact by provenance across eligible order
+	sourceAudioRef := worker.ArtifactRef{
+		SHA256: asset.SHA256,
+		Path:   asset.CASPath,
+	}
+
+	req := provider.SeparationRequest{
+		AssetID:       input.AssetID,
+		SourceAudio:   sourceAudioRef,
+		AudioRolePlan: rolePlan,
+	}
+
+	var routeRes *provider.RouteResult
+	routeReq := provider.RouteRequest{
+		RunID:            input.RunID,
+		Stage:            provider.TypeSeparator,
+		Language:         "*",
+		ExecutionProfile: input.ExecutionProfile,
+	}
+
+	if s.router != nil {
+		if rRes, err := s.router.Route(ctx, routeReq); err == nil && rRes.SelectedProvider != nil {
+			routeRes = rRes
+			// Check candidates in policy-eligible order: SelectedProvider first, then FallbackOrdered
+			eligibleProvs := append([]provider.Provider{rRes.SelectedProvider}, rRes.FallbackOrdered...)
+			for _, p := range eligibleProvs {
+				if p == nil {
+					continue
+				}
+				// Verify provider is currently healthy and policy-allowed
+				if p.PolicyState() != provider.PolicyAllowed || !p.IsHealthy() {
+					continue
+				}
+				mName, mVer := p.ModelInfo()
+				if expectedProvHash, err := domain.ComputeAudioStemsProvenanceHash(input.AssetID, p.ID(), mName, mVer); err == nil {
+					if existingIdx, err := s.db.GetAudioStemsArtifactByProvenance(ctx, expectedProvHash); err == nil && existingIdx != nil && existingIdx.CASHash != "" {
+						stemsReader, err := s.cas.Get(existingIdx.CASHash)
+						if err == nil {
+							defer stemsReader.Close()
+							var cached domain.AudioStemArtifacts
+							if err := json.NewDecoder(stemsReader).Decode(&cached); err == nil {
+								cached.CASHash = existingIdx.CASHash
+								return &cached, nil
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	var res *provider.SeparationResult
+	if s.SeparatorInvoke != nil {
+		res, err = s.SeparatorInvoke(ctx, nil, req)
+		if err != nil {
+			return nil, fmt.Errorf("invoke separator: %w", err)
+		}
+	} else if s.router != nil {
+		if routeRes == nil {
+			var err error
+			routeRes, err = s.router.Route(ctx, routeReq)
+			if err != nil {
+				return nil, fmt.Errorf("route separator provider: %w", err)
+			}
+		}
+
+		err = s.router.ExecuteRoutedWithRetry(ctx, routeReq, routeRes, asset.SHA256, 3, func(p provider.Provider, attemptNum int) error {
+			sepProv, ok := p.(provider.AudioSeparatorProvider)
+			if !ok {
+				return fmt.Errorf("provider %s does not implement AudioSeparatorProvider", p.ID())
+			}
+			out, err := sepProv.SeparateStems(ctx, req)
+			if err != nil {
+				return err
+			}
+			res = out
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("execute separator with retry: %w", err)
+		}
+	} else {
+		// Default fallback to fake provider if router not set
+		fakeProv := provider.NewFakeSeparatorProvider("fake_uvr_separator")
+		res, err = fakeProv.SeparateStems(ctx, req)
+		if err != nil {
+			return nil, fmt.Errorf("default separator fallback: %w", err)
+		}
+	}
+
+	if res == nil || len(res.BackgroundWAV) == 0 {
+		return nil, domain.ErrSeparatorFailed
+	}
+
+	// Store stems in CAS
+	vocalsObj, err := s.cas.Put(bytes.NewReader(res.VocalsWAV))
+	if err != nil {
+		return nil, fmt.Errorf("store vocals in CAS: %w", err)
+	}
+	vocalsCASHash := vocalsObj.SHA256
+	vocalsPath := vocalsObj.Path
+
+	bgObj, err := s.cas.Put(bytes.NewReader(res.BackgroundWAV))
+	if err != nil {
+		return nil, fmt.Errorf("store background stem in CAS: %w", err)
+	}
+	bgCASHash := bgObj.SHA256
+	bgPath := bgObj.Path
+
+	durMs := res.DurationMs
+	if durMs <= 0 {
+		durMs, _ = media.ProbeWAVBytes(res.BackgroundWAV)
+	}
+
+	stems := []domain.AudioStem{
+		{
+			Type:         domain.StemTypeVocals,
+			AudioCASHash: vocalsCASHash,
+			AudioCASPath: vocalsPath,
+			SampleRate:   res.SampleRate,
+			Channels:     res.Channels,
+			Format:       "wav",
+			DurationMs:   durMs,
+		},
+		{
+			Type:         domain.StemTypeBackground,
+			AudioCASHash: bgCASHash,
+			AudioCASPath: bgPath,
+			SampleRate:   res.SampleRate,
+			Channels:     res.Channels,
+			Format:       "wav",
+			DurationMs:   durMs,
+		},
+	}
+
+	provHash, err := domain.ComputeAudioStemsProvenanceHash(input.AssetID, res.ProviderID, res.ModelName, res.ModelVersion)
+	if err != nil {
+		return nil, fmt.Errorf("compute audio stems provenance hash: %w", err)
+	}
+
+	stemArtifact := domain.AudioStemArtifacts{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.AudioStemsSchemaVersion,
+		AssetID:        input.AssetID,
+		ProviderID:     res.ProviderID,
+		ModelName:      res.ModelName,
+		ModelVersion:   res.ModelVersion,
+		Stems:          stems,
+		ProvenanceHash: provHash,
+		CreatedAt:      time.Now().UTC(),
+	}
+	stemBytes, err := json.Marshal(stemArtifact)
+	stemObj, err := s.cas.Put(bytes.NewReader(stemBytes))
+	if err != nil {
+		return nil, fmt.Errorf("store audio stems artifact in CAS: %w", err)
+	}
+	stemArtifact.CASHash = stemObj.SHA256
+
+	// Save to SQLite
+	err = s.db.SaveAudioStemsArtifactIndex(ctx, storage.AudioStemsArtifactIndex{
+		ID:             stemArtifact.ID,
+		AssetID:        stemArtifact.AssetID,
+		ProviderID:     stemArtifact.ProviderID,
+		ModelName:      stemArtifact.ModelName,
+		ModelVersion:   stemArtifact.ModelVersion,
+		CASHash:        stemArtifact.CASHash,
+		ProvenanceHash: stemArtifact.ProvenanceHash,
+		CreatedAt:      stemArtifact.CreatedAt,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("persist audio stems artifact index: %w", err)
+	}
+	return &stemArtifact, nil
+}
+
+// MixAudio deterministically mixes localized speech and preserved background stems.
+//
+// Invariants (CapCap-derived, locked by #16 §5-§6, #18, #37):
+// - Mixer purity: deterministic executor, no invented rescue policy, no anchor alteration.
+// - Mixer refusal: strictly REFUSES candidate segments whose measured duration overruns the slot (zero overrun).
+// - Preserves BGM, SFX, ambience, and music-vocal outside and through dialogue windows.
+// - Suppresses source dialogue inside speech windows with smooth crossfades (15-30ms).
+func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*domain.DubMixArtifact, error) {
+	if strings.TrimSpace(input.AssetID) == "" {
+		return nil, errors.New("asset_id is required")
+	}
+	if !domain.IsValidTargetLanguage(input.TargetLanguage) {
+		return nil, domain.ErrInvalidTargetLanguage
+	}
+
+	asset, err := s.db.GetSourceAsset(ctx, input.AssetID)
+	if err != nil {
+		return nil, fmt.Errorf("load source asset: %w", err)
+	}
+
+	// 1. Load AudioRolePlan (required to determine dialogue/narration vs zero-speech bypass)
+	rolePlan, err := s.db.GetAudioRolePlan(ctx, input.AssetID)
+	if err != nil || rolePlan == nil {
+		return nil, domain.ErrAudioRolePlanRequired
+	}
+
+	// Check if there are dub-eligible segments in the role plan
+	hasDubEligibleSpeech := domain.IsDubEligible(rolePlan)
+
+	// 2. Load or compute AudioStems
+	var stemsArtifact *domain.AudioStemArtifacts
+	var stemsCASRef string
+	if input.AudioStemsCAS != "" {
+		stemsCASRef = input.AudioStemsCAS
+		r, err := s.cas.Get(input.AudioStemsCAS)
+		if err == nil {
+			defer r.Close()
+			var a domain.AudioStemArtifacts
+			if err := json.NewDecoder(r).Decode(&a); err == nil {
+				stemsArtifact = &a
+				stemsArtifact.CASHash = stemsCASRef
+			}
+		}
+	}
+	if stemsArtifact == nil {
+		stemsIdx, err := s.db.GetAudioStemsArtifactIndex(ctx, input.AssetID)
+		if err == nil && stemsIdx != nil && stemsIdx.CASHash != "" {
+			stemsCASRef = stemsIdx.CASHash
+			r, err := s.cas.Get(stemsIdx.CASHash)
+			if err == nil {
+				defer r.Close()
+				var a domain.AudioStemArtifacts
+				if err := json.NewDecoder(r).Decode(&a); err == nil {
+					stemsArtifact = &a
+					stemsArtifact.CASHash = stemsCASRef
+				}
+			}
+		}
+	}
+	if stemsArtifact == nil {
+		// Run separation
+		stemsArtifact, err = s.SeparateAudio(ctx, AudioSeparationInput{
+			RunID:            input.RunID,
+			AssetID:          input.AssetID,
+			JobID:            input.JobID,
+			ExecutionProfile: input.ExecutionProfile,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("separate audio stems: %w", err)
+		}
+	}
+
+	// 3. Load DubSegments (if speech is present and dubbing required)
+	var dubSegments *domain.DubSegmentsVariant
+	var dubSegmentsCASRef string
+	if hasDubEligibleSpeech {
+		if input.DubSegmentsCAS != "" {
+			dubSegmentsCASRef = input.DubSegmentsCAS
+			r, err := s.cas.Get(input.DubSegmentsCAS)
+			if err == nil {
+				defer r.Close()
+				var d domain.DubSegmentsVariant
+				if err := json.NewDecoder(r).Decode(&d); err == nil {
+					dubSegments = &d
+					dubSegments.CASHash = dubSegmentsCASRef
+				}
+			}
+		}
+		if dubSegments == nil {
+			dubIdx, err := s.db.GetDubSegmentsVariantIndex(ctx, input.AssetID, input.TargetLanguage)
+			if err == nil && dubIdx != nil && dubIdx.CASHash != "" {
+				dubSegmentsCASRef = dubIdx.CASHash
+				r, err := s.cas.Get(dubIdx.CASHash)
+				if err == nil {
+					defer r.Close()
+					var d domain.DubSegmentsVariant
+					if err := json.NewDecoder(r).Decode(&d); err == nil {
+						dubSegments = &d
+						dubSegments.CASHash = dubSegmentsCASRef
+					}
+				}
+			}
+		}
+	}
+
+	// 4. Build SoundtrackPreservationPlan
+	crossfadeMs := input.CrossfadeDurationMs
+	if crossfadeMs <= 0 {
+		crossfadeMs = 25 // 25ms canonical default (within 15-30ms envelope)
+	}
+
+	preservationPlan := domain.SoundtrackPreservationPlan{
+		AssetID:             input.AssetID,
+		PreserveSinging:     true, // Canonical invariant: singing vocals preserved untouched
+		PreserveSFX:         true,
+		PreserveAmbience:    true,
+		CrossfadeDurationMs: crossfadeMs,
+		DuckingGainDb:       input.DuckingGainDb,
+		SpeechWindows:       make([]domain.PreservationWindow, 0),
+		SingingWindows:      make([]domain.PreservationWindow, 0),
+	}
+
+	if rolePlan != nil {
+		for _, seg := range rolePlan.Segments {
+			if seg.Role == domain.AudioRoleNarrationDialogue {
+				preservationPlan.SpeechWindows = append(preservationPlan.SpeechWindows, domain.PreservationWindow{
+					StartMs: seg.StartMs,
+					EndMs:   seg.EndMs,
+					Action:  "suppress_dialogue",
+				})
+			} else if seg.Role == domain.AudioRoleSingingMusicVocal {
+				preservationPlan.SingingWindows = append(preservationPlan.SingingWindows, domain.PreservationWindow{
+					StartMs: seg.StartMs,
+					EndMs:   seg.EndMs,
+					Action:  "preserve_music_vocal",
+				})
+			}
+		}
+	}
+
+	// 5. Check Mixer Invariants: Overrun Refusal & Timing Purity
+	if dubSegments != nil {
+		for _, seg := range dubSegments.Segments {
+			slotDuration := seg.EndMs - seg.StartMs
+			// Mixer refusal: if measured audio exceeds immutable source window (measured duration > slot duration)
+			if seg.MeasuredDurationMs > slotDuration {
+				refusalReason := fmt.Sprintf("segment %d measured duration %dms exceeds immutable slot %dms (start: %dms, end: %dms)",
+					seg.Index, seg.MeasuredDurationMs, slotDuration, seg.StartMs, seg.EndMs)
+
+				refusedArtifact := domain.DubMixArtifact{
+					ID:                  uuid.NewString(),
+					SchemaVersion:       domain.DubMixSchemaVersion,
+					AssetID:             input.AssetID,
+					RunID:               input.RunID,
+					JobID:               input.JobID,
+					TargetLanguage:      input.TargetLanguage,
+					DubSegmentsCAS:      dubSegments.CASHash,
+					AudioStemsCAS:       stemsArtifact.CASHash,
+					PreservationPlan:    preservationPlan,
+					DialogueSuppressed:  false,
+					SoundtrackPreserved: true,
+					OverallStatus:       "REFUSED",
+					RefusalReason:       refusalReason,
+					CreatedAt:           time.Now().UTC(),
+				}
+				provHash, _ := domain.ComputeDubMixProvenanceHash(input.AssetID, input.TargetLanguage, dubSegments.CASHash, stemsArtifact.CASHash, preservationPlan)
+				refusedArtifact.ProvenanceHash = provHash
+
+				refusedBytes, _ := json.Marshal(refusedArtifact)
+				refusedObj, _ := s.cas.Put(bytes.NewReader(refusedBytes))
+				refusedArtifact.CASHash = refusedObj.SHA256
+
+				err = s.db.SaveDubMixArtifactIndex(ctx, storage.DubMixArtifactIndex{
+					ID:             refusedArtifact.ID,
+					AssetID:        refusedArtifact.AssetID,
+					RunID:          refusedArtifact.RunID,
+					JobID:          refusedArtifact.JobID,
+					TargetLanguage: refusedArtifact.TargetLanguage,
+					CASHash:        refusedArtifact.CASHash,
+					ProvenanceHash: refusedArtifact.ProvenanceHash,
+					OverallStatus:  refusedArtifact.OverallStatus,
+					RefusalReason:  refusedArtifact.RefusalReason,
+					CreatedAt:      refusedArtifact.CreatedAt,
+				})
+				if err != nil {
+					return nil, fmt.Errorf("persist refused dub mix artifact index: %w", err)
+				}
+				return &refusedArtifact, fmt.Errorf("%w: %s", domain.ErrMixerOverrunRefused, refusalReason)
+			}
+		}
+	}
+
+	// 6. Extract background and vocal stems audio
+	var bgStem, vocalsStem domain.AudioStem
+	for _, stem := range stemsArtifact.Stems {
+		if stem.Type == domain.StemTypeBackground {
+			bgStem = stem
+		} else if stem.Type == domain.StemTypeVocals {
+			vocalsStem = stem
+		}
+	}
+	if bgStem.AudioCASHash == "" {
+		return nil, fmt.Errorf("%w: missing required background stem in audio stems artifact", domain.ErrSoundtrackPreservationFailed)
+	}
+
+	bgReader, err := s.cas.Get(bgStem.AudioCASHash)
+	if err != nil {
+		return nil, fmt.Errorf("%w: read background stem from CAS (%s): %v", domain.ErrSoundtrackPreservationFailed, bgStem.AudioCASHash, err)
+	}
+	defer bgReader.Close()
+	bgData, err := io.ReadAll(bgReader)
+	if err != nil {
+		return nil, fmt.Errorf("%w: read background stem bytes: %v", domain.ErrSoundtrackPreservationFailed, err)
+	}
+
+	bgSamples, bgHeader, err := media.ExtractPCM16Samples(bgData)
+	if err != nil {
+		return nil, fmt.Errorf("%w: extract background PCM16 samples: %v", domain.ErrSoundtrackPreservationFailed, err)
+	}
+
+	sampleRate := int(bgHeader.SampleRate)
+	channels := int(bgHeader.NumChannels)
+	if sampleRate <= 0 || channels <= 0 {
+		return nil, fmt.Errorf("%w: invalid background stem format: sample rate %d, channels %d", domain.ErrSoundtrackPreservationFailed, sampleRate, channels)
+	}
+
+	var vocalsSamples []int16
+	if vocalsStem.AudioCASHash != "" {
+		vReader, err := s.cas.Get(vocalsStem.AudioCASHash)
+		if err != nil {
+			return nil, fmt.Errorf("%w: read vocals stem from CAS (%s): %v", domain.ErrSoundtrackPreservationFailed, vocalsStem.AudioCASHash, err)
+		}
+		defer vReader.Close()
+		vData, err := io.ReadAll(vReader)
+		if err != nil {
+			return nil, fmt.Errorf("%w: read vocals stem bytes: %v", domain.ErrSoundtrackPreservationFailed, err)
+		}
+		vSamples, vHeader, err := media.ExtractPCM16Samples(vData)
+		if err != nil {
+			return nil, fmt.Errorf("%w: extract vocals PCM16 samples: %v", domain.ErrSoundtrackPreservationFailed, err)
+		}
+		// Resample/match vocals to background rate/channels if needed
+		if int(vHeader.SampleRate) != sampleRate || int(vHeader.NumChannels) != channels {
+			vSamples = media.ResamplePCM16(vSamples, int(vHeader.SampleRate), int(vHeader.NumChannels), sampleRate, channels)
+		}
+		vocalsSamples = vSamples
+	}
+
+	// 7. Prepare speech clips for mixing
+	speechClips := make([]media.DubSpeechClip, 0)
+	if dubSegments != nil {
+		for _, seg := range dubSegments.Segments {
+			if seg.AudioSHA256 != "" || seg.AudioCASPath != "" {
+				var r io.ReadCloser
+				var err error
+				if seg.AudioSHA256 != "" {
+					r, err = s.cas.Get(seg.AudioSHA256)
+				}
+				if err != nil && seg.AudioCASPath != "" {
+					r, err = os.Open(seg.AudioCASPath)
+				}
+				if err == nil && r != nil {
+					audioBytes, err := io.ReadAll(r)
+					r.Close()
+					if err == nil {
+						clipSamples, clipHeader, err := media.ExtractPCM16Samples(audioBytes)
+						if err == nil {
+							speechClips = append(speechClips, media.DubSpeechClip{
+								StartMs:    seg.StartMs,
+								SampleRate: int(clipHeader.SampleRate),
+								Channels:   int(clipHeader.NumChannels),
+								Samples:    clipSamples,
+							})
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Prepare suppression windows
+	suppressIntervals := make([]media.PreservationWindowInterval, len(preservationPlan.SpeechWindows))
+	for i, w := range preservationPlan.SpeechWindows {
+		suppressIntervals[i] = media.PreservationWindowInterval{
+			StartMs: w.StartMs,
+			EndMs:   w.EndMs,
+			Action:  w.Action,
+		}
+	}
+
+	// 8. Execute deterministic PCM mixing
+	mixedSamples := media.MixPCM16Stems(
+		bgSamples,
+		vocalsSamples,
+		sampleRate,
+		channels,
+		speechClips,
+		suppressIntervals,
+		crossfadeMs,
+		input.DuckingGainDb,
+	)
+	mixedWAV := media.EncodePCM16Samples(mixedSamples, sampleRate, channels)
+	mixedDurationMs, _ := media.ProbeWAVBytes(mixedWAV)
+	if mixedDurationMs <= 0 {
+		mixedDurationMs = bgHeader.DurationMs
+	}
+
+	// Store mixed audio in CAS
+	mixedAudioObj, err := s.cas.Put(bytes.NewReader(mixedWAV))
+	if err != nil {
+		return nil, fmt.Errorf("store mixed audio in CAS: %w", err)
+	}
+	mixedAudioCASHash := mixedAudioObj.SHA256
+	mixedAudioCASPath := mixedAudioObj.Path
+
+	// 9. Build DubMixArtifact
+	dubSegmentsCAS := ""
+	if dubSegments != nil {
+		dubSegmentsCAS = dubSegments.CASHash
+	}
+	provHash, _ := domain.ComputeDubMixProvenanceHash(
+		input.AssetID,
+		input.TargetLanguage,
+		dubSegmentsCAS,
+		stemsArtifact.CASHash,
+		preservationPlan,
+	)
+
+	mixArtifact := domain.DubMixArtifact{
+		ID:                  uuid.NewString(),
+		SchemaVersion:       domain.DubMixSchemaVersion,
+		AssetID:             input.AssetID,
+		RunID:               input.RunID,
+		JobID:               input.JobID,
+		TargetLanguage:      input.TargetLanguage,
+		AudioCASHash:        mixedAudioCASHash,
+		AudioCASPath:        mixedAudioCASPath,
+		SampleRate:          sampleRate,
+		Channels:            channels,
+		Format:              "wav",
+		DurationMs:          mixedDurationMs,
+		DubSegmentsCAS:      dubSegmentsCAS,
+		AudioStemsCAS:       stemsArtifact.CASHash,
+		PreservationPlan:    preservationPlan,
+		DialogueSuppressed:  len(suppressIntervals) > 0,
+		SoundtrackPreserved: true,
+		ProvenanceHash:      provHash,
+		OverallStatus:       "PASS",
+		CreatedAt:           time.Now().UTC(),
+	}
+
+	// If asset has no speech, mark cleanly as preserved passthrough
+	if !hasDubEligibleSpeech {
+		mixArtifact.DialogueSuppressed = false
+		mixArtifact.SoundtrackPreserved = true
+	}
+
+	mixBytes, err := json.Marshal(mixArtifact)
+	if err != nil {
+		return nil, fmt.Errorf("marshal dub mix artifact: %w", err)
+	}
+	mixObj, err := s.cas.Put(bytes.NewReader(mixBytes))
+	if err != nil {
+		return nil, fmt.Errorf("store dub mix artifact in CAS: %w", err)
+	}
+	mixArtifact.CASHash = mixObj.SHA256
+
+	// Save to SQLite
+	err = s.db.SaveDubMixArtifactIndex(ctx, storage.DubMixArtifactIndex{
+		ID:             mixArtifact.ID,
+		AssetID:        mixArtifact.AssetID,
+		RunID:          mixArtifact.RunID,
+		JobID:          mixArtifact.JobID,
+		TargetLanguage: mixArtifact.TargetLanguage,
+		CASHash:        mixArtifact.CASHash,
+		ProvenanceHash: mixArtifact.ProvenanceHash,
+		OverallStatus:  mixArtifact.OverallStatus,
+		CreatedAt:      mixArtifact.CreatedAt,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("persist dub mix artifact index: %w", err)
+	}
+	_ = asset
+	return &mixArtifact, nil
+}

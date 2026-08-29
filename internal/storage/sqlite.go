@@ -783,6 +783,64 @@ func (s *DB) migrate(ctx context.Context) error {
 			return fmt.Errorf("commit migration v10: %w", err)
 		}
 	}
+
+	// 12. Schema migration v11 (Audio Stems + Dub Mix - T15)
+	var countV11 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 11`).Scan(&countV11)
+	if err != nil {
+		return fmt.Errorf("check migration version 11: %w", err)
+	}
+
+	if countV11 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v11 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		schemaV11SQL := `
+		CREATE TABLE IF NOT EXISTS audio_stems_artifacts (
+			id TEXT PRIMARY KEY,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			provider_id TEXT NOT NULL,
+			model_name TEXT NOT NULL,
+			model_version TEXT NOT NULL,
+			cas_hash TEXT NOT NULL,
+			provenance_hash TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_stems_provenance ON audio_stems_artifacts(provenance_hash);
+		CREATE INDEX IF NOT EXISTS idx_audio_stems_asset ON audio_stems_artifacts(asset_id);
+
+		CREATE TABLE IF NOT EXISTS dub_mix_artifacts (
+			id TEXT PRIMARY KEY,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			run_id TEXT NOT NULL,
+			job_id TEXT NOT NULL,
+			target_language TEXT NOT NULL,
+			cas_hash TEXT NOT NULL,
+			provenance_hash TEXT NOT NULL,
+			overall_status TEXT NOT NULL,
+			refusal_reason TEXT,
+			created_at TEXT NOT NULL
+		);
+
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_dub_mix_provenance ON dub_mix_artifacts(provenance_hash);
+		CREATE INDEX IF NOT EXISTS idx_dub_mix_asset_lang ON dub_mix_artifacts(asset_id, target_language);
+		CREATE INDEX IF NOT EXISTS idx_dub_mix_run ON dub_mix_artifacts(run_id);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (11, datetime('now'));
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaV11SQL); err != nil {
+			return fmt.Errorf("execute migration v11: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v11: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -2825,6 +2883,243 @@ func (s *DB) GetDubSegmentsVariantByProvenance(ctx context.Context, provenanceHa
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("query dub_segments_variant by provenance: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// AudioStemsArtifactIndex captures the SQLite indexing metadata for a persisted AudioStemArtifacts.
+type AudioStemsArtifactIndex struct {
+	ID             string
+	AssetID        string
+	ProviderID     string
+	ModelName      string
+	ModelVersion   string
+	CASHash        string
+	ProvenanceHash string
+	CreatedAt      time.Time
+}
+
+// SaveAudioStemsArtifactIndex records the index row for a CAS-stored AudioStemArtifacts.
+func (s *DB) SaveAudioStemsArtifactIndex(ctx context.Context, idx AudioStemsArtifactIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO audio_stems_artifacts (
+			id, asset_id, provider_id, model_name, model_version, cas_hash, provenance_hash, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provenance_hash) DO UPDATE SET
+			cas_hash = excluded.cas_hash
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID,
+		idx.AssetID,
+		idx.ProviderID,
+		idx.ModelName,
+		idx.ModelVersion,
+		idx.CASHash,
+		idx.ProvenanceHash,
+		func() string {
+			if idx.CreatedAt.IsZero() {
+				return time.Now().UTC().Format(time.RFC3339Nano)
+			}
+			return idx.CreatedAt.Format(time.RFC3339Nano)
+		}(),
+	)
+	if err != nil {
+		return fmt.Errorf("save audio_stems_artifacts index: %w", err)
+	}
+	return nil
+}
+
+// GetAudioStemsArtifactIndex retrieves the latest index row for an asset.
+func (s *DB) GetAudioStemsArtifactIndex(ctx context.Context, assetID string) (*AudioStemsArtifactIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx AudioStemsArtifactIndex
+	var createdStr string
+	query := `SELECT id, asset_id, provider_id, model_name, model_version, cas_hash, provenance_hash, created_at
+		FROM audio_stems_artifacts WHERE asset_id = ?
+		ORDER BY created_at DESC, rowid DESC LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, assetID).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.ProviderID,
+		&idx.ModelName,
+		&idx.ModelVersion,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query audio_stems_artifacts index: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// GetAudioStemsArtifactByProvenance retrieves the index row by provenance hash.
+func (s *DB) GetAudioStemsArtifactByProvenance(ctx context.Context, provenanceHash string) (*AudioStemsArtifactIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx AudioStemsArtifactIndex
+	var createdStr string
+	query := `SELECT id, asset_id, provider_id, model_name, model_version, cas_hash, provenance_hash, created_at
+		FROM audio_stems_artifacts WHERE provenance_hash = ? LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, provenanceHash).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.ProviderID,
+		&idx.ModelName,
+		&idx.ModelVersion,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query audio_stems_artifacts by provenance: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// DubMixArtifactIndex captures the SQLite indexing metadata for a persisted DubMixArtifact.
+type DubMixArtifactIndex struct {
+	ID             string
+	AssetID        string
+	RunID          string
+	JobID          string
+	TargetLanguage string
+	CASHash        string
+	ProvenanceHash string
+	OverallStatus  string
+	RefusalReason  string
+	CreatedAt      time.Time
+}
+
+// SaveDubMixArtifactIndex records the index row for a CAS-stored DubMixArtifact.
+func (s *DB) SaveDubMixArtifactIndex(ctx context.Context, idx DubMixArtifactIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO dub_mix_artifacts (
+			id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+			overall_status, refusal_reason, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provenance_hash) DO UPDATE SET
+			cas_hash = excluded.cas_hash,
+			overall_status = excluded.overall_status,
+			refusal_reason = excluded.refusal_reason
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID,
+		idx.AssetID,
+		idx.RunID,
+		idx.JobID,
+		idx.TargetLanguage,
+		idx.CASHash,
+		idx.ProvenanceHash,
+		idx.OverallStatus,
+		idx.RefusalReason,
+		func() string {
+			if idx.CreatedAt.IsZero() {
+				return time.Now().UTC().Format(time.RFC3339Nano)
+			}
+			return idx.CreatedAt.Format(time.RFC3339Nano)
+		}(),
+	)
+	if err != nil {
+		return fmt.Errorf("save dub_mix_artifacts index: %w", err)
+	}
+	return nil
+}
+
+// GetDubMixArtifactIndex retrieves the latest index row for an asset and target language.
+func (s *DB) GetDubMixArtifactIndex(ctx context.Context, assetID string, targetLang string) (*DubMixArtifactIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx DubMixArtifactIndex
+	var createdStr string
+	var refusalReason sql.NullString
+	query := `SELECT id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+		overall_status, refusal_reason, created_at
+		FROM dub_mix_artifacts WHERE asset_id = ? AND target_language = ?
+		ORDER BY created_at DESC, rowid DESC LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, assetID, targetLang).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&idx.OverallStatus,
+		&refusalReason,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query dub_mix_artifacts index: %w", err)
+	}
+	if refusalReason.Valid {
+		idx.RefusalReason = refusalReason.String
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// GetDubMixArtifactByProvenance retrieves the index row by provenance hash.
+func (s *DB) GetDubMixArtifactByProvenance(ctx context.Context, provenanceHash string) (*DubMixArtifactIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx DubMixArtifactIndex
+	var createdStr string
+	var refusalReason sql.NullString
+	query := `SELECT id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+		overall_status, refusal_reason, created_at
+		FROM dub_mix_artifacts WHERE provenance_hash = ? LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, provenanceHash).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&idx.OverallStatus,
+		&refusalReason,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query dub_mix_artifacts by provenance: %w", err)
+	}
+	if refusalReason.Valid {
+		idx.RefusalReason = refusalReason.String
 	}
 	t, _ := time.Parse(time.RFC3339Nano, createdStr)
 	idx.CreatedAt = t

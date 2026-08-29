@@ -361,6 +361,8 @@ func dispatchStage(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 		return runDiarizerEvidenceAdapter(ctx, cmd, enc)
 	case "tts":
 		return runTTSAdapter(ctx, cmd, enc)
+	case "separator":
+		return runSeparatorAdapter(ctx, cmd, enc)
 	default:
 		// For unrecognized stages, fall back to the marker artifact placeholder.
 		return writeMarkerArtifact(cmd)
@@ -571,6 +573,8 @@ func invokeCommand(ctx context.Context, binary string, args []string, req any, o
 			code = "DIARIZER_EXEC_FAILED"
 		} else if strings.Contains(stageTarget, "asr") || strings.Contains(stageTarget, "qwen3") {
 			code = "ASR_EXEC_FAILED"
+		} else if strings.Contains(stageTarget, "separator") || strings.Contains(stageTarget, "demucs") || strings.Contains(stageTarget, "uvr") {
+			code = "SEPARATOR_EXEC_FAILED"
 		}
 		return worker.NewError(code, fmt.Sprintf("%s exited with error: %v; stderr: %s", binary, err, strings.TrimSpace(stderr.String())), nil)
 	}
@@ -584,6 +588,8 @@ func invokeCommand(ctx context.Context, binary string, args []string, req any, o
 			code = "DIARIZER_OUTPUT_INVALID"
 		} else if strings.Contains(stageTarget, "asr") || strings.Contains(stageTarget, "qwen3") {
 			code = "ASR_OUTPUT_INVALID"
+		} else if strings.Contains(stageTarget, "separator") || strings.Contains(stageTarget, "demucs") || strings.Contains(stageTarget, "uvr") {
+			code = "SEPARATOR_OUTPUT_INVALID"
 		}
 		return worker.NewError(code, fmt.Sprintf("%s returned invalid JSON: %v", binary, err), nil)
 	}
@@ -832,6 +838,111 @@ func resolveTTSRunner() (commandRunner, error) {
 		nil)
 }
 
+func resolveSeparatorRunner() (commandRunner, error) {
+	if bin := os.Getenv("DOUYINIE_SEPARATOR_BIN"); bin != "" {
+		if path, err := exec.LookPath(bin); err == nil {
+			return commandRunner{binary: path}, nil
+		}
+		return commandRunner{}, worker.NewError("SEPARATOR_BINARY_NOT_FOUND",
+			fmt.Sprintf("DOUYINIE_SEPARATOR_BIN %q not found", bin), nil)
+	}
+
+	if script := os.Getenv("DOUYINIE_SEPARATOR_ADAPTER"); script != "" {
+		if _, err := os.Stat(script); err == nil {
+			pyBin := resolveSeparatorPythonBinary()
+			if pyBin != "" {
+				return commandRunner{binary: pyBin, args: []string{script}}, nil
+			}
+			return commandRunner{}, worker.NewError("SEPARATOR_BINARY_NOT_FOUND",
+				"python runtime not found to execute DOUYINIE_SEPARATOR_ADAPTER", nil)
+		}
+	}
+	// Repo-owned Python adapter cmd/stageworker/adapters/separator.py
+	adapterPaths := []string{
+		filepath.Join("cmd", "stageworker", "adapters", "separator.py"),
+		filepath.Join("adapters", "separator.py"),
+		filepath.Join("..", "..", "cmd", "stageworker", "adapters", "separator.py"),
+		filepath.Join("..", "cmd", "stageworker", "adapters", "separator.py"),
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		adapterPaths = append(adapterPaths,
+			filepath.Join(exeDir, "adapters", "separator.py"),
+			filepath.Join(exeDir, "..", "cmd", "stageworker", "adapters", "separator.py"),
+			filepath.Join(exeDir, "..", "..", "cmd", "stageworker", "adapters", "separator.py"),
+		)
+	}
+
+	for _, p := range adapterPaths {
+		if absP, err := filepath.Abs(p); err == nil {
+			if _, err := os.Stat(absP); err == nil {
+				pyBin := resolveSeparatorPythonBinary()
+				if pyBin != "" {
+					return commandRunner{binary: pyBin, args: []string{absP}}, nil
+				}
+			}
+		}
+	}
+	return commandRunner{}, worker.NewError("SEPARATOR_BINARY_NOT_FOUND",
+		"audio separator adapter or binary not available: configure DOUYINIE_SEPARATOR_ADAPTER/DOUYINIE_SEPARATOR_BIN or install python-audio-separator/demucs",
+		nil)
+}
+
+func runSeparatorAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder) (worker.ArtifactRef, error) {
+	if len(cmd.Inputs) == 0 {
+		return worker.ArtifactRef{}, worker.NewError("SEPARATOR_MISSING_INPUT",
+			"separator command has no input audio artifact",
+			map[string]any{"stage": "separator", "command_id": cmd.ID})
+	}
+
+	modelName, _ := cmd.Config[cfgModelName].(string)
+	if modelName == "" {
+		modelName = "UVR-MDX-NET-Inst_HQ_4.onnx"
+	}
+	modelVersion, _ := cmd.Config[cfgModelVersion].(string)
+	if modelVersion == "" {
+		modelVersion = "v3"
+	}
+
+	runner, err := resolveSeparatorRunner()
+	if err != nil {
+		return worker.ArtifactRef{}, err
+	}
+
+	req := map[string]any{
+		"audio_path":    cmd.Inputs[0].Path,
+		"run_id":        cmd.RunID,
+		"attempt_id":    cmd.AttemptID,
+		cfgModelName:    modelName,
+		cfgModelVersion: modelVersion,
+	}
+
+	var out struct {
+		VocalsData       string `json:"vocals_data"`
+		BackgroundData   string `json:"background_data"`
+		VocalsSHA256     string `json:"vocals_sha256"`
+		BackgroundSHA256 string `json:"background_sha256"`
+		DurationMs       int64  `json:"duration_ms"`
+		SampleRate       int    `json:"sample_rate"`
+		Channels         int    `json:"channels"`
+		ModelName        string `json:"model_name"`
+		ModelVersion     string `json:"model_version"`
+	}
+
+	if err := invokeCommand(ctx, runner.binary, runner.args, req, &out); err != nil {
+		return worker.ArtifactRef{}, err
+	}
+
+	if out.ModelName == "" {
+		out.ModelName = modelName
+	}
+	if out.ModelVersion == "" {
+		out.ModelVersion = modelVersion
+	}
+
+	return writeOutputArtifact(cmd, out)
+}
+
 func resolvePythonBinary() string {
 	if py := os.Getenv("DOUYINIE_PYTHON_BIN"); py != "" {
 		if path, err := exec.LookPath(py); err == nil {
@@ -847,6 +958,14 @@ func resolvePythonBinary() string {
 }
 func resolveTTSPythonBinary() string {
 	if py := os.Getenv("DOUYINIE_TTS_PYTHON_BIN"); py != "" {
+		if path, err := exec.LookPath(py); err == nil {
+			return path
+		}
+	}
+	return resolvePythonBinary()
+}
+func resolveSeparatorPythonBinary() string {
+	if py := os.Getenv("DOUYINIE_SEPARATOR_PYTHON_BIN"); py != "" {
 		if path, err := exec.LookPath(py); err == nil {
 			return path
 		}

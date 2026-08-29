@@ -320,9 +320,14 @@ func (p *FakeTTSProvider) SynthesizeSpeech(ctx context.Context, req TTSSynthesis
 // FakeSeparatorProvider simulates python-audio-separator / UVR / Demucs.
 type FakeSeparatorProvider struct {
 	BaseFakeProvider
+	InjectError error
 }
 
 func NewFakeSeparatorProvider(id string) *FakeSeparatorProvider {
+	return NewFakeSeparatorProviderWithModel(id, "UVR-MDX-NET-Inst_HQ_4.onnx", "v3", 0.94)
+}
+
+func NewFakeSeparatorProviderWithModel(id, modelName, modelVer string, quality float64) *FakeSeparatorProvider {
 	return &FakeSeparatorProvider{
 		BaseFakeProvider: BaseFakeProvider{
 			ProviderID:   id,
@@ -334,14 +339,33 @@ func NewFakeSeparatorProvider(id string) *FakeSeparatorProvider {
 				Languages:      []string{"*"},
 				ExecutionTier:  "local",
 				CostPerUnit:    0.0,
-				QualityScore:   0.94,
+				QualityScore:   quality,
 				MaxConcurrency: 1,
 				Features:       []string{"vocal_extraction", "bgm_preservation"},
 			},
-			ModelName:    "uvr-mdx-net",
-			ModelVersion: "v3",
+			ModelName:    modelName,
+			ModelVersion: modelVer,
 		},
 	}
+}
+
+func (p *FakeSeparatorProvider) SeparateStems(ctx context.Context, req SeparationRequest) (*SeparationResult, error) {
+	if p.InjectError != nil {
+		return nil, p.InjectError
+	}
+	durationMs := int64(10000)
+	vocals := media.GeneratePCM16WAV(16000, 1, durationMs)
+	bg := media.GeneratePCM16WAV(16000, 1, durationMs)
+	return &SeparationResult{
+		ProviderID:    p.ProviderID,
+		ModelName:     p.ModelName,
+		ModelVersion:  p.ModelVersion,
+		VocalsWAV:     vocals,
+		BackgroundWAV: bg,
+		DurationMs:    durationMs,
+		SampleRate:    16000,
+		Channels:      1,
+	}, nil
 }
 
 // FakeOCRProvider simulates OCR text extraction and TextRegionPlan generation.
@@ -659,6 +683,7 @@ func NewSeam1FakeRegistry() *Registry {
 	_ = reg.Register(NewFakeTTSProvider("fake_kokoro_tts_en", 1400))
 	_ = reg.Register(NewFakeSeparatorProvider("fake_uvr_separator"))
 	_ = reg.Register(NewFakeOCRProvider("fake_paddle_ocr"))
+	_ = reg.Register(NewFakeSeparatorProviderWithModel("fake_demucs_separator", "htdemucs", "v4", 0.90))
 	_ = reg.Register(NewFakeTranslationProvider("fake_llm_translator"))
 	_ = reg.Register(NewFakeTranslationProviderFallback("fake_local_translator_fallback"))
 	_ = reg.Register(NewFakeDiarizationProvider("fake_campplus_diarizer"))
