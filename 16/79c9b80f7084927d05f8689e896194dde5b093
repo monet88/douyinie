@@ -1,0 +1,28 @@
+internal/domain/render.go
+  h_17f2fa2b92da6a 53-54
+internal/domain/textregion.go
+  h_17f2fa2b92da6a 8-9,23-33,105-114,146-629
+internal/domain/textregion_test.go
+  h_17f2fa2b92da6a 4,122-368
+internal/server/server.go
+  h_17f2fa2b92da6a 110-116,310-316,2142-2274
+internal/service/visual_text.go
+  h_17f2fa2b92da6a 38-41,49-51,66-70,425-946
+internal/service/visual_text_test.go
+  h_17f2fa2b92da6a 5,205-462
+internal/storage/sqlite.go
+  h_17f2fa2b92da6a 945-1001,3636-3861
+test/seam1/text_region_test.go
+  h_17f2fa2b92da6a 247-553
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "1679c9b80f7084927d05f8689e896194dde5b093",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
