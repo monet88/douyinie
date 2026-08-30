@@ -667,7 +667,29 @@ func TestSeam1_FullDub_SubtitleDubSemanticGrounding_Consistency(t *testing.T) {
 		t.Fatalf("POST translate failed: %d", respTrans.StatusCode)
 	}
 
-	// 2. Setup DubScriptVariant with shortened spoken copy
+	// 2. Seed the required AudioRolePlan for this speech-bearing fixture.
+	roleBody, err := json.Marshal(map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 1000, EndMs: 4000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal audio role plan: %v", err)
+	}
+	roleResp, err := http.Post(
+		fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID),
+		"application/json",
+		bytes.NewReader(roleBody),
+	)
+	if err != nil {
+		t.Fatalf("POST audio-role-plan failed: %v", err)
+	}
+	roleResp.Body.Close()
+	if roleResp.StatusCode != http.StatusCreated && roleResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST audio-role-plan failed: %d", roleResp.StatusCode)
+	}
+
+	// 3. Setup DubScriptVariant with shortened spoken copy
 	respDub, dubScriptVariant := runDubScript(t, h, assetID, map[string]any{
 		"run_id":                  runID,
 		"job_id":                  jobID,
@@ -679,7 +701,7 @@ func TestSeam1_FullDub_SubtitleDubSemanticGrounding_Consistency(t *testing.T) {
 		t.Fatalf("POST dub-script failed: %d", respDub.StatusCode)
 	}
 
-	// 3. Run detect-text & localized-visual-track
+	// 4. Run detect-text & localized-visual-track
 	detectBody, _ := json.Marshal(map[string]any{"run_id": runID})
 	resp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/detect-text", h.server.URL, assetID), "application/json", bytes.NewReader(detectBody))
 	if err != nil || resp.StatusCode != http.StatusCreated {
