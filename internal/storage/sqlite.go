@@ -999,6 +999,71 @@ func (s *DB) migrate(ctx context.Context) error {
 			return fmt.Errorf("commit migration v14: %w", err)
 		}
 	}
+
+	// 16. Schema migration v15 (Review Overrides + Multimodal Quality Results - T19)
+	var countV15 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 15`).Scan(&countV15)
+	if err != nil {
+		return fmt.Errorf("check migration version 15: %w", err)
+	}
+
+	if countV15 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v15 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		schemaV15SQL := `
+		CREATE TABLE IF NOT EXISTS review_overrides (
+			id TEXT PRIMARY KEY,
+			run_id TEXT NOT NULL,
+			job_id TEXT NOT NULL,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			target_language TEXT NOT NULL,
+			review_item_id TEXT NOT NULL,
+			item_type TEXT NOT NULL,
+			stage TEXT NOT NULL,
+			item_index INTEGER NOT NULL,
+			segment_id TEXT,
+			region_id TEXT,
+			action TEXT NOT NULL,
+			reason TEXT NOT NULL,
+			operator TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_review_overrides_asset_lang ON review_overrides(asset_id, target_language);
+		CREATE INDEX IF NOT EXISTS idx_review_overrides_item ON review_overrides(review_item_id);
+		CREATE INDEX IF NOT EXISTS idx_review_overrides_run ON review_overrides(run_id);
+
+		CREATE TABLE IF NOT EXISTS quality_results (
+			id TEXT PRIMARY KEY,
+			run_id TEXT NOT NULL,
+			job_id TEXT NOT NULL,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			target_language TEXT NOT NULL,
+			stage TEXT NOT NULL,
+			overall_status TEXT NOT NULL,
+			metrics_json TEXT NOT NULL,
+			issues_json TEXT NOT NULL,
+			details_json TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_quality_results_asset_lang ON quality_results(asset_id, target_language);
+		CREATE INDEX IF NOT EXISTS idx_quality_results_run ON quality_results(run_id);
+		CREATE INDEX IF NOT EXISTS idx_quality_results_stage ON quality_results(stage);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (15, datetime('now'));
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaV15SQL); err != nil {
+			return fmt.Errorf("execute migration v15: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v15: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -3858,4 +3923,336 @@ func (s *DB) GetLocalizedVisualTrackByProvenance(ctx context.Context, provenance
 	t, _ := time.Parse(time.RFC3339Nano, createdStr)
 	idx.CreatedAt = t
 	return &idx, nil
+}
+
+// SaveReviewOverride records an auditable operator acceptance/override of a flagged exception item.
+func (s *DB) SaveReviewOverride(ctx context.Context, ro domain.ReviewOverride) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if ro.ID == "" {
+		ro.ID = uuid.NewString()
+	}
+	if ro.CreatedAt.IsZero() {
+		ro.CreatedAt = time.Now().UTC()
+	}
+	if ro.Action == "" {
+		ro.Action = "manual_override"
+	}
+
+	query := `INSERT INTO review_overrides (id, run_id, job_id, asset_id, target_language, review_item_id, item_type, stage, item_index, segment_id, region_id, action, reason, operator, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+	_, err := s.db.ExecContext(ctx, query,
+		ro.ID,
+		ro.RunID,
+		ro.JobID,
+		ro.AssetID,
+		ro.TargetLanguage,
+		ro.ReviewItemID,
+		string(ro.ItemType),
+		ro.Stage,
+		ro.ItemIndex,
+		ro.SegmentID,
+		ro.RegionID,
+		ro.Action,
+		ro.Reason,
+		ro.Operator,
+		ro.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("insert review_override: %w", err)
+	}
+	return nil
+}
+
+// GetReviewOverrides returns all recorded overrides for an asset and target language.
+func (s *DB) GetReviewOverrides(ctx context.Context, assetID, targetLang string) ([]domain.ReviewOverride, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `SELECT id, run_id, job_id, asset_id, target_language, review_item_id, item_type, stage, item_index, segment_id, region_id, action, reason, operator, created_at
+		FROM review_overrides WHERE asset_id = ? AND target_language = ? ORDER BY created_at ASC`
+
+	rows, err := s.db.QueryContext(ctx, query, assetID, targetLang)
+	if err != nil {
+		return nil, fmt.Errorf("query review_overrides: %w", err)
+	}
+	defer rows.Close()
+
+	var overrides []domain.ReviewOverride
+	for rows.Next() {
+		var ro domain.ReviewOverride
+		var itemTypeStr, createdStr string
+		var segID, regID sql.NullString
+		err := rows.Scan(
+			&ro.ID,
+			&ro.RunID,
+			&ro.JobID,
+			&ro.AssetID,
+			&ro.TargetLanguage,
+			&ro.ReviewItemID,
+			&itemTypeStr,
+			&ro.Stage,
+			&ro.ItemIndex,
+			&segID,
+			&regID,
+			&ro.Action,
+			&ro.Reason,
+			&ro.Operator,
+			&createdStr,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan review_override: %w", err)
+		}
+		ro.ItemType = domain.ReviewItemType(itemTypeStr)
+		if segID.Valid {
+			ro.SegmentID = segID.String
+		}
+		if regID.Valid {
+			ro.RegionID = regID.String
+		}
+		ro.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+		overrides = append(overrides, ro)
+	}
+	return overrides, nil
+}
+
+// GetReviewOverridesByRun returns all recorded overrides for a specific run ID.
+func (s *DB) GetReviewOverridesByRun(ctx context.Context, runID string) ([]domain.ReviewOverride, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `SELECT id, run_id, job_id, asset_id, target_language, review_item_id, item_type, stage, item_index, segment_id, region_id, action, reason, operator, created_at
+		FROM review_overrides WHERE run_id = ? ORDER BY created_at ASC`
+
+	rows, err := s.db.QueryContext(ctx, query, runID)
+	if err != nil {
+		return nil, fmt.Errorf("query review_overrides by run: %w", err)
+	}
+	defer rows.Close()
+
+	var overrides []domain.ReviewOverride
+	for rows.Next() {
+		var ro domain.ReviewOverride
+		var itemTypeStr, createdStr string
+		var segID, regID sql.NullString
+		err := rows.Scan(
+			&ro.ID,
+			&ro.RunID,
+			&ro.JobID,
+			&ro.AssetID,
+			&ro.TargetLanguage,
+			&ro.ReviewItemID,
+			&itemTypeStr,
+			&ro.Stage,
+			&ro.ItemIndex,
+			&segID,
+			&regID,
+			&ro.Action,
+			&ro.Reason,
+			&ro.Operator,
+			&createdStr,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan review_override: %w", err)
+		}
+		ro.ItemType = domain.ReviewItemType(itemTypeStr)
+		if segID.Valid {
+			ro.SegmentID = segID.String
+		}
+		if regID.Valid {
+			ro.RegionID = regID.String
+		}
+		ro.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+		overrides = append(overrides, ro)
+	}
+	return overrides, nil
+}
+
+// SaveQualityResult records an append-only multimodal quality evaluation result.
+// Invariant: Strictly append-only. Never mutates existing rows or overwrites historical execution state.
+func (s *DB) SaveQualityResult(ctx context.Context, qr domain.QualityResult) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if qr.ID == "" {
+		qr.ID = uuid.NewString()
+	}
+	if qr.CreatedAt.IsZero() {
+		qr.CreatedAt = time.Now().UTC()
+	}
+	if qr.OverallStatus == "" {
+		qr.OverallStatus = domain.QualityStatusPass
+	}
+
+	metricsJSON, err := json.Marshal(qr.Metrics)
+	if err != nil {
+		return fmt.Errorf("marshal quality metrics: %w", err)
+	}
+	issuesJSON, err := json.Marshal(qr.Issues)
+	if err != nil {
+		return fmt.Errorf("marshal quality issues: %w", err)
+	}
+	detailsJSON, err := json.Marshal(qr.Details)
+	if err != nil {
+		return fmt.Errorf("marshal quality details: %w", err)
+	}
+
+	query := `INSERT INTO quality_results (id, run_id, job_id, asset_id, target_language, stage, overall_status, metrics_json, issues_json, details_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+	_, err = s.db.ExecContext(ctx, query,
+		qr.ID,
+		qr.RunID,
+		qr.JobID,
+		qr.AssetID,
+		qr.TargetLanguage,
+		qr.Stage,
+		string(qr.OverallStatus),
+		string(metricsJSON),
+		string(issuesJSON),
+		string(detailsJSON),
+		qr.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("insert quality_result: %w", err)
+	}
+	return nil
+}
+
+// GetQualityResults retrieves append-only quality results for an asset, target language, and optional stage.
+func (s *DB) GetQualityResults(ctx context.Context, assetID, targetLang, stage string) ([]domain.QualityResult, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var query string
+	var args []any
+	if stage != "" {
+		query = `SELECT id, run_id, job_id, asset_id, target_language, stage, overall_status, metrics_json, issues_json, details_json, created_at
+			FROM quality_results WHERE asset_id = ? AND target_language = ? AND stage = ? ORDER BY created_at ASC`
+		args = []any{assetID, targetLang, stage}
+	} else {
+		query = `SELECT id, run_id, job_id, asset_id, target_language, stage, overall_status, metrics_json, issues_json, details_json, created_at
+			FROM quality_results WHERE asset_id = ? AND target_language = ? ORDER BY created_at ASC`
+		args = []any{assetID, targetLang}
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query quality_results: %w", err)
+	}
+	defer rows.Close()
+
+	var results []domain.QualityResult
+	for rows.Next() {
+		var qr domain.QualityResult
+		var statusStr, metricsStr, issuesStr, detailsStr, createdStr string
+		err := rows.Scan(
+			&qr.ID,
+			&qr.RunID,
+			&qr.JobID,
+			&qr.AssetID,
+			&qr.TargetLanguage,
+			&qr.Stage,
+			&statusStr,
+			&metricsStr,
+			&issuesStr,
+			&detailsStr,
+			&createdStr,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan quality_result: %w", err)
+		}
+		qr.OverallStatus = domain.QualityStatus(statusStr)
+		_ = json.Unmarshal([]byte(metricsStr), &qr.Metrics)
+		_ = json.Unmarshal([]byte(issuesStr), &qr.Issues)
+		_ = json.Unmarshal([]byte(detailsStr), &qr.Details)
+		qr.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+		results = append(results, qr)
+	}
+	return results, nil
+}
+
+// GetLatestQualityResult retrieves the most recent quality result for an asset, target language, and stage.
+func (s *DB) GetLatestQualityResult(ctx context.Context, assetID, targetLang, stage string) (*domain.QualityResult, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `SELECT id, run_id, job_id, asset_id, target_language, stage, overall_status, metrics_json, issues_json, details_json, created_at
+		FROM quality_results WHERE asset_id = ? AND target_language = ? AND stage = ?
+		ORDER BY created_at DESC, rowid DESC LIMIT 1`
+
+	row := s.db.QueryRowContext(ctx, query, assetID, targetLang, stage)
+	var qr domain.QualityResult
+	var statusStr, metricsStr, issuesStr, detailsStr, createdStr string
+	err := row.Scan(
+		&qr.ID,
+		&qr.RunID,
+		&qr.JobID,
+		&qr.AssetID,
+		&qr.TargetLanguage,
+		&qr.Stage,
+		&statusStr,
+		&metricsStr,
+		&issuesStr,
+		&detailsStr,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query latest quality_result: %w", err)
+	}
+	qr.OverallStatus = domain.QualityStatus(statusStr)
+	_ = json.Unmarshal([]byte(metricsStr), &qr.Metrics)
+	_ = json.Unmarshal([]byte(issuesStr), &qr.Issues)
+	_ = json.Unmarshal([]byte(detailsStr), &qr.Details)
+	qr.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	return &qr, nil
+}
+
+// GetQualityResultsByRun retrieves all append-only quality results for a run ID.
+func (s *DB) GetQualityResultsByRun(ctx context.Context, runID string) ([]domain.QualityResult, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `SELECT id, run_id, job_id, asset_id, target_language, stage, overall_status, metrics_json, issues_json, details_json, created_at
+		FROM quality_results WHERE run_id = ? ORDER BY created_at ASC`
+
+	rows, err := s.db.QueryContext(ctx, query, runID)
+	if err != nil {
+		return nil, fmt.Errorf("query quality_results by run: %w", err)
+	}
+	defer rows.Close()
+
+	var results []domain.QualityResult
+	for rows.Next() {
+		var qr domain.QualityResult
+		var statusStr, metricsStr, issuesStr, detailsStr, createdStr string
+		err := rows.Scan(
+			&qr.ID,
+			&qr.RunID,
+			&qr.JobID,
+			&qr.AssetID,
+			&qr.TargetLanguage,
+			&qr.Stage,
+			&statusStr,
+			&metricsStr,
+			&issuesStr,
+			&detailsStr,
+			&createdStr,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan quality_result: %w", err)
+		}
+		qr.OverallStatus = domain.QualityStatus(statusStr)
+		_ = json.Unmarshal([]byte(metricsStr), &qr.Metrics)
+		_ = json.Unmarshal([]byte(issuesStr), &qr.Issues)
+		_ = json.Unmarshal([]byte(detailsStr), &qr.Details)
+		qr.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+		results = append(results, qr)
+	}
+	return results, nil
 }

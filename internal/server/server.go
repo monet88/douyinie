@@ -120,6 +120,23 @@ func New(cfg Config) *Server {
 			cfg.VisualTextSvc.SetTranslationService(cfg.TranslationSvc)
 		}
 	}
+	if cfg.ReviewSvc != nil {
+		if cfg.TranslationSvc != nil {
+			cfg.ReviewSvc.SetTranslationService(cfg.TranslationSvc)
+		}
+		if cfg.DubbingSvc != nil {
+			cfg.ReviewSvc.SetDubbingService(cfg.DubbingSvc)
+		}
+		if cfg.AudioMixSvc != nil {
+			cfg.ReviewSvc.SetAudioMixService(cfg.AudioMixSvc)
+		}
+		if cfg.VisualTextSvc != nil {
+			cfg.ReviewSvc.SetVisualTextService(cfg.VisualTextSvc)
+		}
+		if cfg.RenderSvc != nil {
+			cfg.ReviewSvc.SetRenderService(cfg.RenderSvc)
+		}
+	}
 	s := &Server{
 		db:             cfg.DB,
 		casStore:       cfg.CASStore,
@@ -175,6 +192,9 @@ func (s *Server) SetTranslationService(svc *service.TranslationService) {
 	if svc != nil && s.router != nil {
 		svc.ConfigureRouter(s.router)
 	}
+	if s.reviewSvc != nil {
+		s.reviewSvc.SetTranslationService(svc)
+	}
 }
 
 // SetDubbingService sets or replaces the injected dubbing pipeline (T14).
@@ -182,6 +202,9 @@ func (s *Server) SetDubbingService(svc *service.DubbingService) {
 	s.dubbingSvc = svc
 	if svc != nil && s.router != nil {
 		svc.ConfigureRouter(s.router)
+	}
+	if s.reviewSvc != nil {
+		s.reviewSvc.SetDubbingService(svc)
 	}
 }
 
@@ -191,6 +214,9 @@ func (s *Server) SetAudioMixService(svc *service.AudioMixService) {
 	if svc != nil && s.router != nil {
 		svc.ConfigureRouter(s.router)
 	}
+	if s.reviewSvc != nil {
+		s.reviewSvc.SetAudioMixService(svc)
+	}
 }
 
 // SetVisualTextService sets or replaces the injected visual text pipeline (T09).
@@ -199,16 +225,39 @@ func (s *Server) SetVisualTextService(svc *service.VisualTextService) {
 	if svc != nil && s.router != nil {
 		svc.ConfigureRouter(s.router)
 	}
+	if s.reviewSvc != nil {
+		s.reviewSvc.SetVisualTextService(svc)
+	}
 }
 
 // SetRenderService sets or replaces the injected render pipeline (T11).
 func (s *Server) SetRenderService(svc *service.RenderService) {
 	s.renderSvc = svc
+	if s.reviewSvc != nil {
+		s.reviewSvc.SetRenderService(svc)
+	}
 }
 
-// SetReviewService sets or replaces the injected review projection service (T16).
+// SetReviewService sets or replaces the injected review projection service (T16, T19).
 func (s *Server) SetReviewService(svc *service.ReviewService) {
 	s.reviewSvc = svc
+	if svc != nil {
+		if s.translationSvc != nil {
+			svc.SetTranslationService(s.translationSvc)
+		}
+		if s.dubbingSvc != nil {
+			svc.SetDubbingService(s.dubbingSvc)
+		}
+		if s.audioMixSvc != nil {
+			svc.SetAudioMixService(s.audioMixSvc)
+		}
+		if s.visualTextSvc != nil {
+			svc.SetVisualTextService(s.visualTextSvc)
+		}
+		if s.renderSvc != nil {
+			svc.SetRenderService(s.renderSvc)
+		}
+	}
 }
 
 // Handler returns the underlying http.Handler for in-memory / testing purposes.
@@ -332,9 +381,21 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/render/preview", s.handleGetRenderPreview)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/render/final", s.handleRenderFinal)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/render/final", s.handleGetRenderFinal)
-	// Exception-only Review Items Projection (T16)
+	// Exception-only Review Items Projection & Approval Overrides (T16, T19)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/review-items", s.handleGetReviewItems)
 	s.mux.HandleFunc("GET /api/v1/runs/{id}/review-items", s.handleGetRunReviewItems)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/review/override", s.handleReviewOverride)
+	s.mux.HandleFunc("POST /api/v1/runs/{id}/review/override", s.handleRunReviewOverride)
+	s.mux.HandleFunc("POST /api/v1/review-items/{id}/override", s.handleReviewItemDirectOverride)
+
+	// Inspector Target-Text Correction & Targeted Rerun (T19)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/inspector/correct-text", s.handleInspectorCorrectText)
+	s.mux.HandleFunc("POST /api/v1/runs/{id}/inspector/correct-text", s.handleRunInspectorCorrectText)
+
+	// Multimodal Quality Results (T19)
+	s.mux.HandleFunc("POST /api/v1/quality-results", s.handleCreateQualityResult)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/quality-results", s.handleGetQualityResults)
+	s.mux.HandleFunc("GET /api/v1/runs/{id}/quality-results", s.handleGetRunQualityResults)
 }
 
 // JSON helpers
@@ -2588,7 +2649,15 @@ func (s *Server) handleGetReviewItems(w http.ResponseWriter, r *http.Request) {
 	if targetLang == "" {
 		targetLang = "vi"
 	}
-	items, err := s.reviewSvc.ProjectReviewItems(r.Context(), assetID, targetLang)
+	includeAll := strings.EqualFold(r.URL.Query().Get("include_resolved"), "true") || strings.EqualFold(r.URL.Query().Get("all"), "true")
+
+	var items []domain.ReviewItem
+	var err error
+	if includeAll {
+		items, err = s.reviewSvc.ProjectAllReviewItems(r.Context(), assetID, targetLang)
+	} else {
+		items, err = s.reviewSvc.ProjectReviewItems(r.Context(), assetID, targetLang)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2624,7 +2693,14 @@ func (s *Server) handleGetRunReviewItems(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	items, err := s.reviewSvc.ProjectReviewItems(r.Context(), job.SourceAssetID, job.TargetLanguage)
+	includeAll := strings.EqualFold(r.URL.Query().Get("include_resolved"), "true") || strings.EqualFold(r.URL.Query().Get("all"), "true")
+
+	var items []domain.ReviewItem
+	if includeAll {
+		items, err = s.reviewSvc.ProjectAllReviewItems(r.Context(), job.SourceAssetID, job.TargetLanguage)
+	} else {
+		items, err = s.reviewSvc.ProjectReviewItems(r.Context(), job.SourceAssetID, job.TargetLanguage)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2638,5 +2714,270 @@ func (s *Server) handleGetRunReviewItems(w http.ResponseWriter, r *http.Request)
 		"target_language": job.TargetLanguage,
 		"review_items":    items,
 		"count":           len(items),
+	})
+}
+
+func (s *Server) handleReviewOverride(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if s.reviewSvc == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+
+	var in service.ManualOverrideInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in.AssetID = assetID
+	override, err := s.reviewSvc.RecordManualOverride(r.Context(), in)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"status":   "accepted",
+		"override": override,
+	})
+}
+
+func (s *Server) handleRunReviewOverride(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+	if s.reviewSvc == nil || s.db == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+
+	run, err := s.db.GetRun(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	job, err := s.db.GetJob(r.Context(), run.JobID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var in service.ManualOverrideInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in.RunID = runID
+	in.JobID = job.ID
+	in.AssetID = job.SourceAssetID
+	if in.TargetLanguage == "" {
+		in.TargetLanguage = job.TargetLanguage
+	}
+
+	override, err := s.reviewSvc.RecordManualOverride(r.Context(), in)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"status":   "accepted",
+		"override": override,
+	})
+}
+
+func (s *Server) handleReviewItemDirectOverride(w http.ResponseWriter, r *http.Request) {
+	itemID := r.PathValue("id")
+	if s.reviewSvc == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+
+	var in service.ManualOverrideInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in.ReviewItemID = itemID
+	override, err := s.reviewSvc.RecordManualOverride(r.Context(), in)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"status":   "accepted",
+		"override": override,
+	})
+}
+
+func (s *Server) handleInspectorCorrectText(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if s.reviewSvc == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+
+	var in service.TargetTextCorrectionInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in.AssetID = assetID
+	result, err := s.reviewSvc.CorrectTargetText(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) || errors.Is(err, domain.ErrTranslationVariantNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"result": result,
+	})
+}
+
+func (s *Server) handleRunInspectorCorrectText(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+	if s.reviewSvc == nil || s.db == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+
+	run, err := s.db.GetRun(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	job, err := s.db.GetJob(r.Context(), run.JobID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var in service.TargetTextCorrectionInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in.RunID = runID
+	in.JobID = job.ID
+	in.AssetID = job.SourceAssetID
+	if in.TargetLanguage == "" {
+		in.TargetLanguage = job.TargetLanguage
+	}
+
+	result, err := s.reviewSvc.CorrectTargetText(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) || errors.Is(err, domain.ErrTranslationVariantNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"result": result,
+	})
+}
+
+func (s *Server) handleCreateQualityResult(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		writeError(w, http.StatusInternalServerError, "database is not configured")
+		return
+	}
+
+	var qr domain.QualityResult
+	if err := json.NewDecoder(r.Body).Decode(&qr); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	if qr.AssetID == "" {
+		writeError(w, http.StatusBadRequest, "asset_id is required")
+		return
+	}
+	if qr.TargetLanguage == "" {
+		qr.TargetLanguage = "vi"
+	}
+	if qr.Stage == "" {
+		qr.Stage = "multimodal_qc"
+	}
+
+	if err := s.db.SaveQualityResult(r.Context(), qr); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"quality_result": qr,
+	})
+}
+
+func (s *Server) handleGetQualityResults(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if s.db == nil {
+		writeError(w, http.StatusInternalServerError, "database is not configured")
+		return
+	}
+	targetLang := r.URL.Query().Get("target_language")
+	if targetLang == "" {
+		targetLang = "vi"
+	}
+	stage := r.URL.Query().Get("stage")
+
+	results, err := s.db.GetQualityResults(r.Context(), assetID, targetLang, stage)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if results == nil {
+		results = []domain.QualityResult{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"asset_id":        assetID,
+		"target_language": targetLang,
+		"quality_results": results,
+		"count":           len(results),
+	})
+}
+
+func (s *Server) handleGetRunQualityResults(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+	if s.db == nil {
+		writeError(w, http.StatusInternalServerError, "database is not configured")
+		return
+	}
+
+	results, err := s.db.GetQualityResultsByRun(r.Context(), runID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if results == nil {
+		results = []domain.QualityResult{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"run_id":          runID,
+		"quality_results": results,
+		"count":           len(results),
 	})
 }

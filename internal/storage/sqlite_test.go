@@ -780,3 +780,128 @@ func TestStorage_MigrationV7_IdempotentAndFailClosed(t *testing.T) {
 	}
 	_ = db2.Close()
 }
+
+func TestStorage_ReviewOverridesAndQualityResults(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_v15.db")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	// 1. Create rights attestation and source asset
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              attID,
+		AttestationType: "user_owned",
+		DeclaredBy:      "test_operator",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	})
+	assetID := "asset-rev-test-1"
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		SHA256:              "sha256-mock",
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		OriginalFilename:    "video.mp4",
+		RightsAttestationID: attID,
+		CreatedAt:           time.Now().UTC(),
+	})
+
+	// 2. Save and query ReviewOverride
+	ro := domain.ReviewOverride{
+		ID:             "override-1",
+		RunID:          "run-1",
+		JobID:          "job-1",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		ReviewItemID:   "rev-item-123",
+		ItemType:       domain.ReviewItemTypeTTSOverrun,
+		Stage:          "dub_synthesize",
+		ItemIndex:      1,
+		SegmentID:      "seg-1",
+		Action:         "manual_override",
+		Reason:         "Pacing is acceptable for short video outro",
+		Operator:       "lead_editor_01",
+		CreatedAt:      time.Now().UTC(),
+	}
+	if err := db.SaveReviewOverride(ctx, ro); err != nil {
+		t.Fatalf("SaveReviewOverride failed: %v", err)
+	}
+
+	overrides, err := db.GetReviewOverrides(ctx, assetID, "vi")
+	if err != nil {
+		t.Fatalf("GetReviewOverrides failed: %v", err)
+	}
+	if len(overrides) != 1 {
+		t.Fatalf("expected 1 override, got %d", len(overrides))
+	}
+	if overrides[0].ReviewItemID != "rev-item-123" || overrides[0].Operator != "lead_editor_01" {
+		t.Errorf("override fields mismatch: %+v", overrides[0])
+	}
+
+	byRun, err := db.GetReviewOverridesByRun(ctx, "run-1")
+	if err != nil || len(byRun) != 1 {
+		t.Fatalf("GetReviewOverridesByRun failed: %v, count: %d", err, len(byRun))
+	}
+
+	// 3. Save and query QualityResult (append-only)
+	qr1 := domain.QualityResult{
+		ID:             "qr-1",
+		RunID:          "run-1",
+		JobID:          "job-1",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Stage:          "render",
+		OverallStatus:  domain.QualityStatusReviewRequired,
+		Metrics: []domain.QualityMetric{
+			{Name: "naturalness", Score: 0.82, Passed: true},
+			{Name: "text_elimination", Score: 0.55, Threshold: 0.8, Passed: false},
+		},
+		Issues: []domain.ReviewItem{
+			{ID: "issue-1", Type: domain.ReviewItemTypeVisualOcclusion, Reason: "text cover box touches UI"},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := db.SaveQualityResult(ctx, qr1); err != nil {
+		t.Fatalf("SaveQualityResult 1 failed: %v", err)
+	}
+
+	qr2 := domain.QualityResult{
+		ID:             "qr-2",
+		RunID:          "run-1",
+		JobID:          "job-1",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Stage:          "render",
+		OverallStatus:  domain.QualityStatusPass,
+		Metrics: []domain.QualityMetric{
+			{Name: "naturalness", Score: 0.95, Passed: true},
+			{Name: "text_elimination", Score: 0.92, Passed: true},
+		},
+		CreatedAt: time.Now().UTC().Add(time.Second),
+	}
+	if err := db.SaveQualityResult(ctx, qr2); err != nil {
+		t.Fatalf("SaveQualityResult 2 failed: %v", err)
+	}
+
+	qResults, err := db.GetQualityResults(ctx, assetID, "vi", "render")
+	if err != nil {
+		t.Fatalf("GetQualityResults failed: %v", err)
+	}
+	if len(qResults) != 2 {
+		t.Fatalf("expected 2 append-only quality results, got %d", len(qResults))
+	}
+
+	latestQR, err := db.GetLatestQualityResult(ctx, assetID, "vi", "render")
+	if err != nil {
+		t.Fatalf("GetLatestQualityResult failed: %v", err)
+	}
+	if latestQR.ID != "qr-2" || latestQR.OverallStatus != domain.QualityStatusPass {
+		t.Errorf("latest quality result mismatch: got %+v", latestQR)
+	}
+}
