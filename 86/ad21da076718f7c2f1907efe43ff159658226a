@@ -1,0 +1,30 @@
+internal/server/server.go
+  h_17f2fa2b92da6a 791-798,910-913,1082-1085,1150-1157
+internal/service/audio_mix.go
+  h_17f2fa2b92da6a 301-400
+internal/service/audio_mix_test.go
+  h_17f2fa2b92da6a 147-163,194-205
+internal/service/dub_script_test.go
+  h_17f2fa2b92da6a 5,52-59,217-224,327-334,404-411,444-588
+internal/service/dubbing.go
+  h_17f2fa2b92da6a 918-935
+internal/service/dubbing_test.go
+  h_17f2fa2b92da6a 2590-2744
+internal/service/translation.go
+  h_17f2fa2b92da6a 9,11-14,459-475
+test/seam1/audio_role_test.go
+  h_17f2fa2b92da6a 547-848
+test/seam1/dub_script_regression_test.go
+  h_17f2fa2b92da6a 4-6,19-33,107-121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "86ad21da076718f7c2f1907efe43ff159658226a",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
