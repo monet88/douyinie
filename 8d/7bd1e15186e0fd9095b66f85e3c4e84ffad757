@@ -1,0 +1,32 @@
+internal/domain/review.go
+  h_17f2fa2b92da6a 1-48
+internal/provider/fake.go
+  h_17f2fa2b92da6a 296-303,363-396,404-405
+internal/server/server.go
+  h_17f2fa2b92da6a 48,73,96-98,141,209-213,335-337,2554-2618
+internal/service/render.go
+  h_17f2fa2b92da6a 174,217-309
+internal/service/review.go
+  h_17f2fa2b92da6a 1-317
+internal/service/review_test.go
+  h_17f2fa2b92da6a 1-280
+internal/service/visual_text.go
+  h_17f2fa2b92da6a 561-567,766,778-784,786,788-849,851-913
+internal/service/visual_text_test.go
+  h_17f2fa2b92da6a 4,6,9,466-1241
+test/seam1/acceptance_test.go
+  h_17f2fa2b92da6a 160
+test/seam1/vertical_slice_test.go
+  h_17f2fa2b92da6a 1-1012
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "8d7bd1e15186e0fd9095b66f85e3c4e84ffad757",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
