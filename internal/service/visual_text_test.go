@@ -1,9 +1,12 @@
 package service_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -458,5 +461,781 @@ func TestVisualTextService_LocalizeVisualTrack_And_Overrides(t *testing.T) {
 	})
 	if err == nil || !errors.Is(err, domain.ErrSubtitleOverlapsProtectedRegion) {
 		t.Fatalf("expected ErrSubtitleOverlapsProtectedRegion when overlay occludes face, got %v", err)
+	}
+}
+
+func TestVisualTextService_LocalizeVisualTrack_EmptyDubScript_FailsClosed(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	transSvc := service.NewTranslationService(db, casStore)
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		target := "Xuất"
+		if strings.Contains(req.Segments[0].SourceText, "1") || strings.Contains(req.Segments[0].SourceText, "Bước") {
+			target = "Bước 1: Chuẩn bị nguyên liệu (đã dịch)"
+		}
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "qwen_trans",
+			ModelVersion: "v1",
+			Segments: []domain.TranslationSegment{
+				{
+					Index:      0,
+					SourceText: req.Segments[0].SourceText,
+					TargetText: target,
+				},
+			},
+		}, nil
+	}
+	svc.SetTranslationService(transSvc)
+
+	// 1. Run detection first to have OCR regions in TextRegionPlan
+	_, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:   "run-empty-dub",
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+
+	// 2. Put empty DubScriptVariant (0 segments) in CAS and register index
+	emptyDub := domain.DubScriptVariant{
+		ID:             "dub-empty-1",
+		AssetID:        assetID,
+		RunID:          "run-empty-dub",
+		TargetLanguage: "vi",
+		Segments:       []domain.DubScriptSegment{}, // 0 segments
+		CreatedAt:      time.Now().UTC(),
+	}
+	dubBytes, _ := json.Marshal(emptyDub)
+	dubObj, err := casStore.Put(bytes.NewReader(dubBytes))
+	if err != nil {
+		t.Fatalf("put empty dub script in CAS: %v", err)
+	}
+
+	err = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID:             emptyDub.ID,
+		AssetID:        assetID,
+		RunID:          emptyDub.RunID,
+		TargetLanguage: "vi",
+		CASHash:        dubObj.SHA256,
+		ProvenanceHash: "prov-empty-dub",
+		CreatedAt:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("save dub script index: %v", err)
+	}
+
+	// 3. LocalizeVisualTrack must fail closed and NOT fall back to OCR source text
+	_, err = svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-empty-dub",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err == nil {
+		t.Fatalf("expected empty dub script variant to fail closed, got nil error")
+	}
+}
+
+func TestVisualTextService_LocalizeVisualTrack_MismatchOrStaleSemanticEvidence_FailsClosed(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	transSvc := service.NewTranslationService(db, casStore)
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		target := "Xuất"
+		if strings.Contains(req.Segments[0].SourceText, "1") || strings.Contains(req.Segments[0].SourceText, "Bước") {
+			target = "Bước 1: Chuẩn bị nguyên liệu (đã dịch)"
+		}
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "qwen_trans",
+			ModelVersion: "v1",
+			Segments: []domain.TranslationSegment{
+				{
+					Index:      0,
+					SourceText: req.Segments[0].SourceText,
+					TargetText: target,
+				},
+			},
+		}, nil
+	}
+	svc.SetTranslationService(transSvc)
+
+	// 1. Detection
+	_, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:   "run-mismatch",
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+
+	// 2. Put canonical TranslationVariant in CAS
+	transVariant := domain.TranslationVariant{
+		ID:             "trans-canon-1",
+		AssetID:        assetID,
+		RunID:          "run-mismatch",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{
+			{
+				Index:      0,
+				SourceText: "今天天气很好。",
+				TargetText: "Hôm nay thời tiết rất đẹp.",
+				StartMs:    0,
+				EndMs:      3000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	transBytes, _ := json.Marshal(transVariant)
+	transObj, err := casStore.Put(bytes.NewReader(transBytes))
+	if err != nil {
+		t.Fatalf("put translation in CAS: %v", err)
+	}
+	err = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             transVariant.ID,
+		AssetID:        assetID,
+		RunID:          transVariant.RunID,
+		TargetLanguage: "vi",
+		CASHash:        transObj.SHA256,
+		ProvenanceHash: "prov-trans-mismatch",
+		CreatedAt:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("save translation variant index: %v", err)
+	}
+	// 3. Put DubScriptVariant with mismatched MeaningText in CAS
+	mismatchedDub := domain.DubScriptVariant{
+		ID:                    "dub-mismatch-1",
+		AssetID:               assetID,
+		RunID:                 "run-mismatch",
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: transObj.SHA256,
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:       0,
+				SourceText:  "今天天气很好。",
+				MeaningText: "Văn bản ý nghĩa bị sai lệch hoàn toàn.", // Mismatch with canonical TargetText
+				SpokenText:  "Thời tiết đẹp.",
+				StartMs:     0,
+				EndMs:       3000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubBytes, _ := json.Marshal(mismatchedDub)
+	dubObj, err := casStore.Put(bytes.NewReader(dubBytes))
+	if err != nil {
+		t.Fatalf("put dub script in CAS: %v", err)
+	}
+
+	err = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID:             mismatchedDub.ID,
+		AssetID:        assetID,
+		RunID:          mismatchedDub.RunID,
+		TargetLanguage: "vi",
+		CASHash:        dubObj.SHA256,
+		ProvenanceHash: "prov-mismatch",
+		CreatedAt:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("save dub script index: %v", err)
+	}
+
+	// 4. LocalizeVisualTrack must fail closed on semantic mismatch
+	_, err = svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-mismatch",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err == nil {
+		t.Fatalf("expected semantic mismatch to fail closed, got nil error")
+	}
+	if !errors.Is(err, domain.ErrMeaningPreservationFailed) {
+		t.Fatalf("expected ErrMeaningPreservationFailed for semantic mismatch, got %v", err)
+	}
+}
+
+func TestVisualTextService_LocalizeVisualTrack_CanonicalTranslationGrounding_Success(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	transSvc := service.NewTranslationService(db, casStore)
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		target := "Xuất"
+		if strings.Contains(req.Segments[0].SourceText, "1") || strings.Contains(req.Segments[0].SourceText, "Bước") {
+			target = "Bước 1: Chuẩn bị nguyên liệu (đã dịch)"
+		}
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "qwen_trans",
+			ModelVersion: "v1",
+			Segments: []domain.TranslationSegment{
+				{
+					Index:      0,
+					SourceText: req.Segments[0].SourceText,
+					TargetText: target,
+				},
+			},
+		}, nil
+	}
+	svc.SetTranslationService(transSvc)
+
+	// 1. Detection
+	_, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:   "run-grounding",
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+
+	// 2. Canonical TranslationVariant with full meaning text
+	canonicalMeaningText := "Bước 1: Chuẩn bị đầy đủ các nguyên liệu tươi ngon."
+	transVariant := domain.TranslationVariant{
+		ID:             "trans-canon-2",
+		AssetID:        assetID,
+		RunID:          "run-grounding",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{
+			{
+				Index:      0,
+				SourceText: "第一步：准备好所有新鲜食材。",
+				TargetText: canonicalMeaningText,
+				StartMs:    0,
+				EndMs:      3000,
+			},
+		},
+		CreatedAt: time.Now().UTC().Add(time.Second),
+	}
+	transBytes, _ := json.Marshal(transVariant)
+	transObj, err := casStore.Put(bytes.NewReader(transBytes))
+	if err != nil {
+		t.Fatalf("put translation in CAS: %v", err)
+	}
+
+	err = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             transVariant.ID,
+		AssetID:        assetID,
+		RunID:          transVariant.RunID,
+		TargetLanguage: "vi",
+		CASHash:        transObj.SHA256,
+		ProvenanceHash: "prov-trans-grounding",
+		CreatedAt:      transVariant.CreatedAt,
+	})
+	if err != nil {
+		t.Fatalf("save translation variant index: %v", err)
+	}
+	// 3. DubScriptVariant with shorten-first spoken adaptation
+	shortenedSpokenText := "Bước 1: Chuẩn bị nguyên liệu."
+	dubVariant := domain.DubScriptVariant{
+		ID:                    "dub-canon-2",
+		AssetID:               assetID,
+		RunID:                 "run-grounding",
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: transObj.SHA256,
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:       0,
+				SourceText:  "第一步：准备好所有新鲜食材。",
+				MeaningText: canonicalMeaningText,
+				SpokenText:  shortenedSpokenText, // Spoken adaptation
+				StartMs:     0,
+				EndMs:       3000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubBytes, _ := json.Marshal(dubVariant)
+	dubObj, err := casStore.Put(bytes.NewReader(dubBytes))
+	if err != nil {
+		t.Fatalf("put dub script in CAS: %v", err)
+	}
+
+	err = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID:             dubVariant.ID,
+		AssetID:        assetID,
+		RunID:          dubVariant.RunID,
+		TargetLanguage: "vi",
+		CASHash:        dubObj.SHA256,
+		ProvenanceHash: "prov-grounding",
+		CreatedAt:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("save dub script index: %v", err)
+	}
+
+	// 4. LocalizeVisualTrack must render canonical TranslationVariant text, NEVER spokenText
+	visTrack, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-grounding",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err != nil {
+		t.Fatalf("localize visual track failed: %v", err)
+	}
+
+	if len(visTrack.SubtitleCues) != 1 {
+		t.Fatalf("expected 1 subtitle cue, got %d", len(visTrack.SubtitleCues))
+	}
+	if visTrack.SubtitleCues[0].Text != canonicalMeaningText {
+		t.Errorf("subtitle text %q != canonical TranslationVariant target text %q (must not use spokenText %q)",
+			visTrack.SubtitleCues[0].Text, canonicalMeaningText, shortenedSpokenText)
+	}
+}
+
+func setupTestTranslationService(db *storage.DB, casStore *cas.Store, svc *service.VisualTextService) {
+	transSvc := service.NewTranslationService(db, casStore)
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		target := "Xuất"
+		if strings.Contains(req.Segments[0].SourceText, "1") || strings.Contains(req.Segments[0].SourceText, "Bước") {
+			target = "Bước 1: Chuẩn bị nguyên liệu (đã dịch)"
+		}
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "qwen_trans",
+			ModelVersion: "v1",
+			Segments: []domain.TranslationSegment{
+				{
+					Index:      0,
+					SourceText: req.Segments[0].SourceText,
+					TargetText: target,
+				},
+			},
+		}, nil
+	}
+	svc.SetTranslationService(transSvc)
+}
+
+func TestVisualTextService_LocalizeVisualTrack_StaleEmbeddedTranslationCAS_FailsClosed(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	setupTestTranslationService(db, casStore, svc)
+
+	ctx := context.Background()
+
+	// 1. Detection
+	_, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:   "run-stale",
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+
+	// 2. Old / Stale TranslationVariant in CAS (matching dub script segment)
+	staleMeaningText := "Bản dịch cũ đã lỗi thời."
+	staleTrans := domain.TranslationVariant{
+		ID:             "trans-stale-1",
+		AssetID:        assetID,
+		RunID:          "run-stale",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{
+			{
+				Index:      0,
+				SourceText: "第一步：准备好所有新鲜食材。",
+				TargetText: staleMeaningText,
+				StartMs:    0,
+				EndMs:      3000,
+			},
+		},
+		CreatedAt: time.Now().UTC().Add(-time.Hour),
+	}
+	staleBytes, _ := json.Marshal(staleTrans)
+	staleObj, err := casStore.Put(bytes.NewReader(staleBytes))
+	if err != nil {
+		t.Fatalf("put stale translation in CAS: %v", err)
+	}
+
+	// 3. New Canonical TranslationVariant in CAS and registered in Index
+	currentMeaningText := "Bước 1: Chuẩn bị đầy đủ các nguyên liệu tươi ngon nhất."
+	currentTrans := domain.TranslationVariant{
+		ID:             "trans-current-1",
+		AssetID:        assetID,
+		RunID:          "run-stale",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{
+			{
+				Index:      0,
+				SourceText: "第一步：准备好所有新鲜食材。",
+				TargetText: currentMeaningText,
+				StartMs:    0,
+				EndMs:      3000,
+			},
+		},
+		CreatedAt: time.Now().UTC().Add(time.Second),
+	}
+	currentBytes, _ := json.Marshal(currentTrans)
+	currentObj, err := casStore.Put(bytes.NewReader(currentBytes))
+	if err != nil {
+		t.Fatalf("put current translation in CAS: %v", err)
+	}
+
+	err = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             currentTrans.ID,
+		AssetID:        assetID,
+		RunID:          currentTrans.RunID,
+		TargetLanguage: "vi",
+		CASHash:        currentObj.SHA256,
+		ProvenanceHash: "prov-trans-current",
+		CreatedAt:      currentTrans.CreatedAt,
+	})
+	if err != nil {
+		t.Fatalf("save translation variant index: %v", err)
+	}
+
+	// 4. DubScriptVariant with stale TranslationVariantCAS embedded (matches staleObj, differs from current indexed TranslationVariant)
+	dubVariant := domain.DubScriptVariant{
+		ID:                    "dub-stale-1",
+		AssetID:               assetID,
+		RunID:                 "run-stale",
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: staleObj.SHA256, // Stale embedded CAS != current indexed CAS
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:       0,
+				SourceText:  "第一步：准备好所有新鲜食材。",
+				MeaningText: staleMeaningText,
+				SpokenText:  "Bản dịch cũ.",
+				StartMs:     0,
+				EndMs:       3000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubBytes, _ := json.Marshal(dubVariant)
+	dubObj, err := casStore.Put(bytes.NewReader(dubBytes))
+	if err != nil {
+		t.Fatalf("put dub script in CAS: %v", err)
+	}
+
+	err = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID:             dubVariant.ID,
+		AssetID:        assetID,
+		RunID:          dubVariant.RunID,
+		TargetLanguage: "vi",
+		CASHash:        dubObj.SHA256,
+		ProvenanceHash: "prov-dub-stale",
+		CreatedAt:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("save dub script index: %v", err)
+	}
+
+	// 5. LocalizeVisualTrack must fail closed because embedded CAS != current index CAS
+	_, err = svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-stale",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err == nil {
+		t.Fatalf("expected stale embedded TranslationVariantCAS to fail closed, got nil error")
+	}
+	if !errors.Is(err, domain.ErrMeaningPreservationFailed) {
+		t.Fatalf("expected ErrMeaningPreservationFailed for stale embedded CAS mismatch, got %v", err)
+	}
+}
+
+func TestVisualTextService_LocalizeVisualTrack_SegmentCountMismatch_FailsClosed(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	setupTestTranslationService(db, casStore, svc)
+
+	ctx := context.Background()
+
+	// 1. Detection
+	_, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:   "run-seg-count-mismatch",
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+
+	// 2. Canonical TranslationVariant with 2 segments
+	transVariant := domain.TranslationVariant{
+		ID:             "trans-count-2",
+		AssetID:        assetID,
+		RunID:          "run-seg-count-mismatch",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{
+			{
+				Index:      0,
+				SourceText: "第一步：准备好所有新鲜食材。",
+				TargetText: "Bước 1: Chuẩn bị nguyên liệu.",
+				StartMs:    0,
+				EndMs:      3000,
+			},
+			{
+				Index:      1,
+				SourceText: "第二步：开始烹饪。",
+				TargetText: "Bước 2: Bắt đầu nấu ăn.",
+				StartMs:    3000,
+				EndMs:      6000,
+			},
+		},
+		CreatedAt: time.Now().UTC().Add(time.Second),
+	}
+	transBytes, _ := json.Marshal(transVariant)
+	transObj, err := casStore.Put(bytes.NewReader(transBytes))
+	if err != nil {
+		t.Fatalf("put translation in CAS: %v", err)
+	}
+
+	err = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             transVariant.ID,
+		AssetID:        assetID,
+		RunID:          transVariant.RunID,
+		TargetLanguage: "vi",
+		CASHash:        transObj.SHA256,
+		ProvenanceHash: "prov-trans-count-2",
+		CreatedAt:      transVariant.CreatedAt,
+	})
+	if err != nil {
+		t.Fatalf("save translation variant index: %v", err)
+	}
+
+	// 3. DubScriptVariant with only 1 segment (count mismatch: 1 != 2)
+	dubVariant := domain.DubScriptVariant{
+		ID:                    "dub-count-1",
+		AssetID:               assetID,
+		RunID:                 "run-seg-count-mismatch",
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: transObj.SHA256,
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:       0,
+				SourceText:  "第一步：准备好所有新鲜食材。",
+				MeaningText: "Bước 1: Chuẩn bị nguyên liệu.",
+				SpokenText:  "Bước 1 chuẩn bị.",
+				StartMs:     0,
+				EndMs:       3000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubBytes, _ := json.Marshal(dubVariant)
+	dubObj, err := casStore.Put(bytes.NewReader(dubBytes))
+	if err != nil {
+		t.Fatalf("put dub script in CAS: %v", err)
+	}
+
+	err = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID:             dubVariant.ID,
+		AssetID:        assetID,
+		RunID:          dubVariant.RunID,
+		TargetLanguage: "vi",
+		CASHash:        dubObj.SHA256,
+		ProvenanceHash: "prov-dub-count-1",
+		CreatedAt:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("save dub script index: %v", err)
+	}
+
+	// 4. LocalizeVisualTrack must fail closed on segment count mismatch
+	_, err = svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-seg-count-mismatch",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err == nil {
+		t.Fatalf("expected segment count mismatch to fail closed, got nil error")
+	}
+	if !errors.Is(err, domain.ErrMeaningPreservationFailed) {
+		t.Fatalf("expected ErrMeaningPreservationFailed for segment count mismatch, got %v", err)
+	}
+}
+
+func TestVisualTextService_LocalizeVisualTrack_SegmentIndexMismatch_FailsClosed(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	setupTestTranslationService(db, casStore, svc)
+
+	ctx := context.Background()
+
+	// 1. Detection
+	_, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:   "run-seg-idx-mismatch",
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+
+	// 2. Canonical TranslationVariant with segment index 0
+	transVariant := domain.TranslationVariant{
+		ID:             "trans-idx-0",
+		AssetID:        assetID,
+		RunID:          "run-seg-idx-mismatch",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{
+			{
+				Index:      0,
+				SourceText: "第一步：准备好所有新鲜食材。",
+				TargetText: "Bước 1: Chuẩn bị nguyên liệu.",
+				StartMs:    0,
+				EndMs:      3000,
+			},
+		},
+		CreatedAt: time.Now().UTC().Add(time.Second),
+	}
+	transBytes, _ := json.Marshal(transVariant)
+	transObj, err := casStore.Put(bytes.NewReader(transBytes))
+	if err != nil {
+		t.Fatalf("put translation in CAS: %v", err)
+	}
+
+	err = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             transVariant.ID,
+		AssetID:        assetID,
+		RunID:          transVariant.RunID,
+		TargetLanguage: "vi",
+		CASHash:        transObj.SHA256,
+		ProvenanceHash: "prov-trans-idx-0",
+		CreatedAt:      transVariant.CreatedAt,
+	})
+	if err != nil {
+		t.Fatalf("save translation variant index: %v", err)
+	}
+
+	// 3. DubScriptVariant with segment index 1 (index mismatch: 1 != 0)
+	dubVariant := domain.DubScriptVariant{
+		ID:                    "dub-idx-1",
+		AssetID:               assetID,
+		RunID:                 "run-seg-idx-mismatch",
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: transObj.SHA256,
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:       1, // Mismatched Index (1 != 0)
+				SourceText:  "第一步：准备好所有新鲜食材。",
+				MeaningText: "Bước 1: Chuẩn bị nguyên liệu.",
+				SpokenText:  "Bước 1 chuẩn bị.",
+				StartMs:     0,
+				EndMs:       3000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubBytes, _ := json.Marshal(dubVariant)
+	dubObj, err := casStore.Put(bytes.NewReader(dubBytes))
+	if err != nil {
+		t.Fatalf("put dub script in CAS: %v", err)
+	}
+
+	err = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID:             dubVariant.ID,
+		AssetID:        assetID,
+		RunID:          dubVariant.RunID,
+		TargetLanguage: "vi",
+		CASHash:        dubObj.SHA256,
+		ProvenanceHash: "prov-dub-idx-1",
+		CreatedAt:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("save dub script index: %v", err)
+	}
+
+	// 4. LocalizeVisualTrack must fail closed on segment index mismatch
+	_, err = svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-seg-idx-mismatch",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err == nil {
+		t.Fatalf("expected segment index mismatch to fail closed, got nil error")
+	}
+	if !errors.Is(err, domain.ErrMeaningPreservationFailed) {
+		t.Fatalf("expected ErrMeaningPreservationFailed for segment index mismatch, got %v", err)
+	}
+}
+
+func TestVisualTextService_LocalizeVisualTrack_EmptyTranslationIndexCASHash_FailsClosed(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	setupTestTranslationService(db, casStore, svc)
+
+	ctx := context.Background()
+
+	// 1. Detection
+	_, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:   "run-empty-trans-hash",
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+
+	// 2. TranslationVariantIndex with empty CASHash
+	err = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             "trans-empty-hash",
+		AssetID:        assetID,
+		RunID:          "run-empty-trans-hash",
+		TargetLanguage: "vi",
+		CASHash:        "", // Empty CAS hash
+		ProvenanceHash: "prov-trans-empty-hash",
+		CreatedAt:      time.Now().UTC().Add(time.Second),
+	})
+	if err != nil {
+		t.Fatalf("save translation variant index: %v", err)
+	}
+
+	// 3. DubScriptVariant in CAS and Index
+	dubVariant := domain.DubScriptVariant{
+		ID:                    "dub-empty-trans-hash",
+		AssetID:               assetID,
+		RunID:                 "run-empty-trans-hash",
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: "some_dummy_cas",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:       0,
+				SourceText:  "第一步：准备好所有新鲜食材。",
+				MeaningText: "Bước 1: Chuẩn bị nguyên liệu.",
+				SpokenText:  "Bước 1 chuẩn bị.",
+				StartMs:     0,
+				EndMs:       3000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubBytes, _ := json.Marshal(dubVariant)
+	dubObj, err := casStore.Put(bytes.NewReader(dubBytes))
+	if err != nil {
+		t.Fatalf("put dub script in CAS: %v", err)
+	}
+
+	err = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID:             dubVariant.ID,
+		AssetID:        assetID,
+		RunID:          dubVariant.RunID,
+		TargetLanguage: "vi",
+		CASHash:        dubObj.SHA256,
+		ProvenanceHash: "prov-dub-empty-trans-hash",
+		CreatedAt:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("save dub script index: %v", err)
+	}
+
+	// 4. LocalizeVisualTrack must fail closed when TranslationVariantIndex has empty CASHash
+	_, err = svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-empty-trans-hash",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err == nil {
+		t.Fatalf("expected empty TranslationVariantIndex CASHash to fail closed, got nil error")
+	}
+	if !errors.Is(err, domain.ErrTranslationVariantNotFound) {
+		t.Fatalf("expected ErrTranslationVariantNotFound for empty translation CASHash, got %v", err)
 	}
 }
