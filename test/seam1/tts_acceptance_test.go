@@ -5,13 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/google/uuid"
+	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/governance"
+	"github.com/monet88/douyinie/internal/media"
+	"github.com/monet88/douyinie/internal/provider"
+	"github.com/monet88/douyinie/internal/storage"
 	"net/http"
 	"testing"
 	"time"
-
-	"github.com/monet88/douyinie/internal/domain"
-	"github.com/monet88/douyinie/internal/governance"
-	"github.com/monet88/douyinie/internal/provider"
 )
 
 // Helper to run translation and dub-script adaptation to produce DubScriptVariant
@@ -475,7 +477,12 @@ func TestSeam1_TTS_VoiceAuditionEndpoint(t *testing.T) {
 	if res.Audition.AudioCASHash == "" {
 		t.Fatalf("expected populated AudioCASHash")
 	}
-
+	if res.Audition.ProviderID == "" {
+		t.Fatalf("expected populated ProviderID on audition result")
+	}
+	if res.Audition.ModelName == "" {
+		t.Fatalf("expected populated ModelName on audition result")
+	}
 	// Non-existent asset ID must fail with 404 Not Found
 	nonExistentResp, err := http.Post(h.server.URL+"/api/v1/assets/non_existent_asset_123/voice-audition", "application/json", bytes.NewReader(bodyBytes))
 	if err != nil {
@@ -764,4 +771,812 @@ func TestSeam1_TTS_VoiceAssignment_SameRun_ConflictingReassignmentReturns409(t *
 	if respConflict.StatusCode != http.StatusConflict {
 		t.Fatalf("expected 409 Conflict on conflicting voice reassignment, got %d", respConflict.StatusCode)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: Contextual ~10s Voice Audition Mixed with Preserved BGM/SFX
+// ---------------------------------------------------------------------------
+func TestSeam1_TTS_VoiceAudition_Contextual_MixedWithBGM(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// 1. Setup audio role plan with dialogue and BGM
+	planPayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 4000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 4000, EndMs: 10000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+	}
+	planBody, _ := json.Marshal(planPayload)
+	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+
+	// 2. Setup DubScriptVariant with actual translated segment
+	segments := []domain.TranslationInputSegment{
+		{
+			Index:      0,
+			SourceText: "今天天气很好。",
+			SpeakerID:  "SPEAKER_00",
+			StartMs:    0,
+			EndMs:      4000,
+		},
+	}
+	_, dubVariant := setupDubScriptForSeam1(t, h, runID, assetID, segments)
+	if dubVariant == nil {
+		t.Fatalf("failed to setup dub script variant")
+	}
+
+	// 3. Setup AudioStems in CAS and SQLite with background audio
+	bgPCM := media.GeneratePCM16WAV(16000, 1, 10000)
+	bgCASObj, err := h.casStore.Put(bytes.NewReader(bgPCM))
+	if err != nil {
+		t.Fatalf("put background stem: %v", err)
+	}
+
+	stemArtifact := domain.AudioStemArtifacts{
+		ID:            "stem_art_audition_test",
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		ProviderID:    "fake_separator",
+		ModelName:     "uvr_mock",
+		ModelVersion:  "1.0",
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: bgCASObj.SHA256,
+				AudioCASPath: bgCASObj.Path,
+				SampleRate:   16000,
+				Channels:     1,
+				Format:       "wav",
+				DurationMs:   10000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	stemBytes, _ := json.Marshal(stemArtifact)
+	stemObj, err := h.casStore.Put(bytes.NewReader(stemBytes))
+	if err != nil {
+		t.Fatalf("put stems artifact: %v", err)
+	}
+	_ = h.db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+		ID:             stemArtifact.ID,
+		AssetID:        assetID,
+		ProviderID:     stemArtifact.ProviderID,
+		ModelName:      stemArtifact.ModelName,
+		ModelVersion:   stemArtifact.ModelVersion,
+		CASHash:        stemObj.SHA256,
+		ProvenanceHash: "prov_stem_audition_123",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	// 4. Request Contextual ~10s voice audition (is_contextual: true) without providing explicit sample_text
+	auditionPayload := map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+		"voice": domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_female_natural",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		"is_contextual": true,
+		"segment_index": 0,
+	}
+	bodyBytes, _ := json.Marshal(auditionPayload)
+	resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-audition", "application/json", bytes.NewReader(bodyBytes))
+	if err != nil {
+		t.Fatalf("POST voice-audition failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for contextual voice-audition, got %d", resp.StatusCode)
+	}
+
+	var res struct {
+		Audition domain.VoiceAuditionResult `json:"audition_result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		t.Fatalf("decode audition result: %v", err)
+	}
+
+	// Verify contextual audition properties
+	if !res.Audition.IsContextual {
+		t.Errorf("expected is_contextual=true in audition result")
+	}
+	if !res.Audition.ContextualMixed {
+		t.Errorf("expected contextual_mixed=true in audition result")
+	}
+	if res.Audition.SampleText == "" {
+		t.Errorf("expected non-empty sample text loaded from DubScriptVariant")
+	}
+	if res.Audition.MeasuredDurationMs <= 0 {
+		t.Errorf("expected positive measured duration, got %d", res.Audition.MeasuredDurationMs)
+	}
+	if res.Audition.AudioCASHash == "" {
+		t.Errorf("expected AudioCASHash in audition result")
+	}
+
+	// Verify no full dub was generated (DubSegmentsVariantIndex and DubMixArtifactIndex do NOT exist)
+	dubIdx, err := h.db.GetDubSegmentsVariantIndex(context.Background(), assetID, "vi")
+	if err == nil && dubIdx != nil {
+		t.Errorf("expected no DubSegmentsVariant to be generated merely for voice audition")
+	}
+	mixIdx, err := h.db.GetDubMixArtifactIndex(context.Background(), assetID, "vi")
+	if err == nil && mixIdx != nil {
+		t.Errorf("expected no DubMixArtifact to be generated merely for voice audition")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: No-Speech Videos Display "No dubbing required" and Skip Audition / Assignment
+// ---------------------------------------------------------------------------
+func TestSeam1_TTS_VoiceAudition_NoSpeech_SkipsAuditionAndAssignment(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// 1. AudioRolePlan with ONLY instrumental BGM (zero dub-eligible dialogue)
+	planPayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 8000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+	}
+	planBody, _ := json.Marshal(planPayload)
+	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+
+	// 2. Call Voice Audition -> returns 422 Unprocessable Entity with "No dubbing required"
+	auditionPayload := map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+		"voice": domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_f1",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+	}
+	bodyBytes, _ := json.Marshal(auditionPayload)
+	respAudition, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-audition", "application/json", bytes.NewReader(bodyBytes))
+	if err != nil {
+		t.Fatalf("POST voice-audition failed: %v", err)
+	}
+	defer respAudition.Body.Close()
+	if respAudition.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity for no-speech voice audition, got %d", respAudition.StatusCode)
+	}
+	var errRes struct {
+		Error string `json:"error"`
+	}
+	_ = json.NewDecoder(respAudition.Body).Decode(&errRes)
+	if errRes.Error != "No dubbing required" {
+		t.Errorf("expected error 'No dubbing required', got %q", errRes.Error)
+	}
+
+	// 3. Call Voice Assignment -> returns 422 Unprocessable Entity with "No dubbing required"
+	respAssign, assign := runAssignVoices(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	})
+	if respAssign.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity for no-speech voice assignment, got %d", respAssign.StatusCode)
+	}
+	if assign != nil {
+		t.Errorf("expected nil voice assignment for no-speech video")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: Contextual Voice Audition with Mid-Video Segment & Long Stems (Preview-Local Window & Fail Closed)
+// ---------------------------------------------------------------------------
+func TestSeam1_TTS_VoiceAudition_Contextual_MidVideoSegmentAndFailClosed(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// 1. Setup DubScriptVariant with segment at index 0 situated at 25000ms (mid-video)
+	segments := []domain.TranslationInputSegment{
+		{
+			Index:      0,
+			SourceText: "今天天气很好。",
+			SpeakerID:  "SPEAKER_00",
+			StartMs:    25000,
+			EndMs:      29000,
+		},
+	}
+	_, dubVariant := setupDubScriptForSeam1(t, h, runID, assetID, segments)
+	if dubVariant == nil {
+		t.Fatalf("failed to setup dub script variant")
+	}
+
+	// 2. Setup audio role plan with multiple segments across a 60-second video:
+	// 0-10s: Intro BGM, 10-25s: Singing/Music-Vocal, 25-29s: Dialogue (mid-video), 29-60s: Outro BGM
+	planPayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleInstrumentalBgm},
+			{StartMs: 10000, EndMs: 25000, Role: domain.AudioRoleSingingMusicVocal},
+			{StartMs: 25000, EndMs: 29000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 29000, EndMs: 60000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+	}
+	planBody, _ := json.Marshal(planPayload)
+	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+	// 3. Setup long source stems (60s = 60000ms) for background and vocals
+	bgPCM := media.GeneratePCM16WAV(16000, 1, 60000)
+	bgCASObj, err := h.casStore.Put(bytes.NewReader(bgPCM))
+	if err != nil {
+		t.Fatalf("put background stem: %v", err)
+	}
+
+	vocalsPCM := media.GeneratePCM16WAV(16000, 1, 60000)
+	vocalsCASObj, err := h.casStore.Put(bytes.NewReader(vocalsPCM))
+	if err != nil {
+		t.Fatalf("put vocals stem: %v", err)
+	}
+
+	stemArtifact := domain.AudioStemArtifacts{
+		ID:            "stem_art_midvideo_test",
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		ProviderID:    "fake_separator",
+		ModelName:     "uvr_mock",
+		ModelVersion:  "1.0",
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: bgCASObj.SHA256,
+				AudioCASPath: bgCASObj.Path,
+				SampleRate:   16000,
+				Channels:     1,
+				Format:       "wav",
+				DurationMs:   60000,
+			},
+			{
+				Type:         domain.StemTypeVocals,
+				AudioCASHash: vocalsCASObj.SHA256,
+				AudioCASPath: vocalsCASObj.Path,
+				SampleRate:   16000,
+				Channels:     1,
+				Format:       "wav",
+				DurationMs:   60000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	stemBytes, _ := json.Marshal(stemArtifact)
+	stemObj, err := h.casStore.Put(bytes.NewReader(stemBytes))
+	if err != nil {
+		t.Fatalf("put stems artifact: %v", err)
+	}
+	_ = h.db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+		ID:             stemArtifact.ID,
+		AssetID:        assetID,
+		ProviderID:     stemArtifact.ProviderID,
+		ModelName:      stemArtifact.ModelName,
+		ModelVersion:   stemArtifact.ModelVersion,
+		CASHash:        stemObj.SHA256,
+		ProvenanceHash: "prov_stem_midvideo_123",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	// 4. Request Contextual voice audition for segment 0 (mid-video: 25000-29000ms)
+	auditionPayload := map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+		"voice": domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_female_natural",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		"is_contextual": true,
+		"segment_index": 0,
+	}
+	bodyBytes, _ := json.Marshal(auditionPayload)
+	resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-audition", "application/json", bytes.NewReader(bodyBytes))
+	if err != nil {
+		t.Fatalf("POST voice-audition failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for contextual voice-audition on mid-video segment, got %d", resp.StatusCode)
+	}
+
+	var res struct {
+		Audition domain.VoiceAuditionResult `json:"audition_result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		t.Fatalf("decode audition result: %v", err)
+	}
+
+	// Verify duration is preview-local ~10s (10000ms), NOT the full 60s (60000ms) timeline
+	if res.Audition.MeasuredDurationMs != 10000 {
+		t.Errorf("expected preview-local measured duration of 10000ms, got %dms", res.Audition.MeasuredDurationMs)
+	}
+	if !res.Audition.ContextualMixed {
+		t.Errorf("expected contextual_mixed=true in result evidence")
+	}
+	if !res.Audition.IsContextual {
+		t.Errorf("expected is_contextual=true")
+	}
+
+	// 5. Fail Closed Verification:
+	// Create a new asset with DubScript and AudioRolePlan but NO audio stems artifact.
+	// Contextual audition must fail closed (500 Internal Server Error / ErrAudioStemsNotFound) rather than silently returning dry TTS.
+	h2 := setupHarness(t)
+	jobID2, runID2 := createJobAndRun(t, h2)
+	job2 := getJobViaAPI(t, h2, jobID2)
+	assetID2 := job2.SourceAssetID
+
+	planBody2, _ := json.Marshal(planPayload)
+	_, _ = http.Post(h2.server.URL+"/api/v1/assets/"+assetID2+"/audio-role-plan", "application/json", bytes.NewReader(planBody2))
+	_, _ = setupDubScriptForSeam1(t, h2, runID2, assetID2, segments)
+
+	auditionPayload2 := map[string]any{
+		"run_id":          runID2,
+		"target_language": "vi",
+		"voice": domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_female_natural",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		"is_contextual": true,
+		"segment_index": 0,
+	}
+	bodyBytes2, _ := json.Marshal(auditionPayload2)
+	resp2, err := http.Post(h2.server.URL+"/api/v1/assets/"+assetID2+"/voice-audition", "application/json", bytes.NewReader(bodyBytes2))
+	if err != nil {
+		t.Fatalf("POST voice-audition without stems failed: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 fail closed when stems missing for contextual audition, got %d", resp2.StatusCode)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: Contextual Voice Audition Fail Closed Without DubScript / AudioRolePlan
+// and Near-Source-End Clamping via Seam 1 API
+// ---------------------------------------------------------------------------
+func TestSeam1_TTS_VoiceAudition_Contextual_FailClosedAndNearEnd(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// Setup 20s background audio stems in CAS and SQLite
+	bgPCM := media.GeneratePCM16WAV(16000, 1, 20000)
+	bgCASObj, err := h.casStore.Put(bytes.NewReader(bgPCM))
+	if err != nil {
+		t.Fatalf("put background stem: %v", err)
+	}
+	stemArtifact := domain.AudioStemArtifacts{
+		ID:            "stem_art_seam1_failclosed_test",
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		ProviderID:    "fake_separator",
+		ModelName:     "uvr_mock",
+		ModelVersion:  "1.0",
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: bgCASObj.SHA256,
+				AudioCASPath: bgCASObj.Path,
+				SampleRate:   16000,
+				Channels:     1,
+				Format:       "wav",
+				DurationMs:   20000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	stemBytes, _ := json.Marshal(stemArtifact)
+	stemObj, err := h.casStore.Put(bytes.NewReader(stemBytes))
+	if err != nil {
+		t.Fatalf("put stems artifact: %v", err)
+	}
+	_ = h.db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+		ID:             stemArtifact.ID,
+		AssetID:        assetID,
+		ProviderID:     stemArtifact.ProviderID,
+		ModelName:      stemArtifact.ModelName,
+		ModelVersion:   stemArtifact.ModelVersion,
+		CASHash:        stemObj.SHA256,
+		ProvenanceHash: "prov_stem_seam1_failclosed_123",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	// Setup audio role plan (13s-15s near source end)
+	planPayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 13000, Role: domain.AudioRoleInstrumentalBgm},
+			{StartMs: 13000, EndMs: 15000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 15000, EndMs: 20000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+	}
+	planBody, _ := json.Marshal(planPayload)
+	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+
+	auditionPayload := map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+		"voice": domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_female_natural",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		"is_contextual": true,
+		"segment_index": 0,
+	}
+	bodyBytes, _ := json.Marshal(auditionPayload)
+
+	// 1. Without DubScriptVariant, contextual audition MUST fail closed (500 Internal Server Error)
+	respNoScript, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-audition", "application/json", bytes.NewReader(bodyBytes))
+	if err != nil {
+		t.Fatalf("POST voice-audition without dub script failed: %v", err)
+	}
+	defer respNoScript.Body.Close()
+	if respNoScript.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when DubScriptVariant missing, got %d", respNoScript.StatusCode)
+	}
+
+	// 2. Now setup DubScriptVariant for segment near end (13000ms-15000ms)
+	segments := []domain.TranslationInputSegment{
+		{
+			Index:      0,
+			SourceText: "结尾附近的对话。",
+			SpeakerID:  "SPEAKER_00",
+			StartMs:    13000,
+			EndMs:      15000,
+		},
+	}
+	_, dubVariant := setupDubScriptForSeam1(t, h, runID, assetID, segments)
+	if dubVariant == nil {
+		t.Fatalf("setup dub script variant failed")
+	}
+
+	// 3. Request contextual audition on near-end segment -> succeeds and returns clamped preview window
+	respSuccess, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-audition", "application/json", bytes.NewReader(bodyBytes))
+	if err != nil {
+		t.Fatalf("POST voice-audition near end failed: %v", err)
+	}
+	defer respSuccess.Body.Close()
+	if respSuccess.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for contextual voice-audition near end, got %d", respSuccess.StatusCode)
+	}
+	var res struct {
+		Audition domain.VoiceAuditionResult `json:"audition_result"`
+	}
+	if err := json.NewDecoder(respSuccess.Body).Decode(&res); err != nil {
+		t.Fatalf("decode audition result: %v", err)
+	}
+	if !res.Audition.ContextualMixed {
+		t.Errorf("expected ContextualMixed=true")
+	}
+	if res.Audition.MeasuredDurationMs != 10000 {
+		t.Errorf("expected 10000ms preview window duration, got %dms", res.Audition.MeasuredDurationMs)
+	}
+	if res.Audition.SampleText == "" {
+		t.Errorf("expected non-empty sample text loaded from DubScriptVariant")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: Contextual Voice Audition Fails Closed On Uncovered Dialogue Suppression
+// or Broken Declared Vocals Stem
+// ---------------------------------------------------------------------------
+func TestSeam1_TTS_VoiceAudition_Contextual_UncoveredSuppressionAndBrokenVocals(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// 1. Setup 20s background audio stems in CAS and SQLite
+	bgPCM := media.GeneratePCM16WAV(16000, 1, 20000)
+	bgCASObj, err := h.casStore.Put(bytes.NewReader(bgPCM))
+	if err != nil {
+		t.Fatalf("put background stem: %v", err)
+	}
+	// 2. Setup DubScriptVariant with segment at 2000ms-6000ms (4s)
+	segments := []domain.TranslationInputSegment{
+		{
+			Index:      0,
+			SourceText: "今天天气很好。",
+			SpeakerID:  "SPEAKER_00",
+			StartMs:    2000,
+			EndMs:      6000,
+		},
+	}
+	_, dubVariant := setupDubScriptForSeam1(t, h, runID, assetID, segments)
+	if dubVariant == nil {
+		t.Fatalf("setup dub script variant failed")
+	}
+
+	auditionPayload := map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+		"voice": domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_female_natural",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		"is_contextual": true,
+		"segment_index": 0,
+	}
+	bodyBytes, _ := json.Marshal(auditionPayload)
+
+	t.Run("UncoveredDialogueSuppression_FailsClosed", func(t *testing.T) {
+		// AudioRolePlan dialogue only covers 2000ms-3000ms (speech is 2000ms-3500ms from fake TTS)
+		planPayload := map[string]any{
+			"segments": []domain.AudioSegment{
+				{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleInstrumentalBgm},
+				{StartMs: 2000, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
+				{StartMs: 3000, EndMs: 20000, Role: domain.AudioRoleInstrumentalBgm},
+			},
+		}
+		planBody, _ := json.Marshal(planPayload)
+		_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+
+		stemArtifact := domain.AudioStemArtifacts{
+			ID:            "stem_art_uncovered_test",
+			SchemaVersion: domain.AudioStemsSchemaVersion,
+			AssetID:       assetID,
+			ProviderID:    "fake_separator",
+			ModelName:     "uvr_mock",
+			ModelVersion:  "1.0",
+			Stems: []domain.AudioStem{
+				{
+					Type:         domain.StemTypeBackground,
+					AudioCASHash: bgCASObj.SHA256,
+					AudioCASPath: bgCASObj.Path,
+					SampleRate:   16000,
+					Channels:     1,
+					Format:       "wav",
+					DurationMs:   20000,
+				},
+			},
+			CreatedAt: time.Now().UTC(),
+		}
+		stemBytes, _ := json.Marshal(stemArtifact)
+		stemObj, _ := h.casStore.Put(bytes.NewReader(stemBytes))
+		_ = h.db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+			ID:             stemArtifact.ID,
+			AssetID:        assetID,
+			ProviderID:     stemArtifact.ProviderID,
+			ModelName:      stemArtifact.ModelName,
+			ModelVersion:   stemArtifact.ModelVersion,
+			CASHash:        stemObj.SHA256,
+			ProvenanceHash: "prov_stem_uncovered_123",
+			CreatedAt:      time.Now().UTC(),
+		})
+
+		resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-audition", "application/json", bytes.NewReader(bodyBytes))
+		if err != nil {
+			t.Fatalf("POST voice-audition failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("expected 500 when speech is not fully covered by dialogue suppression, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("BrokenDeclaredVocalsStem_FailsClosed", func(t *testing.T) {
+		// Valid full dialogue covering 2000ms-6000ms
+		planPayload := map[string]any{
+			"segments": []domain.AudioSegment{
+				{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleInstrumentalBgm},
+				{StartMs: 2000, EndMs: 6000, Role: domain.AudioRoleNarrationDialogue},
+				{StartMs: 6000, EndMs: 20000, Role: domain.AudioRoleInstrumentalBgm},
+			},
+		}
+		planBody, _ := json.Marshal(planPayload)
+		_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+
+		// Stems artifact declares a vocals stem with missing CAS hash
+		stemArtifact := domain.AudioStemArtifacts{
+			ID:            "stem_art_broken_vocals_test",
+			SchemaVersion: domain.AudioStemsSchemaVersion,
+			AssetID:       assetID,
+			ProviderID:    "fake_separator",
+			ModelName:     "uvr_mock",
+			ModelVersion:  "1.0",
+			Stems: []domain.AudioStem{
+				{
+					Type:         domain.StemTypeBackground,
+					AudioCASHash: bgCASObj.SHA256,
+					AudioCASPath: bgCASObj.Path,
+					SampleRate:   16000,
+					Channels:     1,
+					Format:       "wav",
+					DurationMs:   20000,
+				},
+				{
+					Type:         domain.StemTypeVocals,
+					AudioCASHash: "missing_vocals_cas_sha_12345",
+					SampleRate:   16000,
+					Channels:     1,
+					Format:       "wav",
+					DurationMs:   20000,
+				},
+			},
+			CreatedAt: time.Now().UTC(),
+		}
+		stemBytes, _ := json.Marshal(stemArtifact)
+		stemObj, _ := h.casStore.Put(bytes.NewReader(stemBytes))
+		_ = h.db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+			ID:             stemArtifact.ID,
+			AssetID:        assetID,
+			ProviderID:     stemArtifact.ProviderID,
+			ModelName:      stemArtifact.ModelName,
+			ModelVersion:   stemArtifact.ModelVersion,
+			CASHash:        stemObj.SHA256,
+			ProvenanceHash: "prov_stem_broken_vocals_123",
+			CreatedAt:      time.Now().UTC(),
+		})
+
+		resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-audition", "application/json", bytes.NewReader(bodyBytes))
+		if err != nil {
+			t.Fatalf("POST voice-audition failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("expected 500 when declared vocals stem is missing/broken, got %d", resp.StatusCode)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: Contextual Voice Audition Slot Overrun Fails Closed & Secondary Metadata
+// ---------------------------------------------------------------------------
+func TestSeam1_TTS_VoiceAudition_Contextual_SlotOverrunFailsClosed_AndSecondaryMetadata(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// 1. Setup 30s background audio stem in CAS and SQLite
+	bgPCM := media.GeneratePCM16WAV(16000, 1, 30000)
+	bgCASObj, err := h.casStore.Put(bytes.NewReader(bgPCM))
+	if err != nil {
+		t.Fatalf("put background stem: %v", err)
+	}
+
+	stemArtifact := domain.AudioStemArtifacts{
+		ID:            uuid.NewString(),
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		ProviderID:    "fake_separator",
+		ModelName:     "uvr_mdx",
+		ModelVersion:  "1.0",
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: bgCASObj.SHA256,
+				SampleRate:   16000,
+				Channels:     1,
+				Format:       "wav",
+				DurationMs:   30000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	stemBytes, _ := json.Marshal(stemArtifact)
+	stemObj, _ := h.casStore.Put(bytes.NewReader(stemBytes))
+	_ = h.db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+		ID:             stemArtifact.ID,
+		AssetID:        assetID,
+		ProviderID:     stemArtifact.ProviderID,
+		ModelName:      stemArtifact.ModelName,
+		ModelVersion:   stemArtifact.ModelVersion,
+		CASHash:        stemObj.SHA256,
+		ProvenanceHash: "prov_stem_slot_seam1",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	// 2. AudioRolePlan with dialogue from 0ms to 10000ms
+	_ = h.db.SaveAudioRolePlan(context.Background(), domain.AudioRolePlan{
+		ID:        uuid.NewString(),
+		AssetID:   assetID,
+		CreatedAt: time.Now().UTC(),
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 10000, EndMs: 30000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+	})
+
+	auditionPayload := map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+		"voice": domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_f1",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		"is_contextual": true,
+		"segment_index": 0,
+	}
+
+	t.Run("SlotOverrun_FailsClosed", func(t *testing.T) {
+		// DubScript segment is 2000ms-3000ms (1000ms slot).
+		// fake_vieneu_tts_vi generates 1500ms audio -> ends at 3500ms.
+		// 3500ms fits total audio (30s) and suppression (10s), but overruns slot end (3000ms).
+		segmentsOverrun := []domain.TranslationInputSegment{
+			{
+				Index:      0,
+				SourceText: "短段落。",
+				SpeakerID:  "SPEAKER_00",
+				StartMs:    2000,
+				EndMs:      3000, // 1000ms slot
+			},
+		}
+		_, _ = setupDubScriptForSeam1(t, h, runID, assetID, segmentsOverrun)
+
+		bodyBytes, _ := json.Marshal(auditionPayload)
+		resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-audition", "application/json", bytes.NewReader(bodyBytes))
+		if err != nil {
+			t.Fatalf("POST voice-audition failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("expected 500 when speech overruns segment slot, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("ExactSlotFit_PassesAndReturnsSecondaryMetadata", func(t *testing.T) {
+		// DubScript segment is 2000ms-3500ms (1500ms slot).
+		// fake_vieneu_tts_vi generates 1500ms audio -> ends at 3500ms (exact fit).
+		segmentsExact := []domain.TranslationInputSegment{
+			{
+				Index:      0,
+				SourceText: "精确匹配的段落。",
+				SpeakerID:  "SPEAKER_00",
+				StartMs:    2000,
+				EndMs:      3500, // 1500ms slot
+			},
+		}
+		_, _ = setupDubScriptForSeam1(t, h, runID, assetID, segmentsExact)
+
+		bodyBytes, _ := json.Marshal(auditionPayload)
+		resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-audition", "application/json", bytes.NewReader(bodyBytes))
+		if err != nil {
+			t.Fatalf("POST voice-audition failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 on exact slot boundary fit, got %d", resp.StatusCode)
+		}
+
+		var res struct {
+			Audition domain.VoiceAuditionResult `json:"audition_result"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+			t.Fatalf("decode audition result: %v", err)
+		}
+
+		if !res.Audition.ContextualMixed {
+			t.Errorf("expected ContextualMixed=true")
+		}
+		if res.Audition.ProviderID != "fake_vieneu_tts_vi" {
+			t.Errorf("expected ProviderID 'fake_vieneu_tts_vi', got %q", res.Audition.ProviderID)
+		}
+		if res.Audition.ModelName != "fake_vieneu_tts_vi" {
+			t.Errorf("expected ModelName 'fake_vieneu_tts_vi', got %q", res.Audition.ModelName)
+		}
+		if res.Audition.ModelVersion != "1.0.0" {
+			t.Errorf("expected ModelVersion '1.0.0', got %q", res.Audition.ModelVersion)
+		}
+	})
 }

@@ -895,6 +895,10 @@ func (s *Server) handleAssignVoices(w http.ResponseWriter, r *http.Request) {
 
 	assignment, err := s.dubbingSvc.AssignVoices(r.Context(), in)
 	if err != nil {
+		if errors.Is(err, domain.ErrNoDubbingRequired) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "No dubbing required"})
+			return
+		}
 		if errors.Is(err, domain.ErrNoEligibleTTSProvider) {
 			writeError(w, http.StatusServiceUnavailable, err.Error())
 			return
@@ -961,6 +965,10 @@ func (s *Server) handleReassignVoices(w http.ResponseWriter, r *http.Request) {
 
 	assignment, err := s.dubbingSvc.ReassignVoice(r.Context(), in)
 	if err != nil {
+		if errors.Is(err, domain.ErrNoDubbingRequired) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "No dubbing required"})
+			return
+		}
 		if errors.Is(err, domain.ErrVoiceAssignmentNotFound) || errors.Is(err, storage.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "no frozen voice assignment found for run")
 			return
@@ -972,7 +980,6 @@ func (s *Server) handleReassignVoices(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
 	writeJSON(w, http.StatusOK, map[string]any{"voice_assignment": assignment})
 }
 
@@ -1056,6 +1063,10 @@ func (s *Server) handleAuditionVoice(w http.ResponseWriter, r *http.Request) {
 
 	res, err := s.dubbingSvc.AuditionVoice(r.Context(), in)
 	if err != nil {
+		if errors.Is(err, domain.ErrNoDubbingRequired) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "No dubbing required"})
+			return
+		}
 		if errors.Is(err, domain.ErrNoEligibleTTSProvider) {
 			writeError(w, http.StatusServiceUnavailable, err.Error())
 			return

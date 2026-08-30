@@ -5,16 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
+	"testing"
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/governance"
+	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
-	"path/filepath"
-	"testing"
-	"time"
 )
 
 func setupDubbingTestHarness(t *testing.T) (*service.DubbingService, *storage.DB, *cas.Store, *provider.Registry, *provider.Router) {
@@ -181,6 +183,1405 @@ func TestDubbingService_AuditionVoice(t *testing.T) {
 	if res.AudioCASHash == "" {
 		t.Errorf("expected populated AudioCASHash")
 	}
+	if res.ProviderID == "" {
+		t.Errorf("expected populated ProviderID, got empty")
+	}
+	if res.ModelName == "" {
+		t.Errorf("expected populated ModelName, got empty")
+	}
+}
+
+func TestDubbingService_AuditionVoice_Contextual_PreviewLocalAndFailClosed(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, assetID, runID, "vi")
+
+	// 1. Setup AudioRolePlan with mid-video dialogue (30s-34s) in 60s video
+	_ = db.SaveAudioRolePlan(context.Background(), domain.AudioRolePlan{
+		AssetID: assetID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 15000, Role: domain.AudioRoleInstrumentalBgm},
+			{StartMs: 15000, EndMs: 30000, Role: domain.AudioRoleSingingMusicVocal},
+			{StartMs: 30000, EndMs: 34000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 34000, EndMs: 60000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+	})
+
+	// 2. Setup DubScriptVariant at segment index 0 (30000ms-34000ms)
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SpeakerID:      "SPEAKER_00",
+				StartMs:        30000,
+				EndMs:          34000,
+				SlotDurationMs: 4000,
+				SpokenText:     "Đoạn hội thoại ở giữa video.",
+			},
+		},
+	}
+	dBytes, _ := json.Marshal(dubScript)
+	dObj, _ := casStore.Put(bytes.NewReader(dBytes))
+	_ = db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+		ID:             dubScript.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        dObj.SHA256,
+		ProvenanceHash: "prov_dub_script_mid",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	in := domain.VoiceAuditionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Voice: domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_f1",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		IsContextual: true,
+		SegmentIndex: 0,
+	}
+
+	// Fail closed when stems are missing
+	_, err := dubSvc.AuditionVoice(context.Background(), in)
+	if err == nil || !errors.Is(err, domain.ErrAudioStemsNotFound) {
+		t.Fatalf("expected ErrAudioStemsNotFound when stems missing, got: %v", err)
+	}
+
+	// Setup 60s background and vocal stems in CAS + SQLite
+	bgPCM := media.GeneratePCM16WAV(16000, 1, 60000)
+	bgObj, _ := casStore.Put(bytes.NewReader(bgPCM))
+	vocalsPCM := media.GeneratePCM16WAV(16000, 1, 60000)
+	vocalsObj, _ := casStore.Put(bytes.NewReader(vocalsPCM))
+
+	stemArtifact := domain.AudioStemArtifacts{
+		ID:            uuid.NewString(),
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		ProviderID:    "fake_separator",
+		ModelName:     "uvr_mdx",
+		ModelVersion:  "1.0",
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: bgObj.SHA256,
+				SampleRate:   16000,
+				Channels:     1,
+				Format:       "wav",
+				DurationMs:   60000,
+			},
+			{
+				Type:         domain.StemTypeVocals,
+				AudioCASHash: vocalsObj.SHA256,
+				SampleRate:   16000,
+				Channels:     1,
+				Format:       "wav",
+				DurationMs:   60000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	sBytes, _ := json.Marshal(stemArtifact)
+	sObj, _ := casStore.Put(bytes.NewReader(sBytes))
+	_ = db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+		ID:             stemArtifact.ID,
+		AssetID:        assetID,
+		ProviderID:     stemArtifact.ProviderID,
+		ModelName:      stemArtifact.ModelName,
+		ModelVersion:   stemArtifact.ModelVersion,
+		CASHash:        sObj.SHA256,
+		ProvenanceHash: "prov_stem_mid_test",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	res, err := dubSvc.AuditionVoice(context.Background(), in)
+	if err != nil {
+		t.Fatalf("AuditionVoice failed: %v", err)
+	}
+
+	if !res.IsContextual {
+		t.Errorf("expected IsContextual=true")
+	}
+	if !res.ContextualMixed {
+		t.Errorf("expected ContextualMixed=true")
+	}
+	if res.MeasuredDurationMs != 10000 {
+		t.Errorf("expected preview-local measured duration of 10000ms, got %dms", res.MeasuredDurationMs)
+	}
+	if res.SampleText != "Đoạn hội thoại ở giữa video." {
+		t.Errorf("expected sample text from DubScriptVariant, got %q", res.SampleText)
+	}
+}
+
+func TestDubbingService_AuditionVoice_Contextual_FailClosedWithoutDubScriptOrAudioRolePlan(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, assetID, runID, "vi")
+
+	// Setup background stem so stem requirement is satisfied
+	bgPCM := media.GeneratePCM16WAV(16000, 1, 20000)
+	bgObj, _ := casStore.Put(bytes.NewReader(bgPCM))
+	stemArtifact := domain.AudioStemArtifacts{
+		ID:            uuid.NewString(),
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		ProviderID:    "fake_separator",
+		ModelName:     "uvr_mdx",
+		ModelVersion:  "1.0",
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: bgObj.SHA256,
+				SampleRate:   16000,
+				Channels:     1,
+				Format:       "wav",
+				DurationMs:   20000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	sBytes, _ := json.Marshal(stemArtifact)
+	sObj, _ := casStore.Put(bytes.NewReader(sBytes))
+	_ = db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+		ID:             stemArtifact.ID,
+		AssetID:        assetID,
+		ProviderID:     stemArtifact.ProviderID,
+		ModelName:      stemArtifact.ModelName,
+		ModelVersion:   stemArtifact.ModelVersion,
+		CASHash:        sObj.SHA256,
+		ProvenanceHash: "prov_stem_failclosed_test",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	in := domain.VoiceAuditionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Voice: domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_f1",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		IsContextual: true,
+		SegmentIndex: 0,
+	}
+
+	// 1. Missing DubScriptVariant -> MUST fail closed with ErrDubScriptVariantNotFound (no fallback to generic sentence)
+	_, err := dubSvc.AuditionVoice(context.Background(), in)
+	if err == nil || !errors.Is(err, domain.ErrDubScriptVariantNotFound) {
+		t.Fatalf("expected ErrDubScriptVariantNotFound when DubScriptVariant is missing, got: %v", err)
+	}
+
+	// Now setup DubScriptVariant for assetID
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SpeakerID:      "SPEAKER_00",
+				StartMs:        0,
+				EndMs:          2000,
+				SlotDurationMs: 2000,
+				SpokenText:     "Câu thoại thực tế.",
+			},
+		},
+	}
+	dBytes, _ := json.Marshal(dubScript)
+	dObj, _ := casStore.Put(bytes.NewReader(dBytes))
+	_ = db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+		ID:             dubScript.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        dObj.SHA256,
+		ProvenanceHash: "prov_dub_script_failclosed",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	// 2. Missing AudioRolePlan for another asset -> MUST fail closed with ErrAudioRolePlanRequired
+	assetIDNoPlan := uuid.NewString()
+	runIDNoPlan := uuid.NewString()
+	_ = db.CreateSourceAsset(context.Background(), domain.SourceAsset{
+		ID:                  assetIDNoPlan,
+		SHA256:              "sha256_" + assetIDNoPlan,
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		RightsAttestationID: "att-" + assetID,
+		CASPath:             "/mock.mp4",
+		CreatedAt:           time.Now().UTC(),
+	})
+	_ = db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+		ID:             uuid.NewString(),
+		AssetID:        assetIDNoPlan,
+		ProviderID:     stemArtifact.ProviderID,
+		ModelName:      stemArtifact.ModelName,
+		ModelVersion:   stemArtifact.ModelVersion,
+		CASHash:        sObj.SHA256,
+		ProvenanceHash: "prov_stem_noplan_test",
+		CreatedAt:      time.Now().UTC(),
+	})
+	_ = db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+		ID:             uuid.NewString(),
+		AssetID:        assetIDNoPlan,
+		RunID:          runIDNoPlan,
+		TargetLanguage: "vi",
+		CASHash:        dObj.SHA256,
+		ProvenanceHash: "prov_dub_script_noplan",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	inNoPlan := domain.VoiceAuditionInput{
+		RunID:          runIDNoPlan,
+		AssetID:        assetIDNoPlan,
+		TargetLanguage: "vi",
+		Voice: domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_f1",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		IsContextual: true,
+		SegmentIndex: 0,
+	}
+	_, err = dubSvc.AuditionVoice(context.Background(), inNoPlan)
+	if err == nil || !errors.Is(err, domain.ErrAudioRolePlanRequired) {
+		t.Fatalf("expected ErrAudioRolePlanRequired when AudioRolePlan is missing, got: %v", err)
+	}
+}
+
+func TestDubbingService_AuditionVoice_Contextual_NearSourceEndClamped(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, assetID, runID, "vi")
+
+	// Total audio is 15s (15000ms). Segment is at 13000ms-15000ms (near source end).
+	_ = db.SaveAudioRolePlan(context.Background(), domain.AudioRolePlan{
+		AssetID: assetID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 13000, Role: domain.AudioRoleInstrumentalBgm},
+			{StartMs: 13000, EndMs: 15000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	})
+
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SpeakerID:      "SPEAKER_00",
+				StartMs:        13000,
+				EndMs:          15000,
+				SlotDurationMs: 2000,
+				SpokenText:     "Đoạn kết thúc video.",
+			},
+		},
+	}
+	dBytes, _ := json.Marshal(dubScript)
+	dObj, _ := casStore.Put(bytes.NewReader(dBytes))
+	_ = db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+		ID:             dubScript.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        dObj.SHA256,
+		ProvenanceHash: "prov_dub_script_end",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	bgPCM := media.GeneratePCM16WAV(16000, 1, 15000)
+	bgObj, _ := casStore.Put(bytes.NewReader(bgPCM))
+	stemArtifact := domain.AudioStemArtifacts{
+		ID:            uuid.NewString(),
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		ProviderID:    "fake_separator",
+		ModelName:     "uvr_mdx",
+		ModelVersion:  "1.0",
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: bgObj.SHA256,
+				SampleRate:   16000,
+				Channels:     1,
+				Format:       "wav",
+				DurationMs:   15000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	sBytes, _ := json.Marshal(stemArtifact)
+	sObj, _ := casStore.Put(bytes.NewReader(sBytes))
+	_ = db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+		ID:             stemArtifact.ID,
+		AssetID:        assetID,
+		ProviderID:     stemArtifact.ProviderID,
+		ModelName:      stemArtifact.ModelName,
+		ModelVersion:   stemArtifact.ModelVersion,
+		CASHash:        sObj.SHA256,
+		ProvenanceHash: "prov_stem_end_test",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	in := domain.VoiceAuditionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Voice: domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_f1",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		IsContextual: true,
+		SegmentIndex: 0,
+	}
+
+	res, err := dubSvc.AuditionVoice(context.Background(), in)
+	if err != nil {
+		t.Fatalf("AuditionVoice failed on near-end segment: %v", err)
+	}
+	if !res.ContextualMixed {
+		t.Errorf("expected ContextualMixed=true")
+	}
+	if res.MeasuredDurationMs != 10000 {
+		t.Errorf("expected 10000ms preview duration, got %dms", res.MeasuredDurationMs)
+	}
+	if res.SampleText != "Đoạn kết thúc video." {
+		t.Errorf("expected sample text from segment, got %q", res.SampleText)
+	}
+}
+
+func TestDubbingService_AuditionVoice_Contextual_SpeechExceedsSourceTailFailsClosed(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, assetID, runID, "vi")
+
+	// Total audio is 15s (15000ms). Segment starts at 13000ms, dialogue is 13000ms-15000ms.
+	_ = db.SaveAudioRolePlan(context.Background(), domain.AudioRolePlan{
+		ID:        uuid.NewString(),
+		AssetID:   assetID,
+		CreatedAt: time.Now().UTC(),
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 13000, Role: domain.AudioRoleInstrumentalBgm},
+			{StartMs: 13000, EndMs: 15000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	})
+
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SpeakerID:      "SPEAKER_00",
+				StartMs:        13000,
+				EndMs:          15000,
+				SlotDurationMs: 2000,
+				SpokenText:     "Câu thoại quá dài không thể vừa với đoạn kết.",
+			},
+		},
+	}
+	dBytes, _ := json.Marshal(dubScript)
+	dObj, _ := casStore.Put(bytes.NewReader(dBytes))
+	_ = db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+		ID:             dubScript.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        dObj.SHA256,
+		ProvenanceHash: "prov_dub_script_overflow",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	bgPCM := media.GeneratePCM16WAV(16000, 1, 15000)
+	bgObj, _ := casStore.Put(bytes.NewReader(bgPCM))
+	stemArtifact := domain.AudioStemArtifacts{
+		ID:            uuid.NewString(),
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		ProviderID:    "fake_separator",
+		ModelName:     "uvr_mdx",
+		ModelVersion:  "1.0",
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: bgObj.SHA256,
+				SampleRate:   16000,
+				Channels:     1,
+				Format:       "wav",
+				DurationMs:   15000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	sBytes, _ := json.Marshal(stemArtifact)
+	sObj, _ := casStore.Put(bytes.NewReader(sBytes))
+	_ = db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+		ID:             stemArtifact.ID,
+		AssetID:        assetID,
+		ProviderID:     stemArtifact.ProviderID,
+		ModelName:      stemArtifact.ModelName,
+		ModelVersion:   stemArtifact.ModelVersion,
+		CASHash:        sObj.SHA256,
+		ProvenanceHash: "prov_stem_overflow_test",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	// Override TTSInvoke to synthesize 4000ms speech (13000 + 4000 = 17000ms > 15000ms total background)
+	dubSvc.TTSInvoke = func(ctx context.Context, p provider.Provider, req provider.TTSSynthesisRequest) (*provider.TTSSynthesisResult, error) {
+		pcm := media.GeneratePCM16WAV(16000, 1, 4000)
+		return &provider.TTSSynthesisResult{
+			AudioData:          pcm,
+			Format:             "wav",
+			SampleRate:         16000,
+			Channels:           1,
+			MeasuredDurationMs: 4000,
+			ProviderID:         p.ID(),
+			ModelName:          "test_tts",
+			ModelVersion:       "1.0",
+		}, nil
+	}
+
+	in := domain.VoiceAuditionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Voice: domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_f1",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		IsContextual: true,
+		SegmentIndex: 0,
+	}
+
+	_, err := dubSvc.AuditionVoice(context.Background(), in)
+	if err == nil {
+		t.Fatalf("expected error when synthesized speech exceeds source tail bounds, got nil")
+	}
+	if !errors.Is(err, domain.ErrSoundtrackPreservationFailed) {
+		t.Fatalf("expected ErrSoundtrackPreservationFailed, got: %v", err)
+	}
+}
+
+func TestDubbingService_AuditionVoice_Contextual_SpeechExceedsNominal10sExpandsWindow(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, assetID, runID, "vi")
+
+	// Total audio is 40s (40000ms). Segment starts at 5000ms, dialogue is 5000ms-20000ms (15s dialogue window).
+	_ = db.SaveAudioRolePlan(context.Background(), domain.AudioRolePlan{
+		ID:        uuid.NewString(),
+		AssetID:   assetID,
+		CreatedAt: time.Now().UTC(),
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleInstrumentalBgm},
+			{StartMs: 5000, EndMs: 20000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 20000, EndMs: 40000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+	})
+
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SpeakerID:      "SPEAKER_00",
+				StartMs:        5000,
+				EndMs:          18000,
+				SlotDurationMs: 13000,
+				SpokenText:     "Đoạn văn dịch dài mười hai giây cần mở rộng cửa sổ preview.",
+			},
+		},
+	}
+	dBytes, _ := json.Marshal(dubScript)
+	dObj, _ := casStore.Put(bytes.NewReader(dBytes))
+	_ = db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+		ID:             dubScript.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        dObj.SHA256,
+		ProvenanceHash: "prov_dub_script_12s",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	bgPCM := media.GeneratePCM16WAV(16000, 1, 40000)
+	bgObj, _ := casStore.Put(bytes.NewReader(bgPCM))
+	stemArtifact := domain.AudioStemArtifacts{
+		ID:            uuid.NewString(),
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		ProviderID:    "fake_separator",
+		ModelName:     "uvr_mdx",
+		ModelVersion:  "1.0",
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: bgObj.SHA256,
+				SampleRate:   16000,
+				Channels:     1,
+				Format:       "wav",
+				DurationMs:   40000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	sBytes, _ := json.Marshal(stemArtifact)
+	sObj, _ := casStore.Put(bytes.NewReader(sBytes))
+	_ = db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+		ID:             stemArtifact.ID,
+		AssetID:        assetID,
+		ProviderID:     stemArtifact.ProviderID,
+		ModelName:      stemArtifact.ModelName,
+		ModelVersion:   stemArtifact.ModelVersion,
+		CASHash:        sObj.SHA256,
+		ProvenanceHash: "prov_stem_12s_test",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	// Override TTSInvoke to synthesize 12000ms speech
+	dubSvc.TTSInvoke = func(ctx context.Context, p provider.Provider, req provider.TTSSynthesisRequest) (*provider.TTSSynthesisResult, error) {
+		pcm := media.GeneratePCM16WAV(16000, 1, 12000)
+		return &provider.TTSSynthesisResult{
+			AudioData:          pcm,
+			Format:             "wav",
+			SampleRate:         16000,
+			Channels:           1,
+			MeasuredDurationMs: 12000,
+			ProviderID:         p.ID(),
+			ModelName:          "test_tts",
+			ModelVersion:       "1.0",
+		}, nil
+	}
+
+	in := domain.VoiceAuditionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Voice: domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_f1",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		IsContextual: true,
+		SegmentIndex: 0,
+	}
+
+	res, err := dubSvc.AuditionVoice(context.Background(), in)
+	if err != nil {
+		t.Fatalf("AuditionVoice failed for 12s speech: %v", err)
+	}
+	if !res.ContextualMixed {
+		t.Errorf("expected ContextualMixed=true")
+	}
+	if res.MeasuredDurationMs < 12000 {
+		t.Errorf("expected preview window >= 12000ms to contain full speech, got %dms", res.MeasuredDurationMs)
+	}
+}
+
+func TestDubbingService_AuditionVoice_Contextual_UncoveredSuppressionFailsClosed(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, assetID, runID, "vi")
+
+	bgPCM := media.GeneratePCM16WAV(16000, 1, 30000)
+	bgObj, _ := casStore.Put(bytes.NewReader(bgPCM))
+	stemArtifact := domain.AudioStemArtifacts{
+		ID:            uuid.NewString(),
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		ProviderID:    "fake_separator",
+		ModelName:     "uvr_mdx",
+		ModelVersion:  "1.0",
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: bgObj.SHA256,
+				SampleRate:   16000,
+				Channels:     1,
+				Format:       "wav",
+				DurationMs:   30000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	sBytes, _ := json.Marshal(stemArtifact)
+	sObj, _ := casStore.Put(bytes.NewReader(sBytes))
+	_ = db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+		ID:             stemArtifact.ID,
+		AssetID:        assetID,
+		ProviderID:     stemArtifact.ProviderID,
+		ModelName:      stemArtifact.ModelName,
+		ModelVersion:   stemArtifact.ModelVersion,
+		CASHash:        sObj.SHA256,
+		ProvenanceHash: "prov_stem_uncovered_test",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SpeakerID:      "SPEAKER_00",
+				StartMs:        2000,
+				EndMs:          6000,
+				SlotDurationMs: 4000,
+				SpokenText:     "Kiểm tra đoạn không được che phủ.",
+			},
+		},
+	}
+	dBytes, _ := json.Marshal(dubScript)
+	dObj, _ := casStore.Put(bytes.NewReader(dBytes))
+	_ = db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+		ID:             dubScript.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        dObj.SHA256,
+		ProvenanceHash: "prov_dub_script_uncovered",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	// TTS generates 4000ms speech from 2000ms to 6000ms
+	dubSvc.TTSInvoke = func(ctx context.Context, p provider.Provider, req provider.TTSSynthesisRequest) (*provider.TTSSynthesisResult, error) {
+		pcm := media.GeneratePCM16WAV(16000, 1, 4000)
+		return &provider.TTSSynthesisResult{
+			AudioData:          pcm,
+			Format:             "wav",
+			SampleRate:         16000,
+			Channels:           1,
+			MeasuredDurationMs: 4000,
+			ProviderID:         p.ID(),
+			ModelName:          "test_tts",
+			ModelVersion:       "1.0",
+		}, nil
+	}
+
+	in := domain.VoiceAuditionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Voice: domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_f1",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		IsContextual: true,
+		SegmentIndex: 0,
+	}
+
+	t.Run("SpeechExceedsDialogueEnd", func(t *testing.T) {
+		// Dialogue is only 2000ms-4000ms, but speech runs 2000ms-6000ms -> uncovered from 4000ms to 6000ms
+		_ = db.SaveAudioRolePlan(context.Background(), domain.AudioRolePlan{
+			ID:        uuid.NewString(),
+			AssetID:   assetID,
+			CreatedAt: time.Now().UTC(),
+			Segments: []domain.AudioSegment{
+				{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleInstrumentalBgm},
+				{StartMs: 2000, EndMs: 4000, Role: domain.AudioRoleNarrationDialogue},
+				{StartMs: 4000, EndMs: 30000, Role: domain.AudioRoleInstrumentalBgm},
+			},
+		})
+		_, err := dubSvc.AuditionVoice(context.Background(), in)
+		if err == nil || !errors.Is(err, domain.ErrSoundtrackPreservationFailed) {
+			t.Fatalf("expected ErrSoundtrackPreservationFailed when dialogue suppression window is shorter than speech, got: %v", err)
+		}
+	})
+
+	t.Run("DialogueGapDuringSpeech", func(t *testing.T) {
+		// Dialogue has a gap from 3500ms to 4500ms (e.g. singing) during 2000ms-6000ms speech
+		_ = db.SaveAudioRolePlan(context.Background(), domain.AudioRolePlan{
+			ID:        uuid.NewString(),
+			AssetID:   assetID,
+			CreatedAt: time.Now().UTC(),
+			Segments: []domain.AudioSegment{
+				{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleInstrumentalBgm},
+				{StartMs: 2000, EndMs: 3500, Role: domain.AudioRoleNarrationDialogue},
+				{StartMs: 3500, EndMs: 4500, Role: domain.AudioRoleSingingMusicVocal},
+				{StartMs: 4500, EndMs: 6000, Role: domain.AudioRoleNarrationDialogue},
+				{StartMs: 6000, EndMs: 30000, Role: domain.AudioRoleInstrumentalBgm},
+			},
+		})
+		_, err := dubSvc.AuditionVoice(context.Background(), in)
+		if err == nil || !errors.Is(err, domain.ErrSoundtrackPreservationFailed) {
+			t.Fatalf("expected ErrSoundtrackPreservationFailed when dialogue suppression window has gaps, got: %v", err)
+		}
+	})
+
+	t.Run("NoDialogueSuppression", func(t *testing.T) {
+		// Entire interval is singing/music-vocal
+		_ = db.SaveAudioRolePlan(context.Background(), domain.AudioRolePlan{
+			ID:        uuid.NewString(),
+			AssetID:   assetID,
+			CreatedAt: time.Now().UTC(),
+			Segments: []domain.AudioSegment{
+				{StartMs: 0, EndMs: 30000, Role: domain.AudioRoleSingingMusicVocal},
+			},
+		})
+		_, err := dubSvc.AuditionVoice(context.Background(), in)
+		if err == nil {
+			t.Fatalf("expected error when no dialogue suppression exists")
+		}
+	})
+}
+
+func TestDubbingService_AuditionVoice_Contextual_BrokenDeclaredVocalsStemFailsClosed(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, assetID, runID, "vi")
+
+	_ = db.SaveAudioRolePlan(context.Background(), domain.AudioRolePlan{
+		ID:        uuid.NewString(),
+		AssetID:   assetID,
+		CreatedAt: time.Now().UTC(),
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 5000, EndMs: 20000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+	})
+
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SpeakerID:      "SPEAKER_00",
+				StartMs:        0,
+				EndMs:          2000,
+				SlotDurationMs: 2000,
+				SpokenText:     "Thử nghiệm vocal stem hỏng.",
+			},
+		},
+	}
+	dBytes, _ := json.Marshal(dubScript)
+	dObj, _ := casStore.Put(bytes.NewReader(dBytes))
+	_ = db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+		ID:             dubScript.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        dObj.SHA256,
+		ProvenanceHash: "prov_dub_script_vocal_test",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	bgPCM := media.GeneratePCM16WAV(16000, 1, 20000)
+	bgObj, _ := casStore.Put(bytes.NewReader(bgPCM))
+
+	in := domain.VoiceAuditionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Voice: domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_f1",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		IsContextual: true,
+		SegmentIndex: 0,
+	}
+
+	t.Run("MissingCASObjectForDeclaredVocals", func(t *testing.T) {
+		stemArtifact := domain.AudioStemArtifacts{
+			ID:            uuid.NewString(),
+			SchemaVersion: domain.AudioStemsSchemaVersion,
+			AssetID:       assetID,
+			ProviderID:    "fake_separator",
+			ModelName:     "uvr_mdx",
+			ModelVersion:  "1.0",
+			Stems: []domain.AudioStem{
+				{
+					Type:         domain.StemTypeBackground,
+					AudioCASHash: bgObj.SHA256,
+					SampleRate:   16000,
+					Channels:     1,
+					Format:       "wav",
+					DurationMs:   20000,
+				},
+				{
+					Type:         domain.StemTypeVocals,
+					AudioCASHash: "non_existent_vocals_hash_12345",
+					SampleRate:   16000,
+					Channels:     1,
+					Format:       "wav",
+					DurationMs:   20000,
+				},
+			},
+			CreatedAt: time.Now().UTC(),
+		}
+		sBytes, _ := json.Marshal(stemArtifact)
+		sObj, _ := casStore.Put(bytes.NewReader(sBytes))
+		_ = db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+			ID:             stemArtifact.ID,
+			AssetID:        assetID,
+			ProviderID:     stemArtifact.ProviderID,
+			ModelName:      stemArtifact.ModelName,
+			ModelVersion:   stemArtifact.ModelVersion,
+			CASHash:        sObj.SHA256,
+			ProvenanceHash: "prov_stem_missing_vocal",
+			CreatedAt:      time.Now().UTC(),
+		})
+
+		_, err := dubSvc.AuditionVoice(context.Background(), in)
+		if err == nil || !errors.Is(err, domain.ErrSoundtrackPreservationFailed) {
+			t.Fatalf("expected ErrSoundtrackPreservationFailed on missing declared vocals CAS object, got: %v", err)
+		}
+	})
+
+	t.Run("CorruptDeclaredVocalsWAV", func(t *testing.T) {
+		corruptObj, _ := casStore.Put(bytes.NewReader([]byte("not a valid wav header")))
+		stemArtifact := domain.AudioStemArtifacts{
+			ID:            uuid.NewString(),
+			SchemaVersion: domain.AudioStemsSchemaVersion,
+			AssetID:       assetID,
+			ProviderID:    "fake_separator",
+			ModelName:     "uvr_mdx",
+			ModelVersion:  "1.0",
+			Stems: []domain.AudioStem{
+				{
+					Type:         domain.StemTypeBackground,
+					AudioCASHash: bgObj.SHA256,
+					SampleRate:   16000,
+					Channels:     1,
+					Format:       "wav",
+					DurationMs:   20000,
+				},
+				{
+					Type:         domain.StemTypeVocals,
+					AudioCASHash: corruptObj.SHA256,
+					SampleRate:   16000,
+					Channels:     1,
+					Format:       "wav",
+					DurationMs:   20000,
+				},
+			},
+			CreatedAt: time.Now().UTC(),
+		}
+		sBytes, _ := json.Marshal(stemArtifact)
+		sObj, _ := casStore.Put(bytes.NewReader(sBytes))
+		_ = db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+			ID:             stemArtifact.ID,
+			AssetID:        assetID,
+			ProviderID:     stemArtifact.ProviderID,
+			ModelName:      stemArtifact.ModelName,
+			ModelVersion:   stemArtifact.ModelVersion,
+			CASHash:        sObj.SHA256,
+			ProvenanceHash: "prov_stem_corrupt_vocal",
+			CreatedAt:      time.Now().UTC(),
+		})
+
+		_, err := dubSvc.AuditionVoice(context.Background(), in)
+		if err == nil || !errors.Is(err, domain.ErrSoundtrackPreservationFailed) {
+			t.Fatalf("expected ErrSoundtrackPreservationFailed on corrupt declared vocals stem, got: %v", err)
+		}
+	})
+
+	t.Run("ExplicitNoVocalsSucceeds", func(t *testing.T) {
+		// Contract explicitly declares NO vocals stem (AudioCASHash: "")
+		stemArtifact := domain.AudioStemArtifacts{
+			ID:            uuid.NewString(),
+			SchemaVersion: domain.AudioStemsSchemaVersion,
+			AssetID:       assetID,
+			ProviderID:    "fake_separator",
+			ModelName:     "uvr_mdx",
+			ModelVersion:  "1.0",
+			Stems: []domain.AudioStem{
+				{
+					Type:         domain.StemTypeBackground,
+					AudioCASHash: bgObj.SHA256,
+					SampleRate:   16000,
+					Channels:     1,
+					Format:       "wav",
+					DurationMs:   20000,
+				},
+			},
+			CreatedAt: time.Now().UTC(),
+		}
+		sBytes, _ := json.Marshal(stemArtifact)
+		sObj, _ := casStore.Put(bytes.NewReader(sBytes))
+		_ = db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+			ID:             stemArtifact.ID,
+			AssetID:        assetID,
+			ProviderID:     stemArtifact.ProviderID,
+			ModelName:      stemArtifact.ModelName,
+			ModelVersion:   stemArtifact.ModelVersion,
+			CASHash:        sObj.SHA256,
+			ProvenanceHash: "prov_stem_novocal_ok",
+			CreatedAt:      time.Now().UTC(),
+		})
+
+		res, err := dubSvc.AuditionVoice(context.Background(), in)
+		if err != nil {
+			t.Fatalf("expected success with explicit no-vocals contract, got: %v", err)
+		}
+		if !res.ContextualMixed {
+			t.Errorf("expected ContextualMixed=true")
+		}
+	})
+}
+
+func TestDubbingService_AuditionVoice_AudioRolePlan_LookupAndNoSpeechBehavior(t *testing.T) {
+	dubSvc, db, _, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, assetID, runID, "vi")
+
+	in := domain.VoiceAuditionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Voice: domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_f1",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		IsContextual: false,
+		SampleText:   "Thử nghiệm mẫu giọng.",
+	}
+
+	t.Run("AuditionVoice_MissingAudioRolePlan_FailsClosed", func(t *testing.T) {
+		assetNoPlan := uuid.NewString()
+		_ = db.CreateSourceAsset(context.Background(), domain.SourceAsset{
+			ID:                  assetNoPlan,
+			SHA256:              "sha_" + assetNoPlan,
+			ByteSize:            1024,
+			MimeType:            "video/mp4",
+			RightsAttestationID: "att-" + assetID,
+			CASPath:             "/mock.mp4",
+			CreatedAt:           time.Now().UTC(),
+		})
+
+		inNoPlan := in
+		inNoPlan.AssetID = assetNoPlan
+		_, err := dubSvc.AuditionVoice(context.Background(), inNoPlan)
+		if err == nil || !errors.Is(err, domain.ErrAudioRolePlanRequired) {
+			t.Fatalf("expected ErrAudioRolePlanRequired when plan is missing for asset, got: %v", err)
+		}
+	})
+
+	t.Run("AuditionVoice_NoDubEligibleSpeech_ReturnsErrNoDubbingRequired", func(t *testing.T) {
+		assetNoSpeech := uuid.NewString()
+		_ = db.CreateSourceAsset(context.Background(), domain.SourceAsset{
+			ID:                  assetNoSpeech,
+			SHA256:              "sha_" + assetNoSpeech,
+			ByteSize:            1024,
+			MimeType:            "video/mp4",
+			RightsAttestationID: "att-" + assetID,
+			CASPath:             "/mock.mp4",
+			CreatedAt:           time.Now().UTC(),
+		})
+		_ = db.SaveAudioRolePlan(context.Background(), domain.AudioRolePlan{
+			ID:        uuid.NewString(),
+			AssetID:   assetNoSpeech,
+			CreatedAt: time.Now().UTC(),
+			Segments: []domain.AudioSegment{
+				{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleInstrumentalBgm},
+			},
+		})
+
+		inNoSpeech := in
+		inNoSpeech.AssetID = assetNoSpeech
+		_, err := dubSvc.AuditionVoice(context.Background(), inNoSpeech)
+		if err == nil || !errors.Is(err, domain.ErrNoDubbingRequired) {
+			t.Fatalf("expected ErrNoDubbingRequired when AudioRolePlan has no dub-eligible dialogue, got: %v", err)
+		}
+	})
+
+	t.Run("AssignVoices_NoDubEligibleSpeech_ReturnsErrNoDubbingRequired", func(t *testing.T) {
+		assetNoSpeech := uuid.NewString()
+		_ = db.CreateSourceAsset(context.Background(), domain.SourceAsset{
+			ID:                  assetNoSpeech,
+			SHA256:              "sha_" + assetNoSpeech,
+			ByteSize:            1024,
+			MimeType:            "video/mp4",
+			RightsAttestationID: "att-" + assetID,
+			CASPath:             "/mock.mp4",
+			CreatedAt:           time.Now().UTC(),
+		})
+		_ = db.SaveAudioRolePlan(context.Background(), domain.AudioRolePlan{
+			ID:        uuid.NewString(),
+			AssetID:   assetNoSpeech,
+			CreatedAt: time.Now().UTC(),
+			Segments: []domain.AudioSegment{
+				{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleInstrumentalBgm},
+			},
+		})
+
+		assignIn := domain.VoiceAssignmentInput{
+			RunID:          uuid.NewString(),
+			AssetID:        assetNoSpeech,
+			TargetLanguage: "vi",
+		}
+		_, err := dubSvc.AssignVoices(context.Background(), assignIn)
+		if err == nil || !errors.Is(err, domain.ErrNoDubbingRequired) {
+			t.Fatalf("expected ErrNoDubbingRequired from AssignVoices on no-speech video, got: %v", err)
+		}
+	})
+
+	t.Run("AssignVoices_MissingAudioRolePlan_PreservesCompatibility", func(t *testing.T) {
+		assetBare := uuid.NewString()
+		_ = db.CreateSourceAsset(context.Background(), domain.SourceAsset{
+			ID:                  assetBare,
+			SHA256:              "sha_" + assetBare,
+			ByteSize:            1024,
+			MimeType:            "video/mp4",
+			RightsAttestationID: "att-" + assetID,
+			CASPath:             "/mock.mp4",
+			CreatedAt:           time.Now().UTC(),
+		})
+
+		assignIn := domain.VoiceAssignmentInput{
+			RunID:          uuid.NewString(),
+			AssetID:        assetBare,
+			TargetLanguage: "vi",
+		}
+		res, err := dubSvc.AssignVoices(context.Background(), assignIn)
+		if err != nil {
+			t.Fatalf("expected AssignVoices to succeed when plan is missing (compatibility preserved), got: %v", err)
+		}
+		if res == nil || len(res.Assignments) == 0 {
+			t.Fatalf("expected valid assignments returned")
+		}
+	})
+}
+func TestDubbingService_AuditionVoice_Contextual_SlotOverrunAndMetadata(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, assetID, runID, "vi")
+
+	bgPCM := media.GeneratePCM16WAV(16000, 1, 30000)
+	bgObj, _ := casStore.Put(bytes.NewReader(bgPCM))
+	stemArtifact := domain.AudioStemArtifacts{
+		ID:            uuid.NewString(),
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		ProviderID:    "fake_separator",
+		ModelName:     "uvr_mdx",
+		ModelVersion:  "1.0",
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: bgObj.SHA256,
+				SampleRate:   16000,
+				Channels:     1,
+				Format:       "wav",
+				DurationMs:   30000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	sBytes, _ := json.Marshal(stemArtifact)
+	sObj, _ := casStore.Put(bytes.NewReader(sBytes))
+	_ = db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+		ID:             stemArtifact.ID,
+		AssetID:        assetID,
+		ProviderID:     stemArtifact.ProviderID,
+		ModelName:      stemArtifact.ModelName,
+		ModelVersion:   stemArtifact.ModelVersion,
+		CASHash:        sObj.SHA256,
+		ProvenanceHash: "prov_stem_slot_test",
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	// Total audio is 30s. Dialogue suppression covers 0ms to 10000ms.
+	_ = db.SaveAudioRolePlan(context.Background(), domain.AudioRolePlan{
+		ID:        uuid.NewString(),
+		AssetID:   assetID,
+		CreatedAt: time.Now().UTC(),
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 10000, EndMs: 30000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+	})
+
+	in := domain.VoiceAuditionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Voice: domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_f1",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		IsContextual: true,
+		SegmentIndex: 0,
+	}
+
+	t.Run("SlotOverrun_FailsClosedEvenWhenSourceAndSuppressionPermit", func(t *testing.T) {
+		// Segment slot is [2000, 4000]ms (2000ms slot duration)
+		dubScript := domain.DubScriptVariant{
+			ID:             uuid.NewString(),
+			SchemaVersion:  domain.DubScriptSchemaVersion,
+			AssetID:        assetID,
+			RunID:          runID,
+			SourceLanguage: "zh",
+			TargetLanguage: "vi",
+			Segments: []domain.DubScriptSegment{
+				{
+					Index:          0,
+					SpeakerID:      "SPEAKER_00",
+					StartMs:        2000,
+					EndMs:          4000,
+					SlotDurationMs: 2000,
+					SpokenText:     "Đoạn thoại dài hơn slot segment.",
+				},
+			},
+		}
+		dBytes, _ := json.Marshal(dubScript)
+		dObj, _ := casStore.Put(bytes.NewReader(dBytes))
+		_ = db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+			ID:             dubScript.ID,
+			AssetID:        assetID,
+			RunID:          runID,
+			TargetLanguage: "vi",
+			CASHash:        dObj.SHA256,
+			ProvenanceHash: "prov_dub_script_overrun",
+			CreatedAt:      time.Now().UTC(),
+		})
+
+		// TTS synthesizes 2500ms speech -> interval [2000, 4500]ms.
+		// Fits source (30000ms) and suppression (10000ms), but overruns slot end (4000ms).
+		dubSvc.TTSInvoke = func(ctx context.Context, p provider.Provider, req provider.TTSSynthesisRequest) (*provider.TTSSynthesisResult, error) {
+			pcm := media.GeneratePCM16WAV(16000, 1, 2500)
+			return &provider.TTSSynthesisResult{
+				AudioData:          pcm,
+				Format:             "wav",
+				SampleRate:         16000,
+				Channels:           1,
+				MeasuredDurationMs: 2500,
+				ProviderID:         p.ID(),
+				ModelName:          "vieneu_tts_vi",
+				ModelVersion:       "1.0",
+			}, nil
+		}
+
+		_, err := dubSvc.AuditionVoice(context.Background(), in)
+		if err == nil || !errors.Is(err, domain.ErrTTSDurationOverrun) {
+			t.Fatalf("expected ErrTTSDurationOverrun when speech overruns segment slot, got: %v", err)
+		}
+	})
+
+	t.Run("InconsistentSlotDurationMs_FailsClosed", func(t *testing.T) {
+		dubScript := domain.DubScriptVariant{
+			ID:             uuid.NewString(),
+			SchemaVersion:  domain.DubScriptSchemaVersion,
+			AssetID:        assetID,
+			RunID:          runID,
+			SourceLanguage: "zh",
+			TargetLanguage: "vi",
+			Segments: []domain.DubScriptSegment{
+				{
+					Index:          0,
+					SpeakerID:      "SPEAKER_00",
+					StartMs:        2000,
+					EndMs:          4000,
+					SlotDurationMs: 3000, // Inconsistent with 4000-2000=2000
+					SpokenText:     "Inconsistent slot duration.",
+				},
+			},
+		}
+		dBytes, _ := json.Marshal(dubScript)
+		dObj, _ := casStore.Put(bytes.NewReader(dBytes))
+		_ = db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+			ID:             dubScript.ID,
+			AssetID:        assetID,
+			RunID:          runID,
+			TargetLanguage: "vi",
+			CASHash:        dObj.SHA256,
+			ProvenanceHash: "prov_dub_script_inconsistent",
+			CreatedAt:      time.Now().UTC(),
+		})
+
+		_, err := dubSvc.AuditionVoice(context.Background(), in)
+		if err == nil {
+			t.Fatalf("expected error on inconsistent slot duration, got nil")
+		}
+	})
+
+	t.Run("InvalidSlotBounds_FailsClosed", func(t *testing.T) {
+		dubScript := domain.DubScriptVariant{
+			ID:             uuid.NewString(),
+			SchemaVersion:  domain.DubScriptSchemaVersion,
+			AssetID:        assetID,
+			RunID:          runID,
+			SourceLanguage: "zh",
+			TargetLanguage: "vi",
+			Segments: []domain.DubScriptSegment{
+				{
+					Index:          0,
+					SpeakerID:      "SPEAKER_00",
+					StartMs:        4000,
+					EndMs:          2000, // EndMs <= StartMs
+					SlotDurationMs: 2000,
+					SpokenText:     "Invalid slot bounds.",
+				},
+			},
+		}
+		dBytes, _ := json.Marshal(dubScript)
+		dObj, _ := casStore.Put(bytes.NewReader(dBytes))
+		_ = db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+			ID:             dubScript.ID,
+			AssetID:        assetID,
+			RunID:          runID,
+			TargetLanguage: "vi",
+			CASHash:        dObj.SHA256,
+			ProvenanceHash: "prov_dub_script_invalid_bounds",
+			CreatedAt:      time.Now().UTC(),
+		})
+
+		_, err := dubSvc.AuditionVoice(context.Background(), in)
+		if err == nil {
+			t.Fatalf("expected error on invalid slot bounds (EndMs <= StartMs), got nil")
+		}
+	})
+
+	t.Run("ExactSlotBoundaryFit_PassesAndReturnsMetadata", func(t *testing.T) {
+		dubScript := domain.DubScriptVariant{
+			ID:             uuid.NewString(),
+			SchemaVersion:  domain.DubScriptSchemaVersion,
+			AssetID:        assetID,
+			RunID:          runID,
+			SourceLanguage: "zh",
+			TargetLanguage: "vi",
+			Segments: []domain.DubScriptSegment{
+				{
+					Index:          0,
+					SpeakerID:      "SPEAKER_00",
+					StartMs:        2000,
+					EndMs:          4000,
+					SlotDurationMs: 2000,
+					SpokenText:     "Đoạn thoại khớp chính xác slot.",
+				},
+			},
+		}
+		dBytes, _ := json.Marshal(dubScript)
+		dObj, _ := casStore.Put(bytes.NewReader(dBytes))
+		_ = db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+			ID:             dubScript.ID,
+			AssetID:        assetID,
+			RunID:          runID,
+			TargetLanguage: "vi",
+			CASHash:        dObj.SHA256,
+			ProvenanceHash: "prov_dub_script_exact",
+			CreatedAt:      time.Now().UTC(),
+		})
+
+		// TTS synthesizes exactly 2000ms speech -> interval [2000, 4000]ms (exact fit)
+		dubSvc.TTSInvoke = func(ctx context.Context, p provider.Provider, req provider.TTSSynthesisRequest) (*provider.TTSSynthesisResult, error) {
+			pcm := media.GeneratePCM16WAV(16000, 1, 2000)
+			return &provider.TTSSynthesisResult{
+				AudioData:          pcm,
+				Format:             "wav",
+				SampleRate:         16000,
+				Channels:           1,
+				MeasuredDurationMs: 2000,
+				ProviderID:         "fake_vieneu_tts_vi",
+				ModelName:          "vieneu_tts_vi_model",
+				ModelVersion:       "v2.1.0",
+			}, nil
+		}
+
+		res, err := dubSvc.AuditionVoice(context.Background(), in)
+		if err != nil {
+			t.Fatalf("expected success on exact slot boundary fit, got: %v", err)
+		}
+		if !res.ContextualMixed {
+			t.Errorf("expected ContextualMixed=true")
+		}
+		if res.ProviderID != "fake_vieneu_tts_vi" {
+			t.Errorf("expected ProviderID 'fake_vieneu_tts_vi', got %q", res.ProviderID)
+		}
+		if res.ModelName != "vieneu_tts_vi_model" {
+			t.Errorf("expected ModelName 'vieneu_tts_vi_model', got %q", res.ModelName)
+		}
+		if res.ModelVersion != "v2.1.0" {
+			t.Errorf("expected ModelVersion 'v2.1.0', got %q", res.ModelVersion)
+		}
+	})
 }
 
 func TestDubbingService_SynthesizeAndFit_ProbesDurationAndEnforcesZeroOverrun(t *testing.T) {

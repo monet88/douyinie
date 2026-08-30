@@ -34,6 +34,8 @@ var (
 	ErrVoiceAssignmentNotFound = errors.New("voice assignment not found")
 	// ErrDubSegmentsVariantNotFound is returned when DubSegmentsVariant is not found in storage.
 	ErrDubSegmentsVariantNotFound = errors.New("dub segments variant not found")
+	// ErrNoDubbingRequired is returned when no dub-eligible dialogue exists for voice audition/assignment.
+	ErrNoDubbingRequired = errors.New("no dubbing required")
 )
 
 const (
@@ -300,7 +302,11 @@ type VoiceAuditionResult struct {
 	AudioCASPath       string       `json:"audio_cas_path"`
 	MeasuredDurationMs int64        `json:"measured_duration_ms"`
 	IsContextual       bool         `json:"is_contextual"`
+	ContextualMixed    bool         `json:"contextual_mixed"`
 	SampleText         string       `json:"sample_text"`
+	ProviderID         string       `json:"provider_id,omitempty"`
+	ModelName          string       `json:"model_name,omitempty"`
+	ModelVersion       string       `json:"model_version,omitempty"`
 }
 
 // DubbingJobInput defines the inputs required to run the TTS synthesis & fit controller pipeline.

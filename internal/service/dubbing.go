@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -76,6 +77,17 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 	}
 	in.TargetLanguage = targetLang
 
+	// Check if video has audio role plan with no dub-eligible dialogue (no-speech bypass)
+	if s.db != nil && in.AssetID != "" {
+		rolePlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID)
+		if err == nil && rolePlan != nil {
+			if !domain.IsDubEligible(rolePlan) {
+				return nil, domain.ErrNoDubbingRequired
+			}
+		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("get audio role plan: %w", err)
+		}
+	}
 	// 1. Resolve distinct speakers from TranscriptArtifact or DubScriptVariant
 	speakers, err := s.resolveSpeakers(ctx, in.AssetID, targetLang)
 	if err != nil {
@@ -396,7 +408,75 @@ func (s *DubbingService) ReassignVoice(ctx context.Context, in domain.VoiceAssig
 	return newAssignment, nil
 }
 
-// AuditionVoice generates a short 5s standalone or 10s contextual audio clip to audition a voice profile.
+// isSpeechIntervalCoveredBySuppression proves whether the target speech interval [startMs, endMs]
+// is strictly and continuously covered by dialogue suppression intervals from AudioRolePlan.
+func isSpeechIntervalCoveredBySuppression(speechStartMs, speechEndMs int64, segments []domain.AudioSegment) bool {
+	if speechStartMs >= speechEndMs {
+		return false
+	}
+	type interval struct {
+		start int64
+		end   int64
+	}
+	var intervals []interval
+	for _, seg := range segments {
+		if seg.Role == domain.AudioRoleNarrationDialogue {
+			s := seg.StartMs
+			e := seg.EndMs
+			if s < speechStartMs {
+				s = speechStartMs
+			}
+			if e > speechEndMs {
+				e = speechEndMs
+			}
+			if s < e {
+				intervals = append(intervals, interval{start: s, end: e})
+			}
+		}
+	}
+	if len(intervals) == 0 {
+		return false
+	}
+	// Sort intervals by start time
+	sort.Slice(intervals, func(i, j int) bool {
+		if intervals[i].start == intervals[j].start {
+			return intervals[i].end < intervals[j].end
+		}
+		return intervals[i].start < intervals[j].start
+	})
+
+	// Merge contiguous or overlapping intervals
+	currStart := intervals[0].start
+	currEnd := intervals[0].end
+	if currStart > speechStartMs {
+		return false
+	}
+
+	for i := 1; i < len(intervals); i++ {
+		next := intervals[i]
+		if next.start <= currEnd {
+			if next.end > currEnd {
+				currEnd = next.end
+			}
+		} else {
+			// Gap detected
+			return false
+		}
+	}
+
+	return currStart <= speechStartMs && currEnd >= speechEndMs
+}
+
+// AuditionVoice generates a short ~5s standalone or ~10s contextual audio clip to audition a voice profile.
+// For contextual audition (IsContextual=true):
+// - Uses actual translated segment text from DubScriptVariant.
+// - Synthesizes candidate voice segment.
+// - Fails closed if audio stems or background stem are missing/invalid or audio mixing fails.
+// - Extracts a preview-local ~10s window (or expanded if speech exceeds ~10s) containing the entire clip without truncation.
+// - Slices background stem and vocal stem to the preview window, offsets speech clips and suppression windows.
+// - Preserves available source vocals/music-vocals outside dialogue windows while suppressing only dialogue.
+// - Proves speech interval is strictly covered by dialogue suppression windows from AudioRolePlan (preventing collision).
+// - Mixes synthesized speech with preserved stems and reports ContextualMixed=true.
 func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAuditionInput) (*domain.VoiceAuditionResult, error) {
 	if in.Voice.ID == "" {
 		return nil, fmt.Errorf("voice profile is required")
@@ -410,15 +490,95 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 		targetLang = "vi"
 	}
 
-	sampleText := in.SampleText
-	if sampleText == "" {
-		if targetLang == "vi" {
-			sampleText = "Xin chào, đây là bản thử giọng mẫu tự nhiên cho video của bạn."
+	// Check audio role plan and dub-eligibility (fail closed on missing/unreadable plan when asset_id is provided or contextual)
+	var rolePlan *domain.AudioRolePlan
+	if in.AssetID != "" {
+		if s.db == nil {
+			if in.IsContextual {
+				return nil, fmt.Errorf("%w: missing database for contextual audition", domain.ErrAudioRolePlanRequired)
+			}
 		} else {
-			sampleText = "Hello, this is a sample voice audition for your video."
+			rp, err := s.db.GetAudioRolePlan(ctx, in.AssetID)
+			if err != nil {
+				if errors.Is(err, storage.ErrNotFound) {
+					return nil, fmt.Errorf("%w: audio role plan not found for asset %s", domain.ErrAudioRolePlanRequired, in.AssetID)
+				}
+				return nil, fmt.Errorf("%w: failed to get audio role plan for asset %s: %v", domain.ErrAudioRolePlanRequired, in.AssetID, err)
+			}
+			if rp == nil {
+				return nil, fmt.Errorf("%w: audio role plan is nil for asset %s", domain.ErrAudioRolePlanRequired, in.AssetID)
+			}
+			if !domain.IsDubEligible(rp) {
+				return nil, domain.ErrNoDubbingRequired
+			}
+			rolePlan = rp
 		}
+	} else if in.IsContextual {
+		return nil, fmt.Errorf("%w: asset_id is required for contextual audition", domain.ErrAudioRolePlanRequired)
 	}
 
+	var sampleText string
+	var startMs int64
+	var slotEndMs int64
+	var slotDurationMs int64 = 5000
+	// For contextual audition (IsContextual=true):
+	// 1) Fail closed if storage/DB/asset is missing.
+	// 2) Require actual translated segment from DubScriptVariant (or fail closed if missing/unresolvable).
+	// 3) Require AudioRolePlan to prove source dialogue suppression.
+	if in.IsContextual {
+		if s.cas == nil || s.db == nil || strings.TrimSpace(in.AssetID) == "" {
+			return nil, fmt.Errorf("%w: missing required storage/database for contextual audition", domain.ErrSoundtrackPreservationFailed)
+		}
+		if rolePlan == nil {
+			return nil, fmt.Errorf("%w: audio role plan required to prove dialogue suppression", domain.ErrAudioRolePlanRequired)
+		}
+		// Resolve actual translated segment from current DubScriptVariant (fail closed if not found)
+		dIdx, err := s.db.GetDubScriptVariantIndex(ctx, in.AssetID, targetLang)
+		if err != nil || dIdx == nil || dIdx.CASHash == "" {
+			return nil, fmt.Errorf("%w: dub script variant not found for asset %s (%s)", domain.ErrDubScriptVariantNotFound, in.AssetID, targetLang)
+		}
+		rc, err := s.cas.Get(dIdx.CASHash)
+		if err != nil {
+			return nil, fmt.Errorf("%w: read dub script from CAS: %v", domain.ErrDubScriptVariantNotFound, err)
+		}
+		defer rc.Close()
+		var dubScript domain.DubScriptVariant
+		if err := json.NewDecoder(rc).Decode(&dubScript); err != nil || len(dubScript.Segments) == 0 {
+			return nil, fmt.Errorf("%w: dub script has no translated segments", domain.ErrDubScriptVariantNotFound)
+		}
+		segIdx := in.SegmentIndex
+		if segIdx < 0 || segIdx >= len(dubScript.Segments) {
+			return nil, fmt.Errorf("%w: segment index %d out of bounds (total segments: %d)", domain.ErrDubScriptVariantNotFound, segIdx, len(dubScript.Segments))
+		}
+		seg := dubScript.Segments[segIdx]
+		if seg.SpokenText != "" {
+			sampleText = seg.SpokenText
+		} else if seg.MeaningText != "" {
+			sampleText = seg.MeaningText
+		}
+		if strings.TrimSpace(sampleText) == "" {
+			return nil, fmt.Errorf("%w: segment %d has empty translation text", domain.ErrDubScriptVariantNotFound, segIdx)
+		}
+		if seg.StartMs < 0 || seg.EndMs <= seg.StartMs || seg.SlotDurationMs < 0 {
+			return nil, fmt.Errorf("%w: invalid segment slot bounds (start=%d, end=%d, slot_duration=%d)", domain.ErrSoundtrackPreservationFailed, seg.StartMs, seg.EndMs, seg.SlotDurationMs)
+		}
+		canonicalSlotDur := seg.EndMs - seg.StartMs
+		if seg.SlotDurationMs > 0 && seg.SlotDurationMs != canonicalSlotDur {
+			return nil, fmt.Errorf("%w: inconsistent segment slot duration %d != end-start (%d-%d=%d)", domain.ErrSoundtrackPreservationFailed, seg.SlotDurationMs, seg.EndMs, seg.StartMs, canonicalSlotDur)
+		}
+		startMs = seg.StartMs
+		slotEndMs = seg.EndMs
+		slotDurationMs = canonicalSlotDur
+	} else {
+		sampleText = in.SampleText
+		if sampleText == "" {
+			if targetLang == "vi" {
+				sampleText = "Xin chào, đây là bản thử giọng mẫu tự nhiên cho video của bạn."
+			} else {
+				sampleText = "Hello, this is a sample voice audition for your video."
+			}
+		}
+	}
 	req := provider.TTSSynthesisRequest{
 		RunID:          in.RunID,
 		AssetID:        in.AssetID,
@@ -427,8 +587,8 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 		Language:       targetLang,
 		Voice:          in.Voice,
 		Speed:          1.0,
-		SlotDurationMs: 5000,
-		UsableSlotMs:   5000,
+		SlotDurationMs: slotDurationMs,
+		UsableSlotMs:   slotDurationMs,
 		AttemptNumber:  1,
 	}
 
@@ -437,8 +597,269 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 		return nil, fmt.Errorf("synthesize audition voice: %w", err)
 	}
 
-	// Probe duration from synthesized audio (fail closed)
-	probedMs, err := media.ProbeWAVBytes(synthRes.AudioData)
+	finalAudioData := synthRes.AudioData
+	contextualMixed := false
+
+	// If contextual audition, mix with preserved background and vocal stems
+	if in.IsContextual {
+		if s.cas == nil || s.db == nil || in.AssetID == "" {
+			return nil, fmt.Errorf("%w: missing required storage/database for contextual audition", domain.ErrSoundtrackPreservationFailed)
+		}
+
+		stemsIdx, err := s.db.GetAudioStemsArtifactIndex(ctx, in.AssetID)
+		if err != nil || stemsIdx == nil || stemsIdx.CASHash == "" {
+			return nil, fmt.Errorf("%w: stems artifact index not found for asset %s", domain.ErrAudioStemsNotFound, in.AssetID)
+		}
+
+		r, err := s.cas.Get(stemsIdx.CASHash)
+		if err != nil {
+			return nil, fmt.Errorf("%w: read stems artifact from CAS: %v", domain.ErrAudioStemsNotFound, err)
+		}
+		defer r.Close()
+
+		var stemArtifacts domain.AudioStemArtifacts
+		if err := json.NewDecoder(r).Decode(&stemArtifacts); err != nil {
+			return nil, fmt.Errorf("%w: decode stems artifact: %v", domain.ErrSoundtrackPreservationFailed, err)
+		}
+
+		var bgStem, vocalsStem domain.AudioStem
+		for _, st := range stemArtifacts.Stems {
+			if st.Type == domain.StemTypeBackground {
+				bgStem = st
+			} else if st.Type == domain.StemTypeVocals {
+				vocalsStem = st
+			}
+		}
+
+		if bgStem.AudioCASHash == "" {
+			return nil, fmt.Errorf("%w: missing background stem in stems artifact", domain.ErrSoundtrackPreservationFailed)
+		}
+
+		bgR, err := s.cas.Get(bgStem.AudioCASHash)
+		if err != nil {
+			return nil, fmt.Errorf("%w: read background stem from CAS: %v", domain.ErrSoundtrackPreservationFailed, err)
+		}
+		defer bgR.Close()
+
+		bgBytes, err := io.ReadAll(bgR)
+		if err != nil {
+			return nil, fmt.Errorf("%w: read background stem bytes: %v", domain.ErrSoundtrackPreservationFailed, err)
+		}
+
+		bgSamples, bgHeader, err := media.ExtractPCM16Samples(bgBytes)
+		if err != nil || bgHeader == nil {
+			return nil, fmt.Errorf("%w: extract background PCM16 samples: %v", domain.ErrSoundtrackPreservationFailed, err)
+		}
+
+		sampleRate := int(bgHeader.SampleRate)
+		channels := int(bgHeader.NumChannels)
+		if sampleRate <= 0 || channels <= 0 {
+			return nil, fmt.Errorf("%w: invalid background stem format (rate=%d, ch=%d)", domain.ErrSoundtrackPreservationFailed, sampleRate, channels)
+		}
+
+		// Read and resample vocal stem if declared in artifact (fail closed on CAS/load/decode/format error)
+		var vocalsSamples []int16
+		if vocalsStem.AudioCASHash != "" {
+			vR, err := s.cas.Get(vocalsStem.AudioCASHash)
+			if err != nil {
+				return nil, fmt.Errorf("%w: read vocals stem from CAS: %v", domain.ErrSoundtrackPreservationFailed, err)
+			}
+			defer vR.Close()
+
+			vBytes, err := io.ReadAll(vR)
+			if err != nil {
+				return nil, fmt.Errorf("%w: read vocals stem bytes: %v", domain.ErrSoundtrackPreservationFailed, err)
+			}
+
+			vSamp, vHeader, err := media.ExtractPCM16Samples(vBytes)
+			if err != nil || vHeader == nil {
+				return nil, fmt.Errorf("%w: extract vocals PCM16 samples: %v", domain.ErrSoundtrackPreservationFailed, err)
+			}
+
+			vRate := int(vHeader.SampleRate)
+			vCh := int(vHeader.NumChannels)
+			if vRate <= 0 || vCh <= 0 {
+				return nil, fmt.Errorf("%w: invalid vocals stem format (rate=%d, ch=%d)", domain.ErrSoundtrackPreservationFailed, vRate, vCh)
+			}
+
+			if vRate != sampleRate || vCh != channels {
+				vSamp = media.ResamplePCM16(vSamp, vRate, vCh, sampleRate, channels)
+			}
+			vocalsSamples = vSamp
+		}
+
+		// Extract synthesized speech samples
+		speechSamples, spkHeader, err := media.ExtractPCM16Samples(synthRes.AudioData)
+		if err != nil || spkHeader == nil {
+			return nil, fmt.Errorf("%w: extract synthesized speech samples: %v", domain.ErrSoundtrackPreservationFailed, err)
+		}
+
+		// Determine speech duration and source bounds
+		speechFrames := int64(len(speechSamples) / int(spkHeader.NumChannels))
+		speechDurMs := (speechFrames * 1000) / int64(spkHeader.SampleRate)
+		if speechDurMs <= 0 {
+			speechDurMs = slotDurationMs
+		}
+		speechEndMs := startMs + speechDurMs
+
+		totalBgFrames := int64(len(bgSamples) / channels)
+		totalBgDurMs := (totalBgFrames * 1000) / int64(sampleRate)
+
+		// Fail closed if speech exceeds source bounds
+		if startMs < 0 || speechDurMs <= 0 || startMs >= totalBgDurMs || speechEndMs > totalBgDurMs {
+			return nil, fmt.Errorf("%w: synthesized speech interval [%d, %d]ms exceeds source audio duration %dms", domain.ErrSoundtrackPreservationFailed, startMs, speechEndMs, totalBgDurMs)
+		}
+
+		// Fail closed if speech overruns canonical segment slot window
+		if speechEndMs > slotEndMs {
+			return nil, fmt.Errorf("%w: synthesized speech interval [%d, %d]ms overruns canonical segment slot [%d, %d]ms (duration %dms > slot %dms)", domain.ErrTTSDurationOverrun, startMs, speechEndMs, startMs, slotEndMs, speechDurMs, slotDurationMs)
+		}
+		// Prove that the entire speech interval [startMs, speechEndMs] is strictly covered
+		// by verified dialogue suppression windows from AudioRolePlan (prevent unsuppressed dialogue collision)
+		if !isSpeechIntervalCoveredBySuppression(startMs, speechEndMs, rolePlan.Segments) {
+			return nil, fmt.Errorf("%w: speech interval [%d, %d]ms is not fully covered by verified dialogue suppression intervals in audio role plan", domain.ErrSoundtrackPreservationFailed, startMs, speechEndMs)
+		}
+
+		// Determine preview-local window containing the synthesized speech segment without truncation.
+		// Nominal preview window is ~10s; expanded beyond ~10s only when necessary to contain synthesized speech.
+		const nominalPreviewDurMs int64 = 10000
+		targetWinDurMs := nominalPreviewDurMs
+		if speechDurMs > targetWinDurMs {
+			targetWinDurMs = speechDurMs
+		}
+		if targetWinDurMs > totalBgDurMs {
+			targetWinDurMs = totalBgDurMs
+		}
+
+		// Position window at startMs and clamp near source end
+		var windowStartMs int64 = startMs
+		var windowEndMs int64 = windowStartMs + targetWinDurMs
+		if windowEndMs > totalBgDurMs {
+			windowEndMs = totalBgDurMs
+			windowStartMs = windowEndMs - targetWinDurMs
+			if windowStartMs < 0 {
+				windowStartMs = 0
+			}
+		}
+
+		// Verify window strictly contains [startMs, speechEndMs] within source bounds
+		if windowStartMs > startMs || windowEndMs < speechEndMs {
+			return nil, fmt.Errorf("%w: preview window [%d, %d]ms cannot fully contain speech [%d, %d]ms", domain.ErrSoundtrackPreservationFailed, windowStartMs, windowEndMs, startMs, speechEndMs)
+		}
+
+		startFrame := (windowStartMs * int64(sampleRate)) / 1000
+		endFrame := (windowEndMs * int64(sampleRate)) / 1000
+		if startFrame < 0 {
+			startFrame = 0
+		}
+		if endFrame > totalBgFrames {
+			endFrame = totalBgFrames
+		}
+
+		speechOffsetMs := startMs - windowStartMs
+		speechStartFrame := (speechOffsetMs * int64(sampleRate)) / 1000
+
+		// Ensure frame count fits resampled speech to guarantee zero sample drop in MixPCM16Stems
+		resampledSpeechSamples := speechSamples
+		resampledRate := int(spkHeader.SampleRate)
+		resampledCh := int(spkHeader.NumChannels)
+		if resampledRate != sampleRate || resampledCh != channels {
+			resampledSpeechSamples = media.ResamplePCM16(speechSamples, resampledRate, resampledCh, sampleRate, channels)
+			resampledRate = sampleRate
+			resampledCh = channels
+		}
+		resampledSpeechFrames := int64(len(resampledSpeechSamples) / channels)
+
+		if speechStartFrame+resampledSpeechFrames > (endFrame - startFrame) {
+			neededEndFrame := startFrame + speechStartFrame + resampledSpeechFrames
+			if neededEndFrame <= totalBgFrames {
+				endFrame = neededEndFrame
+				windowEndMs = (endFrame * 1000) / int64(sampleRate)
+			} else {
+				return nil, fmt.Errorf("%w: speech samples extend beyond total source audio frames", domain.ErrSoundtrackPreservationFailed)
+			}
+		}
+
+		if startFrame >= endFrame {
+			return nil, fmt.Errorf("%w: invalid preview window [%d, %d]ms", domain.ErrSoundtrackPreservationFailed, windowStartMs, windowEndMs)
+		}
+
+		slicedBgSamples := bgSamples[startFrame*int64(channels) : endFrame*int64(channels)]
+
+		// Slice vocal samples to preview window if available
+		var slicedVocalsSamples []int16
+		if len(vocalsSamples) > 0 {
+			totalVocalsFrames := int64(len(vocalsSamples) / channels)
+			vStartFrame := startFrame
+			vEndFrame := endFrame
+			if vStartFrame < 0 {
+				vStartFrame = 0
+			}
+			if vEndFrame > totalVocalsFrames {
+				vEndFrame = totalVocalsFrames
+			}
+			if vStartFrame < vEndFrame {
+				slicedVocalsSamples = vocalsSamples[vStartFrame*int64(channels) : vEndFrame*int64(channels)]
+			}
+		}
+
+		// Speech clip with preview-local offset
+		speechClips := []media.DubSpeechClip{
+			{
+				StartMs:    speechOffsetMs,
+				SampleRate: int(spkHeader.SampleRate),
+				Channels:   int(spkHeader.NumChannels),
+				Samples:    speechSamples,
+			},
+		}
+
+		// Build preview-local suppression windows for narration dialogue from verified AudioRolePlan
+		var suppressWindows []media.PreservationWindowInterval
+		for _, rSeg := range rolePlan.Segments {
+			if rSeg.Role == domain.AudioRoleNarrationDialogue {
+				segStart := rSeg.StartMs
+				segEnd := rSeg.EndMs
+				if segEnd > windowStartMs && segStart < windowEndMs {
+					localStart := segStart - windowStartMs
+					localEnd := segEnd - windowStartMs
+					if localStart < 0 {
+						localStart = 0
+					}
+					previewDur := windowEndMs - windowStartMs
+					if localEnd > previewDur {
+						localEnd = previewDur
+					}
+					if localStart < localEnd {
+						suppressWindows = append(suppressWindows, media.PreservationWindowInterval{
+							StartMs: localStart,
+							EndMs:   localEnd,
+							Action:  "suppress_dialogue",
+						})
+					}
+				}
+			}
+		}
+
+		mixedSamples := media.MixPCM16Stems(
+			slicedBgSamples,
+			slicedVocalsSamples,
+			sampleRate,
+			channels,
+			speechClips,
+			suppressWindows,
+			25,   // 25ms crossfade
+			-2.0, // gentle ducking
+		)
+		if len(mixedSamples) == 0 {
+			return nil, fmt.Errorf("%w: stem mixing produced 0 samples", domain.ErrSoundtrackPreservationFailed)
+		}
+
+		finalAudioData = media.EncodePCM16Samples(mixedSamples, sampleRate, channels)
+		contextualMixed = true
+	}
+
+	// Probe duration from final audio (fail closed)
+	probedMs, err := media.ProbeWAVBytes(finalAudioData)
 	if err != nil {
 		return nil, fmt.Errorf("probe audition audio duration: %w", err)
 	}
@@ -447,11 +868,21 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 	}
 	var casHash, casPath string
 	if s.cas != nil {
-		casObj, err := s.cas.Put(bytes.NewReader(synthRes.AudioData))
+		casObj, err := s.cas.Put(bytes.NewReader(finalAudioData))
 		if err == nil {
 			casHash = casObj.SHA256
 			casPath = casObj.Path
 		}
+	}
+
+	var providerID, modelName, modelVersion string
+	if synthRes != nil {
+		providerID = synthRes.ProviderID
+		modelName = synthRes.ModelName
+		modelVersion = synthRes.ModelVersion
+	}
+	if providerID == "" && in.Voice.ProviderID != "" {
+		providerID = in.Voice.ProviderID
 	}
 
 	return &domain.VoiceAuditionResult{
@@ -460,7 +891,11 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 		AudioCASPath:       casPath,
 		MeasuredDurationMs: probedMs,
 		IsContextual:       in.IsContextual,
+		ContextualMixed:    contextualMixed,
 		SampleText:         sampleText,
+		ProviderID:         providerID,
+		ModelName:          modelName,
+		ModelVersion:       modelVersion,
 	}, nil
 }
 
