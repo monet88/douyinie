@@ -558,6 +558,13 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 		return nil, fmt.Errorf("%w: %s", domain.ErrInvalidTargetLanguage, in.TargetLanguage)
 	}
 
+	// Query canonical TranslationVariantIndex for this asset & target language upfront
+	// before any on-the-fly overlay translation runs can update the latest index row.
+	transIdx, err := s.db.GetTranslationVariantIndex(ctx, in.AssetID, in.TargetLanguage)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return nil, fmt.Errorf("query translation variant index: %w", err)
+	}
+
 	// 1. Load latest TextRegionPlan
 	planIdx, err := s.db.GetTextRegionPlanIndex(ctx, in.AssetID)
 	if err != nil {
@@ -756,7 +763,7 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 		}
 	}
 
-	// 5. Generate Subtitle Cues from DubScriptVariant or SpeechSubtitle regions
+	// 5. Generate Subtitle Cues grounded in canonical TranslationVariant
 	var subtitleCues []domain.SubtitleCue
 	selector := in.PlacementSelector
 	if selector == nil {
@@ -768,50 +775,142 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 		return nil, fmt.Errorf("query dub script variant index: %w", err)
 	}
 
-	if dubScriptIdx != nil {
-		if dubScriptIdx.CASHash == "" {
-			return nil, fmt.Errorf("corrupt dub script artifact: empty cas_hash in index")
-		}
-		drc, err := s.cas.Get(dubScriptIdx.CASHash)
-		if err != nil {
-			return nil, fmt.Errorf("load dub script from CAS (%s): %w", dubScriptIdx.CASHash, err)
-		}
-		defer drc.Close()
-		var dVariant domain.DubScriptVariant
-		if err := json.NewDecoder(drc).Decode(&dVariant); err != nil {
-			return nil, fmt.Errorf("decode dub script artifact (%s): %w", dubScriptIdx.CASHash, err)
-		}
-		for _, seg := range dVariant.Segments {
-			textToRender := seg.SpokenText
-			if textToRender == "" {
-				textToRender = seg.MeaningText
+	if dubScriptIdx != nil || transIdx != nil {
+		// A localized track is requested/present. Must fail closed on any missing/mismatch/empty artifact.
+		if dubScriptIdx != nil {
+			if dubScriptIdx.CASHash == "" {
+				return nil, fmt.Errorf("dub script variant index has empty CAS hash")
 			}
-			if textToRender == "" {
-				continue
-			}
-			cueProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, seg.StartMs, seg.EndMs, "")
-			cue, err := domain.ComputeCompactSubtitleBoundsWithSelector(
-				plan.FrameWidth,
-				plan.FrameHeight,
-				textToRender,
-				0,
-				0,
-				0,
-				cueProtects,
-				selector,
-			)
+			drc, err := s.cas.Get(dubScriptIdx.CASHash)
 			if err != nil {
-				return nil, fmt.Errorf("place subtitle cue for segment %d: %w", seg.Index, err)
+				return nil, fmt.Errorf("load dub script from CAS (%s): %w", dubScriptIdx.CASHash, err)
 			}
-			cue.ID = fmt.Sprintf("cue-%d", seg.Index)
-			cue.StartMs = seg.StartMs
-			cue.EndMs = seg.EndMs
-			subtitleCues = append(subtitleCues, cue)
-		}
-	}
+			defer drc.Close()
+			var dVariant domain.DubScriptVariant
+			if err := json.NewDecoder(drc).Decode(&dVariant); err != nil {
+				return nil, fmt.Errorf("decode dub script artifact (%s): %w", dubScriptIdx.CASHash, err)
+			}
+			if len(dVariant.Segments) == 0 {
+				return nil, fmt.Errorf("dub script variant has zero segments")
+			}
 
-	// Fallback to speech_subtitle regions in TextRegionPlan if no DubScriptVariant recorded
-	if dubScriptIdx == nil && len(subtitleCues) == 0 {
+			// Load canonical TranslationVariant to cross-check and ground captions
+			var tVariant domain.TranslationVariant
+			if transIdx == nil || transIdx.CASHash == "" {
+				return nil, fmt.Errorf("%w: missing canonical translation index for dub script", domain.ErrTranslationVariantNotFound)
+			}
+			if dVariant.TranslationVariantCAS == "" || dVariant.TranslationVariantCAS != transIdx.CASHash {
+				return nil, fmt.Errorf("%w: dub script translation CAS %q does not match canonical index CAS %q",
+					domain.ErrMeaningPreservationFailed, dVariant.TranslationVariantCAS, transIdx.CASHash)
+			}
+			transCAS := transIdx.CASHash
+			trc, err := s.cas.Get(transCAS)
+			if err != nil {
+				return nil, fmt.Errorf("load translation variant from CAS (%s): %w", transCAS, err)
+			}
+			defer trc.Close()
+			if err := json.NewDecoder(trc).Decode(&tVariant); err != nil {
+				return nil, fmt.Errorf("decode translation variant artifact (%s): %w", transCAS, err)
+			}
+			if len(tVariant.Segments) == 0 {
+				return nil, fmt.Errorf("canonical translation variant has zero segments")
+			}
+			if len(tVariant.Segments) != len(dVariant.Segments) {
+				return nil, fmt.Errorf("%w: translation segment count %d != dub script segment count %d",
+					domain.ErrMeaningPreservationFailed, len(tVariant.Segments), len(dVariant.Segments))
+			}
+
+			for i := range dVariant.Segments {
+				dSeg := dVariant.Segments[i]
+				tSeg := tVariant.Segments[i]
+
+				if dSeg.Index != tSeg.Index {
+					return nil, fmt.Errorf("%w: segment index mismatch at %d: translation=%d, dub=%d",
+						domain.ErrMeaningPreservationFailed, i, tSeg.Index, dSeg.Index)
+				}
+				if dSeg.MeaningText == "" {
+					return nil, fmt.Errorf("canonical translation variant meaning text missing for dub segment %d", dSeg.Index)
+				}
+				if tSeg.TargetText == "" {
+					return nil, fmt.Errorf("canonical translation target text missing for segment %d", tSeg.Index)
+				}
+				if dSeg.MeaningText != tSeg.TargetText {
+					return nil, fmt.Errorf("%w: dub script meaning text %q does not match canonical translation target text %q for segment %d",
+						domain.ErrMeaningPreservationFailed, dSeg.MeaningText, tSeg.TargetText, tSeg.Index)
+				}
+
+				// Caption text strictly grounded in canonical TranslationVariant TargetText as source of truth
+				textToRender := tSeg.TargetText
+				startMs := dSeg.StartMs
+				endMs := dSeg.EndMs
+				if startMs == 0 && endMs == 0 {
+					startMs = tSeg.StartMs
+					endMs = tSeg.EndMs
+				}
+
+				cueProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, startMs, endMs, "")
+				cue, err := domain.ComputeCompactSubtitleBoundsWithSelector(
+					plan.FrameWidth,
+					plan.FrameHeight,
+					textToRender,
+					0,
+					0,
+					0,
+					cueProtects,
+					selector,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("place subtitle cue for segment %d: %w", dSeg.Index, err)
+				}
+				cue.ID = fmt.Sprintf("cue-%d", dSeg.Index)
+				cue.StartMs = startMs
+				cue.EndMs = endMs
+				subtitleCues = append(subtitleCues, cue)
+			}
+		} else {
+			// transIdx != nil && dubScriptIdx == nil
+			if transIdx.CASHash == "" {
+				return nil, fmt.Errorf("translation variant index has empty CAS hash")
+			}
+			trc, err := s.cas.Get(transIdx.CASHash)
+			if err != nil {
+				return nil, fmt.Errorf("load translation variant from CAS (%s): %w", transIdx.CASHash, err)
+			}
+			defer trc.Close()
+			var tVariant domain.TranslationVariant
+			if err := json.NewDecoder(trc).Decode(&tVariant); err != nil {
+				return nil, fmt.Errorf("decode translation variant artifact (%s): %w", transIdx.CASHash, err)
+			}
+			if len(tVariant.Segments) == 0 {
+				return nil, fmt.Errorf("canonical translation variant has zero segments")
+			}
+			for _, seg := range tVariant.Segments {
+				textToRender := seg.TargetText
+				if textToRender == "" {
+					return nil, fmt.Errorf("canonical translation target text missing for segment %d", seg.Index)
+				}
+				cueProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, seg.StartMs, seg.EndMs, "")
+				cue, err := domain.ComputeCompactSubtitleBoundsWithSelector(
+					plan.FrameWidth,
+					plan.FrameHeight,
+					textToRender,
+					0,
+					0,
+					0,
+					cueProtects,
+					selector,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("place subtitle cue for translation segment %d: %w", seg.Index, err)
+				}
+				cue.ID = fmt.Sprintf("cue-%d", seg.Index)
+				cue.StartMs = seg.StartMs
+				cue.EndMs = seg.EndMs
+				subtitleCues = append(subtitleCues, cue)
+			}
+		}
+	} else {
+		// Fallback to speech_subtitle regions in TextRegionPlan ONLY when there is genuinely no localization artifact at all
 		for i, reg := range activePlan.Regions {
 			if reg.Role == domain.TextRoleSpeechSubtitle {
 				cueProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, reg.FirstSeenMs, reg.LastSeenMs, "")
@@ -835,7 +934,6 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			}
 		}
 	}
-
 	// 6. Persist LocalizedSubtitleTrack
 	subTrackProv, err := domain.ComputeSubtitlePlanProvenanceHash(in.AssetID, in.TargetLanguage, subtitleCues, "compact_fit_cues")
 	if err != nil {

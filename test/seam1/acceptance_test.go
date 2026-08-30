@@ -157,6 +157,7 @@ func newRuntimeHost(t *testing.T, db *storage.DB, casStore *cas.Store, queueSvc 
 		AudioMixSvc:    service.NewAudioMixService(db, casStore),
 		VisualTextSvc:  service.NewVisualTextService(db, casStore),
 		RenderSvc:      service.NewRenderService(db, casStore),
+		ReviewSvc:      service.NewReviewService(db, casStore),
 	}), fakeRegistry, router
 }
 

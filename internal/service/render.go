@@ -171,7 +171,7 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 			CueCount:       len(subArt.Cues),
 			CueSpecHash:    domain.ComputeCueSpecHash(subArt.Cues),
 		}
-	} else {
+	} else if len(in.SubtitleCues) > 0 {
 		// Validate provided subtitle cues
 		for i, cue := range in.SubtitleCues {
 			if cue.StartMs < 0 || cue.EndMs <= cue.StartMs {
@@ -213,6 +213,99 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 			Format:         subArt.Format,
 			CueCount:       len(subArt.Cues),
 			CueSpecHash:    cueHash,
+		}
+	} else {
+		// Auto-resolve persisted LocalizedSubtitleTrack if available
+		subTrackIdx, err := s.db.GetLocalizedSubtitleTrackIndex(ctx, in.AssetID, in.TargetLanguage)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("query localized subtitle track index: %w", err)
+		}
+		if subTrackIdx != nil {
+			if subTrackIdx.CASHash == "" {
+				return nil, fmt.Errorf("localized subtitle track index has empty CAS hash")
+			}
+			r, err := s.casStore.Get(subTrackIdx.CASHash)
+			if err != nil {
+				return nil, fmt.Errorf("load localized subtitle track from CAS (%s): %w", subTrackIdx.CASHash, err)
+			}
+			defer r.Close()
+			var subTrack domain.LocalizedSubtitleTrack
+			if err := json.NewDecoder(r).Decode(&subTrack); err != nil {
+				return nil, fmt.Errorf("decode localized subtitle track (%s): %w", subTrackIdx.CASHash, err)
+			}
+			cues = subTrack.Cues
+			cueHash := domain.ComputeCueSpecHash(cues)
+			subProv, err := domain.ComputeSubtitlePlanProvenanceHash(in.AssetID, in.TargetLanguage, cues, "compact_fit_cues")
+			if err != nil {
+				return nil, fmt.Errorf("compute subtitle plan provenance: %w", err)
+			}
+			assContent := media.GenerateASSContent(timeline, cues, s.fontFile)
+			subArt := domain.SubtitlePlanArtifact{
+				ID:             subProv,
+				SchemaVersion:  domain.SubtitlePlanSchemaVersion,
+				AssetID:        in.AssetID,
+				TargetLanguage: in.TargetLanguage,
+				Format:         "compact_fit_cues",
+				Cues:           cues,
+				ASSContent:     assContent,
+				ProvenanceHash: subProv,
+			}
+			artBytes, err := json.Marshal(subArt)
+			if err != nil {
+				return nil, fmt.Errorf("marshal subtitle plan artifact: %w", err)
+			}
+			subObj, err := s.casStore.Put(bytes.NewReader(artBytes))
+			if err != nil {
+				return nil, fmt.Errorf("store subtitle plan artifact in CAS: %w", err)
+			}
+			subArt.CASHash = subObj.SHA256
+			subPlanRef = domain.SubtitlePlanRef{
+				ArtifactID:     subArt.ID,
+				SchemaVersion:  subArt.SchemaVersion,
+				CASHash:        subArt.CASHash,
+				ProvenanceHash: subArt.ProvenanceHash,
+				Format:         subArt.Format,
+				CueCount:       len(subArt.Cues),
+				CueSpecHash:    cueHash,
+			}
+		} else {
+			// Truly absent optional captions -> clean empty subtitle plan
+			cues = []domain.SubtitleCue{}
+			cueHash := domain.ComputeCueSpecHash(cues)
+			subProv, err := domain.ComputeSubtitlePlanProvenanceHash(in.AssetID, in.TargetLanguage, cues, "compact_fit_cues")
+			if err != nil {
+				return nil, fmt.Errorf("compute subtitle plan provenance: %w", err)
+			}
+			assContent := media.GenerateASSContent(timeline, cues, s.fontFile)
+			subArt := domain.SubtitlePlanArtifact{
+				ID:             subProv,
+				SchemaVersion:  domain.SubtitlePlanSchemaVersion,
+				AssetID:        in.AssetID,
+				TargetLanguage: in.TargetLanguage,
+				Format:         "compact_fit_cues",
+				Cues:           cues,
+				ASSContent:     assContent,
+				ProvenanceHash: subProv,
+			}
+			artBytes, err := json.Marshal(subArt)
+			if err != nil {
+				return nil, fmt.Errorf("marshal subtitle plan artifact: %w", err)
+			}
+			subObj, err := s.casStore.Put(bytes.NewReader(artBytes))
+			if err != nil {
+				return nil, fmt.Errorf("store subtitle plan artifact in CAS: %w", err)
+			}
+			subArt.CASHash = subObj.SHA256
+
+			subPlanRef = domain.SubtitlePlanRef{
+				ArtifactID:     subArt.ID,
+				SchemaVersion:  subArt.SchemaVersion,
+				CASHash:        subArt.CASHash,
+				ProvenanceHash: subArt.ProvenanceHash,
+				Format:         subArt.Format,
+				CueCount:       0,
+				CueSpecHash:    cueHash,
+			}
 		}
 	}
 

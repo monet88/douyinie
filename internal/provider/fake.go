@@ -293,8 +293,14 @@ func (p *FakeTTSProvider) SynthesizeSpeech(ctx context.Context, req TTSSynthesis
 			durMs = 100
 		}
 	}
-
-	wavBytes := media.GeneratePCM16WAV(16000, 1, durMs)
+	sampleRate := 16000
+	channels := 1
+	numSamples := (sampleRate * int(durMs)) / 1000
+	ttsSamples := make([]int16, numSamples)
+	for i := range ttsSamples {
+		ttsSamples[i] = 5000 // Deterministic synthesized TTS speech signal
+	}
+	wavBytes := media.EncodePCM16Samples(ttsSamples, sampleRate, channels)
 	sum := sha256.Sum256(wavBytes)
 	shaStr := hex.EncodeToString(sum[:])
 
@@ -354,8 +360,40 @@ func (p *FakeSeparatorProvider) SeparateStems(ctx context.Context, req Separatio
 		return nil, p.InjectError
 	}
 	durationMs := int64(10000)
-	vocals := media.GeneratePCM16WAV(16000, 1, durationMs)
-	bg := media.GeneratePCM16WAV(16000, 1, durationMs)
+	sampleRate := 16000
+	channels := 1
+	totalSamples := (sampleRate * int(durationMs)) / 1000
+
+	bgSamples := make([]int16, totalSamples)
+	for i := range bgSamples {
+		bgSamples[i] = 1000 // Constant BGM baseline
+	}
+	vocalsSamples := make([]int16, totalSamples)
+	if req.AudioRolePlan != nil && len(req.AudioRolePlan.Segments) > 0 {
+		for _, seg := range req.AudioRolePlan.Segments {
+			sStart := (int(seg.StartMs) * sampleRate) / 1000
+			sEnd := (int(seg.EndMs) * sampleRate) / 1000
+			if sStart < 0 {
+				sStart = 0
+			}
+			if sEnd > totalSamples {
+				sEnd = totalSamples
+			}
+			amp := int16(4000)
+			if seg.Role == domain.AudioRoleSingingMusicVocal {
+				amp = 3000
+			}
+			for i := sStart; i < sEnd; i++ {
+				vocalsSamples[i] = amp
+			}
+		}
+	} else {
+		for i := range vocalsSamples {
+			vocalsSamples[i] = 4000
+		}
+	}
+	bg := media.EncodePCM16Samples(bgSamples, sampleRate, channels)
+	vocals := media.EncodePCM16Samples(vocalsSamples, sampleRate, channels)
 	return &SeparationResult{
 		ProviderID:    p.ProviderID,
 		ModelName:     p.ModelName,
@@ -363,8 +401,8 @@ func (p *FakeSeparatorProvider) SeparateStems(ctx context.Context, req Separatio
 		VocalsWAV:     vocals,
 		BackgroundWAV: bg,
 		DurationMs:    durationMs,
-		SampleRate:    16000,
-		Channels:      1,
+		SampleRate:    sampleRate,
+		Channels:      channels,
 	}, nil
 }
 

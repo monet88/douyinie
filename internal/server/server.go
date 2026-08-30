@@ -45,6 +45,7 @@ type Server struct {
 	audioMixSvc    *service.AudioMixService
 	visualTextSvc  *service.VisualTextService
 	renderSvc      *service.RenderService
+	reviewSvc      *service.ReviewService
 	mux            *http.ServeMux
 	server         *http.Server
 }
@@ -69,6 +70,7 @@ type Config struct {
 	AudioMixSvc    *service.AudioMixService    // Audio stems + soundtrack preservation + dialogue-suppression mix (T15)
 	VisualTextSvc  *service.VisualTextService  // OCR detection, tracking, and TextRegionPlan (T09)
 	RenderSvc      *service.RenderService      // NativeRenderBackend + frozen RenderPlan + preview/final parity (T11)
+	ReviewSvc      *service.ReviewService      // Exception-only ReviewItem projection service (T16)
 }
 
 // New creates a new RuntimeHost Server instance.
@@ -90,6 +92,9 @@ func New(cfg Config) *Server {
 	}
 	if cfg.Scheduler == nil {
 		cfg.Scheduler = scheduler.New()
+	}
+	if cfg.ReviewSvc == nil && cfg.DB != nil && cfg.CASStore != nil {
+		cfg.ReviewSvc = service.NewReviewService(cfg.DB, cfg.CASStore)
 	}
 
 	// Wire router-backed speech defaults when both are available.
@@ -133,6 +138,7 @@ func New(cfg Config) *Server {
 		audioMixSvc:    cfg.AudioMixSvc,
 		visualTextSvc:  cfg.VisualTextSvc,
 		renderSvc:      cfg.RenderSvc,
+		reviewSvc:      cfg.ReviewSvc,
 		mux:            http.NewServeMux(),
 	}
 	s.routes()
@@ -198,6 +204,11 @@ func (s *Server) SetVisualTextService(svc *service.VisualTextService) {
 // SetRenderService sets or replaces the injected render pipeline (T11).
 func (s *Server) SetRenderService(svc *service.RenderService) {
 	s.renderSvc = svc
+}
+
+// SetReviewService sets or replaces the injected review projection service (T16).
+func (s *Server) SetReviewService(svc *service.ReviewService) {
+	s.reviewSvc = svc
 }
 
 // Handler returns the underlying http.Handler for in-memory / testing purposes.
@@ -321,6 +332,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/render/preview", s.handleGetRenderPreview)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/render/final", s.handleRenderFinal)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/render/final", s.handleGetRenderFinal)
+	// Exception-only Review Items Projection (T16)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/review-items", s.handleGetReviewItems)
+	s.mux.HandleFunc("GET /api/v1/runs/{id}/review-items", s.handleGetRunReviewItems)
 }
 
 // JSON helpers
@@ -2536,4 +2550,69 @@ func (s *Server) handleGetRenderFinal(w http.ResponseWriter, r *http.Request) {
 	art.CASHash = idx.CASHash
 	art.ProvenanceHash = idx.ProvenanceHash
 	writeJSON(w, http.StatusOK, map[string]any{"final_render": art})
+}
+
+// ReviewItem projection handlers (T16)
+
+func (s *Server) handleGetReviewItems(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if s.reviewSvc == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+	targetLang := r.URL.Query().Get("target_language")
+	if targetLang == "" {
+		targetLang = "vi"
+	}
+	items, err := s.reviewSvc.ProjectReviewItems(r.Context(), assetID, targetLang)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if items == nil {
+		items = []domain.ReviewItem{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"asset_id":        assetID,
+		"target_language": targetLang,
+		"review_items":    items,
+		"count":           len(items),
+	})
+}
+
+func (s *Server) handleGetRunReviewItems(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+	if s.reviewSvc == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+	run, err := s.db.GetRun(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	job, err := s.db.GetJob(r.Context(), run.JobID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	items, err := s.reviewSvc.ProjectReviewItems(r.Context(), job.SourceAssetID, job.TargetLanguage)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if items == nil {
+		items = []domain.ReviewItem{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"run_id":          runID,
+		"asset_id":        job.SourceAssetID,
+		"target_language": job.TargetLanguage,
+		"review_items":    items,
+		"count":           len(items),
+	})
 }
