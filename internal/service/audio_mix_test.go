@@ -3,7 +3,6 @@ package service_test
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -145,6 +144,23 @@ func TestAudioMixService_ZeroSpokenSpeechPassthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("save source asset: %v", err)
 	}
+	// Save PreflightReport in DB
+	preflight := domain.PreflightReport{
+		ID:                     "preflight_" + assetID,
+		AssetID:                assetID,
+		DurationSec:            3.0,
+		DurationMs:             3000,
+		AudioChannels:          1,
+		AudioSampleRate:        16000,
+		ContainerValid:         true,
+		FingerprintMatch:       true,
+		NormalizedAudioSHA256:  mediaObj.SHA256,
+		NormalizedAudioCASPath: mediaObj.Path,
+		CreatedAt:              time.Now().UTC(),
+	}
+	if err := db.SavePreflightReport(ctx, preflight); err != nil {
+		t.Fatalf("save preflight report: %v", err)
+	}
 
 	// Save AudioRolePlan with 0 spoken dialogue segments (only BGM/Instrumental)
 	rolePlan := domain.AudioRolePlan{
@@ -158,31 +174,10 @@ func TestAudioMixService_ZeroSpokenSpeechPassthrough(t *testing.T) {
 		t.Fatalf("save audio role plan: %v", err)
 	}
 
-	// Create stems in CAS
-	bgObj, _ := casStore.Put(bytes.NewReader(dummyMedia))
-	stemsArtifact := domain.AudioStemArtifacts{
-		ID:            "stems_" + assetID,
-		SchemaVersion: domain.AudioStemsSchemaVersion,
-		AssetID:       assetID,
-		Stems: []domain.AudioStem{
-			{
-				Type:         domain.StemTypeBackground,
-				AudioCASHash: bgObj.SHA256,
-				SampleRate:   16000,
-				Channels:     1,
-				DurationMs:   3000,
-			},
-		},
-		CreatedAt: time.Now().UTC(),
-	}
-	stemsBytes, _ := json.Marshal(stemsArtifact)
-	stemsObj, _ := casStore.Put(bytes.NewReader(stemsBytes))
-
 	mixArtifact, err := mixSvc.MixAudio(ctx, service.AudioMixInput{
 		RunID:          runID,
 		AssetID:        assetID,
 		TargetLanguage: "vi",
-		AudioStemsCAS:  stemsObj.SHA256,
 	})
 	if err != nil {
 		t.Fatalf("zero-speech mix failed: %v", err)
@@ -195,5 +190,17 @@ func TestAudioMixService_ZeroSpokenSpeechPassthrough(t *testing.T) {
 	}
 	if !mixArtifact.SoundtrackPreserved {
 		t.Errorf("expected SoundtrackPreserved = true")
+	}
+	if mixArtifact.AudioCASHash != mediaObj.SHA256 {
+		t.Errorf("expected bitstream-exact AudioCASHash %s, got %s", mediaObj.SHA256, mixArtifact.AudioCASHash)
+	}
+	if mixArtifact.AudioCASPath != mediaObj.Path {
+		t.Errorf("expected AudioCASPath %s, got %s", mediaObj.Path, mixArtifact.AudioCASPath)
+	}
+	if mixArtifact.DubSegmentsCAS != "" {
+		t.Errorf("expected empty DubSegmentsCAS, got %s", mixArtifact.DubSegmentsCAS)
+	}
+	if mixArtifact.AudioStemsCAS != "" {
+		t.Errorf("expected empty AudioStemsCAS on clean passthrough, got %s", mixArtifact.AudioStemsCAS)
 	}
 }

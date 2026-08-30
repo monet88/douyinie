@@ -2587,3 +2587,158 @@ func TestDubbingService_SynthesizeAndFit_Regroup_UnresolvedWithoutFurtherBlocks_
 		t.Errorf("expected overall status REVIEW_REQUIRED, got %s", variant.OverallStatus)
 	}
 }
+
+func TestDubbingService_SynthesizeAndFit_MissingAudioRolePlan_FailsClosed(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+
+	_ = db.CreateRightsAttestation(context.Background(), domain.RightsAttestation{
+		ID:              "att-" + assetID,
+		AttestationType: "OWNER_DIRECT",
+		DeclaredBy:      "tester",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	})
+	_ = db.CreateSourceAsset(context.Background(), domain.SourceAsset{
+		ID:                  assetID,
+		SHA256:              "sha256_" + assetID,
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		RightsAttestationID: "att-" + assetID,
+		CASPath:             "/mock.mp4",
+		CreatedAt:           time.Now().UTC(),
+	})
+	_ = db.CreateJob(context.Background(), domain.LocalizationJob{
+		ID:             "job-" + assetID,
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+	})
+	_, _ = db.CreateRunEnqueued(context.Background(), domain.LocalizationRun{
+		ID:                 runID,
+		JobID:              "job-" + assetID,
+		Status:             "running",
+		ConfigSnapshotJSON: "{}",
+		CreatedAt:          time.Now().UTC(),
+	}, "job-"+assetID)
+
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SpeakerID:      "SPEAKER_00",
+				StartMs:        0,
+				EndMs:          2000,
+				SlotDurationMs: 2000,
+				SpokenText:     "Câu thoại kiểm tra.",
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	scriptBytes, _ := json.Marshal(dubScript)
+	scriptCAS, _ := casStore.Put(bytes.NewReader(scriptBytes))
+
+	// Deliberately do NOT save AudioRolePlan. SynthesizeAndFit must fail closed.
+	_, err := dubSvc.SynthesizeAndFit(context.Background(), domain.DubbingJobInput{
+		AssetID:             assetID,
+		RunID:               runID,
+		TargetLanguage:      "vi",
+		DubScriptVariantCAS: scriptCAS.SHA256,
+	})
+	if err == nil {
+		t.Fatal("expected error due to missing AudioRolePlan, got nil")
+	}
+	if !errors.Is(err, domain.ErrAudioRolePlanRequired) {
+		t.Errorf("expected ErrAudioRolePlanRequired, got %v", err)
+	}
+}
+
+func TestDubbingService_SynthesizeAndFit_NoDubPlan_ReturnsErrNoDubbingRequired(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+
+	_ = db.CreateRightsAttestation(context.Background(), domain.RightsAttestation{
+		ID:              "att-" + assetID,
+		AttestationType: "OWNER_DIRECT",
+		DeclaredBy:      "tester",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	})
+	_ = db.CreateSourceAsset(context.Background(), domain.SourceAsset{
+		ID:                  assetID,
+		SHA256:              "sha256_" + assetID,
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		RightsAttestationID: "att-" + assetID,
+		CASPath:             "/mock.mp4",
+		CreatedAt:           time.Now().UTC(),
+	})
+	_ = db.CreateJob(context.Background(), domain.LocalizationJob{
+		ID:             "job-" + assetID,
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+	})
+	_, _ = db.CreateRunEnqueued(context.Background(), domain.LocalizationRun{
+		ID:                 runID,
+		JobID:              "job-" + assetID,
+		Status:             "running",
+		ConfigSnapshotJSON: "{}",
+		CreatedAt:          time.Now().UTC(),
+	}, "job-"+assetID)
+
+	// Save AudioRolePlan with 0 dialogue segments (Instrumental BGM only)
+	_ = db.SaveAudioRolePlan(context.Background(), domain.AudioRolePlan{
+		ID:        "plan-" + assetID,
+		AssetID:   assetID,
+		CreatedAt: time.Now().UTC(),
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+	})
+
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SpeakerID:      "SPEAKER_00",
+				StartMs:        0,
+				EndMs:          2000,
+				SlotDurationMs: 2000,
+				SpokenText:     "Câu thoại kiểm tra.",
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	scriptBytes, _ := json.Marshal(dubScript)
+	scriptCAS, _ := casStore.Put(bytes.NewReader(scriptBytes))
+
+	_, err := dubSvc.SynthesizeAndFit(context.Background(), domain.DubbingJobInput{
+		AssetID:             assetID,
+		RunID:               runID,
+		TargetLanguage:      "vi",
+		DubScriptVariantCAS: scriptCAS.SHA256,
+	})
+	if err == nil {
+		t.Fatal("expected ErrNoDubbingRequired on no-dub AudioRolePlan, got nil")
+	}
+	if !errors.Is(err, domain.ErrNoDubbingRequired) {
+		t.Errorf("expected ErrNoDubbingRequired, got %v", err)
+	}
+}

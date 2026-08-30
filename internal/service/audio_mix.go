@@ -298,7 +298,106 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 	// Check if there are dub-eligible segments in the role plan
 	hasDubEligibleSpeech := domain.IsDubEligible(rolePlan)
 
-	// 2. Load or compute AudioStems
+	// 2. If valid rolePlan has no dub-eligible speech, perform bitstream-exact passthrough
+	if !hasDubEligibleSpeech {
+		report, err := s.db.GetPreflightReport(ctx, input.AssetID)
+		if err != nil {
+			return nil, fmt.Errorf("preflight report required for no-dub audio passthrough: %w", err)
+		}
+		if report.NormalizedAudioSHA256 == "" || report.NormalizedAudioCASPath == "" {
+			return nil, fmt.Errorf("normalized audio missing from preflight report for asset %s", input.AssetID)
+		}
+		if _, err := os.Stat(report.NormalizedAudioCASPath); err != nil {
+			return nil, fmt.Errorf("normalized audio CAS artifact missing at %s: %w", report.NormalizedAudioCASPath, err)
+		}
+
+		durMs := report.DurationMs
+		if durMs <= 0 {
+			durMs = int64(report.DurationSec * 1000)
+		}
+		sampleRate := report.AudioSampleRate
+		if sampleRate <= 0 {
+			sampleRate = 16000
+		}
+		channels := report.AudioChannels
+		if channels <= 0 {
+			channels = 1
+		}
+
+		crossfadeMs := input.CrossfadeDurationMs
+		if crossfadeMs <= 0 {
+			crossfadeMs = 25
+		}
+		preservationPlan := domain.SoundtrackPreservationPlan{
+			AssetID:             input.AssetID,
+			PreserveSinging:     true,
+			PreserveSFX:         true,
+			PreserveAmbience:    true,
+			CrossfadeDurationMs: crossfadeMs,
+			DuckingGainDb:       input.DuckingGainDb,
+			SpeechWindows:       make([]domain.PreservationWindow, 0),
+			SingingWindows:      make([]domain.PreservationWindow, 0),
+		}
+
+		provHash, _ := domain.ComputeDubMixProvenanceHash(
+			input.AssetID,
+			input.TargetLanguage,
+			"",
+			"",
+			preservationPlan,
+		)
+
+		mixArtifact := domain.DubMixArtifact{
+			ID:                  uuid.NewString(),
+			SchemaVersion:       domain.DubMixSchemaVersion,
+			AssetID:             input.AssetID,
+			RunID:               input.RunID,
+			JobID:               input.JobID,
+			TargetLanguage:      input.TargetLanguage,
+			AudioCASHash:        report.NormalizedAudioSHA256,
+			AudioCASPath:        report.NormalizedAudioCASPath,
+			SampleRate:          sampleRate,
+			Channels:            channels,
+			Format:              "wav",
+			DurationMs:          durMs,
+			DubSegmentsCAS:      "",
+			AudioStemsCAS:       "",
+			PreservationPlan:    preservationPlan,
+			DialogueSuppressed:  false,
+			SoundtrackPreserved: true,
+			ProvenanceHash:      provHash,
+			OverallStatus:       "PASS",
+			CreatedAt:           time.Now().UTC(),
+		}
+
+		mixBytes, err := json.Marshal(mixArtifact)
+		if err != nil {
+			return nil, fmt.Errorf("marshal dub mix artifact: %w", err)
+		}
+		mixObj, err := s.cas.Put(bytes.NewReader(mixBytes))
+		if err != nil {
+			return nil, fmt.Errorf("store dub mix artifact in CAS: %w", err)
+		}
+		mixArtifact.CASHash = mixObj.SHA256
+
+		err = s.db.SaveDubMixArtifactIndex(ctx, storage.DubMixArtifactIndex{
+			ID:             mixArtifact.ID,
+			AssetID:        mixArtifact.AssetID,
+			RunID:          mixArtifact.RunID,
+			JobID:          mixArtifact.JobID,
+			TargetLanguage: mixArtifact.TargetLanguage,
+			CASHash:        mixArtifact.CASHash,
+			ProvenanceHash: mixArtifact.ProvenanceHash,
+			OverallStatus:  mixArtifact.OverallStatus,
+			CreatedAt:      mixArtifact.CreatedAt,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("persist dub mix artifact index: %w", err)
+		}
+		return &mixArtifact, nil
+	}
+
+	// 2. Load or compute AudioStems (for dub-eligible audio mixing)
 	var stemsArtifact *domain.AudioStemArtifacts
 	var stemsCASRef string
 	if input.AudioStemsCAS != "" {
@@ -340,7 +439,6 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 			return nil, fmt.Errorf("separate audio stems: %w", err)
 		}
 	}
-
 	// 3. Load DubSegments (if speech is present and dubbing required)
 	var dubSegments *domain.DubSegmentsVariant
 	var dubSegmentsCASRef string
@@ -618,12 +716,6 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 		ProvenanceHash:      provHash,
 		OverallStatus:       "PASS",
 		CreatedAt:           time.Now().UTC(),
-	}
-
-	// If asset has no speech, mark cleanly as preserved passthrough
-	if !hasDubEligibleSpeech {
-		mixArtifact.DialogueSuppressed = false
-		mixArtifact.SoundtrackPreserved = true
 	}
 
 	mixBytes, err := json.Marshal(mixArtifact)
