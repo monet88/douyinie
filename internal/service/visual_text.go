@@ -35,9 +35,10 @@ type OCRInvokeFunc func(ctx context.Context, p provider.Provider, req provider.O
 //  4. Confidence evidence & protected metadata: Persists per-region detection quality metrics
 //     and protection flags for tutorial controls, timeline tracks, and tap targets.
 type VisualTextService struct {
-	db     *storage.DB
-	cas    *cas.Store
-	router *provider.Router
+	db             *storage.DB
+	cas            *cas.Store
+	router         *provider.Router
+	translationSvc *TranslationService
 
 	// OCRInvoke executes one OCR detection attempt.
 	// When nil, router-backed invocation is used.
@@ -45,6 +46,9 @@ type VisualTextService struct {
 
 	// ClassifyConfig optionally supplies custom classification heuristics.
 	ClassifyConfig func(w, h int) domain.TextRegionClassifyConfig
+
+	// SubtitlePlacementSelector optionally supplies a pluggable AI/heuristic subtitle placement selector.
+	SubtitlePlacementSelector domain.SubtitlePlacementSelector
 }
 
 // NewVisualTextService creates a new VisualTextService instance.
@@ -55,9 +59,13 @@ func NewVisualTextService(db *storage.DB, casStore *cas.Store) *VisualTextServic
 	}
 }
 
-// ConfigureRouter injects the provider router.
 func (s *VisualTextService) ConfigureRouter(router *provider.Router) {
 	s.router = router
+}
+
+// SetTranslationService injects the TranslationService used to translate semantic/UI text.
+func (s *VisualTextService) SetTranslationService(svc *TranslationService) {
+	s.translationSvc = svc
 }
 
 // VisualTextDetectionInput defines input parameters for visual text detection and tracking.
@@ -413,4 +421,526 @@ func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, c
 	}
 
 	return results
+}
+
+// LocalizeVisualTrackInput defines input parameters to generate LocalizedVisualTrack and LocalizedSubtitleTrack.
+type LocalizeVisualTrackInput struct {
+	RunID                 string                           `json:"run_id"`
+	AssetID               string                           `json:"asset_id"`
+	JobID                 string                           `json:"job_id,omitempty"`
+	TargetLanguage        string                           `json:"target_language"`
+	Overrides             []domain.RegionOverride          `json:"overrides,omitempty"`
+	InpaintingFallbacks   []string                         `json:"inpainting_fallbacks,omitempty"` // Region IDs where inpainting fallback is explicitly requested
+	SceneProtectedRegions []domain.SceneProtectedRegion    `json:"scene_protected_regions,omitempty"`
+	PlacementSelector     domain.SubtitlePlacementSelector `json:"-"`
+}
+
+// ApplyRegionOverrides applies direct-manipulation overrides (drag/resize/reclassify/text) to a TextRegionPlan.
+// Unknown RegionOverride IDs return an error. Bounding box coordinates and sizes clamp to frame bounds.
+func ApplyRegionOverrides(plan *domain.TextRegionPlan, overrides []domain.RegionOverride) (*domain.TextRegionPlan, error) {
+	if plan == nil {
+		return nil, errors.New("plan is nil")
+	}
+	if len(overrides) == 0 {
+		return plan, nil
+	}
+
+	frameW := plan.FrameWidth
+	if frameW <= 0 {
+		frameW = 1080
+	}
+	frameH := plan.FrameHeight
+	if frameH <= 0 {
+		frameH = 1920
+	}
+
+	// Build map of existing region IDs to validate overrides
+	existingRegionIDs := make(map[string]bool, len(plan.Regions))
+	for _, reg := range plan.Regions {
+		existingRegionIDs[reg.ID] = true
+	}
+
+	overrideMap := make(map[string]domain.RegionOverride, len(overrides))
+	for _, ov := range overrides {
+		regID := strings.TrimSpace(ov.RegionID)
+		if regID == "" {
+			return nil, fmt.Errorf("%w: region_id is required", domain.ErrRegionOverrideInvalid)
+		}
+		if !existingRegionIDs[regID] {
+			return nil, fmt.Errorf("%w: unknown region_id %q", domain.ErrRegionOverrideInvalid, regID)
+		}
+		overrideMap[regID] = ov
+	}
+
+	// Clone plan
+	updatedRegions := make([]domain.TrackedTextRegion, len(plan.Regions))
+	copy(updatedRegions, plan.Regions)
+
+	for i, reg := range updatedRegions {
+		ov, found := overrideMap[reg.ID]
+		if !found {
+			continue
+		}
+
+		if ov.NewRole != nil {
+			if !domain.IsValidTextRegionRole(*ov.NewRole) {
+				return nil, fmt.Errorf("%w: invalid role '%s'", domain.ErrRegionOverrideInvalid, *ov.NewRole)
+			}
+			reg.Role = *ov.NewRole
+		}
+		if ov.NewText != nil {
+			reg.Text = *ov.NewText
+		}
+		if ov.IsProtected != nil {
+			reg.ProtectedMetadata.IsProtected = *ov.IsProtected
+			if *ov.IsProtected && reg.ProtectedMetadata.Reason == "" {
+				reg.ProtectedMetadata.Reason = "manual_override_protection"
+			}
+		}
+
+		// Apply bounding box deltas (drag / resize) to all keyframes and clamp to frame bounds
+		if ov.BoxDeltaX != 0 || ov.BoxDeltaY != 0 || ov.BoxDeltaW != 0 || ov.BoxDeltaH != 0 {
+			for k := range reg.Keyframes {
+				b := reg.Keyframes[k].Box
+				b.X += ov.BoxDeltaX
+				b.Y += ov.BoxDeltaY
+				b.Width += ov.BoxDeltaW
+				b.Height += ov.BoxDeltaH
+
+				// Enforce minimum dimension
+				if b.Width < 1 {
+					b.Width = 1
+				}
+				if b.Height < 1 {
+					b.Height = 1
+				}
+
+				// Clamp position and size within [0, frameW] and [0, frameH]
+				if b.X < 0 {
+					b.X = 0
+				}
+				if b.Y < 0 {
+					b.Y = 0
+				}
+				if b.X >= frameW {
+					b.X = frameW - 1
+				}
+				if b.Y >= frameH {
+					b.Y = frameH - 1
+				}
+				if b.X+b.Width > frameW {
+					b.Width = frameW - b.X
+				}
+				if b.Y+b.Height > frameH {
+					b.Height = frameH - b.Y
+				}
+
+				reg.Keyframes[k].Box = b
+			}
+		}
+
+		updatedRegions[i] = reg
+	}
+
+	clone := *plan
+	clone.Regions = updatedRegions
+	return &clone, nil
+}
+
+// LocalizeVisualTrack builds the LocalizedVisualTrack (and underlying LocalizedSubtitleTrack)
+// with deterministic in-place cover/overlay, standard instructional UI terminology,
+// scale-aware compact fit-content subtitle box, and scene-aware non-occlusion.
+func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in LocalizeVisualTrackInput) (*domain.LocalizedVisualTrack, error) {
+	if strings.TrimSpace(in.AssetID) == "" {
+		return nil, errors.New("asset_id is required")
+	}
+	if !domain.IsValidTargetLanguage(in.TargetLanguage) {
+		return nil, fmt.Errorf("%w: %s", domain.ErrInvalidTargetLanguage, in.TargetLanguage)
+	}
+
+	// 1. Load latest TextRegionPlan
+	planIdx, err := s.db.GetTextRegionPlanIndex(ctx, in.AssetID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrTextRegionPlanNotFound, err)
+	}
+	rc, err := s.cas.Get(planIdx.CASHash)
+	if err != nil {
+		return nil, fmt.Errorf("read text region plan from CAS: %w", err)
+	}
+	defer rc.Close()
+	var plan domain.TextRegionPlan
+	if err := json.NewDecoder(rc).Decode(&plan); err != nil {
+		return nil, fmt.Errorf("decode text region plan: %w", err)
+	}
+	plan.CASHash = planIdx.CASHash
+	plan.ProvenanceHash = planIdx.ProvenanceHash
+
+	// 2. Apply any operator overrides (direct manipulation / reclassification)
+	activePlan, err := ApplyRegionOverrides(&plan, in.Overrides)
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. Extract protected regions for non-occlusion collision checks
+	// Set of region IDs marked for inpainting fallback
+	inpaintSet := make(map[string]bool)
+	for _, id := range in.InpaintingFallbacks {
+		inpaintSet[id] = true
+	}
+
+	// Scale-aware overlay parameters
+	overlayPaddingX := int(float64(plan.FrameWidth) * 0.015) // ~16px for 1080w
+	if overlayPaddingX < 12 {
+		overlayPaddingX = 12
+	} else if overlayPaddingX > 24 {
+		overlayPaddingX = 24
+	}
+	overlayPaddingY := int(float64(plan.FrameHeight) * 0.005) // ~10px for 1920h
+	if overlayPaddingY < 6 {
+		overlayPaddingY = 6
+	} else if overlayPaddingY > 16 {
+		overlayPaddingY = 16
+	}
+	overlayFontSize := int(float64(plan.FrameHeight) * 0.016) // ~30px for 1920h
+	if overlayFontSize < 18 {
+		overlayFontSize = 18
+	}
+
+	// 4. Generate Overlays for semantic_text & instructional_ui_text
+	var overlays []domain.LocalizedOverlayItem
+	for _, reg := range activePlan.Regions {
+		switch reg.Role {
+		case domain.TextRoleSemanticText:
+			if s.translationSvc == nil {
+				return nil, fmt.Errorf("translation service is required to localize semantic text %q: %w", reg.Text, domain.ErrTranslationFailed)
+			}
+			tRes, err := s.translationSvc.Translate(ctx, domain.TranslationJobInput{
+				RunID:          in.RunID,
+				AssetID:        in.AssetID,
+				JobID:          in.JobID,
+				SourceLanguage: "zh",
+				TargetLanguage: in.TargetLanguage,
+				Segments: []domain.TranslationInputSegment{
+					{Index: 0, SourceText: reg.Text},
+				},
+			})
+			if err != nil {
+				return nil, fmt.Errorf("translate semantic text %q: %w", reg.Text, err)
+			}
+			if tRes == nil || len(tRes.Segments) == 0 || tRes.Segments[0].TargetText == "" {
+				return nil, fmt.Errorf("translate semantic text %q: empty translation result", reg.Text)
+			}
+			locText := tRes.Segments[0].TargetText
+
+			baseBox := domain.BoundingBox{Width: int(float64(plan.FrameWidth) * 0.25), Height: overlayFontSize + 2*overlayPaddingY}
+			if len(reg.Keyframes) > 0 {
+				baseBox = reg.Keyframes[0].Box
+			}
+			charWidth := int(float64(overlayFontSize) * 0.55)
+			fitW := len([]rune(locText))*charWidth + 2*overlayPaddingX
+			fitH := overlayFontSize + 2*overlayPaddingY
+			boxW := baseBox.Width
+			if fitW > boxW {
+				boxW = fitW
+			}
+			boxH := baseBox.Height
+			if fitH > boxH {
+				boxH = fitH
+			}
+			if baseBox.X+boxW > plan.FrameWidth {
+				boxW = plan.FrameWidth - baseBox.X
+			}
+			if baseBox.Y+boxH > plan.FrameHeight {
+				boxH = plan.FrameHeight - baseBox.Y
+			}
+			repBox := domain.BoundingBox{X: baseBox.X, Y: baseBox.Y, Width: boxW, Height: boxH}
+
+			// Non-occlusion check: verify overlay does not overlap other protected obstacles during its time window
+			overlayProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, reg.FirstSeenMs, reg.LastSeenMs, reg.ID)
+			for _, prot := range overlayProtects {
+				if domain.BoxesOverlap(repBox, prot) {
+					return nil, fmt.Errorf("%w: overlay for semantic text %q (box %+v) occludes protected region (box %+v)",
+						domain.ErrSubtitleOverlapsProtectedRegion, reg.ID, repBox, prot)
+				}
+			}
+
+			isInpainting := inpaintSet[reg.ID] // Non-default fallback
+			overlays = append(overlays, domain.LocalizedOverlayItem{
+				RegionID:       reg.ID,
+				Role:           reg.Role,
+				SourceText:     reg.Text,
+				LocalizedText:  locText,
+				StartMs:        reg.FirstSeenMs,
+				EndMs:          reg.LastSeenMs,
+				Box:            repBox,
+				IsCoverDefault: !isInpainting,
+				Inpainting:     isInpainting,
+				BoxColor:       "black@0.8",
+				FontColor:      "#FFFFFF",
+				FontSizePx:     overlayFontSize,
+				PaddingX:       overlayPaddingX,
+				PaddingY:       overlayPaddingY,
+			})
+
+		case domain.TextRoleInstructionalUIText:
+			if s.translationSvc == nil {
+				return nil, fmt.Errorf("translation service is required to localize instructional UI text %q: %w", reg.Text, domain.ErrTranslationFailed)
+			}
+			tRes, err := s.translationSvc.Translate(ctx, domain.TranslationJobInput{
+				RunID:          in.RunID,
+				AssetID:        in.AssetID,
+				JobID:          in.JobID,
+				SourceLanguage: "zh",
+				TargetLanguage: in.TargetLanguage,
+				Segments: []domain.TranslationInputSegment{
+					{Index: 0, SourceText: reg.Text},
+				},
+			})
+			if err != nil {
+				return nil, fmt.Errorf("translate instructional UI text %q: %w", reg.Text, err)
+			}
+			if tRes == nil || len(tRes.Segments) == 0 || tRes.Segments[0].TargetText == "" {
+				return nil, fmt.Errorf("translate instructional UI text %q: empty translation result", reg.Text)
+			}
+			locText := domain.NormalizeInstructionalUIText(tRes.Segments[0].TargetText, reg.Text, in.TargetLanguage)
+
+			baseBox := domain.BoundingBox{Width: int(float64(plan.FrameWidth) * 0.15), Height: overlayFontSize + 2*overlayPaddingY}
+			if len(reg.Keyframes) > 0 {
+				baseBox = reg.Keyframes[0].Box
+			}
+			charWidth := int(float64(overlayFontSize) * 0.55)
+			fitW := len([]rune(locText))*charWidth + 2*overlayPaddingX
+			fitH := overlayFontSize + 2*overlayPaddingY
+			boxW := baseBox.Width
+			if fitW > boxW {
+				boxW = fitW
+			}
+			boxH := baseBox.Height
+			if fitH > boxH {
+				boxH = fitH
+			}
+			if baseBox.X+boxW > plan.FrameWidth {
+				boxW = plan.FrameWidth - baseBox.X
+			}
+			if baseBox.Y+boxH > plan.FrameHeight {
+				boxH = plan.FrameHeight - baseBox.Y
+			}
+			repBox := domain.BoundingBox{X: baseBox.X, Y: baseBox.Y, Width: boxW, Height: boxH}
+
+			// Non-occlusion check: verify overlay does not overlap other protected obstacles during its time window
+			overlayProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, reg.FirstSeenMs, reg.LastSeenMs, reg.ID)
+			for _, prot := range overlayProtects {
+				if domain.BoxesOverlap(repBox, prot) {
+					return nil, fmt.Errorf("%w: overlay for instructional UI %q (box %+v) occludes protected region (box %+v)",
+						domain.ErrSubtitleOverlapsProtectedRegion, reg.ID, repBox, prot)
+				}
+			}
+
+			isInpainting := inpaintSet[reg.ID]
+			overlays = append(overlays, domain.LocalizedOverlayItem{
+				RegionID:       reg.ID,
+				Role:           reg.Role,
+				SourceText:     reg.Text,
+				LocalizedText:  locText,
+				StartMs:        reg.FirstSeenMs,
+				EndMs:          reg.LastSeenMs,
+				Box:            repBox,
+				IsCoverDefault: !isInpainting,
+				Inpainting:     isInpainting,
+				BoxColor:       "#1E1E1E@0.9",
+				FontColor:      "#00E5FF",
+				FontSizePx:     overlayFontSize,
+				PaddingX:       overlayPaddingX,
+				PaddingY:       overlayPaddingY,
+			})
+		}
+	}
+
+	// 5. Generate Subtitle Cues from DubScriptVariant or SpeechSubtitle regions
+	var subtitleCues []domain.SubtitleCue
+	selector := in.PlacementSelector
+	if selector == nil {
+		selector = s.SubtitlePlacementSelector
+	}
+
+	dubScriptIdx, err := s.db.GetDubScriptVariantIndex(ctx, in.AssetID, in.TargetLanguage)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return nil, fmt.Errorf("query dub script variant index: %w", err)
+	}
+
+	if dubScriptIdx != nil {
+		if dubScriptIdx.CASHash == "" {
+			return nil, fmt.Errorf("corrupt dub script artifact: empty cas_hash in index")
+		}
+		drc, err := s.cas.Get(dubScriptIdx.CASHash)
+		if err != nil {
+			return nil, fmt.Errorf("load dub script from CAS (%s): %w", dubScriptIdx.CASHash, err)
+		}
+		defer drc.Close()
+		var dVariant domain.DubScriptVariant
+		if err := json.NewDecoder(drc).Decode(&dVariant); err != nil {
+			return nil, fmt.Errorf("decode dub script artifact (%s): %w", dubScriptIdx.CASHash, err)
+		}
+		for _, seg := range dVariant.Segments {
+			textToRender := seg.SpokenText
+			if textToRender == "" {
+				textToRender = seg.MeaningText
+			}
+			if textToRender == "" {
+				continue
+			}
+			cueProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, seg.StartMs, seg.EndMs, "")
+			cue, err := domain.ComputeCompactSubtitleBoundsWithSelector(
+				plan.FrameWidth,
+				plan.FrameHeight,
+				textToRender,
+				0,
+				0,
+				0,
+				cueProtects,
+				selector,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("place subtitle cue for segment %d: %w", seg.Index, err)
+			}
+			cue.ID = fmt.Sprintf("cue-%d", seg.Index)
+			cue.StartMs = seg.StartMs
+			cue.EndMs = seg.EndMs
+			subtitleCues = append(subtitleCues, cue)
+		}
+	}
+
+	// Fallback to speech_subtitle regions in TextRegionPlan if no DubScriptVariant recorded
+	if dubScriptIdx == nil && len(subtitleCues) == 0 {
+		for i, reg := range activePlan.Regions {
+			if reg.Role == domain.TextRoleSpeechSubtitle {
+				cueProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, reg.FirstSeenMs, reg.LastSeenMs, "")
+				cue, err := domain.ComputeCompactSubtitleBoundsWithSelector(
+					plan.FrameWidth,
+					plan.FrameHeight,
+					reg.Text,
+					0,
+					0,
+					0,
+					cueProtects,
+					selector,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("place subtitle cue for region %s: %w", reg.ID, err)
+				}
+				cue.ID = fmt.Sprintf("sub-%d", i)
+				cue.StartMs = reg.FirstSeenMs
+				cue.EndMs = reg.LastSeenMs
+				subtitleCues = append(subtitleCues, cue)
+			}
+		}
+	}
+
+	// 6. Persist LocalizedSubtitleTrack
+	subTrackProv, err := domain.ComputeSubtitlePlanProvenanceHash(in.AssetID, in.TargetLanguage, subtitleCues, "compact_fit_cues")
+	if err != nil {
+		return nil, fmt.Errorf("compute subtitle track provenance: %w", err)
+	}
+	if subTrackProv == "" {
+		return nil, fmt.Errorf("compute subtitle track provenance returned empty hash")
+	}
+	subTrack := domain.LocalizedSubtitleTrack{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.LocalizedSubtitleTrackSchemaVersion,
+		AssetID:        in.AssetID,
+		RunID:          in.RunID,
+		JobID:          in.JobID,
+		TargetLanguage: in.TargetLanguage,
+		Format:         "compact_fit_cues",
+		Cues:           subtitleCues,
+		ProvenanceHash: subTrackProv,
+		CreatedAt:      time.Now().UTC(),
+	}
+	subTrackBytes, err := json.Marshal(subTrack)
+	if err != nil {
+		return nil, fmt.Errorf("marshal localized subtitle track: %w", err)
+	}
+	subTrackCASObj, err := s.cas.Put(bytes.NewReader(subTrackBytes))
+	if err != nil {
+		return nil, fmt.Errorf("put subtitle track in CAS: %w", err)
+	}
+	subTrack.CASHash = subTrackCASObj.SHA256
+
+	err = s.db.SaveLocalizedSubtitleTrackIndex(ctx, storage.LocalizedSubtitleTrackIndex{
+		ID:             subTrack.ID,
+		AssetID:        subTrack.AssetID,
+		RunID:          subTrack.RunID,
+		JobID:          subTrack.JobID,
+		TargetLanguage: subTrack.TargetLanguage,
+		CASHash:        subTrack.CASHash,
+		ProvenanceHash: subTrack.ProvenanceHash,
+		CueCount:       len(subTrack.Cues),
+		CreatedAt:      subTrack.CreatedAt,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("save localized subtitle track index: %w", err)
+	}
+
+	// 7. Persist LocalizedVisualTrack
+	allProtectedBoxes := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, 0, 0, "")
+
+	dubScriptProvStr := ""
+	if dubScriptIdx != nil {
+		dubScriptProvStr = dubScriptIdx.ProvenanceHash
+	}
+	visProv, err := domain.ComputeLocalizedVisualTrackProvenanceHash(
+		in.AssetID,
+		in.TargetLanguage,
+		plan.ProvenanceHash,
+		dubScriptProvStr,
+		overlays,
+		subtitleCues,
+		in.SceneProtectedRegions,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("compute visual track provenance: %w", err)
+	}
+
+	visTrack := domain.LocalizedVisualTrack{
+		ID:                 uuid.NewString(),
+		SchemaVersion:      domain.LocalizedVisualTrackSchemaVersion,
+		AssetID:            in.AssetID,
+		RunID:              in.RunID,
+		JobID:              in.JobID,
+		TargetLanguage:     in.TargetLanguage,
+		TextRegionPlanCAS:  plan.CASHash,
+		TextRegionPlanProv: plan.ProvenanceHash,
+		SubtitleTrackCAS:   subTrack.CASHash,
+		Overlays:           overlays,
+		SubtitleCues:       subtitleCues,
+		ProtectedRegions:   allProtectedBoxes,
+		ProvenanceHash:     visProv,
+		CreatedAt:          time.Now().UTC(),
+	}
+	visTrackBytes, err := json.Marshal(visTrack)
+	if err != nil {
+		return nil, fmt.Errorf("marshal visual track: %w", err)
+	}
+	visCASObj, err := s.cas.Put(bytes.NewReader(visTrackBytes))
+	if err != nil {
+		return nil, fmt.Errorf("put visual track in CAS: %w", err)
+	}
+	visTrack.CASHash = visCASObj.SHA256
+
+	err = s.db.SaveLocalizedVisualTrackIndex(ctx, storage.LocalizedVisualTrackIndex{
+		ID:                visTrack.ID,
+		AssetID:           visTrack.AssetID,
+		RunID:             visTrack.RunID,
+		JobID:             visTrack.JobID,
+		TargetLanguage:    visTrack.TargetLanguage,
+		TextRegionPlanCAS: visTrack.TextRegionPlanCAS,
+		CASHash:           visTrack.CASHash,
+		ProvenanceHash:    visTrack.ProvenanceHash,
+		CreatedAt:         visTrack.CreatedAt,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("save localized visual track index: %w", err)
+	}
+
+	return &visTrack, nil
 }

@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"regexp"
 	"strings"
 	"time"
@@ -17,8 +19,18 @@ var (
 	ErrOCRFailed = errors.New("ocr detection or tracking failed")
 )
 
-// TextRegionSchemaVersion is the canonical schema version for TextRegionPlan artifacts.
 const TextRegionPlanSchemaVersion = 1
+const LocalizedVisualTrackSchemaVersion = 1
+const LocalizedSubtitleTrackSchemaVersion = 1
+
+var (
+	// ErrSubtitleOverlapsProtectedRegion is returned when a subtitle or overlay occludes a protected area.
+	ErrSubtitleOverlapsProtectedRegion = errors.New("subtitle or overlay overlaps protected region")
+	// ErrRegionOverrideInvalid is returned when a region override specification is malformed.
+	ErrRegionOverrideInvalid = errors.New("invalid text region override")
+	// ErrTranslationFailed is returned when visual text translation fails or service is unavailable.
+	ErrTranslationFailed = errors.New("translation failed or translation service not available")
+)
 
 // TextRegionRole represents the classified operational role of an on-screen text region.
 type TextRegionRole string
@@ -90,6 +102,16 @@ type RegionKeyframe struct {
 	Observed    bool        `json:"observed"` // true if detected by OCR; false if linearly interpolated
 }
 
+// SceneProtectedRegion represents upstream/operator evidence for visual regions that must not be occluded
+// (e.g. detected faces, UI tap targets, timeline/slider controls, brand marks).
+type SceneProtectedRegion struct {
+	ID      string      `json:"id,omitempty"`
+	Reason  string      `json:"reason"` // e.g. "face", "tap_target", "timeline_control", "brand_keep"
+	StartMs int64       `json:"start_ms,omitempty"`
+	EndMs   int64       `json:"end_ms,omitempty"`
+	Box     BoundingBox `json:"box"`
+}
+
 // ProtectedRegionMetadata holds non-occlusion constraints and protection flags.
 type ProtectedRegionMetadata struct {
 	IsProtected bool   `json:"is_protected"`
@@ -119,6 +141,490 @@ type TrackedTextRegion struct {
 	ProtectedMetadata  ProtectedRegionMetadata `json:"protected_metadata"`
 	ReviewRequired     bool                    `json:"review_required"`
 	ReviewReason       string                  `json:"review_reason,omitempty"`
+}
+
+// RegionOverride defines manual or AI direct-manipulation adjustments for a tracked text region.
+// Allows changing role classification, shifting/scaling bounding box, or providing manual translation text.
+type RegionOverride struct {
+	RegionID    string          `json:"region_id"`
+	NewRole     *TextRegionRole `json:"new_role,omitempty"`
+	NewText     *string         `json:"new_text,omitempty"`
+	BoxDeltaX   int             `json:"box_delta_x,omitempty"`
+	BoxDeltaY   int             `json:"box_delta_y,omitempty"`
+	BoxDeltaW   int             `json:"box_delta_w,omitempty"`
+	BoxDeltaH   int             `json:"box_delta_h,omitempty"`
+	IsProtected *bool           `json:"is_protected,omitempty"`
+	Notes       string          `json:"notes,omitempty"`
+}
+
+// LocalizedOverlayItem represents a single in-place localized cover/overlay unit.
+type LocalizedOverlayItem struct {
+	RegionID       string         `json:"region_id"`
+	Role           TextRegionRole `json:"role"`
+	SourceText     string         `json:"source_text"`
+	LocalizedText  string         `json:"localized_text"`
+	StartMs        int64          `json:"start_ms"`
+	EndMs          int64          `json:"end_ms"`
+	Box            BoundingBox    `json:"box"`
+	IsCoverDefault bool           `json:"is_cover_default"` // true = deterministic in-place cover; false = inpainting fallback
+	Inpainting     bool           `json:"inpainting"`       // true if fallback inpainting requested (non-default)
+	BoxColor       string         `json:"box_color,omitempty"`
+	FontColor      string         `json:"font_color,omitempty"`
+	FontSizePx     int            `json:"font_size_px,omitempty"`
+	PaddingX       int            `json:"padding_x,omitempty"`
+	PaddingY       int            `json:"padding_y,omitempty"`
+}
+
+// LocalizedSubtitleTrack represents a persisted localized subtitle track conforming to the V3 compact fit-content standard.
+type LocalizedSubtitleTrack struct {
+	ID             string        `json:"id"`
+	SchemaVersion  int           `json:"schema_version"`
+	AssetID        string        `json:"asset_id"`
+	RunID          string        `json:"run_id,omitempty"`
+	JobID          string        `json:"job_id,omitempty"`
+	TargetLanguage string        `json:"target_language"`
+	Format         string        `json:"format"` // "compact_fit_cues" or "ass"
+	Cues           []SubtitleCue `json:"cues"`
+	CASHash        string        `json:"cas_hash,omitempty"`
+	ProvenanceHash string        `json:"provenance_hash,omitempty"`
+	CreatedAt      time.Time     `json:"created_at"`
+}
+
+// LocalizedVisualTrack is the complete localized visual layer artifact (compact subtitles + in-place overlays).
+type LocalizedVisualTrack struct {
+	ID                 string                 `json:"id"`
+	SchemaVersion      int                    `json:"schema_version"`
+	AssetID            string                 `json:"asset_id"`
+	RunID              string                 `json:"run_id,omitempty"`
+	JobID              string                 `json:"job_id,omitempty"`
+	TargetLanguage     string                 `json:"target_language"`
+	TextRegionPlanCAS  string                 `json:"text_region_plan_cas"`
+	TextRegionPlanProv string                 `json:"text_region_plan_provenance"`
+	SubtitleTrackCAS   string                 `json:"subtitle_track_cas,omitempty"`
+	Overlays           []LocalizedOverlayItem `json:"overlays"`
+	SubtitleCues       []SubtitleCue          `json:"subtitle_cues"`
+	ProtectedRegions   []BoundingBox          `json:"protected_regions,omitempty"`
+	CASHash            string                 `json:"cas_hash,omitempty"`
+	ProvenanceHash     string                 `json:"provenance_hash,omitempty"`
+	CreatedAt          time.Time              `json:"created_at"`
+}
+
+type termEntry struct {
+	source string
+	target string
+}
+
+// Ordered glossary definitions for deterministic matching.
+// Ordered from most specific (longer/compound terms) to least specific.
+var (
+	standardDictVI = []termEntry{
+		{source: "画中画", target: "Lớp phủ"},
+		{source: "关键帧", target: "Keyframe"},
+		{source: "透明度", target: "Độ mờ"},
+		{source: "短视频", target: "Video ngắn"},
+		{source: "草稿箱", target: "Bản nháp"},
+		{source: "导出", target: "Xuất"},
+		{source: "剪辑", target: "Chỉnh sửa"},
+		{source: "图层", target: "Lớp"},
+		{source: "滤镜", target: "Bộ lọc"},
+		{source: "特效", target: "Hiệu ứng"},
+		{source: "蒙版", target: "Mặt nạ"},
+		{source: "音频", target: "Âm thanh"},
+		{source: "文本", target: "Văn bản"},
+		{source: "比例", target: "Tỷ lệ"},
+		{source: "背景", target: "Phông nền"},
+		{source: "调节", target: "Tùy chỉnh"},
+		{source: "贴纸", target: "Nhãn dán"},
+		{source: "变速", target: "Tốc độ"},
+		{source: "动画", target: "Hoạt ảnh"},
+		{source: "分割", target: "Tách"},
+		{source: "删除", target: "Xóa"},
+		{source: "复制", target: "Sao chép"},
+		{source: "替换", target: "Thay thế"},
+	}
+
+	standardDictEN = []termEntry{
+		{source: "画中画", target: "Overlay"},
+		{source: "关键帧", target: "Keyframe"},
+		{source: "透明度", target: "Opacity"},
+		{source: "短视频", target: "Short Video"},
+		{source: "草稿箱", target: "Drafts"},
+		{source: "导出", target: "Export"},
+		{source: "剪辑", target: "Edit"},
+		{source: "图层", target: "Layer"},
+		{source: "滤镜", target: "Filter"},
+		{source: "特效", target: "Effects"},
+		{source: "蒙版", target: "Mask"},
+		{source: "音频", target: "Audio"},
+		{source: "文本", target: "Text"},
+		{source: "比例", target: "Ratio"},
+		{source: "背景", target: "Background"},
+		{source: "调节", target: "Adjust"},
+		{source: "贴纸", target: "Stickers"},
+		{source: "变速", target: "Speed"},
+		{source: "动画", target: "Animation"},
+		{source: "分割", target: "Split"},
+		{source: "删除", target: "Delete"},
+		{source: "复制", target: "Copy"},
+		{source: "替换", target: "Replace"},
+	}
+)
+
+// StandardInstructionalUITerm returns the standard target-language software UI term for CapCut/JianYing concepts.
+// Matches deterministically using an ordered lookup table: exact match on source or target.
+func StandardInstructionalUITerm(sourceText, targetLang string) (string, bool) {
+	normalized := strings.TrimSpace(sourceText)
+	if normalized == "" {
+		return "", false
+	}
+	targetLang = strings.ToLower(strings.TrimSpace(targetLang))
+
+	var dict []termEntry
+	switch targetLang {
+	case "vi":
+		dict = standardDictVI
+	case "en":
+		dict = standardDictEN
+	default:
+		return sourceText, false
+	}
+
+	// 1. Exact match on source
+	for _, entry := range dict {
+		if strings.EqualFold(normalized, entry.source) {
+			return entry.target, true
+		}
+	}
+
+	// 2. Exact match on target
+	for _, entry := range dict {
+		if strings.EqualFold(normalized, entry.target) {
+			return entry.target, true
+		}
+	}
+
+	return sourceText, false
+}
+
+// NormalizeInstructionalUIText normalizes translated instructional UI text using canonical target-language glossary terms.
+// Performs exact matching first, and preserves surrounding text remainder for compound phrases without discarding words.
+func NormalizeInstructionalUIText(translatedText, sourceText, targetLang string) string {
+	trimmedTrans := strings.TrimSpace(translatedText)
+	trimmedSrc := strings.TrimSpace(sourceText)
+
+	// 1. Exact match on source or translation
+	if stdTerm, found := StandardInstructionalUITerm(trimmedSrc, targetLang); found {
+		return stdTerm
+	}
+	if stdTerm, found := StandardInstructionalUITerm(trimmedTrans, targetLang); found {
+		return stdTerm
+	}
+
+	// 2. Canonical dictionary term replacement preserving remainder
+	var dict []termEntry
+	switch strings.ToLower(strings.TrimSpace(targetLang)) {
+	case "vi":
+		dict = standardDictVI
+	case "en":
+		dict = standardDictEN
+	default:
+		return trimmedTrans
+	}
+
+	res := trimmedTrans
+	for _, entry := range dict {
+		if strings.Contains(res, entry.source) {
+			res = strings.ReplaceAll(res, entry.source, entry.target)
+		}
+	}
+	return res
+}
+
+// TimeWindowsOverlap returns true if intervals [s1, e1] and [s2, e2] overlap in time.
+// If either interval has start == 0 && end == 0, it is treated as spanning all time.
+func TimeWindowsOverlap(s1, e1, s2, e2 int64) bool {
+	if (s1 == 0 && e1 == 0) || (s2 == 0 && e2 == 0) {
+		return true
+	}
+	if e1 <= 0 {
+		e1 = math.MaxInt64
+	}
+	if e2 <= 0 {
+		e2 = math.MaxInt64
+	}
+	return s1 <= e2 && s2 <= e1
+}
+
+// GetProtectedBoxesForTimeWindow collects all relevant protected bounding boxes
+// (from tracked text regions' keyframes and scene-protected regions) that are active during [startMs, endMs].
+// If excludeRegionID is non-empty, keyframes from that specific region are ignored (e.g. self-occlusion for overlays).
+func GetProtectedBoxesForTimeWindow(
+	regions []TrackedTextRegion,
+	sceneProtected []SceneProtectedRegion,
+	startMs, endMs int64,
+	excludeRegionID string,
+) []BoundingBox {
+	var result []BoundingBox
+
+	// 1. From TrackedTextRegion keyframes
+	for _, reg := range regions {
+		if !reg.ProtectedMetadata.IsProtected {
+			continue
+		}
+		if excludeRegionID != "" && reg.ID == excludeRegionID {
+			continue
+		}
+		if !TimeWindowsOverlap(reg.FirstSeenMs, reg.LastSeenMs, startMs, endMs) {
+			continue
+		}
+		for _, kf := range reg.Keyframes {
+			if (startMs == 0 && endMs == 0) || (kf.TimestampMs >= startMs && kf.TimestampMs <= endMs) || len(reg.Keyframes) == 1 {
+				result = append(result, kf.Box)
+			}
+		}
+	}
+
+	// 2. From SceneProtectedRegions (faces, tap targets, timeline controls, etc.)
+	for _, sp := range sceneProtected {
+		if TimeWindowsOverlap(sp.StartMs, sp.EndMs, startMs, endMs) {
+			result = append(result, sp.Box)
+		}
+	}
+
+	return result
+}
+
+// BoxesOverlap returns true if two bounding boxes overlap in 2D space.
+func BoxesOverlap(a, b BoundingBox) bool {
+	return a.X < b.X+b.Width &&
+		a.X+a.Width > b.X &&
+		a.Y < b.Y+b.Height &&
+		a.Y+a.Height > b.Y
+}
+
+// SubtitlePlacementSelector defines a pluggable selector hook (e.g. AI or heuristic)
+// to choose optimal subtitle box placement. Return (chosenBox, ok). If !ok or out-of-bounds/colliding,
+// deterministic safe fallback is used.
+type SubtitlePlacementSelector func(frameWidth, frameHeight int, candBox BoundingBox, protectedAreas []BoundingBox) (BoundingBox, bool)
+
+// ComputeCompactSubtitleBoundsWithSelector calculates scale-aware fit-content subtitle box coordinates and padding,
+// invoking an optional pluggable placement selector with deterministic safe fallback.
+// If no safe in-frame placement exists without occluding protected regions, it fails closed and returns ErrSubtitleOverlapsProtectedRegion.
+func ComputeCompactSubtitleBoundsWithSelector(
+	frameWidth, frameHeight int,
+	text string,
+	fontSizePx int,
+	paddingX, paddingY int,
+	protectedAreas []BoundingBox,
+	selector SubtitlePlacementSelector,
+) (SubtitleCue, error) {
+	if frameWidth <= 0 {
+		frameWidth = 1080
+	}
+	if frameHeight <= 0 {
+		frameHeight = 1920
+	}
+	if fontSizePx <= 0 {
+		fontSizePx = int(float64(frameHeight) * 0.018) // ~34px for 1920h
+		if fontSizePx < 20 {
+			fontSizePx = 20
+		}
+	}
+	// Scale-aware reference padding guidance: ~18-28px horizontal, ~10-16px vertical
+	if paddingX <= 0 {
+		paddingX = int(float64(frameWidth) * 0.02) // ~22px for 1080w
+		if paddingX < 18 {
+			paddingX = 18
+		} else if paddingX > 28 {
+			paddingX = 28
+		}
+	}
+	if paddingY <= 0 {
+		paddingY = int(float64(frameHeight) * 0.007) // ~14px for 1920h
+		if paddingY < 10 {
+			paddingY = 10
+		} else if paddingY > 16 {
+			paddingY = 16
+		}
+	}
+
+	// Approximate text width: rough proportional font estimation (average char width ~ 0.55 * fontSize)
+	charWidth := int(float64(fontSizePx) * 0.55)
+	textLen := len([]rune(text))
+	rawTextWidth := textLen * charWidth
+
+	// Check if multi-line needed (max width ~ 80% frame width)
+	maxAllowedWidth := int(float64(frameWidth) * 0.80)
+	boxWidth := rawTextWidth + 2*paddingX
+	boxHeight := fontSizePx + 2*paddingY
+
+	if boxWidth > maxAllowedWidth {
+		boxWidth = maxAllowedWidth
+		boxHeight = fontSizePx*2 + int(float64(fontSizePx)*0.3) + 2*paddingY
+	}
+
+	// Center horizontally by default, clamp inside horizontal frame margins
+	defaultX := (frameWidth - boxWidth) / 2
+	if defaultX < 10 {
+		defaultX = 10
+	}
+	if defaultX+boxWidth > frameWidth-10 {
+		boxWidth = frameWidth - 20
+		defaultX = 10
+	}
+
+	// Default subtitle placement: lower band (~75% from top)
+	defaultY := int(float64(frameHeight) * 0.75)
+	minY := int(float64(frameHeight) * 0.10)
+	maxY := frameHeight - boxHeight - int(float64(frameHeight)*0.03)
+	if defaultY > maxY {
+		defaultY = maxY
+	}
+	if defaultY < minY {
+		defaultY = minY
+	}
+
+	candBox := BoundingBox{X: defaultX, Y: defaultY, Width: boxWidth, Height: boxHeight}
+
+	// Helper to check if a box overlaps any protected region
+	overlapsAny := func(b BoundingBox) bool {
+		for _, prot := range protectedAreas {
+			if BoxesOverlap(b, prot) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Helper to check if a box is inside frame bounds
+	inFrame := func(b BoundingBox) bool {
+		return b.X >= 0 && b.X+b.Width <= frameWidth && b.Y >= minY && b.Y <= maxY
+	}
+
+	var chosenBox BoundingBox
+	foundSafe := false
+
+	// Try pluggable selector if provided
+	if selector != nil {
+		if selBox, ok := selector(frameWidth, frameHeight, candBox, protectedAreas); ok {
+			if inFrame(selBox) && !overlapsAny(selBox) {
+				chosenBox = selBox
+				foundSafe = true
+			}
+		}
+	}
+
+	// Candidate position without shift
+	if !foundSafe && inFrame(candBox) && !overlapsAny(candBox) {
+		chosenBox = candBox
+		foundSafe = true
+	}
+
+	// Deterministic safe search: try shifting upward, then downward, in 16px increments
+	if !foundSafe {
+		// 1. Try upward shifts
+		for testY := defaultY - 16; testY >= minY; testY -= 16 {
+			testBox := BoundingBox{X: defaultX, Y: testY, Width: boxWidth, Height: boxHeight}
+			if !overlapsAny(testBox) {
+				chosenBox = testBox
+				foundSafe = true
+				break
+			}
+		}
+		// 2. If upward shift did not find a clear spot, try downward shifts
+		if !foundSafe {
+			for testY := defaultY + 16; testY <= maxY; testY += 16 {
+				testBox := BoundingBox{X: defaultX, Y: testY, Width: boxWidth, Height: boxHeight}
+				if !overlapsAny(testBox) {
+					chosenBox = testBox
+					foundSafe = true
+					break
+				}
+			}
+		}
+		// 3. Full frame sweep top to bottom
+		if !foundSafe {
+			for testY := minY; testY <= maxY; testY += 16 {
+				testBox := BoundingBox{X: defaultX, Y: testY, Width: boxWidth, Height: boxHeight}
+				if !overlapsAny(testBox) {
+					chosenBox = testBox
+					foundSafe = true
+					break
+				}
+			}
+		}
+	}
+
+	if !foundSafe {
+		return SubtitleCue{}, fmt.Errorf("%w: cannot place subtitle cue %q (dims %dx%d) without occluding protected regions",
+			ErrSubtitleOverlapsProtectedRegion, text, boxWidth, boxHeight)
+	}
+
+	return SubtitleCue{
+		Text:       text,
+		X:          chosenBox.X,
+		Y:          chosenBox.Y,
+		Width:      chosenBox.Width,
+		Height:     chosenBox.Height,
+		FontSizePx: fontSizePx,
+		PaddingX:   paddingX,
+		PaddingY:   paddingY,
+		BoxColor:   "black@0.6",
+		FontColor:  "#FFFFFF",
+	}, nil
+}
+
+// ComputeCompactSubtitleBounds calculates scale-aware fit-content subtitle box coordinates and padding.
+// Follows the V3 compact fit-content standard: hugs rendered text, 1-2 lines, avoids protected UI areas,
+// and guarantees candidate cues remain within visible frame bounds.
+func ComputeCompactSubtitleBounds(
+	frameWidth, frameHeight int,
+	text string,
+	fontSizePx int,
+	paddingX, paddingY int,
+	protectedAreas []BoundingBox,
+) (SubtitleCue, error) {
+	return ComputeCompactSubtitleBoundsWithSelector(frameWidth, frameHeight, text, fontSizePx, paddingX, paddingY, protectedAreas, nil)
+}
+
+// ComputeLocalizedVisualTrackProvenanceHash computes deterministic cache identity for LocalizedVisualTrack.
+func ComputeLocalizedVisualTrackProvenanceHash(
+	assetID, targetLang, textRegionPlanProv, dubScriptProv string,
+	overlays []LocalizedOverlayItem,
+	cues []SubtitleCue,
+	sceneProtected ...[]SceneProtectedRegion,
+) (string, error) {
+	cueHash := ComputeCueSpecHash(cues)
+	var sp []SceneProtectedRegion
+	if len(sceneProtected) > 0 {
+		sp = sceneProtected[0]
+	}
+	payload := struct {
+		AssetID               string                 `json:"asset_id"`
+		TargetLanguage        string                 `json:"target_language"`
+		TextRegionPlanProv    string                 `json:"text_region_plan_prov"`
+		DubScriptProv         string                 `json:"dub_script_prov"`
+		Overlays              []LocalizedOverlayItem `json:"overlays"`
+		CueSpecHash           string                 `json:"cue_spec_hash"`
+		SceneProtectedRegions []SceneProtectedRegion `json:"scene_protected_regions,omitempty"`
+		SchemaVersion         int                    `json:"schema_version"`
+	}{
+		AssetID:               strings.TrimSpace(assetID),
+		TargetLanguage:        strings.ToLower(strings.TrimSpace(targetLang)),
+		TextRegionPlanProv:    strings.TrimSpace(textRegionPlanProv),
+		DubScriptProv:         strings.TrimSpace(dubScriptProv),
+		Overlays:              overlays,
+		CueSpecHash:           cueHash,
+		SceneProtectedRegions: sp,
+		SchemaVersion:         LocalizedVisualTrackSchemaVersion,
+	}
+
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal visual track provenance payload: %w", err)
+	}
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:]), nil
 }
 
 // TextRegionPlan is the immutable source-derived artifact containing tracked and classified text regions.

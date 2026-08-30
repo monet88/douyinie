@@ -942,6 +942,63 @@ func (s *DB) migrate(ctx context.Context) error {
 			return fmt.Errorf("commit migration v13: %w", err)
 		}
 	}
+
+	// 15. Schema migration v14 (Visual Text Tracks & Localized Subtitle Tracks - T10)
+	var countV14 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 14`).Scan(&countV14)
+	if err != nil {
+		return fmt.Errorf("check migration version 14: %w", err)
+	}
+
+	if countV14 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v14 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		schemaV14SQL := `
+		CREATE TABLE IF NOT EXISTS localized_subtitle_tracks (
+			id TEXT PRIMARY KEY,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			run_id TEXT NOT NULL,
+			job_id TEXT NOT NULL,
+			target_language TEXT NOT NULL,
+			cas_hash TEXT NOT NULL,
+			provenance_hash TEXT NOT NULL,
+			cue_count INTEGER NOT NULL,
+			created_at TEXT NOT NULL
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_localized_subtitle_tracks_provenance ON localized_subtitle_tracks(provenance_hash);
+		CREATE INDEX IF NOT EXISTS idx_localized_subtitle_tracks_asset_lang ON localized_subtitle_tracks(asset_id, target_language);
+		CREATE INDEX IF NOT EXISTS idx_localized_subtitle_tracks_run ON localized_subtitle_tracks(run_id);
+
+		CREATE TABLE IF NOT EXISTS localized_visual_tracks (
+			id TEXT PRIMARY KEY,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			run_id TEXT NOT NULL,
+			job_id TEXT NOT NULL,
+			target_language TEXT NOT NULL,
+			text_region_plan_cas TEXT NOT NULL,
+			cas_hash TEXT NOT NULL,
+			provenance_hash TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_localized_visual_tracks_provenance ON localized_visual_tracks(provenance_hash);
+		CREATE INDEX IF NOT EXISTS idx_localized_visual_tracks_asset_lang ON localized_visual_tracks(asset_id, target_language);
+		CREATE INDEX IF NOT EXISTS idx_localized_visual_tracks_run ON localized_visual_tracks(run_id);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (14, datetime('now'));
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaV14SQL); err != nil {
+			return fmt.Errorf("execute migration v14: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v14: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -3571,6 +3628,232 @@ func (s *DB) GetRenderArtifactByProvenance(ctx context.Context, provenanceHash s
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("query render_artifacts by provenance: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// LocalizedSubtitleTrackIndex captures SQLite indexing metadata for a persisted LocalizedSubtitleTrack.
+type LocalizedSubtitleTrackIndex struct {
+	ID             string
+	AssetID        string
+	RunID          string
+	JobID          string
+	TargetLanguage string
+	CASHash        string
+	ProvenanceHash string
+	CueCount       int
+	CreatedAt      time.Time
+}
+
+// SaveLocalizedSubtitleTrackIndex records the index row for a CAS-stored LocalizedSubtitleTrack.
+func (s *DB) SaveLocalizedSubtitleTrackIndex(ctx context.Context, idx LocalizedSubtitleTrackIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO localized_subtitle_tracks (
+			id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash, cue_count, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provenance_hash) DO UPDATE SET
+			cas_hash = excluded.cas_hash,
+			cue_count = excluded.cue_count
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID,
+		idx.AssetID,
+		idx.RunID,
+		idx.JobID,
+		idx.TargetLanguage,
+		idx.CASHash,
+		idx.ProvenanceHash,
+		idx.CueCount,
+		func() string {
+			if idx.CreatedAt.IsZero() {
+				return time.Now().UTC().Format(time.RFC3339Nano)
+			}
+			return idx.CreatedAt.Format(time.RFC3339Nano)
+		}(),
+	)
+	if err != nil {
+		return fmt.Errorf("save localized_subtitle_tracks index: %w", err)
+	}
+	return nil
+}
+
+// GetLocalizedSubtitleTrackIndex retrieves the latest index row for an asset and target language.
+func (s *DB) GetLocalizedSubtitleTrackIndex(ctx context.Context, assetID, targetLang string) (*LocalizedSubtitleTrackIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx LocalizedSubtitleTrackIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash, cue_count, created_at
+		FROM localized_subtitle_tracks WHERE asset_id = ? AND target_language = ?
+		ORDER BY created_at DESC, rowid DESC LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, assetID, targetLang).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&idx.CueCount,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query localized_subtitle_tracks index: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// GetLocalizedSubtitleTrackByProvenance retrieves the index row by provenance hash.
+func (s *DB) GetLocalizedSubtitleTrackByProvenance(ctx context.Context, provenanceHash string) (*LocalizedSubtitleTrackIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx LocalizedSubtitleTrackIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash, cue_count, created_at
+		FROM localized_subtitle_tracks WHERE provenance_hash = ? LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, provenanceHash).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&idx.CueCount,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query localized_subtitle_tracks by provenance: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// LocalizedVisualTrackIndex captures SQLite indexing metadata for a persisted LocalizedVisualTrack.
+type LocalizedVisualTrackIndex struct {
+	ID                string
+	AssetID           string
+	RunID             string
+	JobID             string
+	TargetLanguage    string
+	TextRegionPlanCAS string
+	CASHash           string
+	ProvenanceHash    string
+	CreatedAt         time.Time
+}
+
+// SaveLocalizedVisualTrackIndex records the index row for a CAS-stored LocalizedVisualTrack.
+func (s *DB) SaveLocalizedVisualTrackIndex(ctx context.Context, idx LocalizedVisualTrackIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO localized_visual_tracks (
+			id, asset_id, run_id, job_id, target_language, text_region_plan_cas, cas_hash, provenance_hash, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provenance_hash) DO UPDATE SET
+			cas_hash = excluded.cas_hash,
+			text_region_plan_cas = excluded.text_region_plan_cas
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID,
+		idx.AssetID,
+		idx.RunID,
+		idx.JobID,
+		idx.TargetLanguage,
+		idx.TextRegionPlanCAS,
+		idx.CASHash,
+		idx.ProvenanceHash,
+		func() string {
+			if idx.CreatedAt.IsZero() {
+				return time.Now().UTC().Format(time.RFC3339Nano)
+			}
+			return idx.CreatedAt.Format(time.RFC3339Nano)
+		}(),
+	)
+	if err != nil {
+		return fmt.Errorf("save localized_visual_tracks index: %w", err)
+	}
+	return nil
+}
+
+// GetLocalizedVisualTrackIndex retrieves the latest index row for an asset and target language.
+func (s *DB) GetLocalizedVisualTrackIndex(ctx context.Context, assetID, targetLang string) (*LocalizedVisualTrackIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx LocalizedVisualTrackIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, job_id, target_language, text_region_plan_cas, cas_hash, provenance_hash, created_at
+		FROM localized_visual_tracks WHERE asset_id = ? AND target_language = ?
+		ORDER BY created_at DESC, rowid DESC LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, assetID, targetLang).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.TextRegionPlanCAS,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query localized_visual_tracks index: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// GetLocalizedVisualTrackByProvenance retrieves the index row by provenance hash.
+func (s *DB) GetLocalizedVisualTrackByProvenance(ctx context.Context, provenanceHash string) (*LocalizedVisualTrackIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx LocalizedVisualTrackIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, job_id, target_language, text_region_plan_cas, cas_hash, provenance_hash, created_at
+		FROM localized_visual_tracks WHERE provenance_hash = ? LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, provenanceHash).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.RunID,
+		&idx.JobID,
+		&idx.TargetLanguage,
+		&idx.TextRegionPlanCAS,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query localized_visual_tracks by provenance: %w", err)
 	}
 	t, _ := time.Parse(time.RFC3339Nano, createdStr)
 	idx.CreatedAt = t

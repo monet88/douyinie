@@ -50,6 +50,8 @@ type SubtitleCue struct {
 	Text       string `json:"text"`
 	X          int    `json:"x"`
 	Y          int    `json:"y"`
+	Width      int    `json:"width,omitempty"`
+	Height     int    `json:"height,omitempty"`
 	FontSizePx int    `json:"font_size_px"`
 	PaddingX   int    `json:"padding_x,omitempty"`
 	PaddingY   int    `json:"padding_y,omitempty"`

@@ -107,8 +107,13 @@ func New(cfg Config) *Server {
 	if cfg.AudioMixSvc != nil && cfg.Router != nil {
 		cfg.AudioMixSvc.ConfigureRouter(cfg.Router)
 	}
-	if cfg.VisualTextSvc != nil && cfg.Router != nil {
-		cfg.VisualTextSvc.ConfigureRouter(cfg.Router)
+	if cfg.VisualTextSvc != nil {
+		if cfg.Router != nil {
+			cfg.VisualTextSvc.ConfigureRouter(cfg.Router)
+		}
+		if cfg.TranslationSvc != nil {
+			cfg.VisualTextSvc.SetTranslationService(cfg.TranslationSvc)
+		}
 	}
 	s := &Server{
 		db:             cfg.DB,
@@ -302,6 +307,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/text-region-plan", s.handleRunDetectText)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/text-region-plan", s.handleGetTextRegionPlan)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/text-regions", s.handleGetTextRegionPlan)
+	// Visual Text Localization & Subtitle Track (T10: LocalizedVisualTrack + LocalizedSubtitleTrack)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/visual-track", s.handleLocalizeVisualTrack)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/localized-visual-track", s.handleLocalizeVisualTrack)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/visual-track", s.handleGetLocalizedVisualTrack)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/localized-visual-track", s.handleGetLocalizedVisualTrack)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/subtitle-track", s.handleGetLocalizedSubtitleTrack)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/localized-subtitle-track", s.handleGetLocalizedSubtitleTrack)
 	// Render & Preview/Final Parity (T11)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/render-plan", s.handleFreezeRenderPlan)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/render-plan", s.handleGetRenderPlan)
@@ -2125,6 +2137,139 @@ func (s *Server) handleGetTextRegionPlan(w http.ResponseWriter, r *http.Request)
 	plan.CASHash = idx.CASHash
 	plan.ProvenanceHash = idx.ProvenanceHash
 	writeJSON(w, http.StatusOK, map[string]any{"text_region_plan": plan})
+}
+
+func (s *Server) handleLocalizeVisualTrack(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	asset, err := s.db.GetSourceAsset(r.Context(), assetID)
+	if err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) || errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.visualTextSvc == nil {
+		writeError(w, http.StatusInternalServerError, "visual text service is not configured")
+		return
+	}
+
+	var body struct {
+		RunID                 string                        `json:"run_id"`
+		JobID                 string                        `json:"job_id,omitempty"`
+		TargetLanguage        string                        `json:"target_language"`
+		Overrides             []domain.RegionOverride       `json:"overrides,omitempty"`
+		InpaintingFallbacks   []string                      `json:"inpainting_fallbacks,omitempty"`
+		SceneProtectedRegions []domain.SceneProtectedRegion `json:"scene_protected_regions,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	targetLang := strings.ToLower(strings.TrimSpace(body.TargetLanguage))
+	if targetLang == "" {
+		targetLang = domain.TargetLanguageVI
+	}
+
+	in := service.LocalizeVisualTrackInput{
+		RunID:                 body.RunID,
+		AssetID:               asset.ID,
+		JobID:                 body.JobID,
+		TargetLanguage:        targetLang,
+		Overrides:             body.Overrides,
+		InpaintingFallbacks:   body.InpaintingFallbacks,
+		SceneProtectedRegions: body.SceneProtectedRegions,
+	}
+
+	track, err := s.visualTextSvc.LocalizeVisualTrack(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, domain.ErrTextRegionPlanNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrRegionOverrideInvalid) || errors.Is(err, domain.ErrInvalidTargetLanguage) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrSubtitleOverlapsProtectedRegion) || errors.Is(err, domain.ErrTranslationFailed) {
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"localized_visual_track": track})
+}
+
+func (s *Server) handleGetLocalizedVisualTrack(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	targetLang := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("target_language")))
+	if targetLang == "" {
+		targetLang = domain.TargetLanguageVI
+	}
+
+	idx, err := s.db.GetLocalizedVisualTrackIndex(r.Context(), assetID, targetLang)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "localized visual track not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	reader, err := s.casStore.Get(idx.CASHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load localized visual track from cas: "+err.Error())
+		return
+	}
+	defer reader.Close()
+
+	var track domain.LocalizedVisualTrack
+	if err := json.NewDecoder(reader).Decode(&track); err != nil {
+		writeError(w, http.StatusInternalServerError, "decode localized visual track: "+err.Error())
+		return
+	}
+	track.CASHash = idx.CASHash
+	track.ProvenanceHash = idx.ProvenanceHash
+	writeJSON(w, http.StatusOK, map[string]any{"localized_visual_track": track})
+}
+
+func (s *Server) handleGetLocalizedSubtitleTrack(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	targetLang := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("target_language")))
+	if targetLang == "" {
+		targetLang = domain.TargetLanguageVI
+	}
+
+	idx, err := s.db.GetLocalizedSubtitleTrackIndex(r.Context(), assetID, targetLang)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "localized subtitle track not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	reader, err := s.casStore.Get(idx.CASHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "load localized subtitle track from cas: "+err.Error())
+		return
+	}
+	defer reader.Close()
+
+	var track domain.LocalizedSubtitleTrack
+	if err := json.NewDecoder(reader).Decode(&track); err != nil {
+		writeError(w, http.StatusInternalServerError, "decode localized subtitle track: "+err.Error())
+		return
+	}
+	track.CASHash = idx.CASHash
+	track.ProvenanceHash = idx.ProvenanceHash
+	writeJSON(w, http.StatusOK, map[string]any{"localized_subtitle_track": track})
 }
 
 // Render endpoints (T11)

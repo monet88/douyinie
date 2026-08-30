@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -199,5 +200,263 @@ func TestVisualTextService_ProvenanceCacheReuse(t *testing.T) {
 	}
 	if plan1.CASHash != plan2.CASHash {
 		t.Errorf("expected identical CAS hash: %s vs %s", plan1.CASHash, plan2.CASHash)
+	}
+}
+
+func TestVisualTextService_LocalizeVisualTrack_And_Overrides(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// Wire translation service with a mock/fake
+	transSvc := service.NewTranslationService(db, casStore)
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "qwen_trans",
+			ModelVersion: "v1",
+			Segments: []domain.TranslationSegment{
+				{
+					Index:      0,
+					SourceText: req.Segments[0].SourceText,
+					TargetText: "Bước 1: Chuẩn bị nguyên liệu (đã dịch)",
+				},
+			},
+		}, nil
+	}
+	svc.SetTranslationService(transSvc)
+
+	// 1. Run detection first
+	plan, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:   "run-track-1",
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+
+	// 2. Generate LocalizedVisualTrack for VI
+	visTrack, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-track-1",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err != nil {
+		t.Fatalf("localize visual track failed: %v", err)
+	}
+
+	if visTrack.CASHash == "" {
+		t.Error("expected non-empty CASHash for LocalizedVisualTrack")
+	}
+	if visTrack.SubtitleTrackCAS == "" {
+		t.Error("expected non-empty SubtitleTrackCAS for LocalizedSubtitleTrack")
+	}
+
+	// Verify overlays contain semantic_text and instructional_ui_text
+	foundUI := false
+	foundSemantic := false
+	for _, ov := range visTrack.Overlays {
+		if ov.Role == domain.TextRoleInstructionalUIText {
+			foundUI = true
+			if ov.LocalizedText != "Xuất" {
+				t.Errorf("expected standard instructional UI term 'Xuất' for '导出', got %q", ov.LocalizedText)
+			}
+			if !ov.IsCoverDefault {
+				t.Errorf("expected IsCoverDefault=true for standard instructional UI overlay")
+			}
+		}
+		if ov.Role == domain.TextRoleSemanticText {
+			foundSemantic = true
+			if ov.LocalizedText != "Bước 1: Chuẩn bị nguyên liệu (đã dịch)" {
+				t.Errorf("expected translated semantic text, got %q", ov.LocalizedText)
+			}
+		}
+	}
+	if !foundUI {
+		t.Errorf("expected instructional_ui_text overlay in visual track")
+	}
+	if !foundSemantic {
+		t.Errorf("expected semantic_text overlay in visual track")
+	}
+
+	// 3. Test Direct Manipulation Overrides (Drag/Resize/Reclassify)
+	newRole := domain.TextRoleSemanticText
+	newText := "Nút Tùy Chỉnh"
+	targetRegID := plan.Regions[0].ID
+
+	visTrackWithOverride, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-track-2",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides: []domain.RegionOverride{
+			{
+				RegionID:  targetRegID,
+				NewRole:   &newRole,
+				NewText:   &newText,
+				BoxDeltaX: 10,
+				BoxDeltaY: 20,
+				BoxDeltaW: 30,
+				BoxDeltaH: 15,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("localize visual track with override failed: %v", err)
+	}
+
+	if visTrackWithOverride.ProvenanceHash == visTrack.ProvenanceHash {
+		t.Errorf("expected override to alter provenance hash")
+	}
+
+	// 4. Test Unknown Region Override ID fails closed
+	_, err = svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-track-unk",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides: []domain.RegionOverride{
+			{
+				RegionID: "unknown-region-999",
+			},
+		},
+	})
+	if err == nil || !errors.Is(err, domain.ErrRegionOverrideInvalid) {
+		t.Fatalf("expected ErrRegionOverrideInvalid for unknown region_id, got %v", err)
+	}
+
+	// 5. Test Drag/Resize Clamping to Frame Bounds
+	clampedPlan, err := service.ApplyRegionOverrides(plan, []domain.RegionOverride{
+		{
+			RegionID:  targetRegID,
+			BoxDeltaX: 99999, // Way past frame width
+			BoxDeltaY: 99999,
+			BoxDeltaW: 5000,
+			BoxDeltaH: 5000,
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected clamping to succeed, got %v", err)
+	}
+	var clampedReg *domain.TrackedTextRegion
+	for _, r := range clampedPlan.Regions {
+		if r.ID == targetRegID {
+			clampedReg = &r
+			break
+		}
+	}
+	if clampedReg == nil || len(clampedReg.Keyframes) == 0 {
+		t.Fatalf("expected clamped region keyframes")
+	}
+	box := clampedReg.Keyframes[0].Box
+	if box.X >= plan.FrameWidth || box.Y >= plan.FrameHeight || box.X+box.Width > plan.FrameWidth || box.Y+box.Height > plan.FrameHeight {
+		t.Errorf("expected box to clamp strictly within frame (%dx%d), got %+v", plan.FrameWidth, plan.FrameHeight, box)
+	}
+
+	// 6. Test Translation Failure Propagation
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		return nil, errors.New("simulated translation backend failure")
+	}
+	_, err = svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-track-fail",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err == nil {
+		t.Fatalf("expected translation failure to propagate, got nil error")
+	}
+
+	// 7. Test Corrupt/Missing DubScript Artifact Fails Closed
+	// Insert a corrupt dub script index pointing to non-existent CAS
+	err = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID:             "dub-corrupt-1",
+		AssetID:        assetID,
+		RunID:          "run-track-1",
+		TargetLanguage: "en",
+		CASHash:        "non_existent_cas_hash_corrupt_test",
+		ProvenanceHash: "prov-corrupt-1",
+		CreatedAt:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("save corrupt dubscript index: %v", err)
+	}
+
+	_, err = svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-track-corrupt",
+		AssetID:        assetID,
+		TargetLanguage: "en",
+	})
+	if err == nil {
+		t.Fatalf("expected corrupt dubscript CAS artifact to fail closed, got nil error")
+	}
+
+	// 8. Test Missing TranslationService Fails Closed
+	svcNoTrans := service.NewVisualTextService(db, casStore)
+	_, err = svcNoTrans.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-track-notrans",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err == nil || !errors.Is(err, domain.ErrTranslationFailed) {
+		t.Fatalf("expected ErrTranslationFailed when TranslationService is missing, got %v", err)
+	}
+	// 9. Test SceneProtectedRegions (Upstream/Operator evidence like faces / tap targets)
+	// Restore working translation invoke
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "qwen_trans",
+			ModelVersion: "v1",
+			Segments: []domain.TranslationSegment{
+				{
+					Index:      0,
+					SourceText: req.Segments[0].SourceText,
+					TargetText: "Bước 1: Chuẩn bị nguyên liệu (đã dịch)",
+				},
+			},
+		}, nil
+	}
+
+	// Add face obstacle right at standard subtitle location (Y=1440)
+	visTrackScene, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-track-scene",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		SceneProtectedRegions: []domain.SceneProtectedRegion{
+			{
+				Reason:  "face",
+				StartMs: 0,
+				EndMs:   5000,
+				Box:     domain.BoundingBox{X: 100, Y: 1400, Width: 880, Height: 200},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected safe repositioning around scene-protected face, got error: %v", err)
+	}
+	for _, cue := range visTrackScene.SubtitleCues {
+		cueBox := domain.BoundingBox{X: cue.X, Y: cue.Y, Width: cue.Width, Height: cue.Height}
+		faceBox := domain.BoundingBox{X: 100, Y: 1400, Width: 880, Height: 200}
+		if domain.BoxesOverlap(cueBox, faceBox) {
+			t.Errorf("expected subtitle cue to avoid scene-protected face, but overlapped: cue=%+v", cueBox)
+		}
+	}
+
+	// 10. Test Overlay Collision with Scene-Protected Face Fails Closed
+	// Place a face directly covering the semantic text overlay at Y=300 (where 'Bước 1' is)
+	_, err = svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-track-overlay-collision",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		SceneProtectedRegions: []domain.SceneProtectedRegion{
+			{
+				Reason:  "face",
+				StartMs: 0,
+				EndMs:   5000,
+				Box:     domain.BoundingBox{X: 50, Y: 250, Width: 800, Height: 200},
+			},
+		},
+	})
+	if err == nil || !errors.Is(err, domain.ErrSubtitleOverlapsProtectedRegion) {
+		t.Fatalf("expected ErrSubtitleOverlapsProtectedRegion when overlay occludes face, got %v", err)
 	}
 }
