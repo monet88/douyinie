@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,14 @@ func TestTranslationService_AdaptDubScript_ShortensOverlongSpokenText(t *testing
 		CreatedAt: time.Now().UTC(),
 	})
 
+	_ = db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{
+		ID:        "plan-" + assetID,
+		AssetID:   assetID,
+		CreatedAt: time.Now().UTC(),
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	})
 	// 1. Create meaning-first translation variant with different slot budgets:
 	// Seg 0: Normal slot (2000ms for short greeting)
 	// Seg 1: Brisk but fittable after generic shortening.
@@ -205,6 +214,14 @@ func TestTranslationService_AdaptDubScript_English_ShortenFirst(t *testing.T) {
 		Status:    "running",
 		CreatedAt: time.Now().UTC(),
 	})
+	_ = db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{
+		ID:        "plan-" + assetID,
+		AssetID:   assetID,
+		CreatedAt: time.Now().UTC(),
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	})
 
 	transInput := domain.TranslationJobInput{
 		RunID:          runID,
@@ -307,6 +324,14 @@ func TestTranslationService_AdaptDubScript_CASAssetMismatch_FailsClosed(t *testi
 		Status:    "running",
 		CreatedAt: time.Now().UTC(),
 	})
+	_ = db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{
+		ID:        "plan-" + assetB,
+		AssetID:   assetB,
+		CreatedAt: time.Now().UTC(),
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	})
 
 	// Translate for Asset A
 	transVariantA, err := svc.Translate(ctx, domain.TranslationJobInput{
@@ -376,6 +401,14 @@ func TestTranslationService_AdaptDubScript_CASTargetLanguageMismatch_FailsClosed
 		Status:    "running",
 		CreatedAt: time.Now().UTC(),
 	})
+	_ = db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{
+		ID:        "plan-" + assetID,
+		AssetID:   assetID,
+		CreatedAt: time.Now().UTC(),
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	})
 
 	// Translate for VI
 	transVariantVI, err := svc.Translate(ctx, domain.TranslationJobInput{
@@ -406,5 +439,150 @@ func TestTranslationService_AdaptDubScript_CASTargetLanguageMismatch_FailsClosed
 	}
 	if !strings.Contains(err.Error(), "target_language mismatch") {
 		t.Errorf("expected 'target_language mismatch' error, got: %v", err)
+	}
+}
+
+func TestTranslationService_AdaptDubScript_MissingAudioRolePlan_FailsClosed(t *testing.T) {
+	db, casStore, router, _ := setupTranslationTestEnv(t)
+	svc := service.NewTranslationService(db, casStore)
+	svc.ConfigureRouter(router)
+
+	ctx := context.Background()
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              attID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		DeclaredBy:      "test-operator",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		RightsAttestationID: attID,
+		SHA256:              "fake-sha256-no-plan",
+		ByteSize:            1024,
+		CreatedAt:           time.Now().UTC(),
+	})
+	_ = db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             "job-no-plan",
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		CreatedAt:      time.Now().UTC(),
+	})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        runID,
+		JobID:     "job-no-plan",
+		Status:    "running",
+		CreatedAt: time.Now().UTC(),
+	})
+
+	transVariant, err := svc.Translate(ctx, domain.TranslationJobInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		JobID:          "job-no-plan",
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "今天天气很好。", StartMs: 0, EndMs: 2000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("translate failed: %v", err)
+	}
+
+	// Deliberately do NOT save AudioRolePlan. AdaptDubScript must fail closed.
+	_, err = svc.AdaptDubScript(ctx, domain.DubScriptJobInput{
+		RunID:                 runID,
+		AssetID:               assetID,
+		JobID:                 "job-no-plan",
+		SourceLanguage:        "zh",
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: transVariant.CASHash,
+	})
+	if err == nil {
+		t.Fatal("expected error due to missing AudioRolePlan, got nil")
+	}
+	if !errors.Is(err, domain.ErrAudioRolePlanRequired) {
+		t.Errorf("expected ErrAudioRolePlanRequired, got %v", err)
+	}
+}
+
+func TestTranslationService_AdaptDubScript_NoDubPlan_ReturnsErrNoDubbingRequired(t *testing.T) {
+	db, casStore, router, _ := setupTranslationTestEnv(t)
+	svc := service.NewTranslationService(db, casStore)
+	svc.ConfigureRouter(router)
+
+	ctx := context.Background()
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              attID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		DeclaredBy:      "test-operator",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		RightsAttestationID: attID,
+		SHA256:              "fake-sha256-no-dub",
+		ByteSize:            1024,
+		CreatedAt:           time.Now().UTC(),
+	})
+	_ = db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             "job-no-dub",
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		CreatedAt:      time.Now().UTC(),
+	})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        runID,
+		JobID:     "job-no-dub",
+		Status:    "running",
+		CreatedAt: time.Now().UTC(),
+	})
+
+	// Save AudioRolePlan with 0 dialogue segments (Instrumental BGM only)
+	_ = db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{
+		ID:        "plan-" + assetID,
+		AssetID:   assetID,
+		CreatedAt: time.Now().UTC(),
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+	})
+
+	transVariant, err := svc.Translate(ctx, domain.TranslationJobInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		JobID:          "job-no-dub",
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "今天天气很好。", StartMs: 0, EndMs: 2000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("translate failed: %v", err)
+	}
+
+	_, err = svc.AdaptDubScript(ctx, domain.DubScriptJobInput{
+		RunID:                 runID,
+		AssetID:               assetID,
+		JobID:                 "job-no-dub",
+		SourceLanguage:        "zh",
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: transVariant.CASHash,
+	})
+	if err == nil {
+		t.Fatal("expected ErrNoDubbingRequired on no-dub AudioRolePlan, got nil")
+	}
+	if !errors.Is(err, domain.ErrNoDubbingRequired) {
+		t.Errorf("expected ErrNoDubbingRequired, got %v", err)
 	}
 }

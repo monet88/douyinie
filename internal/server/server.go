@@ -788,6 +788,14 @@ func (s *Server) handleRunDubScript(w http.ResponseWriter, r *http.Request) {
 
 	variant, err := s.translationSvc.AdaptDubScript(r.Context(), in)
 	if err != nil {
+		if errors.Is(err, domain.ErrNoDubbingRequired) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "No dubbing required"})
+			return
+		}
+		if errors.Is(err, domain.ErrAudioRolePlanRequired) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+			return
+		}
 		if errors.Is(err, domain.ErrMeaningPreservationFailed) ||
 			errors.Is(err, domain.ErrFactCorrupted) ||
 			errors.Is(err, domain.ErrNameCorrupted) ||
@@ -897,6 +905,10 @@ func (s *Server) handleAssignVoices(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, domain.ErrNoDubbingRequired) {
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "No dubbing required"})
+			return
+		}
+		if errors.Is(err, domain.ErrAudioRolePlanRequired) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
 			return
 		}
 		if errors.Is(err, domain.ErrNoEligibleTTSProvider) {
@@ -1067,6 +1079,10 @@ func (s *Server) handleAuditionVoice(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "No dubbing required"})
 			return
 		}
+		if errors.Is(err, domain.ErrAudioRolePlanRequired) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+			return
+		}
 		if errors.Is(err, domain.ErrNoEligibleTTSProvider) {
 			writeError(w, http.StatusServiceUnavailable, err.Error())
 			return
@@ -1131,6 +1147,14 @@ func (s *Server) handleRunDubSynthesize(w http.ResponseWriter, r *http.Request) 
 
 	variant, err := s.dubbingSvc.SynthesizeAndFit(r.Context(), in)
 	if err != nil {
+		if errors.Is(err, domain.ErrNoDubbingRequired) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "No dubbing required"})
+			return
+		}
+		if errors.Is(err, domain.ErrAudioRolePlanRequired) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error()})
+			return
+		}
 		if errors.Is(err, domain.ErrDubScriptRequiredForDubbing) || errors.Is(err, domain.ErrVoiceAssignmentRequired) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return

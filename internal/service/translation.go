@@ -6,15 +6,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"strings"
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/storage"
-	"io"
-	"strings"
-	"time"
 )
 
 // TranslationInvokeFunc executes one translation provider attempt.
@@ -454,6 +456,23 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 		sourceLang = "zh"
 	}
 	in.SourceLanguage = sourceLang
+	// Fail closed if AudioRolePlan is missing, unreadable, or contains no dub-eligible dialogue.
+	if s.db == nil || strings.TrimSpace(in.AssetID) == "" {
+		return nil, domain.ErrAudioRolePlanRequired
+	}
+	rolePlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, domain.ErrAudioRolePlanRequired
+		}
+		return nil, fmt.Errorf("get audio role plan: %w", err)
+	}
+	if rolePlan == nil {
+		return nil, domain.ErrAudioRolePlanRequired
+	}
+	if !domain.IsDubEligible(rolePlan) {
+		return nil, domain.ErrNoDubbingRequired
+	}
 
 	// 1. Load meaning-first TranslationVariant
 	transVariant, transCAS, err := s.loadTranslationVariant(ctx, in.AssetID, in.TargetLanguage, in.TranslationVariantCAS)
@@ -461,7 +480,6 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 		return nil, fmt.Errorf("load translation variant for dub script adaptation: %w", err)
 	}
 	in.TranslationVariantCAS = transCAS
-
 	// 2. Compute deterministic provenance cache identity
 	provenanceHash, err := s.computeDubScriptProvenanceHash(in, transVariant)
 	if err != nil {

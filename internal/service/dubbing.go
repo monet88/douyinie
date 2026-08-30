@@ -915,13 +915,30 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 	}
 	in.TargetLanguage = targetLang
 
+	// Fail closed if AudioRolePlan is missing, unreadable, or contains no dub-eligible dialogue.
+	if s.db == nil || strings.TrimSpace(in.AssetID) == "" {
+		return nil, domain.ErrAudioRolePlanRequired
+	}
+	rolePlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, domain.ErrAudioRolePlanRequired
+		}
+		return nil, fmt.Errorf("get audio role plan: %w", err)
+	}
+	if rolePlan == nil {
+		return nil, domain.ErrAudioRolePlanRequired
+	}
+	if !domain.IsDubEligible(rolePlan) {
+		return nil, domain.ErrNoDubbingRequired
+	}
+
 	// 1. Load DubScriptVariant
 	dubScript, dubScriptCAS, err := s.loadDubScriptVariant(ctx, in.AssetID, targetLang, in.DubScriptVariantCAS)
 	if err != nil {
 		return nil, fmt.Errorf("load dub script for synthesis: %w", err)
 	}
 	in.DubScriptVariantCAS = dubScriptCAS
-
 	// 2. Load frozen VoiceAssignment
 	voiceAssign, voiceAssignCAS, err := s.loadVoiceAssignment(ctx, in.AssetID, in.RunID, targetLang, in.VoiceAssignmentCAS)
 	if err != nil {

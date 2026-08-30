@@ -544,3 +544,305 @@ func TestSeam1_AudioRolePlan_TTSFailsOnMissingOrUnknownRunID(t *testing.T) {
 		t.Errorf("expected 422 Unprocessable Entity for unknown run_id on TTS, got %d: %s", resp2.StatusCode, string(bodyBytes))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Issue #32 T12: End-to-end No-dub visual vertical slice (Video-1 style fixture)
+// ---------------------------------------------------------------------------
+
+// TestSeam1_NoDub_EndToEnd_Video1StyleFixture verifies:
+// 1. No-speech video routes through valid no-dub AudioRolePlan contract.
+// 2. Dubbing/voice-selection/TTS branch skipped completely; zero TTS injected; operator-facing "No dubbing required".
+// 3. Visual text localization (compact overlay + subtitles) continues.
+// 4. Soundtrack preserved (bitstream-exact where the plan allows passthrough).
+// 5. Frozen RenderPlan -> preview -> final with exact semantic parity.
+func TestSeam1_NoDub_EndToEnd_Video1StyleFixture(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// 1. AudioRolePlan with 0 dub-eligible dialogue segments (Instrumental BGM + Ambience SFX)
+	rolePlanPayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 4000, Role: domain.AudioRoleInstrumentalBgm},
+			{StartMs: 4000, EndMs: 8000, Role: domain.AudioRoleAmbienceSFX},
+		},
+	}
+	roleBody, _ := json.Marshal(rolePlanPayload)
+	savePlanResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
+	if err != nil {
+		t.Fatalf("save audio role plan failed: %v", err)
+	}
+	defer savePlanResp.Body.Close()
+	if savePlanResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created for audio role plan, got %d", savePlanResp.StatusCode)
+	}
+
+	// 2. Track executor calls to prove ZERO TTS / dub executor calls occur
+	var mu sync.Mutex
+	var executedStages []string
+	h.SetExecutor(func(ctx context.Context, p provider.Provider, attemptNumber int) error {
+		mu.Lock()
+		executedStages = append(executedStages, string(p.Type()))
+		mu.Unlock()
+		return nil
+	})
+
+	// 3. Speech understanding: POST /api/v1/assets/{id}/speech-understand -> 422 with "no dub-eligible speech"
+	speechPayload, _ := json.Marshal(map[string]any{"run_id": runID})
+	speechResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/speech-understand", h.server.URL, assetID), "application/json", bytes.NewReader(speechPayload))
+	if err != nil {
+		t.Fatalf("speech understand failed: %v", err)
+	}
+	defer speechResp.Body.Close()
+	if speechResp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("expected 422 for speech understand on no-dub video, got %d", speechResp.StatusCode)
+	}
+	var speechErrRes struct {
+		Error string `json:"error"`
+	}
+	_ = json.NewDecoder(speechResp.Body).Decode(&speechErrRes)
+	if !strings.Contains(speechErrRes.Error, "no dub-eligible speech") {
+		t.Errorf("expected error mentioning no dub-eligible speech, got %q", speechErrRes.Error)
+	}
+
+	// 4. Voice Audition: POST /api/v1/assets/{id}/voice-audition -> 422 with "No dubbing required"
+	auditionPayload := map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+		"voice": domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_f1",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+	}
+	audBody, _ := json.Marshal(auditionPayload)
+	audResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/voice-audition", h.server.URL, assetID), "application/json", bytes.NewReader(audBody))
+	if err != nil {
+		t.Fatalf("voice audition failed: %v", err)
+	}
+	defer audResp.Body.Close()
+	if audResp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("expected 422 for voice audition on no-dub video, got %d", audResp.StatusCode)
+	}
+	var audErrRes struct {
+		Error string `json:"error"`
+	}
+	_ = json.NewDecoder(audResp.Body).Decode(&audErrRes)
+	if audErrRes.Error != "No dubbing required" {
+		t.Errorf("expected 'No dubbing required', got %q", audErrRes.Error)
+	}
+
+	// 5. Voice Assignment: POST /api/v1/assets/{id}/voice-assignment -> 422 with "No dubbing required"
+	assignPayload := map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	}
+	assignBody, _ := json.Marshal(assignPayload)
+	assignResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/voice-assignment", h.server.URL, assetID), "application/json", bytes.NewReader(assignBody))
+	if err != nil {
+		t.Fatalf("voice assignment failed: %v", err)
+	}
+	defer assignResp.Body.Close()
+	if assignResp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("expected 422 for voice assignment on no-dub video, got %d", assignResp.StatusCode)
+	}
+	var assignErrRes struct {
+		Error string `json:"error"`
+	}
+	_ = json.NewDecoder(assignResp.Body).Decode(&assignErrRes)
+	if assignErrRes.Error != "No dubbing required" {
+		t.Errorf("expected 'No dubbing required', got %q", assignErrRes.Error)
+	}
+
+	// 6. Router-based Dub Execution (TTS & dialogue adaptation) -> BYPASS decision with zero executor calls
+	ttsExecPayload := map[string]any{
+		"run_id":      runID,
+		"stage":       "tts",
+		"language":    "vi",
+		"input_hash":  "no_dub_tts_input_hash",
+		"max_retries": 1,
+	}
+	ttsExecBody, _ := json.Marshal(ttsExecPayload)
+	ttsExecResp, err := http.Post(fmt.Sprintf("%s/api/v1/routing/execute", h.server.URL), "application/json", bytes.NewReader(ttsExecBody))
+	if err != nil {
+		t.Fatalf("tts execute failed: %v", err)
+	}
+	defer ttsExecResp.Body.Close()
+	if ttsExecResp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK for bypassed tts execution, got %d", ttsExecResp.StatusCode)
+	}
+
+	decisions := getRoutingDecisions(t, h, runID, "tts")
+	if len(decisions) == 0 || decisions[0].PolicyCheckResult != "BYPASS" {
+		t.Errorf("expected BYPASS routing decision for TTS stage on no-dub video, got %+v", decisions)
+	}
+
+	// Verify ZERO TTS executor calls were made
+	mu.Lock()
+	for _, st := range executedStages {
+		if st == "tts" {
+			t.Errorf("TTS executor was called unexpectedly during no-dub execution")
+		}
+	}
+	mu.Unlock()
+
+	// 7. Visual Text Localization: Detect text (T09) & Localize visual track (T10)
+	detectBody, _ := json.Marshal(map[string]any{"run_id": runID, "frame_sample_step_ms": 500})
+	detectResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/detect-text", h.server.URL, assetID), "application/json", bytes.NewReader(detectBody))
+	if err != nil {
+		t.Fatalf("detect-text failed: %v", err)
+	}
+	defer detectResp.Body.Close()
+	if detectResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created from detect-text, got %d", detectResp.StatusCode)
+	}
+
+	visPayload := map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	}
+	visBody, _ := json.Marshal(visPayload)
+	visResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/visual-track", h.server.URL, assetID), "application/json", bytes.NewReader(visBody))
+	if err != nil {
+		t.Fatalf("visual-track localization failed: %v", err)
+	}
+	defer visResp.Body.Close()
+	if visResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created from visual-track, got %d", visResp.StatusCode)
+	}
+
+	var visRes struct {
+		Track domain.LocalizedVisualTrack `json:"localized_visual_track"`
+	}
+	if err := json.NewDecoder(visResp.Body).Decode(&visRes); err != nil {
+		t.Fatalf("decode visual-track response failed: %v", err)
+	}
+	if visRes.Track.CASHash == "" || visRes.Track.SubtitleTrackCAS == "" {
+		t.Errorf("expected valid CAS hashes for localized visual track and subtitle track")
+	}
+	if len(visRes.Track.Overlays) == 0 {
+		t.Errorf("expected localized visual overlays in no-dub visual vertical slice")
+	}
+
+	// 8. Soundtrack Preservation / Audio Mix (T15): zero-speech clean passthrough
+	mixPayload := map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	}
+	mixBody, _ := json.Marshal(mixPayload)
+	mixResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-mix", h.server.URL, assetID), "application/json", bytes.NewReader(mixBody))
+	if err != nil {
+		t.Fatalf("audio mix failed: %v", err)
+	}
+	defer mixResp.Body.Close()
+	if mixResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created from audio-mix, got %d", mixResp.StatusCode)
+	}
+
+	var mixRes struct {
+		DubMix domain.DubMixArtifact `json:"dub_mix"`
+	}
+	if err := json.NewDecoder(mixResp.Body).Decode(&mixRes); err != nil {
+		t.Fatalf("decode audio-mix response failed: %v", err)
+	}
+	dubMix := mixRes.DubMix
+	if dubMix.OverallStatus != "PASS" {
+		t.Errorf("expected PASS dub mix status, got %s", dubMix.OverallStatus)
+	}
+	if dubMix.DialogueSuppressed {
+		t.Errorf("expected DialogueSuppressed=false on no-dub video")
+	}
+	if !dubMix.SoundtrackPreserved {
+		t.Errorf("expected SoundtrackPreserved=true on no-dub video")
+	}
+	if dubMix.DubSegmentsCAS != "" {
+		t.Errorf("expected empty DubSegmentsCAS (zero TTS injected), got %s", dubMix.DubSegmentsCAS)
+	}
+	if dubMix.AudioStemsCAS != "" {
+		t.Errorf("expected empty AudioStemsCAS on no-dub passthrough, got %s", dubMix.AudioStemsCAS)
+	}
+
+	// Verify byte/hash identity of preserved audio against preflight source audio
+	preflightResp, err := http.Get(fmt.Sprintf("%s/api/v1/assets/%s/preflight", h.server.URL, assetID))
+	if err != nil {
+		t.Fatalf("get preflight report failed: %v", err)
+	}
+	defer preflightResp.Body.Close()
+	if preflightResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for preflight report, got %d", preflightResp.StatusCode)
+	}
+	var pfRes struct {
+		Preflight domain.PreflightReport `json:"preflight_report"`
+	}
+	_ = json.NewDecoder(preflightResp.Body).Decode(&pfRes)
+	if dubMix.AudioCASHash != pfRes.Preflight.NormalizedAudioSHA256 {
+		t.Errorf("expected bitstream-exact AudioCASHash %s, got %s", pfRes.Preflight.NormalizedAudioSHA256, dubMix.AudioCASHash)
+	}
+	if dubMix.AudioCASPath != pfRes.Preflight.NormalizedAudioCASPath {
+		t.Errorf("expected AudioCASPath %s, got %s", pfRes.Preflight.NormalizedAudioCASPath, dubMix.AudioCASPath)
+	}
+
+	// 9. Freeze RenderPlan (T11): combines preserved soundtrack + actual LocalizedSubtitleTrack produced by T10
+	freezeResp, plan := runFreezeRenderPlan(t, h, assetID, map[string]any{
+		"run_id":            runID,
+		"job_id":            jobID,
+		"target_language":   domain.TargetLanguageVI,
+		"subtitle_plan_cas": visRes.Track.SubtitleTrackCAS,
+	})
+	defer freezeResp.Body.Close()
+	if freezeResp.StatusCode != http.StatusCreated || plan == nil {
+		t.Fatalf("freeze render plan failed: status %d", freezeResp.StatusCode)
+	}
+	if plan.DubMixCASHash != dubMix.CASHash {
+		t.Errorf("expected RenderPlan to freeze exact DubMixCASHash: %s vs %s", plan.DubMixCASHash, dubMix.CASHash)
+	}
+	if plan.AudioCASHash != dubMix.AudioCASHash {
+		t.Errorf("expected RenderPlan to freeze exact AudioCASHash: %s vs %s", plan.AudioCASHash, dubMix.AudioCASHash)
+	}
+	if plan.SubtitlePlan.CASHash != visRes.Track.SubtitleTrackCAS {
+		t.Errorf("expected RenderPlan to freeze exact SubtitleTrackCAS from T10: %s vs %s", plan.SubtitlePlan.CASHash, visRes.Track.SubtitleTrackCAS)
+	}
+
+	// 10. Render Preview & Final: verify preview -> final exact semantic parity
+	prevResp, preview := runRenderPreview(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": domain.TargetLanguageVI,
+		"plan_provenance": plan.ProvenanceHash,
+	})
+	defer prevResp.Body.Close()
+	if prevResp.StatusCode != http.StatusCreated || preview == nil {
+		t.Fatalf("preview render failed: status %d", prevResp.StatusCode)
+	}
+
+	finResp, final := runRenderFinal(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": domain.TargetLanguageVI,
+		"plan_provenance": plan.ProvenanceHash,
+	})
+	defer finResp.Body.Close()
+	if finResp.StatusCode != http.StatusCreated || final == nil {
+		t.Fatalf("final render failed: status %d", finResp.StatusCode)
+	}
+
+	// Semantic Parity Assertions
+	if preview.ConsumedPlan.PlanProvenanceHash != final.ConsumedPlan.PlanProvenanceHash {
+		t.Errorf("parity violation: PlanProvenanceHash mismatch: preview=%s, final=%s",
+			preview.ConsumedPlan.PlanProvenanceHash, final.ConsumedPlan.PlanProvenanceHash)
+	}
+	if preview.ConsumedPlan.PlanCASHash != final.ConsumedPlan.PlanCASHash {
+		t.Errorf("parity violation: PlanCASHash mismatch: preview=%s, final=%s",
+			preview.ConsumedPlan.PlanCASHash, final.ConsumedPlan.PlanCASHash)
+	}
+	if preview.ConsumedPlan.AudioCASHash != dubMix.AudioCASHash || final.ConsumedPlan.AudioCASHash != dubMix.AudioCASHash {
+		t.Errorf("parity violation: AudioCASHash mismatch against preserved soundtrack: %s", dubMix.AudioCASHash)
+	}
+	if preview.ConsumedPlan.SubtitlePlan.CASHash != final.ConsumedPlan.SubtitlePlan.CASHash {
+		t.Errorf("parity violation: SubtitlePlan CAS mismatch: preview=%s, final=%s",
+			preview.ConsumedPlan.SubtitlePlan.CASHash, final.ConsumedPlan.SubtitlePlan.CASHash)
+	}
+}
