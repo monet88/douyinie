@@ -1,0 +1,22 @@
+internal/domain/tts.go
+  h_17f2fa2b92da6a 37-38,305,307-309
+internal/server/server.go
+  h_17f2fa2b92da6a 886-889,956-959,1054-1057
+internal/service/dubbing.go
+  h_17f2fa2b92da6a 8,80-90,411-479,493-499,501-579,590-591,600-862,871,878-887,894,896-898
+internal/service/dubbing_test.go
+  h_17f2fa2b92da6a 8-11,16,186-1584
+test/seam1/tts_acceptance_test.go
+  h_17f2fa2b92da6a 8,11,13-16,480-485,775-1582
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "e84edd3313e9a7c8d7ba2474b5f70ac5117f966c",
+  "prompts": {},
+  "humans": {
+    "h_17f2fa2b92da6a": {
+      "author": "monet88 <minhthang421992@gmail.com>"
+    }
+  }
+}
