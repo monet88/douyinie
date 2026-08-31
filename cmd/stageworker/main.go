@@ -1243,22 +1243,14 @@ func writeOutputArtifact(cmd worker.Command, v any) (worker.ArtifactRef, error) 
 
 // writeMarkerArtifact writes a stage marker to the output path. It is only
 // used for unrecognized/neutral stages to preserve protocol lifecycle
-// compatibility; real ASR/aligner stages never produce placeholder artifacts.
+// compatibility. The returned content address is the real SHA-256 of the
+// marker bytes — placeholder hashes are never emitted.
 func writeMarkerArtifact(cmd worker.Command) (worker.ArtifactRef, error) {
-	if cmd.OutputPath != "" {
-		marker := map[string]any{
-			"command_id": cmd.ID,
-			"stage":      cmd.Stage,
-			"family":     cmd.Family,
-			"status":     "executed",
-		}
-		b, _ := json.MarshalIndent(marker, "", "  ")
-		if err := os.WriteFile(cmd.OutputPath, b, 0644); err != nil {
-			return worker.ArtifactRef{}, fmt.Errorf("write output artifact: %w", err)
-		}
+	marker := map[string]any{
+		"command_id": cmd.ID,
+		"stage":      cmd.Stage,
+		"family":     cmd.Family,
+		"status":     "executed",
 	}
-	return worker.ArtifactRef{
-		SHA256: cmd.ID + "-sha256-placeholder",
-		Path:   cmd.OutputPath,
-	}, nil
+	return writeOutputArtifact(cmd, marker)
 }

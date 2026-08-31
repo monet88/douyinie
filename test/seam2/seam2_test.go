@@ -156,8 +156,8 @@ func TestSeam2_SubprocessLifecycleAndComplete(t *testing.T) {
 	if artifact.Path != outPath {
 		t.Fatalf("unexpected artifact path %q", artifact.Path)
 	}
-	if !strings.Contains(artifact.SHA256, "sha256") {
-		t.Fatalf("unexpected artifact hash %q", artifact.SHA256)
+	if artifact.SHA256 == "" || strings.Contains(artifact.SHA256, "placeholder") {
+		t.Fatalf("expected real SHA-256, got %q", artifact.SHA256)
 	}
 	if _, err := os.Stat(outPath); err != nil {
 		t.Fatalf("output artifact missing: %v", err)
@@ -224,8 +224,8 @@ func TestSeam2_CooperativeCancelCompletesBeforeEscalation(t *testing.T) {
 		_ = sup.Terminate()
 		t.Fatalf("subsequent command failed on live worker: %v", err)
 	}
-	if !strings.Contains(art2.SHA256, "cmd-subsequent") {
-		t.Fatalf("unexpected subsequent artifact: %+v", art2)
+	if art2.SHA256 == "" || strings.Contains(art2.SHA256, "placeholder") {
+		t.Fatalf("expected real SHA-256 on subsequent artifact, got %q", art2.SHA256)
 	}
 	_ = client.Shutdown()
 }
