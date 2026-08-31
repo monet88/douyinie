@@ -197,8 +197,52 @@ func setupFullReviewHarness(t *testing.T) (*service.ReviewService, *storage.DB, 
 		ProvenanceHash: "prov-va-" + assetID,
 		CreatedAt:      va.CreatedAt,
 	})
+	// Setup DubMixArtifact
+	dubMix := domain.DubMixArtifact{
+		ID:             "dubmix-" + assetID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		AudioCASHash:   wavObj.SHA256,
+		OverallStatus:  "PASS",
+		CreatedAt:      time.Now().UTC(),
+	}
+	dmBytes, _ := json.Marshal(dubMix)
+	dmObj, _ := casStore.Put(bytes.NewReader(dmBytes))
+	_ = db.SaveDubMixArtifactIndex(ctx, storage.DubMixArtifactIndex{
+		ID:             dubMix.ID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		CASHash:        dmObj.SHA256,
+		ProvenanceHash: "prov-dubmix-" + assetID,
+		OverallStatus:  "PASS",
+		CreatedAt:      dubMix.CreatedAt,
+	})
 
 	transSvc := service.NewTranslationService(db, casStore)
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		var segs []domain.TranslationSegment
+		for _, s := range req.Segments {
+			target := "Bản dịch: " + s.SourceText
+			if s.SourceText == "关注" {
+				target = "Theo dõi"
+			}
+			segs = append(segs, domain.TranslationSegment{
+				Index:        s.Index,
+				SourceText:   s.SourceText,
+				TargetText:   target,
+				StartMs:      s.StartMs,
+				EndMs:        s.EndMs,
+				QAConfidence: 0.95,
+				PassedQAGate: true,
+			})
+		}
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "qwen_trans",
+			ModelVersion: "v1",
+			Segments:     segs,
+		}, nil
+	}
 	dubSvc := service.NewDubbingService(db, casStore)
 	dubSvc.TTSInvoke = func(ctx context.Context, p provider.Provider, req provider.TTSSynthesisRequest) (*provider.TTSSynthesisResult, error) {
 		pcm := media.GeneratePCM16WAV(16000, 1, 1000)
@@ -213,6 +257,7 @@ func setupFullReviewHarness(t *testing.T) (*service.ReviewService, *storage.DB, 
 	}
 	mixSvc := service.NewAudioMixService(db, casStore)
 	visSvc := service.NewVisualTextService(db, casStore)
+	visSvc.SetTranslationService(transSvc)
 	renderSvc := service.NewRenderService(db, casStore)
 
 	reviewSvc.SetTranslationService(transSvc)
@@ -1198,5 +1243,604 @@ func TestReviewService_CorrectTargetText_HonestQAEvaluation_And_FailClosed(t *te
 				t.Errorf("invented fake QA pass/score for failing correction! %+v", savedTVar.Segments[0])
 			}
 		}
+	}
+}
+
+func TestReviewService_CorrectRegionGeometry_FailClosedOnPersistenceErrors(t *testing.T) {
+	svc, _, _, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+
+	newRole := domain.TextRoleSemanticText
+	// 1. Missing TextRegionPlan index in DB
+	_, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides: []domain.RegionOverride{
+			{
+				RegionID: "region-1",
+				NewRole:  &newRole,
+			},
+		},
+		Reason:   "Test missing plan",
+		Operator: "tester",
+	})
+	if err == nil {
+		t.Errorf("expected error when TextRegionPlan is missing in DB, got nil")
+	}
+}
+
+func TestReviewService_ReassignVoice_VisualTrackFailClosed(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-reassign-fc-01"
+
+	// Setup initial VoiceAssignment for runID
+	va := domain.VoiceAssignment{
+		ID:             "va-fc-1",
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		Assignments: map[string]domain.VoiceProfile{
+			"SPEAKER_00": {
+				ID:         "vi-preset-1",
+				Name:       "Preset Voice 1",
+				Language:   "vi",
+				Gender:     "female",
+				ProviderID: "fake_tts",
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	vaBytes, _ := json.Marshal(va)
+	vaObj, _ := casStore.Put(bytes.NewReader(vaBytes))
+	_ = db.SaveVoiceAssignmentIndex(ctx, storage.VoiceAssignmentIndex{
+		ID:             va.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        vaObj.SHA256,
+		ProvenanceHash: "prov-va-fc-1",
+		CreatedAt:      va.CreatedAt,
+	})
+
+	// Setup DubScriptVariant in DB and CAS
+	dsVar := domain.DubScriptVariant{
+		ID:             "dubscript-fc-1",
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		ProvenanceHash: "prov-ds-fc-1",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:               0,
+				SourceText:          "测试",
+				SpokenText:          "Thử nghiệm",
+				SpeakerID:           "SPEAKER_00",
+				StartMs:             0,
+				EndMs:               1500,
+				SlotDurationMs:      1500,
+				EstimatedDurationMs: 1000,
+				PassedQAGate:        true,
+				QAConfidence:        0.95,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dsBytes, _ := json.Marshal(dsVar)
+	dsObj, _ := casStore.Put(bytes.NewReader(dsBytes))
+	_ = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID:             dsVar.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        dsObj.SHA256,
+		ProvenanceHash: dsVar.ProvenanceHash,
+		CreatedAt:      dsVar.CreatedAt,
+	})
+
+	// Case A: Corrupt CAS hash in LocalizedVisualTrackIndex
+	_ = db.SaveLocalizedVisualTrackIndex(ctx, storage.LocalizedVisualTrackIndex{
+		ID:                "vis-corrupt-1",
+		AssetID:           assetID,
+		RunID:             runID,
+		TargetLanguage:    "vi",
+		TextRegionPlanCAS: "some_plan_cas",
+		CASHash:           "non_existent_visual_cas_hash_999",
+		ProvenanceHash:    "prov-vis-corrupt-1",
+		CreatedAt:         time.Now().UTC(),
+	})
+
+	_, err := svc.ReassignVoice(ctx, service.VoiceReassignCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		CustomAssignments: map[string]domain.VoiceProfile{
+			"SPEAKER_00": {
+				ID:         "vi-preset-2",
+				Name:       "Preset Voice 2",
+				Language:   "vi",
+				Gender:     "male",
+				ProviderID: "fake_tts",
+			},
+		},
+		Reason:   "Test corrupt visual track CAS",
+		Operator: "tester",
+	})
+	if err == nil || !strings.Contains(err.Error(), "load localized visual track from CAS") {
+		t.Fatalf("expected fail-closed error on corrupt visual track CAS, got: %v", err)
+	}
+
+	// Case B: Corrupt JSON payload in CAS
+	badJSONObj, _ := casStore.Put(bytes.NewReader([]byte("{invalid-json-bytes-for-visual-track")))
+	_ = db.SaveLocalizedVisualTrackIndex(ctx, storage.LocalizedVisualTrackIndex{
+		ID:                "vis-corrupt-2",
+		AssetID:           assetID,
+		RunID:             runID,
+		TargetLanguage:    "vi",
+		TextRegionPlanCAS: "some_plan_cas",
+		CASHash:           badJSONObj.SHA256,
+		ProvenanceHash:    "prov-vis-corrupt-2",
+		CreatedAt:         time.Now().UTC(),
+	})
+
+	_, err = svc.ReassignVoice(ctx, service.VoiceReassignCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		CustomAssignments: map[string]domain.VoiceProfile{
+			"SPEAKER_00": {
+				ID:         "vi-preset-3",
+				Name:       "Preset Voice 3",
+				Language:   "vi",
+				Gender:     "female",
+				ProviderID: "fake_tts",
+			},
+		},
+		Reason:   "Test corrupt visual track JSON decode",
+		Operator: "tester",
+	})
+	if err == nil || !strings.Contains(err.Error(), "decode localized visual track") {
+		t.Fatalf("expected fail-closed error on corrupt visual track JSON, got: %v", err)
+	}
+
+	// Case C: Valid LocalizedVisualTrack in CAS
+	validVisTrack := domain.LocalizedVisualTrack{
+		ID:             "vis-valid-1",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		SubtitleCues: []domain.SubtitleCue{
+			{
+				StartMs: 0,
+				EndMs:   1500,
+				Text:    "Thử nghiệm phụ đề",
+				X:       100,
+				Y:       200,
+				Width:   300,
+				Height:  50,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	validVisBytes, _ := json.Marshal(validVisTrack)
+	validVisObj, _ := casStore.Put(bytes.NewReader(validVisBytes))
+	_ = db.SaveLocalizedVisualTrackIndex(ctx, storage.LocalizedVisualTrackIndex{
+		ID:                validVisTrack.ID,
+		AssetID:           assetID,
+		RunID:             runID,
+		TargetLanguage:    "vi",
+		TextRegionPlanCAS: "some_plan_cas",
+		CASHash:           validVisObj.SHA256,
+		ProvenanceHash:    "prov-vis-valid-1",
+		CreatedAt:         validVisTrack.CreatedAt,
+	})
+
+	res, err := svc.ReassignVoice(ctx, service.VoiceReassignCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		CustomAssignments: map[string]domain.VoiceProfile{
+			"SPEAKER_00": {
+				ID:         "vi-preset-4",
+				Name:       "Preset Voice 4",
+				Language:   "vi",
+				Gender:     "female",
+				ProviderID: "fake_tts",
+			},
+		},
+		Reason:   "Valid voice reassign with visual track",
+		Operator: "tester",
+	})
+	if err != nil {
+		t.Fatalf("expected success with valid visual track, got err: %v", err)
+	}
+	if res.RenderPlanCAS == "" {
+		t.Fatalf("expected non-empty RenderPlanCAS")
+	}
+}
+
+func TestReviewService_CorrectRegionGeometry_DubMixStorageErrorAndNoDubPreservation(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-dubmix-test-01"
+
+	// 1. Setup TextRegionPlan with a valid region
+	tPlan := domain.TextRegionPlan{
+		ID:             "text-plan-dm-1",
+		AssetID:        assetID,
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		ProvenanceHash: "prov-text-dm-1",
+		Regions: []domain.TrackedTextRegion{
+			{
+				ID:          "region-dm-1",
+				Text:        "关注",
+				Role:        domain.TextRoleSemanticText,
+				FirstSeenMs: 0,
+				LastSeenMs:  1500,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(tPlan)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	_ = db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             tPlan.ID,
+		AssetID:        assetID,
+		CASHash:        tObj.SHA256,
+		ProvenanceHash: tPlan.ProvenanceHash,
+		CreatedAt:      tPlan.CreatedAt,
+	})
+
+	// Case A: Valid DubMix index in DB -> passed to RenderPlan
+	newRole := domain.TextRoleSemanticText
+	res, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides: []domain.RegionOverride{
+			{
+				RegionID: "region-dm-1",
+				NewRole:  &newRole,
+			},
+		},
+		Reason:   "Test dub mix pass-through",
+		Operator: "tester",
+	})
+	if err != nil {
+		t.Fatalf("expected success with existing dub mix index, got err: %v", err)
+	}
+	if res.RenderPlanCAS == "" {
+		t.Fatalf("expected non-empty RenderPlanCAS")
+	}
+
+	rcPlan, err := casStore.Get(res.RenderPlanCAS)
+	if err != nil {
+		t.Fatalf("load render plan from CAS: %v", err)
+	}
+	var rPlan domain.RenderPlan
+	_ = json.NewDecoder(rcPlan).Decode(&rPlan)
+	rcPlan.Close()
+	if rPlan.DubMixCASHash == "" {
+		t.Errorf("expected non-empty DubMixCASHash in RenderPlan")
+	}
+
+	// Case B: Storage error on GetDubMixArtifactIndex -> must fail closed and propagate error
+	_ = db.Close() // Force unexpected storage failure on closed DB
+	_, err = svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides: []domain.RegionOverride{
+			{
+				RegionID: "region-dm-1",
+				NewRole:  &newRole,
+			},
+		},
+		Reason:   "Test storage error propagation",
+		Operator: "tester",
+	})
+	if err == nil {
+		t.Fatalf("expected error on storage failure during CorrectRegionGeometry, got nil")
+	}
+}
+
+func TestReviewService_CorrectRegionGeometry_MissingDubMixFailsClosed(t *testing.T) {
+	svc, db, casStore, _ := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-dubmix-missing-01"
+	newRole := domain.TextRoleSemanticText
+
+	// Dedicated asset with NO DubMix index. A valid no-speech/no-dub run still executes
+	// AudioMixService and persists a PASS passthrough DubMixArtifact, so its absence here is an
+	// incomplete/invalid review state and must fail closed — not be treated as a no-dub success.
+	assetIDNoDub := "asset-no-dub-01"
+	srcObj, err := casStore.Put(bytes.NewReader([]byte("no-dub source media bytes")))
+	if err != nil {
+		t.Fatalf("put no-dub media: %v", err)
+	}
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetIDNoDub,
+		SHA256:              srcObj.SHA256,
+		ByteSize:            int64(len("no-dub source media bytes")),
+		MimeType:            "video/mp4",
+		OriginalFilename:    "video.mp4",
+		RightsAttestationID: "att-review-001",
+		CreatedAt:           time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create no-dub source asset: %v", err)
+	}
+
+	noDubPlan := domain.TextRegionPlan{
+		ID:             "text-plan-nodub-1",
+		AssetID:        assetIDNoDub,
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		ProvenanceHash: "prov-text-nodub-1",
+		Regions: []domain.TrackedTextRegion{
+			{ID: "region-nodub-1", Text: "关注", Role: domain.TextRoleSemanticText, FirstSeenMs: 0, LastSeenMs: 1500},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	noDubBytes, _ := json.Marshal(noDubPlan)
+	noDubObj, _ := casStore.Put(bytes.NewReader(noDubBytes))
+	if err := db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             noDubPlan.ID,
+		AssetID:        assetIDNoDub,
+		CASHash:        noDubObj.SHA256,
+		ProvenanceHash: noDubPlan.ProvenanceHash,
+		CreatedAt:      noDubPlan.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save no-dub text region plan index: %v", err)
+	}
+
+	// No DubMix index exists for assetIDNoDub -> CorrectRegionGeometry must fail closed
+	// BEFORE freezing any RenderPlan.
+	_, err = svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetIDNoDub,
+		TargetLanguage: "vi",
+		Overrides: []domain.RegionOverride{
+			{RegionID: "region-nodub-1", NewRole: &newRole},
+		},
+		Reason:   "Missing DubMix index must fail closed",
+		Operator: "tester",
+	})
+	if err == nil || !strings.Contains(err.Error(), "dub mix") {
+		t.Fatalf("expected fail-closed error on missing DubMix index, got: %v", err)
+	}
+
+	// Prove it failed BEFORE freezing RenderPlan: no RenderPlan row persisted.
+	if idx, gerr := db.GetRenderPlanIndex(ctx, assetIDNoDub, "vi"); gerr == nil && idx != nil {
+		t.Errorf("expected no RenderPlan frozen when DubMix is missing, got %+v", idx)
+	}
+}
+
+func TestReviewService_CorrectRegionGeometry_OverrideMintsNewImmutablePlanIdentity(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-lineage-01"
+
+	// Setup a source TextRegionPlan with one region to override.
+	origProv := "prov-text-lineage-1"
+	srcPlan := domain.TextRegionPlan{
+		ID:             "text-plan-lineage-1",
+		AssetID:        assetID,
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		ProvenanceHash: origProv,
+		Regions: []domain.TrackedTextRegion{
+			{
+				ID:             "reg-lineage-1",
+				Text:           "注意",
+				Role:           domain.TextRoleUncertain,
+				FirstSeenMs:    0,
+				LastSeenMs:     1500,
+				ReviewRequired: true,
+				ReviewReason:   "uncertain_role",
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	srcBytes, _ := json.Marshal(srcPlan)
+	srcObj, _ := casStore.Put(bytes.NewReader(srcBytes))
+	if err := db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             srcPlan.ID,
+		AssetID:        assetID,
+		CASHash:        srcObj.SHA256,
+		ProvenanceHash: origProv,
+		CreatedAt:      srcPlan.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save source plan index: %v", err)
+	}
+
+	// Reclassify the uncertain region to semantic_text.
+	semanticRole := domain.TextRoleSemanticText
+	res, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides: []domain.RegionOverride{
+			{RegionID: "reg-lineage-1", NewRole: &semanticRole},
+		},
+		Reason:   "Reclassify uncertain region",
+		Operator: "tester",
+	})
+	if err != nil {
+		t.Fatalf("CorrectRegionGeometry failed: %v", err)
+	}
+	if res.Status != domain.ReviewItemStatusAutoResolved {
+		t.Errorf("expected auto_resolved, got: %s", res.Status)
+	}
+
+	// The overridden plan is latest.
+	overIdx, err := db.GetTextRegionPlanIndex(ctx, assetID)
+	if err != nil {
+		t.Fatalf("get latest plan index: %v", err)
+	}
+	if overIdx == nil {
+		t.Fatalf("expected latest plan index")
+	}
+	if overIdx.ProvenanceHash == origProv {
+		t.Errorf("overridden plan must NOT reuse source provenance")
+	}
+	if overIdx.ID == srcPlan.ID {
+		t.Errorf("overridden plan must carry a NEW immutable ID")
+	}
+
+	// The source plan is still retrievable by its ORIGINAL provenance (never overwritten).
+	srcIdx, err := db.GetTextRegionPlanByProvenance(ctx, origProv)
+	if err != nil {
+		t.Fatalf("source plan must remain retrievable by original provenance: %v", err)
+	}
+	if srcIdx == nil || srcIdx.CASHash != srcObj.SHA256 {
+		t.Errorf("source plan index was overwritten: got %+v, want CAS %s", srcIdx, srcObj.SHA256)
+	}
+}
+
+func TestReviewService_RegionOverride_TruthfulnessAndLowOCRFlags(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-truth-01"
+
+	// Setup TextRegionPlan with:
+	// 1. "reg-uncertain": uncertain role exception
+	// 2. "reg-low-ocr": low OCR confidence exception on subtitle
+	tPlan := domain.TextRegionPlan{
+		ID:             "text-plan-truth-1",
+		AssetID:        assetID,
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		ProvenanceHash: "prov-text-truth-1",
+		Regions: []domain.TrackedTextRegion{
+			{
+				ID:             "reg-uncertain",
+				Text:           "模糊文本",
+				Role:           domain.TextRoleUncertain,
+				FirstSeenMs:    0,
+				LastSeenMs:     1000,
+				ReviewRequired: true,
+				ReviewReason:   "uncertain_role",
+			},
+			{
+				ID:             "reg-low-ocr",
+				Text:           "低置信度文本",
+				Role:           domain.TextRoleSpeechSubtitle,
+				FirstSeenMs:    1000,
+				LastSeenMs:     2000,
+				ReviewRequired: true,
+				ReviewReason:   "low_ocr_confidence_subtitle",
+				ConfidenceEvidence: domain.ConfidenceEvidence{
+					LowConfidence:  true,
+					MeanConfidence: 0.38,
+				},
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(tPlan)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	_ = db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             tPlan.ID,
+		AssetID:        assetID,
+		CASHash:        tObj.SHA256,
+		ProvenanceHash: tPlan.ProvenanceHash,
+		CreatedAt:      tPlan.CreatedAt,
+	})
+
+	// Initial pending queue: 2 exceptions
+	itemsInitial, err := svc.ProjectReviewItems(ctx, assetID, "vi")
+	if err != nil || len(itemsInitial) != 2 {
+		t.Fatalf("expected 2 pending review exceptions, got %d (err: %v)", len(itemsInitial), err)
+	}
+
+	// Step 1: Reclassify "reg-uncertain" to semantic_text (role-only edit, genuine uncertain-role exception cleared)
+	semanticRole := domain.TextRoleSemanticText
+	res1, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides: []domain.RegionOverride{
+			{
+				RegionID: "reg-uncertain",
+				NewRole:  &semanticRole,
+			},
+		},
+		Reason:   "Reclassify uncertain role to semantic text",
+		Operator: "editor_monet",
+	})
+	if err != nil {
+		t.Fatalf("CorrectRegionGeometry step 1 failed: %v", err)
+	}
+	if res1.Status != domain.ReviewItemStatusAutoResolved {
+		t.Errorf("expected auto_resolved for resolved uncertain role exception, got: %s", res1.Status)
+	}
+
+	// Check queue: only "reg-low-ocr" remains pending (1 item)
+	itemsAfterStep1, err := svc.ProjectReviewItems(ctx, assetID, "vi")
+	if err != nil || len(itemsAfterStep1) != 1 {
+		t.Fatalf("expected 1 remaining pending item, got %d (err: %v)", len(itemsAfterStep1), err)
+	}
+	if itemsAfterStep1[0].RegionID != "reg-low-ocr" {
+		t.Errorf("expected 'reg-low-ocr' to remain pending, got: %s", itemsAfterStep1[0].RegionID)
+	}
+
+	// Step 2: Role-only edit on "reg-low-ocr" (change role to semantic_text, NewText = nil)
+	// Must PRESERVE low-OCR ReviewRequired flag and remain pending!
+	res2, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides: []domain.RegionOverride{
+			{
+				RegionID: "reg-low-ocr",
+				NewRole:  &semanticRole,
+			},
+		},
+		Reason:   "Role-only change on low OCR region",
+		Operator: "editor_monet",
+	})
+	if err != nil {
+		t.Fatalf("CorrectRegionGeometry step 2 failed: %v", err)
+	}
+	if res2.Status != domain.ReviewItemStatusPending {
+		t.Errorf("role-only edit on low-OCR region must remain pending, got: %s", res2.Status)
+	}
+
+	// Check queue: "reg-low-ocr" is STILL in pending review queue
+	itemsAfterStep2, err := svc.ProjectReviewItems(ctx, assetID, "vi")
+	if err != nil || len(itemsAfterStep2) != 1 {
+		t.Fatalf("expected 'reg-low-ocr' to remain pending in queue, got %d items", len(itemsAfterStep2))
+	}
+	if itemsAfterStep2[0].RegionID != "reg-low-ocr" || itemsAfterStep2[0].Type != domain.ReviewItemTypeLowConfidenceOCR {
+		t.Errorf("expected low_confidence_ocr exception for 'reg-low-ocr', got: %+v", itemsAfterStep2[0])
+	}
+
+	// Step 3: Relabel edit on "reg-low-ocr" providing explicit corrected text (resolves OCR exception)
+	correctedText := "Văn bản đã sửa lỗi OCR"
+	res3, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides: []domain.RegionOverride{
+			{
+				RegionID: "reg-low-ocr",
+				NewRole:  &semanticRole,
+				NewText:  &correctedText,
+			},
+		},
+		Reason:   "Operator corrected OCR text",
+		Operator: "editor_monet",
+	})
+	if err != nil {
+		t.Fatalf("CorrectRegionGeometry step 3 failed: %v", err)
+	}
+	if res3.Status != domain.ReviewItemStatusAutoResolved {
+		t.Errorf("expected auto_resolved when OCR text is explicitly corrected, got: %s", res3.Status)
+	}
+
+	// Check queue: queue is now clean (0 pending items)
+	itemsAfterStep3, err := svc.ProjectReviewItems(ctx, assetID, "vi")
+	if err != nil || len(itemsAfterStep3) != 0 {
+		t.Fatalf("expected queue zero after OCR text correction, got %d items: %+v", len(itemsAfterStep3), itemsAfterStep3)
 	}
 }

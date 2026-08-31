@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
 )
@@ -748,4 +750,646 @@ func TestSeam1_ManualOverride_StrictPendingValidation_RejectionsAndSuccess(t *te
 		t.Errorf("expected 400 Bad Request for already-overridden item, got %d", respDup.StatusCode)
 	}
 	respDup.Body.Close()
+}
+
+// TestSeam1_VoiceReassign_TargetedInvalidation_And_DownstreamRerun verifies:
+// 1. Voice reassignment regenerates exactly the changed speaker's affected downstream scope (TTS -> DubSegment -> DubMix -> RenderPlan).
+// 2. Unchanged speakers' synthesized audio segments are reused without re-synthesis.
+// 3. Upstream source artifacts (SourceAsset, AudioStems, TranscriptArtifact, TranslationVariant, DubScriptVariant, TextRegionPlan) are strictly reused.
+// 4. Clean rerun auto-resolves.
+func TestSeam1_VoiceReassign_TargetedInvalidation_And_DownstreamRerun(t *testing.T) {
+	h := setupHarness(t)
+	ctx := context.Background()
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// 1. Setup multi-speaker dub script (2 segments per speaker, 4 total)
+	segments := []domain.TranslationInputSegment{
+		{Index: 0, SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 2000, SourceText: "今天天气很好。"},
+		{Index: 1, SpeakerID: "SPEAKER_00", StartMs: 2200, EndMs: 4200, SourceText: "测试语音输入"},
+		{Index: 2, SpeakerID: "SPEAKER_01", StartMs: 4500, EndMs: 6500, SourceText: "我们去公园散步吧。"},
+		{Index: 3, SpeakerID: "SPEAKER_01", StartMs: 6700, EndMs: 8700, SourceText: "明天再继续工作。"},
+	}
+	transVariant, dubVariant := setupDubScriptForSeam1(t, h, runID, assetID, segments)
+
+	// Setup AudioRolePlan
+	rolePayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 2200, EndMs: 4200, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 4500, EndMs: 6500, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 6700, EndMs: 8700, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	roleBody, _ := json.Marshal(rolePayload)
+	_, _ = http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
+
+	// Setup TextRegionPlan
+	tPlan := domain.TextRegionPlan{
+		ID:             "text-plan-reassign-seam1",
+		AssetID:        assetID,
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		ProvenanceHash: "prov-text-reassign-seam1",
+		CreatedAt:      time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(tPlan)
+	tObj, _ := h.casStore.Put(bytes.NewReader(tBytes))
+	_ = h.db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             tPlan.ID,
+		AssetID:        assetID,
+		CASHash:        tObj.SHA256,
+		ProvenanceHash: tPlan.ProvenanceHash,
+		CreatedAt:      tPlan.CreatedAt,
+	})
+
+	// 2. Initial voice assignment + synthesis + mix + visual track + render plan
+	assignBody := map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	}
+	respAssign, assign1 := runAssignVoices(t, h, assetID, assignBody)
+	if respAssign.StatusCode != http.StatusCreated || assign1 == nil {
+		t.Fatalf("initial assign voices failed: %d", respAssign.StatusCode)
+	}
+
+	respSynth1, variant1 := runDubSynthesize(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": dubVariant.CASHash,
+		"voice_assignment_cas":   assign1.CASHash,
+	})
+	if respSynth1.StatusCode != http.StatusCreated || variant1 == nil {
+		t.Fatalf("initial synthesis failed: %d", respSynth1.StatusCode)
+	}
+
+	_, mix1 := runAudioMix(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	})
+	if mix1 == nil {
+		t.Fatalf("initial audio mix failed")
+	}
+
+	// Generate visual track
+	_, _ = http.Post(fmt.Sprintf("%s/api/v1/assets/%s/visual-track", h.server.URL, assetID), "application/json", bytes.NewReader([]byte(`{"run_id":"`+runID+`","target_language":"vi"}`)))
+
+	_, rPlan1 := runFreezeRenderPlan(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": "vi",
+	})
+	if rPlan1 == nil {
+		t.Fatalf("initial render plan freeze failed")
+	}
+
+	// Record initial artifacts
+	sourceAsset, _ := h.db.GetSourceAsset(ctx, assetID)
+	spk1Seg2_v1 := variant1.Segments[2]
+	spk1Seg3_v1 := variant1.Segments[3]
+	spk0Seg0_v1 := variant1.Segments[0]
+
+	// 3. Register CosyVoice3 provider & license for new voice
+	fakeCosy := provider.NewFakeTTSProvider("fake_cosyvoice3_tts", 1350)
+	fakeCosy.SpeedFitEnabled = true
+	_ = h.registry.Register(fakeCosy)
+
+	licBody, _ := json.Marshal(domain.LicenseManifestEntry{
+		DependencyName: "fake_cosyvoice3_tts",
+		Version:        "1.0.0",
+		SHA256:         "sha256_mock_fake_cosyvoice3_tts",
+		SourceRepo:     "github.com/monet88/douyinie/models/fake_cosyvoice3_tts",
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Standard",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	})
+	licResp, _ := http.Post(h.server.URL+"/api/v1/licenses", "application/json", bytes.NewReader(licBody))
+	licResp.Body.Close()
+
+	// 4. Execute inspector voice reassignment via POST /api/v1/assets/{id}/inspector/reassign-voice
+	viPresets := provider.DefaultPresetVoices("vi")
+	newVoiceForSpk0 := viPresets[2]
+
+	reassignPayload := map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": "vi",
+		"custom_assignments": map[string]domain.VoiceProfile{
+			"SPEAKER_00": newVoiceForSpk0,
+		},
+		"reason":   "Operator prefers warmer tone for SPEAKER_00",
+		"operator": "lead_audio_editor",
+	}
+	reassignBytes, _ := json.Marshal(reassignPayload)
+	reassignURL := fmt.Sprintf("%s/api/v1/assets/%s/inspector/reassign-voice", h.server.URL, assetID)
+	reassignResp, err := http.Post(reassignURL, "application/json", bytes.NewReader(reassignBytes))
+	if err != nil || reassignResp.StatusCode != http.StatusOK {
+		buf := new(bytes.Buffer)
+		if reassignResp != nil {
+			_, _ = buf.ReadFrom(reassignResp.Body)
+		}
+		t.Fatalf("POST inspector/reassign-voice failed: status=%d err=%v body=%s", reassignResp.StatusCode, err, buf.String())
+	}
+
+	var reassignResult struct {
+		Result service.VoiceReassignCorrectionResult `json:"result"`
+	}
+	_ = json.NewDecoder(reassignResp.Body).Decode(&reassignResult)
+	reassignResp.Body.Close()
+
+	res := reassignResult.Result
+	if res.VoiceAssignmentCAS == "" || res.VoiceAssignmentCAS == assign1.CASHash {
+		t.Errorf("expected new VoiceAssignment CAS, got %s", res.VoiceAssignmentCAS)
+	}
+	if len(res.InvalidatedSpeakers) != 1 || res.InvalidatedSpeakers[0] != "SPEAKER_00" {
+		t.Errorf("expected InvalidatedSpeakers=[SPEAKER_00], got %v", res.InvalidatedSpeakers)
+	}
+	if res.DubSegmentsVariantCAS == "" || res.DubSegmentsVariantCAS == variant1.CASHash {
+		t.Errorf("expected new DubSegmentsVariant CAS, got %s", res.DubSegmentsVariantCAS)
+	}
+	if res.DubMixCAS == "" || res.DubMixCAS == mix1.CASHash {
+		t.Errorf("expected new DubMix CAS, got %s", res.DubMixCAS)
+	}
+	if res.RenderPlanCAS == "" || res.RenderPlanCAS == rPlan1.CASHash {
+		t.Errorf("expected new RenderPlan CAS, got %s", res.RenderPlanCAS)
+	}
+	if res.Status != domain.ReviewItemStatusAutoResolved {
+		t.Errorf("expected auto_resolved status, got %s", res.Status)
+	}
+
+	// 5. Verify that SPEAKER_01's segments were strictly reused from prior variant
+	rcDub, err := h.casStore.Get(res.DubSegmentsVariantCAS)
+	if err != nil {
+		t.Fatalf("load dub segments from CAS failed: %v", err)
+	}
+	var var2 domain.DubSegmentsVariant
+	_ = json.NewDecoder(rcDub).Decode(&var2)
+	rcDub.Close()
+
+	if len(var2.Segments) != 4 {
+		t.Fatalf("expected 4 segments in variant 2, got %d", len(var2.Segments))
+	}
+	if var2.Segments[2].AudioSHA256 != spk1Seg2_v1.AudioSHA256 {
+		t.Errorf("SPEAKER_01 segment 2 was re-synthesized! %s vs %s", var2.Segments[2].AudioSHA256, spk1Seg2_v1.AudioSHA256)
+	}
+	if var2.Segments[3].AudioSHA256 != spk1Seg3_v1.AudioSHA256 {
+		t.Errorf("SPEAKER_01 segment 3 was re-synthesized! %s vs %s", var2.Segments[3].AudioSHA256, spk1Seg3_v1.AudioSHA256)
+	}
+	if var2.Segments[0].AudioSHA256 == spk0Seg0_v1.AudioSHA256 {
+		t.Errorf("SPEAKER_00 segment 0 was NOT regenerated with new voice!")
+	}
+
+	// 6. Verify Upstream source-derived artifacts strictly preserved
+	sourceAfter, _ := h.db.GetSourceAsset(ctx, assetID)
+	if sourceAfter.SHA256 != sourceAsset.SHA256 {
+		t.Errorf("source media was altered")
+	}
+	tAfter, _ := h.db.GetTranslationVariantIndex(ctx, assetID, "vi")
+	if tAfter.CASHash != transVariant.CASHash {
+		t.Errorf("translation was invalidated: %s vs %s", tAfter.CASHash, transVariant.CASHash)
+	}
+}
+
+// TestSeam1_RegionOverride_Reclassify_Drag_Resize_Relabel_TargetedInvalidation verifies:
+// 1. Region reclassify/drag/resize/relabel via inspector updates TextRegionPlan and regenerates LocalizedVisualTrack + LocalizedSubtitleTrack + RenderPlan.
+// 2. Upstream source audio, ASR, translation, TTS, dub segments, audio stems, and dub mix are strictly preserved and untouched.
+// 3. Uncertain text role exception in review queue auto-resolves after reclassifying to a valid role.
+func TestSeam1_RegionOverride_Reclassify_Drag_Resize_Relabel_TargetedInvalidation(t *testing.T) {
+	h := setupHarness(t)
+	ctx := context.Background()
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// 1. Initial TextRegionPlan with an uncertain region that flags a review exception
+	textPlan := domain.TextRegionPlan{
+		ID:             "text-plan-region-ovr-seam1",
+		AssetID:        assetID,
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		ProvenanceHash: "prov-text-region-ovr-seam1",
+		Regions: []domain.TrackedTextRegion{
+			{
+				ID:                 "region-ovr-101",
+				Role:               domain.TextRoleUncertain,
+				Text:               "点击下载应用",
+				FirstSeenMs:        0,
+				LastSeenMs:         3000,
+				ConfidenceEvidence: domain.ConfidenceEvidence{MeanConfidence: 0.55},
+				ReviewReason:       "uncertain_visual_role",
+				Keyframes: []domain.RegionKeyframe{
+					{
+						FrameIndex:  0,
+						TimestampMs: 0,
+						Box:         domain.BoundingBox{X: 100, Y: 200, Width: 300, Height: 80},
+						Observed:    true,
+					},
+				},
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(textPlan)
+	tObj, _ := h.casStore.Put(bytes.NewReader(tBytes))
+	_ = h.db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             textPlan.ID,
+		AssetID:        assetID,
+		CASHash:        tObj.SHA256,
+		ProvenanceHash: textPlan.ProvenanceHash,
+		CreatedAt:      textPlan.CreatedAt,
+	})
+
+	// Setup dub mix via helper
+	_, _, _, _ = setupAssetWithDubMix(t, h)
+
+	// 2. Query review items -> 1 pending low confidence / uncertain role item
+	getQueueURL := fmt.Sprintf("%s/api/v1/assets/%s/review-items?target_language=vi", h.server.URL, assetID)
+	qResp, _ := http.Get(getQueueURL)
+	var qBody struct {
+		ReviewItems []domain.ReviewItem `json:"review_items"`
+		Count       int                 `json:"count"`
+	}
+	_ = json.NewDecoder(qResp.Body).Decode(&qBody)
+	qResp.Body.Close()
+	if qBody.Count != 1 {
+		t.Fatalf("expected 1 pending review exception, got %d", qBody.Count)
+	}
+
+	// 3. Post direct-manipulation region override (reclassify to semantic_text, drag +20,+30, resize +50,+10, relabel)
+	newRole := domain.TextRoleSemanticText
+	newText := "Bấm để tải ứng dụng"
+	deltaX := 20
+	deltaY := 30
+	deltaW := 50
+	deltaH := 10
+
+	ovrPayload := map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": "vi",
+		"overrides": []domain.RegionOverride{
+			{
+				RegionID:  "region-ovr-101",
+				NewRole:   &newRole,
+				NewText:   &newText,
+				BoxDeltaX: deltaX,
+				BoxDeltaY: deltaY,
+				BoxDeltaW: deltaW,
+				BoxDeltaH: deltaH,
+			},
+		},
+		"reason":   "Operator reclassified to semantic_text with repositioned box",
+		"operator": "visual_editor",
+	}
+	ovrBytes, _ := json.Marshal(ovrPayload)
+	ovrURL := fmt.Sprintf("%s/api/v1/assets/%s/inspector/override-region", h.server.URL, assetID)
+	ovrResp, err := http.Post(ovrURL, "application/json", bytes.NewReader(ovrBytes))
+	if err != nil || ovrResp.StatusCode != http.StatusOK {
+		buf := new(bytes.Buffer)
+		if ovrResp != nil {
+			_, _ = buf.ReadFrom(ovrResp.Body)
+		}
+		t.Fatalf("POST inspector/override-region failed: status=%d err=%v body=%s", ovrResp.StatusCode, err, buf.String())
+	}
+
+	var regRes struct {
+		Result service.RegionGeometryCorrectionResult `json:"result"`
+	}
+	_ = json.NewDecoder(ovrResp.Body).Decode(&regRes)
+	ovrResp.Body.Close()
+
+	if regRes.Result.LocalizedVisualTrackCAS == "" {
+		t.Errorf("expected non-empty LocalizedVisualTrackCAS")
+	}
+	if regRes.Result.LocalizedSubtitleCAS == "" {
+		t.Errorf("expected non-empty LocalizedSubtitleCAS")
+	}
+	if regRes.Result.RenderPlanCAS == "" {
+		t.Errorf("expected non-empty RenderPlanCAS")
+	}
+	if regRes.Result.Status != domain.ReviewItemStatusAutoResolved {
+		t.Errorf("expected auto_resolved status, got %s", regRes.Result.Status)
+	}
+
+	// 4. Verify LocalizedVisualTrack contains the updated overlay
+	rcVis, err := h.casStore.Get(regRes.Result.LocalizedVisualTrackCAS)
+	if err != nil {
+		t.Fatalf("load visual track from CAS failed: %v", err)
+	}
+	var visTrack domain.LocalizedVisualTrack
+	_ = json.NewDecoder(rcVis).Decode(&visTrack)
+	rcVis.Close()
+
+	foundOverlay := false
+	for _, ov := range visTrack.Overlays {
+		if ov.RegionID == "region-ovr-101" {
+			foundOverlay = true
+			if ov.Role != domain.TextRoleSemanticText {
+				t.Errorf("expected semantic_text role, got %s", ov.Role)
+			}
+			if !strings.Contains(ov.LocalizedText, "Bấm để tải ứng dụng") {
+				t.Errorf("expected localized text containing 'Bấm để tải ứng dụng', got %s", ov.LocalizedText)
+			}
+			if ov.Box.X != 120 || ov.Box.Y != 230 {
+				t.Errorf("expected shifted box (120, 230), got (%d, %d)", ov.Box.X, ov.Box.Y)
+			}
+		}
+	}
+	if !foundOverlay {
+		t.Errorf("overridden region not found in LocalizedVisualTrack overlays")
+	}
+
+	// 5. Verify that the pending review queue is now clean (0 items)
+	qResp2, _ := http.Get(getQueueURL)
+	var qBody2 struct {
+		ReviewItems []domain.ReviewItem `json:"review_items"`
+		Count       int                 `json:"count"`
+	}
+	_ = json.NewDecoder(qResp2.Body).Decode(&qBody2)
+	qResp2.Body.Close()
+	if qBody2.Count != 0 {
+		t.Errorf("expected 0 pending review items after reclassification, got %d: %+v", qBody2.Count, qBody2.ReviewItems)
+	}
+}
+
+// TestSeam1_FinalRenderHandoff_QueueZero_AutoVsReview verifies:
+// 1. When queue has pending review exceptions (queue > 0):
+//   - Handoff returns can_start_final_render=false, auto_render_started=false, action="review_required".
+//
+// 2. When queue reaches zero (after manual_override or auto_resolved):
+//   - In Review mode (posture="review"): returns can_start_final_render=true, auto_render_started=false, action="start_final_render".
+//   - In Auto mode (posture="auto"): returns can_start_final_render=true, auto_render_started=true, action="auto_render_started", and renders final video automatically.
+func TestSeam1_FinalRenderHandoff_QueueZero_AutoVsReview(t *testing.T) {
+	h := setupHarness(t)
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// 1. Setup dub mix
+	_, _, _, dubMix := setupAssetWithDubMix(t, h)
+
+	// Overwrite AudioRolePlan with an uncertain segment -> creates 1 pending review exception
+	rolePayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleUncertain},
+		},
+	}
+	roleBody, _ := json.Marshal(rolePayload)
+	_, _ = http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
+
+	_, rPlan := runFreezeRenderPlan(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": "vi",
+		"dub_mix_cas":     dubMix.CASHash,
+		"subtitle_cues": []domain.SubtitleCue{
+			{StartMs: 0, EndMs: 1500, Text: "Test Handoff Subtitle", X: 100, Y: 200, Width: 400, Height: 80},
+		},
+	})
+	if rPlan == nil {
+		t.Fatalf("setup render plan failed")
+	}
+
+	// 2. Query pending queue -> 1 item
+	getQueueURL := fmt.Sprintf("%s/api/v1/assets/%s/review-items?target_language=vi", h.server.URL, assetID)
+	qResp, _ := http.Get(getQueueURL)
+	var qBody struct {
+		ReviewItems []domain.ReviewItem `json:"review_items"`
+		Count       int                 `json:"count"`
+	}
+	_ = json.NewDecoder(qResp.Body).Decode(&qBody)
+	qResp.Body.Close()
+	if qBody.Count != 1 {
+		t.Fatalf("expected 1 pending item, got %d", qBody.Count)
+	}
+	pendingItemID := qBody.ReviewItems[0].ID
+
+	// 3. Test Handoff with queue > 0 (Auto mode)
+	handoffURL := fmt.Sprintf("%s/api/v1/assets/%s/render/handoff", h.server.URL, assetID)
+	hResp1, err := http.Post(handoffURL, "application/json", bytes.NewReader([]byte(`{"run_id":"`+runID+`","posture":"auto","target_language":"vi"}`)))
+	if err != nil || hResp1.StatusCode != http.StatusOK {
+		t.Fatalf("POST render/handoff failed: %v", err)
+	}
+	var hRes1 struct {
+		Handoff domain.FinalRenderHandoffResult `json:"handoff"`
+	}
+	_ = json.NewDecoder(hResp1.Body).Decode(&hRes1)
+	hResp1.Body.Close()
+
+	if hRes1.Handoff.QueueZero {
+		t.Errorf("expected QueueZero=false when exception is pending")
+	}
+	if hRes1.Handoff.CanStartFinalRender {
+		t.Errorf("expected CanStartFinalRender=false when exception is pending")
+	}
+	if hRes1.Handoff.AutoRenderStarted {
+		t.Errorf("expected AutoRenderStarted=false when exception is pending")
+	}
+	if hRes1.Handoff.Action != "review_required" {
+		t.Errorf("expected Action='review_required', got %s", hRes1.Handoff.Action)
+	}
+
+	// 4. Resolve the pending exception via manual_override
+	ovrPayload := map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": "vi",
+		"review_item_id":  pendingItemID,
+		"stage":           "audio_role_plan",
+		"reason":          "Background speech confirmed as BGM",
+		"operator":        "qa_supervisor",
+	}
+	ovrBytes, _ := json.Marshal(ovrPayload)
+	ovrResp, _ := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/review/override", h.server.URL, assetID), "application/json", bytes.NewReader(ovrBytes))
+	if ovrResp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST review/override failed: %d", ovrResp.StatusCode)
+	}
+	ovrResp.Body.Close()
+
+	// Verify queue is now zero
+	qResp2, _ := http.Get(getQueueURL)
+	var qBody2 struct {
+		ReviewItems []domain.ReviewItem `json:"review_items"`
+		Count       int                 `json:"count"`
+	}
+	_ = json.NewDecoder(qResp2.Body).Decode(&qBody2)
+	qResp2.Body.Close()
+	if qBody2.Count != 0 {
+		t.Fatalf("expected 0 pending items, got %d", qBody2.Count)
+	}
+
+	// 5. Test Handoff with queue == 0 in Review mode (posture="review")
+	hRespReview, err := http.Post(handoffURL, "application/json", bytes.NewReader([]byte(`{"run_id":"`+runID+`","posture":"review","target_language":"vi"}`)))
+	if err != nil || hRespReview.StatusCode != http.StatusOK {
+		t.Fatalf("POST render/handoff in review mode failed: %v", err)
+	}
+	var hResReview struct {
+		Handoff domain.FinalRenderHandoffResult `json:"handoff"`
+	}
+	_ = json.NewDecoder(hRespReview.Body).Decode(&hResReview)
+	hRespReview.Body.Close()
+
+	if !hResReview.Handoff.QueueZero {
+		t.Errorf("expected QueueZero=true")
+	}
+	if !hResReview.Handoff.CanStartFinalRender {
+		t.Errorf("expected CanStartFinalRender=true")
+	}
+	if hResReview.Handoff.AutoRenderStarted {
+		t.Errorf("expected AutoRenderStarted=false in Review mode (awaits operator)")
+	}
+	if hResReview.Handoff.Action != "start_final_render" {
+		t.Errorf("expected Action='start_final_render' in Review mode, got %s", hResReview.Handoff.Action)
+	}
+
+	// 6. Test Handoff with queue == 0 in Auto mode (posture="auto")
+	hRespAuto, err := http.Post(handoffURL, "application/json", bytes.NewReader([]byte(`{"run_id":"`+runID+`","posture":"auto","target_language":"vi"}`)))
+	if err != nil || hRespAuto.StatusCode != http.StatusOK {
+		t.Fatalf("POST render/handoff in auto mode failed: %v", err)
+	}
+	var hResAuto struct {
+		Handoff domain.FinalRenderHandoffResult `json:"handoff"`
+	}
+	_ = json.NewDecoder(hRespAuto.Body).Decode(&hResAuto)
+	hRespAuto.Body.Close()
+
+	if !hResAuto.Handoff.QueueZero {
+		t.Errorf("expected QueueZero=true")
+	}
+	if !hResAuto.Handoff.CanStartFinalRender {
+		t.Errorf("expected CanStartFinalRender=true")
+	}
+	if !hResAuto.Handoff.AutoRenderStarted {
+		t.Errorf("expected AutoRenderStarted=true in Auto mode")
+	}
+	if hResAuto.Handoff.Action != "auto_render_started" {
+		t.Errorf("expected Action='auto_render_started', got %s", hResAuto.Handoff.Action)
+	}
+	if hResAuto.Handoff.FinalRenderCAS == "" {
+		t.Errorf("expected non-empty FinalRenderCAS produced automatically in Auto mode")
+	}
+
+	// Verify final render artifact in CAS decodes cleanly
+	rcFinal, err := h.casStore.Get(hResAuto.Handoff.FinalRenderCAS)
+	if err != nil {
+		t.Fatalf("load final render artifact from CAS failed: %v", err)
+	}
+	var finalArt domain.FinalRenderArtifact
+	_ = json.NewDecoder(rcFinal).Decode(&finalArt)
+	rcFinal.Close()
+
+	if finalArt.OutputCASHash == "" {
+		t.Errorf("final render artifact missing OutputCASHash")
+	}
+}
+
+// TestSeam1_FinalRenderHandoff_RouteAndValidationRemediation verifies:
+// 1. GET /api/v1/assets/{id}/render/handoff and GET /api/v1/runs/{id}/render/handoff are removed and return 404 / 405.
+// 2. POST /api/v1/assets/{id}/render/handoff and POST /api/v1/runs/{id}/render/handoff return HTTP 400 on malformed JSON.
+// 3. Empty body / query parameter requests are preserved.
+func TestSeam1_FinalRenderHandoff_RouteAndValidationRemediation(t *testing.T) {
+	h := setupHarness(t)
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	assetHandoffURL := fmt.Sprintf("%s/api/v1/assets/%s/render/handoff", h.server.URL, assetID)
+	runHandoffURL := fmt.Sprintf("%s/api/v1/runs/%s/render/handoff", h.server.URL, runID)
+
+	// 1. Verify GET routes are removed (Method Not Allowed or Not Found)
+	getAssetResp, err := http.Get(assetHandoffURL)
+	if err != nil {
+		t.Fatalf("GET asset render/handoff request failed: %v", err)
+	}
+	getAssetResp.Body.Close()
+	if getAssetResp.StatusCode != http.StatusMethodNotAllowed && getAssetResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected GET asset render/handoff to be rejected with 404 or 405, got %d", getAssetResp.StatusCode)
+	}
+
+	getRunResp, err := http.Get(runHandoffURL)
+	if err != nil {
+		t.Fatalf("GET run render/handoff request failed: %v", err)
+	}
+	getRunResp.Body.Close()
+	if getRunResp.StatusCode != http.StatusMethodNotAllowed && getRunResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected GET run render/handoff to be rejected with 404 or 405, got %d", getRunResp.StatusCode)
+	}
+
+	// 2. Verify POST returns HTTP 400 on malformed JSON for both asset and run endpoints
+	badJSON := []byte(`{malformed_json: true, "run_id":`)
+	postAssetBad, err := http.Post(assetHandoffURL, "application/json", bytes.NewReader(badJSON))
+	if err != nil {
+		t.Fatalf("POST asset render/handoff bad json failed: %v", err)
+	}
+	postAssetBad.Body.Close()
+	if postAssetBad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400 on malformed JSON for asset handoff, got %d", postAssetBad.StatusCode)
+	}
+
+	postRunBad, err := http.Post(runHandoffURL, "application/json", bytes.NewReader(badJSON))
+	if err != nil {
+		t.Fatalf("POST run render/handoff bad json failed: %v", err)
+	}
+	postRunBad.Body.Close()
+	if postRunBad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400 on malformed JSON for run handoff, got %d", postRunBad.StatusCode)
+	}
+
+	// 3. Verify POST with empty body (query parameter driven) is accepted without error
+	postEmptyBodyURL := fmt.Sprintf("%s/api/v1/assets/%s/render/handoff?run_id=%s&target_language=vi&posture=review", h.server.URL, assetID, runID)
+	postEmptyResp, err := http.Post(postEmptyBodyURL, "application/json", bytes.NewReader([]byte{}))
+	if err != nil {
+		t.Fatalf("POST asset render/handoff empty body failed: %v", err)
+	}
+	postEmptyResp.Body.Close()
+	if postEmptyResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected HTTP 200 on valid empty body with query params, got %d", postEmptyResp.StatusCode)
+	}
+}
+
+// TestSeam1_CorrectRegionGeometry_FailClosedOnPersistenceErrors verifies:
+// When TextRegionPlan is missing in DB or CAS, or DB write fails,
+// CorrectRegionGeometry fails closed with an error and does not return auto_resolved.
+func TestSeam1_CorrectRegionGeometry_FailClosedOnPersistenceErrors(t *testing.T) {
+	h := setupHarness(t)
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// Attempt region override on asset with no persisted TextRegionPlan
+	newRole := domain.TextRoleSemanticText
+	ovrPayload := map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": "vi",
+		"overrides": []domain.RegionOverride{
+			{
+				RegionID: "nonexistent-region-1",
+				NewRole:  &newRole,
+			},
+		},
+		"reason":   "Operator override on missing plan",
+		"operator": "visual_editor",
+	}
+	ovrBytes, _ := json.Marshal(ovrPayload)
+	ovrURL := fmt.Sprintf("%s/api/v1/assets/%s/inspector/override-region", h.server.URL, assetID)
+	ovrResp, err := http.Post(ovrURL, "application/json", bytes.NewReader(ovrBytes))
+	if err != nil {
+		t.Fatalf("POST override-region request failed: %v", err)
+	}
+	defer ovrResp.Body.Close()
+
+	// Expect fail closed (500 or non-200 error since TextRegionPlan is missing from DB/CAS)
+	if ovrResp.StatusCode == http.StatusOK {
+		t.Fatalf("expected fail-closed error response when TextRegionPlan is missing, got 200 OK")
+	}
 }

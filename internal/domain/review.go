@@ -103,3 +103,37 @@ type QualityResult struct {
 	Details        map[string]any  `json:"details,omitempty"`
 	CreatedAt      time.Time       `json:"created_at"`
 }
+
+// ReviewPosture defines the operator review posture (Auto vs Review mode).
+type ReviewPosture string
+
+const (
+	ReviewPostureAuto   ReviewPosture = "auto"   // Default: queue reaching zero starts final render automatically
+	ReviewPostureReview ReviewPosture = "review" // Review mode: queue reaching zero exposes explicit 'Start final render' action
+)
+
+// FinalRenderHandoffInput defines parameters for evaluating final-render handoff readiness.
+type FinalRenderHandoffInput struct {
+	AssetID        string        `json:"asset_id"`
+	RunID          string        `json:"run_id,omitempty"`
+	JobID          string        `json:"job_id,omitempty"`
+	TargetLanguage string        `json:"target_language"`
+	Posture        ReviewPosture `json:"posture"` // "auto" (default) or "review"
+	FontFile       string        `json:"font_file,omitempty"`
+}
+
+// FinalRenderHandoffResult returns the evaluation of final-render readiness and auto-render execution.
+type FinalRenderHandoffResult struct {
+	AssetID             string        `json:"asset_id"`
+	RunID               string        `json:"run_id,omitempty"`
+	JobID               string        `json:"job_id,omitempty"`
+	TargetLanguage      string        `json:"target_language"`
+	Posture             ReviewPosture `json:"posture"`
+	QueueZero           bool          `json:"queue_zero"`
+	PendingReviewCount  int           `json:"pending_review_count"`
+	CanStartFinalRender bool          `json:"can_start_final_render"`
+	AutoRenderStarted   bool          `json:"auto_render_started"`
+	Action              string        `json:"action"` // "auto_render_started" | "start_final_render" | "review_required"
+	FinalRenderCAS      string        `json:"final_render_cas,omitempty"`
+	Message             string        `json:"message"`
+}

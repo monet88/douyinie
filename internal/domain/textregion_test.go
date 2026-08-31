@@ -120,6 +120,69 @@ func TestTextRegionPlanProvenanceHash(t *testing.T) {
 	}
 }
 
+func TestComputeTextRegionPlanOverrideProvenanceHash(t *testing.T) {
+	regions := []domain.TrackedTextRegion{
+		{ID: "reg-a", Text: "关注", Role: domain.TextRoleSemanticText, FirstSeenMs: 0, LastSeenMs: 1500},
+		{ID: "reg-b", Text: "步骤一", Role: domain.TextRoleInstructionalUIText, FirstSeenMs: 1500, LastSeenMs: 3000},
+	}
+	h1, err := domain.ComputeTextRegionPlanOverrideProvenanceHash("prov-src-1", regions)
+	if err != nil {
+		t.Fatalf("compute override prov: %v", err)
+	}
+	h2, err := domain.ComputeTextRegionPlanOverrideProvenanceHash("prov-src-1", regions)
+	if err != nil {
+		t.Fatalf("compute override prov: %v", err)
+	}
+	if h1 != h2 {
+		t.Errorf("expected deterministic override provenance, got %s != %s", h1, h2)
+	}
+
+	// Order-independence: regions sorted by ID before hashing.
+	reversed := []domain.TrackedTextRegion{regions[1], regions[0]}
+	hRev, err := domain.ComputeTextRegionPlanOverrideProvenanceHash("prov-src-1", reversed)
+	if err != nil {
+		t.Fatalf("compute reversed override prov: %v", err)
+	}
+	if hRev != h1 {
+		t.Errorf("expected override provenance to be order-independent, got %s != %s", hRev, h1)
+	}
+
+	// Different parent provenance -> different hash.
+	hParent, err := domain.ComputeTextRegionPlanOverrideProvenanceHash("prov-src-2", regions)
+	if err != nil {
+		t.Fatalf("compute override prov: %v", err)
+	}
+	if hParent == h1 {
+		t.Errorf("expected different hash for different parent provenance")
+	}
+
+	// Different canonical region state -> different hash.
+	changed := []domain.TrackedTextRegion{
+		{ID: "reg-a", Text: "关注", Role: domain.TextRoleSemanticText, FirstSeenMs: 0, LastSeenMs: 1500},
+		{ID: "reg-b", Text: "步骤一", Role: domain.TextRoleBrandKeep, FirstSeenMs: 1500, LastSeenMs: 3000},
+	}
+	hChanged, err := domain.ComputeTextRegionPlanOverrideProvenanceHash("prov-src-1", changed)
+	if err != nil {
+		t.Fatalf("compute changed override prov: %v", err)
+	}
+	if hChanged == h1 {
+		t.Errorf("expected different hash for changed region state")
+	}
+
+	// Override provenance must NEVER collide with the source-derived plan provenance.
+	srcProv, err := domain.ComputeTextRegionPlanProvenanceHash("asset-1", "fake_paddle_ocr", "paddleocr", "v4", 500)
+	if err != nil {
+		t.Fatalf("compute source prov: %v", err)
+	}
+	overrideProv, err := domain.ComputeTextRegionPlanOverrideProvenanceHash(srcProv, regions)
+	if err != nil {
+		t.Fatalf("compute override prov: %v", err)
+	}
+	if overrideProv == srcProv {
+		t.Errorf("override provenance must differ from source-derived provenance")
+	}
+}
+
 func TestStandardInstructionalUITerm(t *testing.T) {
 	tests := []struct {
 		zh        string

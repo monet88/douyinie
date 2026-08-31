@@ -487,9 +487,38 @@ func ApplyRegionOverrides(plan *domain.TextRegionPlan, overrides []domain.Region
 				return nil, fmt.Errorf("%w: invalid role '%s'", domain.ErrRegionOverrideInvalid, *ov.NewRole)
 			}
 			reg.Role = *ov.NewRole
+			if *ov.NewRole == domain.TextRoleUncertain {
+				reg.ReviewRequired = true
+				if reg.ReviewReason == "" {
+					reg.ReviewReason = "uncertain_role"
+				}
+			} else {
+				// Reclassification of a genuinely uncertain-role exception clears that role exception.
+				// Preserve unrelated low-OCR ReviewRequired flags when a role-only edit does not resolve them.
+				if reg.ConfidenceEvidence.LowConfidence || strings.Contains(reg.ReviewReason, "low_ocr") || strings.Contains(reg.ReviewReason, "low_confidence") {
+					if (*ov.NewRole == domain.TextRoleSpeechSubtitle || *ov.NewRole == domain.TextRoleSemanticText) && (ov.NewText == nil || strings.TrimSpace(*ov.NewText) == "") {
+						reg.ReviewRequired = true
+						if *ov.NewRole == domain.TextRoleSpeechSubtitle {
+							reg.ReviewReason = "low_ocr_confidence_subtitle"
+						} else {
+							reg.ReviewReason = "low_ocr_confidence_semantic_text"
+						}
+					} else {
+						reg.ReviewRequired = false
+						reg.ReviewReason = ""
+					}
+				} else {
+					reg.ReviewRequired = false
+					reg.ReviewReason = ""
+				}
+			}
 		}
 		if ov.NewText != nil {
 			reg.Text = *ov.NewText
+			if strings.TrimSpace(*ov.NewText) != "" && reg.Role != domain.TextRoleUncertain {
+				reg.ReviewRequired = false
+				reg.ReviewReason = ""
+			}
 		}
 		if ov.IsProtected != nil {
 			reg.ProtectedMetadata.IsProtected = *ov.IsProtected
@@ -628,7 +657,7 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 				SourceLanguage: "zh",
 				TargetLanguage: in.TargetLanguage,
 				Segments: []domain.TranslationInputSegment{
-					{Index: 0, SourceText: reg.Text},
+					{Index: 0, SourceText: reg.Text, StartMs: reg.FirstSeenMs, EndMs: reg.LastSeenMs},
 				},
 			})
 			if err != nil {
@@ -700,7 +729,7 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 				SourceLanguage: "zh",
 				TargetLanguage: in.TargetLanguage,
 				Segments: []domain.TranslationInputSegment{
-					{Index: 0, SourceText: reg.Text},
+					{Index: 0, SourceText: reg.Text, StartMs: reg.FirstSeenMs, EndMs: reg.LastSeenMs},
 				},
 			})
 			if err != nil {

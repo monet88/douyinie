@@ -392,6 +392,18 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/inspector/correct-text", s.handleInspectorCorrectText)
 	s.mux.HandleFunc("POST /api/v1/runs/{id}/inspector/correct-text", s.handleRunInspectorCorrectText)
 
+	// Inspector Voice Reassignment & Targeted Rerun (T20)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/inspector/reassign-voice", s.handleInspectorReassignVoice)
+	s.mux.HandleFunc("POST /api/v1/runs/{id}/inspector/reassign-voice", s.handleRunInspectorReassignVoice)
+
+	// Inspector Region Override & Targeted Rerun (T20)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/inspector/override-region", s.handleInspectorOverrideRegion)
+	s.mux.HandleFunc("POST /api/v1/runs/{id}/inspector/override-region", s.handleRunInspectorOverrideRegion)
+
+	// Final Render Handoff (T20: Auto queue-zero vs Review explicit action)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/render/handoff", s.handleFinalRenderHandoff)
+	s.mux.HandleFunc("POST /api/v1/runs/{id}/render/handoff", s.handleRunFinalRenderHandoff)
+
 	// Multimodal Quality Results (T19)
 	s.mux.HandleFunc("POST /api/v1/quality-results", s.handleCreateQualityResult)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/quality-results", s.handleGetQualityResults)
@@ -2894,6 +2906,272 @@ func (s *Server) handleRunInspectorCorrectText(w http.ResponseWriter, r *http.Re
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"result": result,
+	})
+}
+
+func (s *Server) handleInspectorReassignVoice(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if s.reviewSvc == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+
+	var in service.VoiceReassignCorrectionInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in.AssetID = assetID
+	result, err := s.reviewSvc.ReassignVoice(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) || errors.Is(err, domain.ErrVoiceAssignmentNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"result": result,
+	})
+}
+
+func (s *Server) handleRunInspectorReassignVoice(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+	if s.reviewSvc == nil || s.db == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+
+	run, err := s.db.GetRun(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	job, err := s.db.GetJob(r.Context(), run.JobID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var in service.VoiceReassignCorrectionInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in.RunID = runID
+	in.JobID = job.ID
+	in.AssetID = job.SourceAssetID
+	if in.TargetLanguage == "" {
+		in.TargetLanguage = job.TargetLanguage
+	}
+
+	result, err := s.reviewSvc.ReassignVoice(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) || errors.Is(err, domain.ErrVoiceAssignmentNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"result": result,
+	})
+}
+
+func (s *Server) handleInspectorOverrideRegion(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if s.reviewSvc == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+
+	var in service.RegionGeometryCorrectionInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in.AssetID = assetID
+	result, err := s.reviewSvc.CorrectRegionGeometry(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) || errors.Is(err, domain.ErrTextRegionPlanNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrRegionOverrideInvalid) || errors.Is(err, domain.ErrSubtitleOverlapsProtectedRegion) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"result": result,
+	})
+}
+
+func (s *Server) handleRunInspectorOverrideRegion(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+	if s.reviewSvc == nil || s.db == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+
+	run, err := s.db.GetRun(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	job, err := s.db.GetJob(r.Context(), run.JobID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var in service.RegionGeometryCorrectionInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in.RunID = runID
+	in.JobID = job.ID
+	in.AssetID = job.SourceAssetID
+	if in.TargetLanguage == "" {
+		in.TargetLanguage = job.TargetLanguage
+	}
+
+	result, err := s.reviewSvc.CorrectRegionGeometry(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) || errors.Is(err, domain.ErrTextRegionPlanNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrRegionOverrideInvalid) || errors.Is(err, domain.ErrSubtitleOverlapsProtectedRegion) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"result": result,
+	})
+}
+
+func (s *Server) handleFinalRenderHandoff(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if s.reviewSvc == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+
+	var in domain.FinalRenderHandoffInput
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+			return
+		}
+	}
+	in.AssetID = assetID
+	if in.TargetLanguage == "" {
+		in.TargetLanguage = r.URL.Query().Get("target_language")
+	}
+	if in.Posture == "" {
+		in.Posture = domain.ReviewPosture(r.URL.Query().Get("posture"))
+	}
+	if in.RunID == "" {
+		in.RunID = r.URL.Query().Get("run_id")
+	}
+	if in.JobID == "" {
+		in.JobID = r.URL.Query().Get("job_id")
+	}
+
+	result, err := s.reviewSvc.EvaluateFinalRenderHandoff(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) || errors.Is(err, domain.ErrAssetNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"handoff": result,
+	})
+}
+
+func (s *Server) handleRunFinalRenderHandoff(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+	if s.reviewSvc == nil || s.db == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+
+	run, err := s.db.GetRun(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	job, err := s.db.GetJob(r.Context(), run.JobID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var in domain.FinalRenderHandoffInput
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil && err != io.EOF {
+			writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+			return
+		}
+	}
+	in.RunID = runID
+	in.JobID = job.ID
+	in.AssetID = job.SourceAssetID
+	if in.TargetLanguage == "" {
+		in.TargetLanguage = job.TargetLanguage
+	}
+	if in.Posture == "" {
+		in.Posture = domain.ReviewPosture(r.URL.Query().Get("posture"))
+	}
+
+	result, err := s.reviewSvc.EvaluateFinalRenderHandoff(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) || errors.Is(err, domain.ErrAssetNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"handoff": result,
 	})
 }
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -661,6 +662,35 @@ func ComputeTextRegionPlanProvenanceHash(assetID, providerID, modelName, modelVe
 		ModelVersion: modelVersion,
 		SampleStepMs: sampleStepMs,
 		SchemaVer:    TextRegionPlanSchemaVersion,
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:]), nil
+}
+
+// ComputeTextRegionPlanOverrideProvenanceHash computes a deterministic SHA-256 identity for an
+// operator-overridden TextRegionPlan. It is derived from stable semantic inputs ONLY: the parent
+// (source-derived) provenance hash plus the canonical overridden region state (sorted by region ID).
+// It deliberately excludes timestamps, paths, run IDs, and job IDs so that re-applying the same
+// override is idempotent and the source-derived plan row is never overwritten by a conflicting
+// provenance in SaveTextRegionPlanIndex (UNIQUE on provenance_hash).
+func ComputeTextRegionPlanOverrideProvenanceHash(parentProvenance string, regions []TrackedTextRegion) (string, error) {
+	canon := make([]TrackedTextRegion, len(regions))
+	copy(canon, regions)
+	sort.Slice(canon, func(i, j int) bool { return canon[i].ID < canon[j].ID })
+	payload := struct {
+		ParentProvenance string              `json:"parent_provenance"`
+		Regions          []TrackedTextRegion `json:"regions"`
+		Kind             string              `json:"kind"`
+		SchemaVer        int                 `json:"schema_version"`
+	}{
+		ParentProvenance: strings.TrimSpace(parentProvenance),
+		Regions:          canon,
+		Kind:             "text_region_plan_override",
+		SchemaVer:        TextRegionPlanSchemaVersion,
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
