@@ -687,13 +687,16 @@ func (r *Router) ExecuteRoutedWithRetry(
 
 			lastErr = err
 
-			// 1. Check for non-transient governance/policy errors (FAIL-CLOSED, no retry, no fallback)
+			// 1. Check for non-transient governance/policy/inconsistency errors (FAIL-CLOSED, no retry, no fallback)
 			if errors.Is(err, domain.ErrPolicyBlocked) ||
 				errors.Is(err, domain.ErrConsentRequired) ||
 				errors.Is(err, domain.ErrAuthRequired) ||
 				errors.Is(err, domain.ErrLicenseManifestMissing) ||
-				errors.Is(err, domain.ErrRawSecretForbidden) {
-
+				errors.Is(err, domain.ErrRawSecretForbidden) ||
+				errors.Is(err, domain.ErrContentUnavailable) ||
+				errors.Is(err, domain.ErrInvalidURL) ||
+				errors.Is(err, domain.ErrUnsupportedMediaType) ||
+				errors.Is(err, domain.ErrInconsistentProvenance) {
 				pa := domain.ProviderAttempt{
 					ID:            uuid.NewString(),
 					RunID:         req.RunID,

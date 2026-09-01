@@ -233,6 +233,36 @@ func (cs *CredentialService) ValidateCredentialRef(ctx context.Context, refIDOrN
 	return true, nil
 }
 
+// MaterializeSecret validates a credential reference for a provider and
+// returns the backing secret value transiently, for one authorized subprocess
+// call. Raw session material never leaves this function except to the
+// immediate caller; it must not be logged, persisted, or placed in provenance
+// (Issue #17). Callers receive an empty string only when the backing store
+// legitimately holds no value.
+func (cs *CredentialService) MaterializeSecret(ctx context.Context, refIDOrName string, providerID string) (string, error) {
+	ok, err := cs.ValidateCredentialRef(ctx, refIDOrName, providerID)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("%w: credential reference validation failed", domain.ErrAuthRequired)
+	}
+	ref, err := cs.GetCredentialRef(ctx, refIDOrName)
+	if err != nil {
+		return "", fmt.Errorf("%w: credential reference not found", domain.ErrAuthRequired)
+	}
+
+	key := strings.TrimSpace(ref.KeyRef)
+	switch strings.ToLower(strings.TrimSpace(ref.StorageType)) {
+	case domain.StorageTypeEnvRef:
+		return os.Getenv(key), nil
+	case domain.StorageTypeOSCredentialStore:
+		return readWindowsCredential(key)
+	default:
+		return "", fmt.Errorf("%w: unsupported storage_type", domain.ErrAuthRequired)
+	}
+}
+
 // ListCredentialRefs lists all registered credential references.
 func (cs *CredentialService) ListCredentialRefs(ctx context.Context) ([]domain.CredentialRef, error) {
 	cs.mu.RLock()

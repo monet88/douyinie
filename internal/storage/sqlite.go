@@ -1064,6 +1064,48 @@ func (s *DB) migrate(ctx context.Context) error {
 			return fmt.Errorf("commit migration v15: %w", err)
 		}
 	}
+
+	// 17. Schema migration v16 (Source Acquisition Provenance + Identity Dedup - T05)
+	var countV16 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 16`).Scan(&countV16)
+	if err != nil {
+		return fmt.Errorf("check migration version 16: %w", err)
+	}
+
+	if countV16 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v16 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		// One row per canonical source identity. `source_id` is the stable
+		// platform+aweme reuse key (Issue #4); `asset_id` points at the
+		// immutable content-fingerprinted SourceAsset, so an equivalent
+		// reacquisition resolves to existing source-derived artifacts instead
+		// of re-downloading. Provenance stores safe references only.
+		schemaV16SQL := `
+		CREATE TABLE IF NOT EXISTS source_acquisitions (
+			id TEXT PRIMARY KEY,
+			source_id TEXT NOT NULL UNIQUE,
+			platform TEXT NOT NULL,
+			canonical_url TEXT NOT NULL,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			provenance_json TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (16, datetime('now'));
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaV16SQL); err != nil {
+			return fmt.Errorf("execute migration v16: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v16: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -4255,4 +4297,49 @@ func (s *DB) GetQualityResultsByRun(ctx context.Context, runID string) ([]domain
 		results = append(results, qr)
 	}
 	return results, nil
+}
+
+// SaveSourceAcquisition upserts the provenance row binding a canonical
+// source identity to its content-fingerprinted SourceAsset.
+func (s *DB) SaveSourceAcquisition(ctx context.Context, prov domain.AcquisitionProvenance) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	provJSON, err := json.Marshal(prov)
+	if err != nil {
+		return fmt.Errorf("marshal acquisition provenance: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO source_acquisitions (id, source_id, platform, canonical_url, asset_id, provenance_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(source_id) DO UPDATE SET
+			canonical_url=excluded.canonical_url,
+			asset_id=excluded.asset_id,
+			provenance_json=excluded.provenance_json
+	`, prov.ID, prov.SourceID, prov.Platform, prov.CanonicalURL, prov.AssetID, string(provJSON), prov.AcquiredAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("upsert source acquisition: %w", err)
+	}
+	return nil
+}
+
+// GetSourceAcquisitionBySourceID resolves a canonical source identity to its
+// previously acquired SourceAsset provenance (content-fingerprint dedup).
+func (s *DB) GetSourceAcquisitionBySourceID(ctx context.Context, sourceID string) (*domain.AcquisitionProvenance, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var provJSON string
+	err := s.db.QueryRowContext(ctx, `SELECT provenance_json FROM source_acquisitions WHERE source_id = ?`, sourceID).Scan(&provJSON)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query source acquisition: %w", err)
+	}
+	var prov domain.AcquisitionProvenance
+	if err := json.Unmarshal([]byte(provJSON), &prov); err != nil {
+		return nil, fmt.Errorf("unmarshal acquisition provenance: %w", err)
+	}
+	return &prov, nil
 }

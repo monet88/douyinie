@@ -91,6 +91,26 @@ func main() {
 	licSvc := governance.NewLicenseService(db)
 	credSvc := governance.NewCredentialService(db)
 	router := provider.NewRouter(reg, polSvc, licSvc, credSvc, nil, db)
+
+	// 5b. Douyin URL acquisition ladder (Issue #28): Jiji preferred -> F2
+	// parser fallback -> browser-assisted auth last. Adapters are fail-closed
+	// (REQUIRES_AUTHORIZATION) until an operator enables them for an
+	// authorized-use basis; session secrets resolve only through the
+	// CredentialService seam at call time and are never logged or persisted.
+	jijiScript := os.Getenv("DOUYINIE_JIJI_SCRIPT")
+	jijiPython := os.Getenv("DOUYINIE_JIJI_PYTHON")
+	if jijiPython == "" {
+		jijiPython = "python"
+	}
+	if jijiScript != "" {
+		_ = reg.Register(provider.NewJijiAdapter("v2", jijiPython, jijiScript, credSvc.MaterializeSecret))
+		_ = reg.Register(provider.NewBrowserAssistAdapter("v2", jijiPython, jijiScript, credSvc.MaterializeSecret))
+	}
+	if f2Bin := os.Getenv("DOUYINIE_F2_BIN"); f2Bin != "" {
+		_ = reg.Register(provider.NewF2Adapter("v0", f2Bin, credSvc.MaterializeSecret))
+	}
+	acquisitionSvc := service.NewAcquisitionService(db, ingestSvc, router, absDataDir)
+
 	// 6. Optional Demo Ingestion
 	if *demoFile != "" {
 		log.Printf("[RuntimeHost] Running DEMO ingestion on: %s", *demoFile)
@@ -128,6 +148,7 @@ func main() {
 		DB:             db,
 		CASStore:       casStore,
 		Ingest:         ingestSvc,
+		Acquisition:    acquisitionSvc,
 		Registry:       reg,
 		PolicySvc:      polSvc,
 		LicenseSvc:     licSvc,

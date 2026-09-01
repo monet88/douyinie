@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"syscall"
 	"unsafe"
+
+	"github.com/monet88/douyinie/internal/domain"
 )
 
 var (
@@ -49,6 +51,39 @@ func verifyWindowsCredential(targetName string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// readWindowsCredential returns the secret blob stored under targetName in
+// Windows Credential Manager. This is the only path that materializes raw
+// session material; callers must pass it transiently to an authorized
+// subprocess and never log or persist it (Issue #17: local-only secrets).
+func readWindowsCredential(targetName string) (string, error) {
+	targetPtr, err := syscall.UTF16PtrFromString(targetName)
+	if err != nil {
+		return "", fmt.Errorf("invalid credential target name")
+	}
+
+	var pCred unsafe.Pointer
+	r1, _, err := procCredReadW.Call(
+		uintptr(unsafe.Pointer(targetPtr)),
+		uintptr(credTypeGeneric),
+		0,
+		uintptr(unsafe.Pointer(&pCred)),
+	)
+	if r1 == 0 {
+		if errno, ok := err.(syscall.Errno); ok && errno == 1168 { // ERROR_NOT_FOUND
+			return "", fmt.Errorf("%w: credential %q not found", domain.ErrAuthRequired, targetName)
+		}
+		return "", fmt.Errorf("%w: CredReadW failed for %q", domain.ErrAuthRequired, targetName)
+	}
+	defer procCredFree.Call(uintptr(pCred))
+
+	cred := *(*winCredentialW)(pCred)
+	if cred.CredentialBlob == nil || cred.CredentialBlobSize == 0 {
+		return "", nil
+	}
+	blob := unsafe.Slice(cred.CredentialBlob, cred.CredentialBlobSize)
+	return string(blob), nil
 }
 
 type winCredentialW struct {

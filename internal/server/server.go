@@ -31,6 +31,7 @@ type Server struct {
 	db             *storage.DB
 	casStore       *cas.Store
 	ingest         *service.IngestService
+	acquisition    *service.AcquisitionService
 	registry       *provider.Registry
 	policySvc      *governance.PolicyService
 	licenseSvc     *governance.LicenseService
@@ -56,6 +57,7 @@ type Config struct {
 	DB             *storage.DB
 	CASStore       *cas.Store
 	Ingest         *service.IngestService
+	Acquisition    *service.AcquisitionService // Douyin URL acquisition ladder (T05)
 	Registry       *provider.Registry
 	PolicySvc      *governance.PolicyService
 	LicenseSvc     *governance.LicenseService
@@ -141,6 +143,7 @@ func New(cfg Config) *Server {
 		db:             cfg.DB,
 		casStore:       cfg.CASStore,
 		ingest:         cfg.Ingest,
+		acquisition:    cfg.Acquisition,
 		registry:       cfg.Registry,
 		policySvc:      cfg.PolicySvc,
 		licenseSvc:     cfg.LicenseSvc,
@@ -286,6 +289,8 @@ func (s *Server) routes() {
 
 	// Source Asset Ingest & Retrieval
 	s.mux.HandleFunc("POST /api/v1/assets/ingest", s.handleIngestAsset)
+	s.mux.HandleFunc("POST /api/v1/sources/probe", s.handleProbeSource)
+	s.mux.HandleFunc("POST /api/v1/sources/acquire", s.handleAcquireSource)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}", s.handleGetAsset)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/preflight", s.handleGetAssetPreflight)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/audio-role-plan", s.handleSaveAudioRolePlan)
@@ -510,6 +515,84 @@ func (s *Server) handleIngestAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeJSON(w, http.StatusCreated, res)
+}
+
+// writeAcquisitionError maps structural acquisition states and governance
+// rejections to stable HTTP statuses. Invalid client input (INVALID_URL) is
+// a 400 — never a 500 and never mislabeled as content being gone. Policy/auth/
+// license/content-unavailable/unsupported-media rejections are 422
+// (fail-closed, never retried past policy); download failures are 502.
+func writeAcquisitionError(w http.ResponseWriter, err error) {
+	var acqErr *domain.AcquisitionError
+	if errors.As(err, &acqErr) {
+		status := http.StatusUnprocessableEntity
+		switch acqErr.State {
+		case domain.AcquisitionDownloadFailed:
+			status = http.StatusBadGateway
+		case domain.AcquisitionInvalidURL:
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, map[string]any{
+			"error":             acqErr.Error(),
+			"acquisition_state": string(acqErr.State),
+			"provider_id":       acqErr.ProviderID,
+		})
+		return
+	}
+	switch {
+	case errors.Is(err, domain.ErrInvalidURL):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, domain.ErrPolicyBlocked),
+		errors.Is(err, domain.ErrConsentRequired),
+		errors.Is(err, domain.ErrAuthRequired),
+		errors.Is(err, domain.ErrLicenseManifestMissing),
+		errors.Is(err, domain.ErrNoEligibleProvider),
+		errors.Is(err, domain.ErrRightsAttestationRequired),
+		errors.Is(err, domain.ErrUnsupportedMediaType),
+		errors.Is(err, domain.ErrContentUnavailable),
+		errors.Is(err, domain.ErrCorruptMedia),
+		errors.Is(err, domain.ErrFingerprintMismatch),
+		errors.Is(err, domain.ErrInconsistentProvenance):
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, err.Error())
+	}
+}
+
+func (s *Server) handleProbeSource(w http.ResponseWriter, r *http.Request) {
+	if s.acquisition == nil {
+		writeError(w, http.StatusInternalServerError, "acquisition service is not configured")
+		return
+	}
+	var req service.AcquireRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	desc, err := s.acquisition.Probe(r.Context(), req)
+	if err != nil {
+		writeAcquisitionError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"descriptor": desc})
+}
+
+func (s *Server) handleAcquireSource(w http.ResponseWriter, r *http.Request) {
+	if s.acquisition == nil {
+		writeError(w, http.StatusInternalServerError, "acquisition service is not configured")
+		return
+	}
+	var req service.AcquireRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	res, err := s.acquisition.Acquire(r.Context(), req)
+	if err != nil {
+		writeAcquisitionError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusCreated, res)
 }
 
