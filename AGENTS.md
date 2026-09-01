@@ -1,56 +1,44 @@
-# Douyinie Agent Context & Guidelines
+# Douyinie Agent Steering
 
-When working on Douyinie architecture, provider selection, benchmarks, implementation planning, or code changes:
+## Hierarchy of Truth
 
-1. **Hierarchy of Truth**:
-   - **[Wayfinder Issue #1](https://github.com/monet88/douyinie/issues/1)**: Canonical source of truth for resolved decisions.
-   - **[Implementation Spec #18](https://github.com/monet88/douyinie/issues/18)**: Authoritative Phase 1 implementation spec (body + normative revalidation amendments).
-   - **[`docs/architecture/phase1-architecture.md`](docs/architecture/phase1-architecture.md)**: Canonical repo-local Phase 1 architecture synthesis; it materializes the locked #16 architecture plus authoritative #18 amendments. If it drifts from #1/#18, GitHub issues win.
-   - **[`PRODUCT.md`](PRODUCT.md)** & **[`CONTEXT.md`](CONTEXT.md)**: Repo-local product charter and domain invariant glossary.
-   - **[`docs/reference-repositories.md`](docs/reference-repositories.md)**: Mining and reference inventory (**not** a dependency lockfile).
+1. **[Wayfinder Issue #1](https://github.com/monet88/douyinie/issues/1)** → resolved decisions.
+2. **[Implementation Spec #18](https://github.com/monet88/douyinie/issues/18)** → Phase 1 spec + normative amendments.
+3. **[`docs/architecture/phase1-architecture.md`](docs/architecture/phase1-architecture.md)** → canonical repo-local architecture. GitHub issues win on drift.
+4. **[`PRODUCT.md`](PRODUCT.md)** & **[`CONTEXT.md`](CONTEXT.md)** → product charter, domain invariants.
+5. **[`docs/reference-repositories.md`](docs/reference-repositories.md)** → mining inventory (not a dependency lockfile).
 
-2. **Core Pipeline Invariants**:
-   - **Dialogue/Narration Dubbing Only**: Preserve BGM, sound effects (Foley/ambient), singing/music-vocals, and instrumental outros perceptually and semantically. Never replace full audio tracks with TTS.
-   - **Immutable Source Timing**: Video cuts are locked; shorten/rewrite text concise first; probe actual duration; enforce zero overrun (`tts_finish <= source_end`) with natural inter-turn breathing room.
-   - **Multi-Role `TextRegionPlan`**: Classify text as `speech_subtitle`, `semantic_text`, `instructional_ui_text`, `brand_keep`, or `ignore`. In-place cover/overlay is the default; inpainting is non-default.
-   - **Compact Fit-Content Subtitle Box**: Background box must hug rendered text (1–2 lines max, compact padding), never a full-width rectangle. Keep UI buttons, timeline tracks, and finger tap targets unobstructed.
-   - **Pre-Dub Voice Audition**: AI recommended default, 5s standalone or 10s contextual audition mixed with video BGM, 1 stable voice per speaker per run.
-   - **Target Languages**: Vietnamese AND English (VI/EN).
-   - **No Facial Lip-Sync**: Timeline-constrained speech alignment defines V1; facial lip sync is out of scope.
+## Load-Bearing Guardrails
 
-3. **Obligation Layers**:
-   - Keep `CODE_LICENSE`, `MODEL_LICENSE`, `DATA_LICENSE`, and `SERVICE_TERMS` separate. Rewriting source code does not remove model/data obligations.
+- **Two testing seams only**: Seam 1 (RuntimeHost localhost API) and Seam 2 (StageWorker runtime contract). In-memory unit tests are not additional seams.
+- **Obligation layers**: `CODE_LICENSE`, `MODEL_LICENSE`, `DATA_LICENSE`, `SERVICE_TERMS` stay separate. Code changes do not remove model/data obligations.
+- **Completion is evidence-gated**: agent claims are evidence, not proof. Verify repo state, tests, and acceptance criteria before declaring PASS.
 
-4. **Testing Seams**:
-   - Maintain exactly two approved architectural integration/acceptance seams: **Seam 1** (localhost RuntimeHost API) and **Seam 2** (StageWorker runtime contract). Ordinary in-memory unit tests for pure helpers/parsers/math do not create another architectural seam.
+## Context by Task
 
-## Agent Skills
+| Task | Read before starting |
+|------|---------------------|
+| **Architecture / design** | `docs/architecture/phase1-architecture.md`, `CONTEXT.md`, relevant `docs/adr/` |
+| **Implementation** | Above, plus the ticket's spec, `PRODUCT.md` §invariants, `docs/agents/domain.md` |
+| **Review** | Above, plus `docs/agents/orca-orchestration.md` §Mutation and Verification Boundaries |
+| **Coordination** | `docs/agents/orca-orchestration.md` (roles, workflow skills, mutation policy, continuity) |
+| **Issue tracker ops** | `docs/agents/issue-tracker.md` |
+| **Triage** | `docs/agents/triage-labels.md` |
+| **Domain vocabulary** | `docs/agents/domain.md` → `CONTEXT.md` + `docs/adr/` |
+| **Out-of-repo file discovery** | `docs/agents/fastctx-discovery.md` (exact-first, bounded-fallback) |
 
-### Issue Tracker
-Issues tracked in GitHub Issues via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+## Agent Orchestration (summary)
 
-### Triage Labels
-Five default triage labels, strings equal to role names. See `docs/agents/triage-labels.md`.
+Full policy: [`docs/agents/orca-orchestration.md`](docs/agents/orca-orchestration.md).
 
-### Domain Docs
-Single-context layout — root `CONTEXT.md` + `docs/adr/`; Phase 1 architecture is materialized in `docs/architecture/phase1-architecture.md`. See `docs/agents/domain.md`.
-
-
-## Agent Orchestration
-
-When coordinating multiple coding agents:
-
-- Honor the exact supervisor, implementation-worker, and reviewer families selected by the user/coordinator. Never substitute another agent family without explicit authorization.
-- A supervisor is control-plane only unless explicitly assigned implementation or review work.
-- Explicit workflow Skill invocation must be the first characters of the actual agent-visible prompt; do not prepend lifecycle prose or transport markers.
-- Before launching AGY, OpenCode, Pi, or another agent with a documented transport workaround, read [`docs/agents/orca-orchestration.md`](docs/agents/orca-orchestration.md) and follow its current repo-local launch policy.
-- Preserve one editing owner for overlapping mutable scope and use fresh, read-only reviewer sessions.
-- Agent completion claims are evidence, not proof. Verify repository state, required tests/checks, and acceptance criteria before declaring PASS.
+- Honor user-selected agent families; never substitute without authorization.
+- One editing owner per overlapping mutable scope; reviewers are read-only.
+- Workflow Skill invocation must lead the agent-visible prompt.
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **douyinie** (4165 symbols, 18444 relationships, 260 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **douyinie**. For current index statistics (symbols, relationships, execution flows), read `gitnexus://repo/douyinie/context`. Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
@@ -83,11 +71,11 @@ This project is indexed by GitNexus as **douyinie** (4165 symbols, 18444 relatio
 
 | Task | Read this skill file |
 |------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+| Understand architecture / "How does X work?" | `~/.agents/skills/gitnexus/gitnexus-exploring/SKILL.md` |
+| Blast radius / "What breaks if I change X?" | `~/.agents/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
+| Trace bugs / "Why is X failing?" | `~/.agents/skills/gitnexus/gitnexus-debugging/SKILL.md` |
+| Rename / extract / split / refactor | `~/.agents/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
+| Tools, resources, schema reference | `~/.agents/skills/gitnexus/gitnexus-guide/SKILL.md` |
+| Index, status, clean, wiki CLI commands | `~/.agents/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->
