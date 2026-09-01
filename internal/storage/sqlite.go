@@ -4343,3 +4343,756 @@ func (s *DB) GetSourceAcquisitionBySourceID(ctx context.Context, sourceID string
 	}
 	return &prov, nil
 }
+
+// ---- Job Bundle Storage Helpers (T21) ----
+
+// ListRunsByJobID retrieves all localization runs for a job ordered by creation date.
+func (s *DB) ListRunsByJobID(ctx context.Context, jobID string) ([]domain.LocalizationRun, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `SELECT id, job_id, status, config_snapshot_json, created_at, completed_at FROM localization_runs WHERE job_id = ? ORDER BY created_at ASC, id ASC`
+	rows, err := s.db.QueryContext(ctx, query, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("query localization_runs by job: %w", err)
+	}
+	defer rows.Close()
+
+	var runs []domain.LocalizationRun
+	for rows.Next() {
+		var r domain.LocalizationRun
+		var createdStr string
+		var completedStr sql.NullString
+		if err := rows.Scan(&r.ID, &r.JobID, &r.Status, &r.ConfigSnapshotJSON, &createdStr, &completedStr); err != nil {
+			return nil, fmt.Errorf("scan localization_run: %w", err)
+		}
+		r.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+		if completedStr.Valid {
+			t, err := time.Parse(time.RFC3339Nano, completedStr.String)
+			if err == nil {
+				r.CompletedAt = &t
+			}
+		}
+		runs = append(runs, r)
+	}
+	return runs, nil
+}
+
+// GetTranscriptArtifactIndexByRun retrieves the transcript artifact index for a run.
+func (s *DB) GetTranscriptArtifactIndexByRun(ctx context.Context, runID string) (*TranscriptArtifactIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx TranscriptArtifactIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, cas_hash, provenance_hash, asr_provider_id, asr_model_name, asr_model_version, aligner_provider_id, aligner_model_name, aligner_model_version, segment_cfg_json, created_at
+		FROM transcript_artifacts WHERE run_id = ? ORDER BY created_at DESC LIMIT 1`
+	err := s.db.QueryRowContext(ctx, query, runID).Scan(
+		&idx.ID, &idx.AssetID, &idx.RunID, &idx.CASHash, &idx.ProvenanceHash,
+		&idx.ASRProviderID, &idx.ASRModelName, &idx.ASRModelVersion,
+		&idx.AlignerProviderID, &idx.AlignerModelName, &idx.AlignerModelVersion,
+		&idx.SegmentCfgJSON, &createdStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query transcript artifact index by run: %w", err)
+	}
+	idx.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	return &idx, nil
+}
+
+// GetTranslationVariantIndexByRun retrieves the translation variant index for a run.
+func (s *DB) GetTranslationVariantIndexByRun(ctx context.Context, runID string) (*TranslationVariantIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx TranslationVariantIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, target_language, cas_hash, provenance_hash, provider_id, model_name, model_version, created_at
+		FROM translation_variants WHERE run_id = ? ORDER BY created_at DESC LIMIT 1`
+	err := s.db.QueryRowContext(ctx, query, runID).Scan(
+		&idx.ID, &idx.AssetID, &idx.RunID, &idx.TargetLanguage, &idx.CASHash, &idx.ProvenanceHash,
+		&idx.ProviderID, &idx.ModelName, &idx.ModelVersion, &createdStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query translation variant index by run: %w", err)
+	}
+	idx.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	return &idx, nil
+}
+
+// GetDubScriptVariantIndexByRun retrieves the dub script variant index for a run.
+func (s *DB) GetDubScriptVariantIndexByRun(ctx context.Context, runID string) (*DubScriptVariantIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx DubScriptVariantIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, target_language, cas_hash, provenance_hash, provider_id, model_name, model_version, created_at
+		FROM dub_script_variants WHERE run_id = ? ORDER BY created_at DESC LIMIT 1`
+	err := s.db.QueryRowContext(ctx, query, runID).Scan(
+		&idx.ID, &idx.AssetID, &idx.RunID, &idx.TargetLanguage, &idx.CASHash, &idx.ProvenanceHash,
+		&idx.ProviderID, &idx.ModelName, &idx.ModelVersion, &createdStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query dub script variant index by run: %w", err)
+	}
+	idx.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	return &idx, nil
+}
+
+// GetVoiceAssignmentIndexByRunID retrieves the voice assignment index for a run.
+func (s *DB) GetVoiceAssignmentIndexByRunID(ctx context.Context, runID string) (*VoiceAssignmentIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx VoiceAssignmentIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at
+		FROM voice_assignments WHERE run_id = ? ORDER BY created_at DESC LIMIT 1`
+	err := s.db.QueryRowContext(ctx, query, runID).Scan(
+		&idx.ID, &idx.AssetID, &idx.RunID, &idx.TargetLanguage, &idx.CASHash, &idx.ProvenanceHash, &createdStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query voice assignment index by run: %w", err)
+	}
+	idx.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	return &idx, nil
+}
+
+// GetDubSegmentsVariantIndexByRun retrieves the dub segments variant index for a run.
+func (s *DB) GetDubSegmentsVariantIndexByRun(ctx context.Context, runID string) (*DubSegmentsVariantIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx DubSegmentsVariantIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at
+		FROM dub_segments_variants WHERE run_id = ? ORDER BY created_at DESC LIMIT 1`
+	err := s.db.QueryRowContext(ctx, query, runID).Scan(
+		&idx.ID, &idx.AssetID, &idx.RunID, &idx.TargetLanguage, &idx.CASHash, &idx.ProvenanceHash, &createdStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query dub segments variant index by run: %w", err)
+	}
+	idx.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	return &idx, nil
+}
+
+// GetDubMixArtifactIndexByRun retrieves the dub mix artifact index for a run.
+func (s *DB) GetDubMixArtifactIndexByRun(ctx context.Context, runID string) (*DubMixArtifactIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx DubMixArtifactIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at
+		FROM dub_mix_artifacts WHERE run_id = ? ORDER BY created_at DESC LIMIT 1`
+	err := s.db.QueryRowContext(ctx, query, runID).Scan(
+		&idx.ID, &idx.AssetID, &idx.RunID, &idx.TargetLanguage, &idx.CASHash, &idx.ProvenanceHash, &createdStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query dub mix artifact index by run: %w", err)
+	}
+	idx.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	return &idx, nil
+}
+
+// GetRenderPlanIndexByRun retrieves the render plan index for a run.
+func (s *DB) GetRenderPlanIndexByRun(ctx context.Context, runID string) (*RenderPlanIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx RenderPlanIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at
+		FROM render_plans WHERE run_id = ? ORDER BY created_at DESC LIMIT 1`
+	err := s.db.QueryRowContext(ctx, query, runID).Scan(
+		&idx.ID, &idx.AssetID, &idx.RunID, &idx.TargetLanguage, &idx.CASHash, &idx.ProvenanceHash, &createdStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query render plan index by run: %w", err)
+	}
+	idx.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	return &idx, nil
+}
+
+// GetRenderArtifactIndicesByRun retrieves all render artifact indices for a run (e.g. preview and final).
+func (s *DB) GetRenderArtifactIndicesByRun(ctx context.Context, runID string) ([]RenderArtifactIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `SELECT id, asset_id, run_id, target_language, kind, cas_hash, provenance_hash, created_at
+		FROM render_artifacts WHERE run_id = ? ORDER BY created_at ASC`
+	rows, err := s.db.QueryContext(ctx, query, runID)
+	if err != nil {
+		return nil, fmt.Errorf("query render artifacts by run: %w", err)
+	}
+	defer rows.Close()
+
+	var list []RenderArtifactIndex
+	for rows.Next() {
+		var idx RenderArtifactIndex
+		var createdStr string
+		if err := rows.Scan(&idx.ID, &idx.AssetID, &idx.RunID, &idx.TargetLanguage, &idx.Kind, &idx.CASHash, &idx.ProvenanceHash, &createdStr); err != nil {
+			return nil, fmt.Errorf("scan render artifact index: %w", err)
+		}
+		idx.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+		list = append(list, idx)
+	}
+	return list, nil
+}
+
+// GetLocalizedSubtitleTrackIndexByRun retrieves the localized subtitle track index for a run.
+func (s *DB) GetLocalizedSubtitleTrackIndexByRun(ctx context.Context, runID string) (*LocalizedSubtitleTrackIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx LocalizedSubtitleTrackIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at
+		FROM localized_subtitle_tracks WHERE run_id = ? ORDER BY created_at DESC LIMIT 1`
+	err := s.db.QueryRowContext(ctx, query, runID).Scan(
+		&idx.ID, &idx.AssetID, &idx.RunID, &idx.TargetLanguage, &idx.CASHash, &idx.ProvenanceHash, &createdStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query localized subtitle track index by run: %w", err)
+	}
+	idx.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	return &idx, nil
+}
+
+// GetLocalizedVisualTrackIndexByRun retrieves the localized visual track index for a run.
+func (s *DB) GetLocalizedVisualTrackIndexByRun(ctx context.Context, runID string) (*LocalizedVisualTrackIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx LocalizedVisualTrackIndex
+	var createdStr string
+	query := `SELECT id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at
+		FROM localized_visual_tracks WHERE run_id = ? ORDER BY created_at DESC LIMIT 1`
+	err := s.db.QueryRowContext(ctx, query, runID).Scan(
+		&idx.ID, &idx.AssetID, &idx.RunID, &idx.TargetLanguage, &idx.CASHash, &idx.ProvenanceHash, &createdStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query localized visual track index by run: %w", err)
+	}
+	idx.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	return &idx, nil
+}
+
+// UpsertRightsAttestation inserts or replaces a rights attestation record.
+func (s *DB) UpsertRightsAttestation(ctx context.Context, ra domain.RightsAttestation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	termsInt := 0
+	if ra.TermsAccepted {
+		termsInt = 1
+	}
+
+	query := `
+		INSERT INTO rights_attestations (id, attestation_type, declared_by, terms_accepted, notes, confirmed_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			attestation_type = excluded.attestation_type,
+			declared_by = excluded.declared_by,
+			terms_accepted = excluded.terms_accepted,
+			notes = excluded.notes,
+			confirmed_at = excluded.confirmed_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		ra.ID, ra.AttestationType, ra.DeclaredBy, termsInt, ra.Notes, ra.ConfirmedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("upsert rights_attestation: %w", err)
+	}
+	return nil
+}
+
+// UpsertSourceAsset inserts or replaces a source asset record.
+func (s *DB) UpsertSourceAsset(ctx context.Context, sa domain.SourceAsset) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO source_assets (id, sha256, byte_size, mime_type, original_filename, rights_attestation_id, cas_path, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			sha256 = excluded.sha256,
+			byte_size = excluded.byte_size,
+			mime_type = excluded.mime_type,
+			original_filename = excluded.original_filename,
+			rights_attestation_id = excluded.rights_attestation_id,
+			cas_path = excluded.cas_path,
+			created_at = excluded.created_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		sa.ID, sa.SHA256, sa.ByteSize, sa.MimeType, sa.OriginalFilename, sa.RightsAttestationID, sa.CASPath, sa.CreatedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("upsert source_asset: %w", err)
+	}
+	return nil
+}
+
+// UpsertJob inserts or replaces a localization job record.
+func (s *DB) UpsertJob(ctx context.Context, job domain.LocalizationJob) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO localization_jobs (id, source_asset_id, target_language, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			source_asset_id = excluded.source_asset_id,
+			target_language = excluded.target_language,
+			status = excluded.status,
+			updated_at = excluded.updated_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		job.ID, job.SourceAssetID, job.TargetLanguage, job.Status, job.CreatedAt.Format(time.RFC3339Nano), job.UpdatedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("upsert localization_job: %w", err)
+	}
+	return nil
+}
+
+// UpsertRun inserts or replaces a localization run record.
+func (s *DB) UpsertRun(ctx context.Context, run domain.LocalizationRun) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var completedStr sql.NullString
+	if run.CompletedAt != nil {
+		completedStr = sql.NullString{String: run.CompletedAt.Format(time.RFC3339Nano), Valid: true}
+	}
+
+	query := `
+		INSERT INTO localization_runs (id, job_id, status, config_snapshot_json, created_at, completed_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			job_id = excluded.job_id,
+			status = excluded.status,
+			config_snapshot_json = excluded.config_snapshot_json,
+			created_at = excluded.created_at,
+			completed_at = excluded.completed_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		run.ID, run.JobID, run.Status, run.ConfigSnapshotJSON, run.CreatedAt.Format(time.RFC3339Nano), completedStr)
+	if err != nil {
+		return fmt.Errorf("upsert localization_run: %w", err)
+	}
+	return nil
+}
+
+// UpsertStageExecution inserts or replaces a stage execution record.
+func (s *DB) UpsertStageExecution(ctx context.Context, se domain.StageExecution) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO stage_executions (id, run_id, stage, status, started_at, completed_at, artifact_sha256, error_message, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			run_id = excluded.run_id,
+			stage = excluded.stage,
+			status = excluded.status,
+			started_at = excluded.started_at,
+			completed_at = excluded.completed_at,
+			artifact_sha256 = excluded.artifact_sha256,
+			error_message = excluded.error_message,
+			updated_at = excluded.updated_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		se.ID, se.RunID, se.Stage, se.Status,
+		nullableTime(se.StartedAt), nullableTime(se.CompletedAt),
+		sql.NullString{String: se.ArtifactSHA256, Valid: se.ArtifactSHA256 != ""},
+		sql.NullString{String: se.ErrorMessage, Valid: se.ErrorMessage != ""},
+		se.CreatedAt.Format(time.RFC3339Nano), se.UpdatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert stage_execution: %w", err)
+	}
+	return nil
+}
+
+// UpsertSelectionDecision inserts an immutable routing decision (idempotent).
+func (s *DB) UpsertSelectionDecision(ctx context.Context, dec domain.SelectionDecision) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	candJSON, err := json.Marshal(dec.CandidatesEvaluated)
+	if err != nil {
+		return fmt.Errorf("marshal candidates evaluated: %w", err)
+	}
+
+	query := `
+		INSERT INTO selection_decisions (id, run_id, stage, selected_provider_id, candidates_evaluated_json, policy_check_result, decision_reason, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO NOTHING
+	`
+	_, err = s.db.ExecContext(ctx, query,
+		dec.ID, dec.RunID, dec.Stage, dec.SelectedProviderID,
+		string(candJSON), dec.PolicyCheckResult, dec.DecisionReason,
+		dec.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert selection_decision: %w", err)
+	}
+	return nil
+}
+
+// UpsertProviderAttempt inserts an immutable provider attempt (idempotent).
+func (s *DB) UpsertProviderAttempt(ctx context.Context, attempt domain.ProviderAttempt) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO provider_attempts (id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO NOTHING
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		attempt.ID, attempt.RunID, attempt.Stage, attempt.ProviderID,
+		attempt.ModelName, attempt.ModelVersion, attempt.InputHash,
+		attempt.AttemptNumber, attempt.Status, attempt.ErrorMessage,
+		attempt.LatencyMs, attempt.CostUnits, attempt.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert provider_attempt: %w", err)
+	}
+	return nil
+}
+
+// UpsertTranscriptArtifactIndex upserts the index row for a TranscriptArtifact.
+func (s *DB) UpsertTranscriptArtifactIndex(ctx context.Context, idx TranscriptArtifactIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO transcript_artifacts (id, asset_id, run_id, cas_hash, provenance_hash, asr_provider_id, asr_model_name, asr_model_version, aligner_provider_id, aligner_model_name, aligner_model_version, segment_cfg_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			asset_id = excluded.asset_id,
+			run_id = excluded.run_id,
+			cas_hash = excluded.cas_hash,
+			provenance_hash = excluded.provenance_hash,
+			asr_provider_id = excluded.asr_provider_id,
+			asr_model_name = excluded.asr_model_name,
+			asr_model_version = excluded.asr_model_version,
+			aligner_provider_id = excluded.aligner_provider_id,
+			aligner_model_name = excluded.aligner_model_name,
+			aligner_model_version = excluded.aligner_model_version,
+			segment_cfg_json = excluded.segment_cfg_json,
+			created_at = excluded.created_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID, idx.AssetID, idx.RunID, idx.CASHash, idx.ProvenanceHash,
+		idx.ASRProviderID, idx.ASRModelName, idx.ASRModelVersion,
+		idx.AlignerProviderID, idx.AlignerModelName, idx.AlignerModelVersion,
+		idx.SegmentCfgJSON, idx.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert transcript artifact index: %w", err)
+	}
+	return nil
+}
+
+// UpsertTranslationVariantIndex upserts the index row for a TranslationVariant.
+func (s *DB) UpsertTranslationVariantIndex(ctx context.Context, idx TranslationVariantIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO translation_variants (id, asset_id, run_id, target_language, cas_hash, provenance_hash, provider_id, model_name, model_version, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			asset_id = excluded.asset_id,
+			run_id = excluded.run_id,
+			target_language = excluded.target_language,
+			cas_hash = excluded.cas_hash,
+			provenance_hash = excluded.provenance_hash,
+			provider_id = excluded.provider_id,
+			model_name = excluded.model_name,
+			model_version = excluded.model_version,
+			created_at = excluded.created_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash,
+		idx.ProviderID, idx.ModelName, idx.ModelVersion, idx.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert translation variant index: %w", err)
+	}
+	return nil
+}
+
+// UpsertDubScriptVariantIndex upserts the index row for a DubScriptVariant.
+func (s *DB) UpsertDubScriptVariantIndex(ctx context.Context, idx DubScriptVariantIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO dub_script_variants (id, asset_id, run_id, target_language, cas_hash, provenance_hash, provider_id, model_name, model_version, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			asset_id = excluded.asset_id,
+			run_id = excluded.run_id,
+			target_language = excluded.target_language,
+			cas_hash = excluded.cas_hash,
+			provenance_hash = excluded.provenance_hash,
+			provider_id = excluded.provider_id,
+			model_name = excluded.model_name,
+			model_version = excluded.model_version,
+			created_at = excluded.created_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash,
+		idx.ProviderID, idx.ModelName, idx.ModelVersion, idx.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert dub script variant index: %w", err)
+	}
+	return nil
+}
+
+// UpsertVoiceAssignmentIndex upserts the index row for a VoiceAssignment.
+func (s *DB) UpsertVoiceAssignmentIndex(ctx context.Context, idx VoiceAssignmentIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO voice_assignments (id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			asset_id = excluded.asset_id,
+			run_id = excluded.run_id,
+			target_language = excluded.target_language,
+			cas_hash = excluded.cas_hash,
+			provenance_hash = excluded.provenance_hash,
+			created_at = excluded.created_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert voice assignment index: %w", err)
+	}
+	return nil
+}
+
+// UpsertDubSegmentsVariantIndex upserts the index row for a DubSegmentsVariant.
+func (s *DB) UpsertDubSegmentsVariantIndex(ctx context.Context, idx DubSegmentsVariantIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO dub_segments_variants (id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			asset_id = excluded.asset_id,
+			run_id = excluded.run_id,
+			target_language = excluded.target_language,
+			cas_hash = excluded.cas_hash,
+			provenance_hash = excluded.provenance_hash,
+			created_at = excluded.created_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert dub segments variant index: %w", err)
+	}
+	return nil
+}
+
+// UpsertAudioStemsArtifactIndex upserts the index row for an AudioStemArtifacts.
+func (s *DB) UpsertAudioStemsArtifactIndex(ctx context.Context, idx AudioStemsArtifactIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO audio_stems_artifacts (id, asset_id, provider_id, cas_hash, provenance_hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			asset_id = excluded.asset_id,
+			provider_id = excluded.provider_id,
+			cas_hash = excluded.cas_hash,
+			provenance_hash = excluded.provenance_hash,
+			created_at = excluded.created_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID, idx.AssetID, idx.ProviderID, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert audio stems artifact index: %w", err)
+	}
+	return nil
+}
+
+// UpsertDubMixArtifactIndex upserts the index row for a DubMixArtifact.
+func (s *DB) UpsertDubMixArtifactIndex(ctx context.Context, idx DubMixArtifactIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO dub_mix_artifacts (id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			asset_id = excluded.asset_id,
+			run_id = excluded.run_id,
+			target_language = excluded.target_language,
+			cas_hash = excluded.cas_hash,
+			provenance_hash = excluded.provenance_hash,
+			created_at = excluded.created_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert dub mix artifact index: %w", err)
+	}
+	return nil
+}
+
+// UpsertTextRegionPlanIndex upserts the index row for a TextRegionPlan.
+func (s *DB) UpsertTextRegionPlanIndex(ctx context.Context, idx TextRegionPlanIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO text_region_plans (id, asset_id, provider_id, cas_hash, provenance_hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			asset_id = excluded.asset_id,
+			provider_id = excluded.provider_id,
+			cas_hash = excluded.cas_hash,
+			provenance_hash = excluded.provenance_hash,
+			created_at = excluded.created_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID, idx.AssetID, idx.ProviderID, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert text region plan index: %w", err)
+	}
+	return nil
+}
+
+// UpsertRenderPlanIndex upserts the index row for a RenderPlan.
+func (s *DB) UpsertRenderPlanIndex(ctx context.Context, idx RenderPlanIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO render_plans (id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			asset_id = excluded.asset_id,
+			run_id = excluded.run_id,
+			target_language = excluded.target_language,
+			cas_hash = excluded.cas_hash,
+			provenance_hash = excluded.provenance_hash,
+			created_at = excluded.created_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert render plan index: %w", err)
+	}
+	return nil
+}
+
+// UpsertRenderArtifactIndex upserts the index row for a RenderArtifact.
+func (s *DB) UpsertRenderArtifactIndex(ctx context.Context, idx RenderArtifactIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO render_artifacts (id, asset_id, run_id, target_language, kind, cas_hash, provenance_hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			asset_id = excluded.asset_id,
+			run_id = excluded.run_id,
+			target_language = excluded.target_language,
+			kind = excluded.kind,
+			cas_hash = excluded.cas_hash,
+			provenance_hash = excluded.provenance_hash,
+			created_at = excluded.created_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.Kind, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert render artifact index: %w", err)
+	}
+	return nil
+}
+
+// UpsertLocalizedSubtitleTrackIndex upserts the index row for a LocalizedSubtitleTrack.
+func (s *DB) UpsertLocalizedSubtitleTrackIndex(ctx context.Context, idx LocalizedSubtitleTrackIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO localized_subtitle_tracks (id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			asset_id = excluded.asset_id,
+			run_id = excluded.run_id,
+			target_language = excluded.target_language,
+			cas_hash = excluded.cas_hash,
+			provenance_hash = excluded.provenance_hash,
+			created_at = excluded.created_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert localized subtitle track index: %w", err)
+	}
+	return nil
+}
+
+// UpsertLocalizedVisualTrackIndex upserts the index row for a LocalizedVisualTrack.
+func (s *DB) UpsertLocalizedVisualTrackIndex(ctx context.Context, idx LocalizedVisualTrackIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO localized_visual_tracks (id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			asset_id = excluded.asset_id,
+			run_id = excluded.run_id,
+			target_language = excluded.target_language,
+			cas_hash = excluded.cas_hash,
+			provenance_hash = excluded.provenance_hash,
+			created_at = excluded.created_at
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert localized visual track index: %w", err)
+	}
+	return nil
+}
+

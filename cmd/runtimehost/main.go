@@ -161,6 +161,7 @@ func main() {
 		AudioMixSvc:    audioMixSvc,
 		VisualTextSvc:  visualTextSvc,
 		RenderSvc:      renderSvc,
+		BundleSvc:      service.NewBundleService(db, casStore, licSvc),
 	})
 	go func() {
 		log.Printf("[RuntimeHost] API daemon listening on http://%s", addr)

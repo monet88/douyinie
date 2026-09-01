@@ -47,6 +47,7 @@ type Server struct {
 	visualTextSvc  *service.VisualTextService
 	renderSvc      *service.RenderService
 	reviewSvc      *service.ReviewService
+	bundleSvc      *service.BundleService
 	mux            *http.ServeMux
 	server         *http.Server
 }
@@ -73,6 +74,7 @@ type Config struct {
 	VisualTextSvc  *service.VisualTextService  // OCR detection, tracking, and TextRegionPlan (T09)
 	RenderSvc      *service.RenderService      // NativeRenderBackend + frozen RenderPlan + preview/final parity (T11)
 	ReviewSvc      *service.ReviewService      // Exception-only ReviewItem projection service (T16)
+	BundleSvc      *service.BundleService      // Job export/import + bundle integrity (T21)
 }
 
 // New creates a new RuntimeHost Server instance.
@@ -97,6 +99,9 @@ func New(cfg Config) *Server {
 	}
 	if cfg.ReviewSvc == nil && cfg.DB != nil && cfg.CASStore != nil {
 		cfg.ReviewSvc = service.NewReviewService(cfg.DB, cfg.CASStore)
+	}
+	if cfg.BundleSvc == nil && cfg.DB != nil && cfg.CASStore != nil {
+		cfg.BundleSvc = service.NewBundleService(cfg.DB, cfg.CASStore, cfg.LicenseSvc)
 	}
 
 	// Wire router-backed speech defaults when both are available.
@@ -159,6 +164,7 @@ func New(cfg Config) *Server {
 		visualTextSvc:  cfg.VisualTextSvc,
 		renderSvc:      cfg.RenderSvc,
 		reviewSvc:      cfg.ReviewSvc,
+		bundleSvc:      cfg.BundleSvc,
 		mux:            http.NewServeMux(),
 	}
 	s.routes()
@@ -263,6 +269,11 @@ func (s *Server) SetReviewService(svc *service.ReviewService) {
 	}
 }
 
+// SetBundleService sets or replaces the injected bundle service (T21).
+func (s *Server) SetBundleService(svc *service.BundleService) {
+	s.bundleSvc = svc
+}
+
 // Handler returns the underlying http.Handler for in-memory / testing purposes.
 func (s *Server) Handler() http.Handler {
 	return s.mux
@@ -306,6 +317,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/runs/{id}/cancel", s.handleCancelRun)
 	s.mux.HandleFunc("POST /api/v1/runs/{id}/resume", s.handleResumeRun)
 	s.mux.HandleFunc("GET /api/v1/runs/{id}/stages", s.handleListRunStages)
+
+	// Job Bundle Export & Import (T21)
+	s.mux.HandleFunc("POST /api/v1/jobs/{id}/export", s.handleExportJob)
+	s.mux.HandleFunc("POST /api/v1/jobs/import", s.handleImportJob)
+	s.mux.HandleFunc("POST /api/v1/bundles/export", s.handleExportBundle)
+	s.mux.HandleFunc("POST /api/v1/bundles/import", s.handleImportBundle)
 
 	// Persisted Queue
 	s.mux.HandleFunc("GET /api/v1/queue", s.handleListQueue)
@@ -3341,4 +3358,170 @@ func (s *Server) handleGetRunQualityResults(w http.ResponseWriter, r *http.Reque
 		"quality_results": results,
 		"count":           len(results),
 	})
+}
+
+// ---- Job Bundle Handlers (T21) ----
+
+func (s *Server) handleExportJob(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("id")
+	var req struct {
+		ExportPath string `json:"export_path,omitempty"`
+	}
+	if r.Body != nil && r.ContentLength > 0 {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	s.exportJob(w, r, jobID, req.ExportPath)
+}
+
+func (s *Server) handleExportBundle(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		JobID      string `json:"job_id"`
+		ExportPath string `json:"export_path,omitempty"`
+	}
+	if r.Body != nil && r.ContentLength > 0 {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	s.exportJob(w, r, body.JobID, body.ExportPath)
+}
+func (s *Server) handleImportJob(w http.ResponseWriter, r *http.Request) {
+	s.importJob(w, r)
+}
+
+func (s *Server) handleImportBundle(w http.ResponseWriter, r *http.Request) {
+	s.importJob(w, r)
+}
+
+func (s *Server) exportJob(w http.ResponseWriter, r *http.Request, jobID, exportPath string) {
+	if s.bundleSvc == nil {
+		writeError(w, http.StatusInternalServerError, "bundle service is not configured")
+		return
+	}
+
+	if jobID == "" {
+		writeError(w, http.StatusBadRequest, "job_id is required")
+		return
+	}
+
+	if exportPath != "" {
+		manifest, err := s.bundleSvc.ExportBundleToFile(r.Context(), jobID, exportPath)
+		if err != nil {
+			s.writeBundleError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":      "exported",
+			"job_id":      jobID,
+			"export_path": exportPath,
+			"manifest":    manifest,
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"job_bundle_%s.zip\"", jobID))
+
+	if _, err := s.bundleSvc.ExportBundle(r.Context(), jobID, w); err != nil {
+		s.writeBundleError(w, err)
+		return
+	}
+}
+
+func (s *Server) importJob(w http.ResponseWriter, r *http.Request) {
+	if s.bundleSvc == nil {
+		writeError(w, http.StatusInternalServerError, "bundle service is not configured")
+		return
+	}
+
+	contentType := r.Header.Get("Content-Type")
+
+	// 1. Multipart form file
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		if err := r.ParseMultipartForm(100 << 20); err != nil {
+			writeError(w, http.StatusBadRequest, "parse multipart form: "+err.Error())
+			return
+		}
+		file, _, err := r.FormFile("bundle")
+		if err != nil {
+			file, _, err = r.FormFile("file")
+		}
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "missing bundle file in multipart form")
+			return
+		}
+		defer file.Close()
+
+		manifest, err := s.bundleSvc.ImportBundleFromReader(r.Context(), file, service.ImportOptions{})
+		if err != nil {
+			s.writeBundleError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"status":   "imported",
+			"job_id":   manifest.Job.ID,
+			"manifest": manifest,
+		})
+		return
+	}
+
+	// 2. Direct zip binary payload
+	if strings.HasPrefix(contentType, "application/zip") || strings.HasPrefix(contentType, "application/octet-stream") {
+		manifest, err := s.bundleSvc.ImportBundleFromReader(r.Context(), r.Body, service.ImportOptions{})
+		if err != nil {
+			s.writeBundleError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"status":   "imported",
+			"job_id":   manifest.Job.ID,
+			"manifest": manifest,
+		})
+		return
+	}
+
+	// 3. JSON body with bundle_path
+	var req struct {
+		BundlePath string `json:"bundle_path"`
+		Overwrite  bool   `json:"overwrite"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	if req.BundlePath == "" {
+		writeError(w, http.StatusBadRequest, "bundle_path is required")
+		return
+	}
+
+	manifest, err := s.bundleSvc.ImportBundleFromFile(r.Context(), req.BundlePath, service.ImportOptions{Overwrite: req.Overwrite})
+	if err != nil {
+		s.writeBundleError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"status":   "imported",
+		"job_id":   manifest.Job.ID,
+		"manifest": manifest,
+	})
+}
+
+func (s *Server) writeBundleError(w http.ResponseWriter, err error) {
+	if errors.Is(err, domain.ErrJobNotFound) {
+		writeError(w, http.StatusNotFound, "job not found")
+		return
+	}
+	if errors.Is(err, domain.ErrJobBundleTampered) ||
+		errors.Is(err, domain.ErrJobBundleSecretDetected) ||
+		errors.Is(err, domain.ErrJobBundleMachineLocalPath) ||
+		errors.Is(err, domain.ErrJobBundleLicenseIncomplete) {
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	if errors.Is(err, domain.ErrJobBundleInvalid) ||
+		errors.Is(err, domain.ErrJobBundleArtifactMissing) {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeError(w, http.StatusInternalServerError, err.Error())
 }
