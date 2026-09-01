@@ -31,7 +31,7 @@ func repoRoot(t *testing.T) string {
 }
 
 // steeringFiles are the always-loaded agent steering surface files.
-var steeringFiles = []string{"AGENTS.md", "CLAUDE.md"}
+var steeringFiles = []string{"AGENTS.md"}
 
 // extractRepoRelativePaths extracts repository-relative file/directory
 // pointers from markdown. It finds:
@@ -85,8 +85,8 @@ func isRepoRelativePath(p string) bool {
 	if strings.HasPrefix(p, "#") {
 		return false
 	}
-	// Skip external tool paths (e.g. .claude/skills/...)
-	if strings.HasPrefix(p, ".") {
+	// Skip external / home paths (e.g. ~/.agents/skills/..., .claude/skills/...)
+	if strings.HasPrefix(p, ".") || strings.HasPrefix(p, "~") {
 		return false
 	}
 	// Must look like a file or directory path (contains / or has an extension or ends with /)
@@ -156,8 +156,8 @@ func extractGitNexusSection(content string) string {
 	return strings.TrimSpace(content[sectionStart:endIdx])
 }
 
-// TestSteeringIntegrity_GitNexusDivergence checks that the GitNexus
-// sections in AGENTS.md and CLAUDE.md are identical.
+// TestSteeringIntegrity_GitNexusDivergence checks that if multiple steering
+// entrypoints exist (e.g. AGENTS.md, CLAUDE.md), their GitNexus sections are identical.
 func TestSteeringIntegrity_GitNexusDivergence(t *testing.T) {
 	root := repoRoot(t)
 
@@ -165,17 +165,23 @@ func TestSteeringIntegrity_GitNexusDivergence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	claude, err := os.ReadFile(filepath.Join(root, "CLAUDE.md"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	agentsSection := extractGitNexusSection(string(agents))
-	claudeSection := extractGitNexusSection(string(claude))
-
 	if agentsSection == "" {
 		t.Fatal("AGENTS.md: no <!-- gitnexus:start/end --> section found")
 	}
+
+	claudePath := filepath.Join(root, "CLAUDE.md")
+	claude, err := os.ReadFile(claudePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// CLAUDE.md is optional when only AGENTS.md is maintained
+			t.Skip("CLAUDE.md not present; skipping divergence check")
+			return
+		}
+		t.Fatal(err)
+	}
+
+	claudeSection := extractGitNexusSection(string(claude))
 	if claudeSection == "" {
 		t.Fatal("CLAUDE.md: no <!-- gitnexus:start/end --> section found")
 	}
