@@ -12,6 +12,7 @@ var (
 	ErrJobBundleInvalid           = errors.New("invalid job bundle format or manifest")
 	ErrJobBundleArtifactMissing   = errors.New("bundle artifact missing from archive")
 	ErrJobBundleLicenseIncomplete = errors.New("bundle manifest missing required license obligation layers (CODE/MODEL/DATA_LICENSE + SERVICE_TERMS)")
+	ErrJobAlreadyExists           = errors.New("job already exists on target host (use overwrite: true to replace)")
 )
 
 // JobBundleArtifact represents a content-addressed media or data artifact inside the bundle archive.

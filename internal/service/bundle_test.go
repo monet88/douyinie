@@ -495,3 +495,42 @@ func TestBundleService_FileHelpers(t *testing.T) {
 		t.Errorf("expected job ID %s, got %s", jobID, imported.Job.ID)
 	}
 }
+
+func TestBundleService_OverwriteHandling(t *testing.T) {
+	ctx := context.Background()
+	dbA, casA, licA, bundleSvcA := setupBundleTestEnv(t)
+	defer dbA.Close()
+
+	jobID, _ := seedTestJob(t, dbA, casA, licA)
+
+	var zipBuf bytes.Buffer
+	_, err := bundleSvcA.ExportBundle(ctx, jobID, &zipBuf)
+	if err != nil {
+		t.Fatalf("export failed: %v", err)
+	}
+
+	zipBytes := zipBuf.Bytes()
+
+	// 1. First import into destination dbB succeeds
+	dbB, casB, licB, bundleSvcB := setupBundleTestEnv(t)
+	defer dbB.Close()
+	_ = casB
+	_ = licB
+
+	_, err = bundleSvcB.ImportBundle(ctx, bytes.NewReader(zipBytes), int64(len(zipBytes)), service.ImportOptions{Overwrite: false})
+	if err != nil {
+		t.Fatalf("initial import failed: %v", err)
+	}
+
+	// 2. Second import with Overwrite: false MUST fail with ErrJobAlreadyExists
+	_, err = bundleSvcB.ImportBundle(ctx, bytes.NewReader(zipBytes), int64(len(zipBytes)), service.ImportOptions{Overwrite: false})
+	if !errors.Is(err, domain.ErrJobAlreadyExists) {
+		t.Fatalf("expected ErrJobAlreadyExists when overwrite is false, got %v", err)
+	}
+
+	// 3. Third import with Overwrite: true MUST succeed
+	_, err = bundleSvcB.ImportBundle(ctx, bytes.NewReader(zipBytes), int64(len(zipBytes)), service.ImportOptions{Overwrite: true})
+	if err != nil {
+		t.Fatalf("import with overwrite: true failed: %v", err)
+	}
+}

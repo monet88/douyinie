@@ -436,6 +436,13 @@ func (s *BundleService) ImportBundle(ctx context.Context, r io.ReaderAt, size in
 		return nil, err
 	}
 
+	// If overwrite is false, fail early if job already exists on target host
+	if !opts.Overwrite {
+		existingJob, err := s.db.GetJob(ctx, manifest.Job.ID)
+		if err == nil && existingJob != nil {
+			return nil, fmt.Errorf("%w: job %s", domain.ErrJobAlreadyExists, manifest.Job.ID)
+		}
+	}
 	// 2.5. Verify all referenced CAS hashes in manifest are present in declared artifacts
 	declaredHashes := make(map[string]bool)
 	for _, art := range manifest.Artifacts {

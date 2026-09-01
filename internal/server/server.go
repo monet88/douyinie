@@ -3433,6 +3433,7 @@ func (s *Server) importJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	contentType := r.Header.Get("Content-Type")
+	overwrite := r.URL.Query().Get("overwrite") == "true"
 
 	// 1. Multipart form file
 	if strings.HasPrefix(contentType, "multipart/form-data") {
@@ -3450,7 +3451,11 @@ func (s *Server) importJob(w http.ResponseWriter, r *http.Request) {
 		}
 		defer file.Close()
 
-		manifest, err := s.bundleSvc.ImportBundleFromReader(r.Context(), file, service.ImportOptions{})
+		if r.FormValue("overwrite") == "true" {
+			overwrite = true
+		}
+
+		manifest, err := s.bundleSvc.ImportBundleFromReader(r.Context(), file, service.ImportOptions{Overwrite: overwrite})
 		if err != nil {
 			s.writeBundleError(w, err)
 			return
@@ -3465,7 +3470,7 @@ func (s *Server) importJob(w http.ResponseWriter, r *http.Request) {
 
 	// 2. Direct zip binary payload
 	if strings.HasPrefix(contentType, "application/zip") || strings.HasPrefix(contentType, "application/octet-stream") {
-		manifest, err := s.bundleSvc.ImportBundleFromReader(r.Context(), r.Body, service.ImportOptions{})
+		manifest, err := s.bundleSvc.ImportBundleFromReader(r.Context(), r.Body, service.ImportOptions{Overwrite: overwrite})
 		if err != nil {
 			s.writeBundleError(w, err)
 			return
@@ -3509,6 +3514,10 @@ func (s *Server) importJob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) writeBundleError(w http.ResponseWriter, err error) {
 	if errors.Is(err, domain.ErrJobNotFound) {
 		writeError(w, http.StatusNotFound, "job not found")
+		return
+	}
+	if errors.Is(err, domain.ErrJobAlreadyExists) {
+		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 	if errors.Is(err, domain.ErrJobBundleTampered) ||
