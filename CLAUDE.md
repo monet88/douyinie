@@ -1,38 +1,6 @@
-# Douyinie Agent Steering
+# Douyinie — Claude Code Steering
 
-## Hierarchy of Truth
-
-1. **[Wayfinder Issue #1](https://github.com/monet88/douyinie/issues/1)** → resolved decisions.
-2. **[Implementation Spec #18](https://github.com/monet88/douyinie/issues/18)** → Phase 1 spec + normative amendments.
-3. **[`docs/architecture/phase1-architecture.md`](docs/architecture/phase1-architecture.md)** → canonical repo-local architecture. GitHub issues win on drift.
-4. **[`PRODUCT.md`](PRODUCT.md)** & **[`CONTEXT.md`](CONTEXT.md)** → product charter, domain invariants.
-5. **[`docs/reference-repositories.md`](docs/reference-repositories.md)** → mining inventory (not a dependency lockfile).
-
-## Load-Bearing Guardrails
-
-- **Two testing seams only**: Seam 1 (RuntimeHost localhost API) and Seam 2 (StageWorker runtime contract). In-memory unit tests are not additional seams.
-- **Obligation layers**: `CODE_LICENSE`, `MODEL_LICENSE`, `DATA_LICENSE`, `SERVICE_TERMS` stay separate. Code changes do not remove model/data obligations.
-- **Completion is evidence-gated**: agent claims are evidence, not proof. Verify repo state, tests, and acceptance criteria before declaring PASS.
-
-## Context by Task
-
-| Task | Read before starting |
-|------|---------------------|
-| **Architecture / design** | `docs/architecture/phase1-architecture.md`, `CONTEXT.md`, relevant `docs/adr/` |
-| **Implementation** | Above, plus the ticket's spec, `PRODUCT.md` §invariants, `docs/agents/domain.md` |
-| **Review** | Above, plus `docs/agents/orca-orchestration.md` §Mutation and Verification Boundaries |
-| **Coordination** | `docs/agents/orca-orchestration.md` (roles, workflow skills, mutation policy, continuity) |
-| **Issue tracker ops** | `docs/agents/issue-tracker.md` |
-| **Triage** | `docs/agents/triage-labels.md` |
-| **Domain vocabulary** | `docs/agents/domain.md` → `CONTEXT.md` + `docs/adr/` |
-
-## Agent Orchestration (summary)
-
-Full policy: [`docs/agents/orca-orchestration.md`](docs/agents/orca-orchestration.md).
-
-- Honor user-selected agent families; never substitute without authorization.
-- One editing owner per overlapping mutable scope; reviewers are read-only.
-- Workflow Skill invocation must lead the agent-visible prompt.
+Read [`AGENTS.md`](AGENTS.md) for the full steering contract (hierarchy of truth, guardrails, context-by-task, orchestration).
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
