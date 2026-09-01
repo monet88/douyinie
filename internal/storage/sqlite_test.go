@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -903,5 +904,185 @@ func TestStorage_ReviewOverridesAndQualityResults(t *testing.T) {
 	}
 	if latestQR.ID != "qr-2" || latestQR.OverallStatus != domain.QualityStatusPass {
 		t.Errorf("latest quality result mismatch: got %+v", latestQR)
+	}
+}
+
+func TestStorage_MigrationV16_SourceAcquisitions(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_v16.db")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	// 1. Migration v16 recorded exactly once and table exists.
+	var countV16 int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 16`).Scan(&countV16); err != nil || countV16 != 1 {
+		t.Fatalf("expected migration version 16 recorded, got count=%d err=%v", countV16, err)
+	}
+	var tableCount int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='source_acquisitions'`).Scan(&tableCount); err != nil || tableCount != 1 {
+		t.Fatalf("expected source_acquisitions table, got count=%d err=%v", tableCount, err)
+	}
+
+	// 2. Provenance CRUD round-trip keyed by canonical source identity.
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		DeclaredBy: "tester", TermsAccepted: true, ConfirmedAt: time.Now().UTC(),
+	})
+	assetID := uuid.NewString()
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID: assetID, SHA256: "v16-test-sha", ByteSize: 10, MimeType: "video/mp4",
+		OriginalFilename: "v16.mp4", RightsAttestationID: attID, CASPath: "/cas/v16",
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create asset: %v", err)
+	}
+
+	prov := domain.AcquisitionProvenance{
+		ID: uuid.NewString(), AssetID: assetID, SourceID: "douyin:aweme:123",
+		Platform: "douyin", CanonicalURL: "https://www.douyin.com/video/123",
+		Adapter: "jiji_douyin", AdapterVersion: "v2", Method: "api",
+		Authenticated: true, AuthRefID: "cred-ref-1", AcquiredAt: time.Now().UTC(),
+	}
+	if err := db.SaveSourceAcquisition(ctx, prov); err != nil {
+		t.Fatalf("save acquisition: %v", err)
+	}
+	got, err := db.GetSourceAcquisitionBySourceID(ctx, "douyin:aweme:123")
+	if err != nil {
+		t.Fatalf("get acquisition: %v", err)
+	}
+	if got.AssetID != assetID || got.Adapter != "jiji_douyin" || got.AuthRefID != "cred-ref-1" {
+		t.Errorf("provenance round-trip mismatch: %+v", got)
+	}
+
+	// 3. Upsert on same source id keeps one row and updates the asset binding.
+	prov2 := prov
+	prov2.ID = uuid.NewString()
+	prov2.Adapter = "f2_douyin"
+	if err := db.SaveSourceAcquisition(ctx, prov2); err != nil {
+		t.Fatalf("upsert acquisition: %v", err)
+	}
+	got2, err := db.GetSourceAcquisitionBySourceID(ctx, "douyin:aweme:123")
+	if err != nil {
+		t.Fatalf("get acquisition after upsert: %v", err)
+	}
+	if got2.Adapter != "f2_douyin" {
+		t.Errorf("upsert must update provenance, got %+v", got2)
+	}
+	var rows int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM source_acquisitions`).Scan(&rows); err != nil || rows != 1 {
+		t.Errorf("expected exactly 1 row after upsert, got %d err=%v", rows, err)
+	}
+
+	if _, err := db.GetSourceAcquisitionBySourceID(ctx, "douyin:aweme:missing"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing source id must return ErrNotFound, got %v", err)
+	}
+
+	// 4. Re-opening is idempotent.
+	_ = db.Close()
+	db2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("re-open failed: %v", err)
+	}
+	_ = db2.Close()
+}
+
+// TestStorage_MigrationV15ToV16_UpgradeAddsTableAndPreservesMetadata is the
+// real upgrade-path test for T05: a database genuinely sitting at v15 (the
+// v16 artifacts removed) is opened through storage.Open, which must apply the
+// additive v16 block — creating source_acquisitions and recording version
+// 16 — while every pre-existing v1..v15 row survives untouched. No
+// speculative asset_id index: no production lookup filters on it.
+func TestStorage_MigrationV15ToV16_UpgradeAddsTableAndPreservesMetadata(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "migration_v15_to_v16.db")
+
+	// 1. Build a database with pre-existing metadata, then force it back to a
+	// genuine v15 state: drop the v16 table and its version row.
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	attID := uuid.NewString()
+	if err := db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		DeclaredBy: "v15-upgrade-tester", TermsAccepted: true, ConfirmedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create attestation: %v", err)
+	}
+	assetID := uuid.NewString()
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID: assetID, SHA256: "v15_preexisting_sha", ByteSize: 2048, MimeType: "video/quicktime",
+		OriginalFilename: "preexisting.mov", RightsAttestationID: attID, CASPath: "cas/v15/preexisting",
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create asset: %v", err)
+	}
+
+	if _, err := db.db.ExecContext(ctx, `DROP TABLE IF EXISTS source_acquisitions`); err != nil {
+		t.Fatalf("downgrade to v15 (drop table): %v", err)
+	}
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = 16`); err != nil {
+		t.Fatalf("downgrade to v15 (delete version row): %v", err)
+	}
+	// Confirm the v15 baseline: no table, no version-16 row.
+	var objs int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE name = 'source_acquisitions'`).Scan(&objs); err != nil || objs != 0 {
+		t.Fatalf("expected v15 baseline without v16 artifacts, got count=%d err=%v", objs, err)
+	}
+	_ = db.Close()
+
+	// 2. Re-open: migrate() must apply v16 forward from the v15 state.
+	db2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("storage.Open failed on v15 db: %v", err)
+	}
+	defer db2.Close()
+
+	var countV16 int
+	if err := db2.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 16`).Scan(&countV16); err != nil || countV16 != 1 {
+		t.Fatalf("expected migration version 16 recorded after upgrade, got count=%d err=%v", countV16, err)
+	}
+	var tableCount, indexCount int
+	if err := db2.QueryRow(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='source_acquisitions'`).Scan(&tableCount); err != nil || tableCount != 1 {
+		t.Fatalf("upgrade must create source_acquisitions, got count=%d err=%v", tableCount, err)
+	}
+	if err := db2.QueryRow(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_source_acquisitions_asset'`).Scan(&indexCount); err != nil || indexCount != 0 {
+		t.Fatalf("upgrade must not create a speculative asset index, got count=%d err=%v", indexCount, err)
+	}
+
+	// 3. Pre-existing v1..v15 metadata survives the additive migration.
+	survived, err := db2.GetSourceAsset(ctx, assetID)
+	if err != nil {
+		t.Fatalf("pre-existing SourceAsset lost during v15->v16 upgrade: %v", err)
+	}
+	if survived.SHA256 != "v15_preexisting_sha" || survived.MimeType != "video/quicktime" || survived.RightsAttestationID != attID {
+		t.Errorf("pre-existing SourceAsset corrupted during upgrade: %+v", survived)
+	}
+	if _, err := db2.GetRightsAttestation(ctx, attID); err != nil {
+		t.Errorf("pre-existing rights attestation lost during upgrade: %v", err)
+	}
+
+	// 4. The upgraded table is functional and empty of stale bindings.
+	if _, err := db2.GetSourceAcquisitionBySourceID(ctx, "douyin:aweme:123"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("freshly upgraded table must have no rows, got %v", err)
+	}
+	if err := db2.SaveSourceAcquisition(ctx, domain.AcquisitionProvenance{
+		ID: uuid.NewString(), AssetID: assetID, SourceID: "douyin:aweme:123",
+		Platform: "douyin", CanonicalURL: "https://www.douyin.com/video/123",
+		Adapter: "jiji_douyin", AdapterVersion: "v2", Method: "api",
+		Authenticated: false, AcquiredAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("save provenance after upgrade: %v", err)
+	}
+	got, err := db2.GetSourceAcquisitionBySourceID(ctx, "douyin:aweme:123")
+	if err != nil || got.AssetID != assetID {
+		t.Fatalf("provenance round-trip after upgrade failed: %+v err=%v", got, err)
 	}
 }

@@ -896,5 +896,17 @@ func NewSeam1FakeRegistry() *Registry {
 		TranscribedText: "企业级语音识别输出",
 	})
 
+	// Acquisition ladder (T05): Jiji preferred -> F2 parser fallback ->
+	// browser-assisted auth last. All require an authorized credential
+	// reference; ordering comes from quality score at one tier.
+	_ = reg.Register(NewFakeAcquisitionProvider("fake_jiji_douyin", PolicyRequiresAuthorization, 0.95))
+	_ = reg.Register(NewFakeAcquisitionProvider("fake_f2_douyin", PolicyRequiresAuthorization, 0.60))
+	_ = reg.Register(NewFakeAcquisitionProvider("fake_browser_assist", PolicyRequiresAuthorization, 0.50))
+
+	// Healthy but policy-blocked acquisition adapter with the highest quality:
+	// must never be routable (Seam 1 policy-before-health).
+	blockedAcq := NewFakeAcquisitionProvider("fake_scrapling_blocked", PolicyBlocked, 0.99)
+	_ = reg.Register(blockedAcq)
+
 	return reg
 }
