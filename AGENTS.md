@@ -25,6 +25,7 @@
 | **Issue tracker ops** | `docs/agents/issue-tracker.md` |
 | **Triage** | `docs/agents/triage-labels.md` |
 | **Domain vocabulary** | `docs/agents/domain.md` → `CONTEXT.md` + `docs/adr/` |
+| **Out-of-repo file discovery** | `docs/agents/fastctx-discovery.md` (exact-first, bounded-fallback) |
 
 ## Agent Orchestration (summary)
 
