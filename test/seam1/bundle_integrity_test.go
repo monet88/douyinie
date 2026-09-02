@@ -362,6 +362,51 @@ func TestSeam1_BundleImport_SecretRejection(t *testing.T) {
 	}
 }
 
+func TestSeam1_BundleImport_SecretWithSpecialCharactersRejection(t *testing.T) {
+	h := setupHarness(t)
+	jobID, _ := setupJobWithStages(t, h)
+
+	resp, err := http.Post(h.server.URL+"/api/v1/jobs/"+jobID+"/export", "application/json", nil)
+	if err != nil {
+		t.Fatalf("export failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	origZip, _ := io.ReadAll(resp.Body)
+
+	// Tamper: inject API key with special characters in manifest.json
+	zr, _ := zip.NewReader(bytes.NewReader(origZip), int64(len(origZip)))
+	var tamperedZip bytes.Buffer
+	zw := zip.NewWriter(&tamperedZip)
+
+	for _, f := range zr.File {
+		rc, _ := f.Open()
+		data, _ := io.ReadAll(rc)
+		rc.Close()
+
+		if f.Name == "manifest.json" {
+			data = bytes.Replace(data, []byte(`"target_language": "vi"`), []byte(`"target_language": "vi", "api_key": "sec!@#$%^&*ret12345"`), 1)
+		}
+
+		w, _ := zw.Create(f.Name)
+		_, _ = w.Write(data)
+	}
+	zw.Close()
+
+	h2 := setupHarness(t)
+	importResp, err := http.Post(h2.server.URL+"/api/v1/jobs/import", "application/zip", bytes.NewReader(tamperedZip.Bytes()))
+	if err != nil {
+		t.Fatalf("POST /api/v1/jobs/import failed: %v", err)
+	}
+	defer importResp.Body.Close()
+
+	// Invariant: Secret with special characters MUST be rejected with HTTP 422 Unprocessable Entity
+	if importResp.StatusCode != http.StatusUnprocessableEntity {
+		bodyBytes, _ := io.ReadAll(importResp.Body)
+		t.Fatalf("expected HTTP 422 for secret with special chars detected, got %d: %s", importResp.StatusCode, string(bodyBytes))
+	}
+}
+
 func TestSeam1_BundleImport_MachineLocalPathRejection(t *testing.T) {
 	h := setupHarness(t)
 	jobID, _ := setupJobWithStages(t, h)

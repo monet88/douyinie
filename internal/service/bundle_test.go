@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -461,35 +460,28 @@ func TestBundleService_MachineLocalPath_Rejected(t *testing.T) {
 	}
 }
 
-func TestBundleService_FileHelpers(t *testing.T) {
+func TestBundleService_ImportFromReader(t *testing.T) {
 	ctx := context.Background()
 	dbA, casA, licA, bundleSvcA := setupBundleTestEnv(t)
 	defer dbA.Close()
 
 	jobID, _ := seedTestJob(t, dbA, casA, licA)
 
-	tmpDir := t.TempDir()
-	exportPath := filepath.Join(tmpDir, "exported_bundle.zip")
-
-	manifest, err := bundleSvcA.ExportBundleToFile(ctx, jobID, exportPath)
+	var zipBuf bytes.Buffer
+	manifest, err := bundleSvcA.ExportBundle(ctx, jobID, &zipBuf)
 	if err != nil {
-		t.Fatalf("export to file failed: %v", err)
+		t.Fatalf("export failed: %v", err)
 	}
 	if manifest == nil {
 		t.Fatalf("manifest is nil")
 	}
 
-	info, err := os.Stat(exportPath)
-	if err != nil || info.Size() == 0 {
-		t.Fatalf("export file is missing or empty: %v", err)
-	}
-
 	dbB, _, _, bundleSvcB := setupBundleTestEnv(t)
 	defer dbB.Close()
 
-	imported, err := bundleSvcB.ImportBundleFromFile(ctx, exportPath, service.ImportOptions{})
+	imported, err := bundleSvcB.ImportBundleFromReader(ctx, bytes.NewReader(zipBuf.Bytes()), service.ImportOptions{})
 	if err != nil {
-		t.Fatalf("import from file failed: %v", err)
+		t.Fatalf("import from reader failed: %v", err)
 	}
 	if imported.Job.ID != jobID {
 		t.Errorf("expected job ID %s, got %s", jobID, imported.Job.ID)

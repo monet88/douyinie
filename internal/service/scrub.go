@@ -18,12 +18,15 @@ var (
 	// Unix system absolute paths: /Users/..., /home/..., /tmp/..., etc.
 	unixPathRegex = regexp.MustCompile(`/(?:Users|home|tmp|var|private|etc|opt|usr|root|mnt|media)/[^"'\s\t\r\n,;}{]+`)
 
-	apiKeyParamRegex = regexp.MustCompile(`(?i)["']?(api[_-]?key|access[_-]?token|secret|password|bearer|auth[_-]?token|credential)["']?\s*[=:]\s*["']?([a-zA-Z0-9_\-\.]{8,})["']?`)
-	skKeyRegex       = regexp.MustCompile(`sk-[a-zA-Z0-9_\-]{20,}`)
-	ghpKeyRegex      = regexp.MustCompile(`ghp_[a-zA-Z0-9]{20,}`)
-	awsKeyRegex      = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
-	bearerRegex      = regexp.MustCompile(`(?i)bearer\s+([a-zA-Z0-9_\-\.]{15,})`)
-	jwtRegex         = regexp.MustCompile(`eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]+`)
+	apiKeyQuotedRegex   = regexp.MustCompile(`(?i)["']?(api[_-]?key|access[_-]?token|secret|password|bearer|auth[_-]?token|credential)["']?\s*[=:]\s*["']([^"'\r\n]+)["']`)
+	apiKeyUnquotedRegex = regexp.MustCompile(`(?i)["']?(api[_-]?key|access[_-]?token|secret|password|bearer|auth[_-]?token|credential)["']?\s*[=:]\s*([^\s"'` + "`" + `\r\n,;}{]+)`)
+	apiKeyParamRegexes  = []*regexp.Regexp{apiKeyQuotedRegex, apiKeyUnquotedRegex}
+	apiKeyParamRegex    = apiKeyQuotedRegex
+	skKeyRegex          = regexp.MustCompile(`sk-[a-zA-Z0-9_\-]{20,}`)
+	ghpKeyRegex         = regexp.MustCompile(`ghp_[a-zA-Z0-9]{20,}`)
+	awsKeyRegex         = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
+	bearerRegex         = regexp.MustCompile(`(?i)bearer\s+([^\s"'` + "`" + `\r\n,;}{]{15,})`)
+	jwtRegex            = regexp.MustCompile(`eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]+`)
 )
 
 // ScrubPath replaces machine-local absolute paths with portable representations.
@@ -58,16 +61,18 @@ func ScrubSecrets(s string) string {
 	res = bearerRegex.ReplaceAllString(res, "Bearer [REDACTED_SECRET]")
 
 	// Scrub key=value or "key": "value" patterns
-	res = apiKeyParamRegex.ReplaceAllStringFunc(res, func(m string) string {
-		sub := apiKeyParamRegex.FindStringSubmatch(m)
-		if len(sub) >= 3 {
-			val := sub[2]
-			if val != "[REDACTED_SECRET]" {
-				return strings.Replace(m, val, "[REDACTED_SECRET]", 1)
+	for _, re := range apiKeyParamRegexes {
+		res = re.ReplaceAllStringFunc(res, func(m string) string {
+			sub := re.FindStringSubmatch(m)
+			if len(sub) >= 3 {
+				val := sub[2]
+				if val != "[REDACTED_SECRET]" && !strings.Contains(val, "REDACTED") && val != "null" && val != "true" && val != "false" {
+					return strings.Replace(m, val, "[REDACTED_SECRET]", 1)
+				}
 			}
-		}
-		return m
-	})
+			return m
+		})
+	}
 
 	return res
 }
@@ -184,13 +189,24 @@ func ValidateManifestJSON(data []byte) error {
 		return domain.ErrJobBundleSecretDetected
 	}
 
-	// Check for unredacted password/secret/api_key values
-	matches := apiKeyParamRegex.FindAllStringSubmatch(s, -1)
-	for _, match := range matches {
-		if len(match) >= 3 {
-			val := match[2]
+	for _, match := range bearerRegex.FindAllStringSubmatch(s, -1) {
+		if len(match) >= 2 {
+			val := match[1]
 			if val != "[REDACTED_SECRET]" && !strings.Contains(val, "REDACTED") {
 				return domain.ErrJobBundleSecretDetected
+			}
+		}
+	}
+
+	// Check for unredacted password/secret/api_key values
+	for _, re := range apiKeyParamRegexes {
+		matches := re.FindAllStringSubmatch(s, -1)
+		for _, match := range matches {
+			if len(match) >= 3 {
+				val := match[2]
+				if val != "[REDACTED_SECRET]" && !strings.Contains(val, "REDACTED") && val != "null" && val != "true" && val != "false" {
+					return domain.ErrJobBundleSecretDetected
+				}
 			}
 		}
 	}

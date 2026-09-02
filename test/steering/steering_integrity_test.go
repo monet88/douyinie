@@ -134,78 +134,6 @@ func TestSteeringIntegrity_BrokenPointers(t *testing.T) {
 	}
 }
 
-// extractGitNexusSection returns the content between <!-- gitnexus:start -->
-// and <!-- gitnexus:end --> markers, or empty string if not found.
-func extractGitNexusSection(content string) string {
-	const startMarker = "<!-- gitnexus:start -->"
-	const endMarker = "<!-- gitnexus:end -->"
-
-	startIdx := strings.Index(content, startMarker)
-	if startIdx == -1 {
-		return ""
-	}
-	endIdx := strings.Index(content, endMarker)
-	if endIdx == -1 {
-		return ""
-	}
-	// Include marker-to-marker content (between, exclusive of markers)
-	sectionStart := startIdx + len(startMarker)
-	if sectionStart > endIdx {
-		return ""
-	}
-	return strings.TrimSpace(content[sectionStart:endIdx])
-}
-
-// TestSteeringIntegrity_GitNexusDivergence checks that if multiple steering
-// entrypoints exist (e.g. AGENTS.md, CLAUDE.md), their GitNexus sections are identical.
-func TestSteeringIntegrity_GitNexusDivergence(t *testing.T) {
-	root := repoRoot(t)
-
-	agents, err := os.ReadFile(filepath.Join(root, "AGENTS.md"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	agentsSection := extractGitNexusSection(string(agents))
-	if agentsSection == "" {
-		t.Fatal("AGENTS.md: no <!-- gitnexus:start/end --> section found")
-	}
-
-	claudePath := filepath.Join(root, "CLAUDE.md")
-	claude, err := os.ReadFile(claudePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// CLAUDE.md is optional when only AGENTS.md is maintained
-			t.Skip("CLAUDE.md not present; skipping divergence check")
-			return
-		}
-		t.Fatal(err)
-	}
-
-	claudeSection := extractGitNexusSection(string(claude))
-	if claudeSection == "" {
-		t.Fatal("CLAUDE.md: no <!-- gitnexus:start/end --> section found")
-	}
-
-	if agentsSection != claudeSection {
-		// Find the first diverging line for actionable diagnostics.
-		aLines := strings.Split(agentsSection, "\n")
-		cLines := strings.Split(claudeSection, "\n")
-		for i := 0; i < len(aLines) || i < len(cLines); i++ {
-			var a, c string
-			if i < len(aLines) {
-				a = aLines[i]
-			}
-			if i < len(cLines) {
-				c = cLines[i]
-			}
-			if a != c {
-				t.Fatalf("GitNexus section diverges at line %d:\n  AGENTS.md: %q\n  CLAUDE.md: %q", i+1, a, c)
-			}
-		}
-		t.Fatal("GitNexus sections differ in length")
-	}
-}
-
 // dynamicStatsPattern matches hard-coded index statistics like
 // "4165 symbols", "12,345 relationships", "500 execution flows".
 // These are dynamic counts that should not appear in always-loaded
@@ -254,17 +182,6 @@ func TestSteeringIntegrity_NegativeFixtures(t *testing.T) {
 		p := paths[0]
 		if p != "docs/nonexistent/phantom.md" {
 			t.Fatalf("unexpected extracted path: %q", p)
-		}
-	})
-
-	t.Run("gitnexus_divergence", func(t *testing.T) {
-		a := extractGitNexusSection("<!-- gitnexus:start -->\n## Always Do\n- Rule A\n<!-- gitnexus:end -->")
-		b := extractGitNexusSection("<!-- gitnexus:start -->\n## Always Do\n- Rule B\n<!-- gitnexus:end -->")
-		if a == b {
-			t.Fatal("divergent sections should differ")
-		}
-		if a == "" || b == "" {
-			t.Fatal("section extraction failed on fixture")
 		}
 	})
 

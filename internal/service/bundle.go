@@ -371,21 +371,6 @@ func (s *BundleService) ExportBundle(ctx context.Context, jobID string, w io.Wri
 	return manifest, nil
 }
 
-// ExportBundleToFile exports a job bundle directly to a local zip file.
-func (s *BundleService) ExportBundleToFile(ctx context.Context, jobID string, filePath string) (*domain.JobBundleManifest, error) {
-	f, err := os.Create(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("create export file: %w", err)
-	}
-	defer f.Close()
-
-	manifest, err := s.ExportBundle(ctx, jobID, f)
-	if err != nil {
-		return nil, err
-	}
-	return manifest, nil
-}
-
 // ImportBundle imports and verifies a self-contained job bundle from a random-access reader.
 func (s *BundleService) ImportBundle(ctx context.Context, r io.ReaderAt, size int64, opts ImportOptions) (*domain.JobBundleManifest, error) {
 	if s.db == nil || s.cas == nil {
@@ -861,22 +846,6 @@ func (s *BundleService) ImportBundle(ctx context.Context, r io.ReaderAt, size in
 	}
 
 	return &manifest, nil
-}
-
-// ImportBundleFromFile reads a bundle from a local file path.
-func (s *BundleService) ImportBundleFromFile(ctx context.Context, filePath string, opts ImportOptions) (*domain.JobBundleManifest, error) {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("open bundle file: %w", err)
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat bundle file: %w", err)
-	}
-
-	return s.ImportBundle(ctx, f, info.Size(), opts)
 }
 
 // ImportBundleFromReader reads all bundle bytes from a sequential reader into memory/temp file and imports it.

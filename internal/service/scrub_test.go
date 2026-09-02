@@ -87,6 +87,26 @@ func TestScrubSecrets(t *testing.T) {
 			input:    `{"api_key": "mySecretPassword12345"}`,
 			notMatch: "mySecretPassword12345",
 		},
+		{
+			name:     "api_key param with special characters !@#$%^&*",
+			input:    `{"api_key": "sec!@#$%^&*ret123"}`,
+			notMatch: "sec!@#$%^&*ret123",
+		},
+		{
+			name:     "password with special characters !@#$%^&*",
+			input:    `{"password": "P@$$w0rd!#%^&*123"}`,
+			notMatch: "P@$$w0rd!#%^&*123",
+		},
+		{
+			name:     "unquoted secret with special characters !@#$%^&*",
+			input:    "secret=super!@#$%^&*Key12345",
+			notMatch: "super!@#$%^&*Key12345",
+		},
+		{
+			name:     "bearer token with special characters !@#$%^&*",
+			input:    "Authorization: Bearer myToken!@#$%^&*12345",
+			notMatch: "myToken!@#$%^&*12345",
+		},
 	}
 
 	for _, tc := range tests {
@@ -190,5 +210,31 @@ func TestValidateManifest_MissingLicenseLayers(t *testing.T) {
 	err := service.ValidateBundleManifest(manifest)
 	if !errors.Is(err, domain.ErrJobBundleLicenseIncomplete) {
 		t.Fatalf("expected ErrJobBundleLicenseIncomplete, got %v", err)
+	}
+}
+
+func TestValidateManifestJSON_SpecialCharSecrets(t *testing.T) {
+	// 1. Manifest containing sensitive key with special characters MUST be rejected
+	specialCharKeys := []string{
+		`{"api_key": "sec!@#$%^&*ret123"}`,
+		`{"password": "P@$$w0rd!#%^&*123"}`,
+		`{"access_token": "tok!@#$%^&*123456"}`,
+		`{"secret": "val!@#$%^&*7890"}`,
+	}
+
+	for _, jsonStr := range specialCharKeys {
+		err := service.ValidateManifestJSON([]byte(jsonStr))
+		if !errors.Is(err, domain.ErrJobBundleSecretDetected) {
+			t.Errorf("expected ErrJobBundleSecretDetected for %s, got: %v", jsonStr, err)
+		}
+
+		// Scrubbed version MUST pass validation
+		scrubbed := service.ScrubText(jsonStr)
+		if strings.Contains(scrubbed, "!@#$%^&*") {
+			t.Errorf("special characters not scrubbed: %s", scrubbed)
+		}
+		if err := service.ValidateManifestJSON([]byte(scrubbed)); err != nil {
+			t.Errorf("scrubbed json failed validation: %v, scrubbed: %s", err, scrubbed)
+		}
 	}
 }

@@ -321,8 +321,6 @@ func (s *Server) routes() {
 	// Job Bundle Export & Import (T21)
 	s.mux.HandleFunc("POST /api/v1/jobs/{id}/export", s.handleExportJob)
 	s.mux.HandleFunc("POST /api/v1/jobs/import", s.handleImportJob)
-	s.mux.HandleFunc("POST /api/v1/bundles/export", s.handleExportBundle)
-	s.mux.HandleFunc("POST /api/v1/bundles/import", s.handleImportBundle)
 
 	// Persisted Queue
 	s.mux.HandleFunc("GET /api/v1/queue", s.handleListQueue)
@@ -3364,34 +3362,14 @@ func (s *Server) handleGetRunQualityResults(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) handleExportJob(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
-	var req struct {
-		ExportPath string `json:"export_path,omitempty"`
-	}
-	if r.Body != nil && r.ContentLength > 0 {
-		_ = json.NewDecoder(r.Body).Decode(&req)
-	}
-	s.exportJob(w, r, jobID, req.ExportPath)
+	s.exportJob(w, r, jobID)
 }
 
-func (s *Server) handleExportBundle(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		JobID      string `json:"job_id"`
-		ExportPath string `json:"export_path,omitempty"`
-	}
-	if r.Body != nil && r.ContentLength > 0 {
-		_ = json.NewDecoder(r.Body).Decode(&body)
-	}
-	s.exportJob(w, r, body.JobID, body.ExportPath)
-}
 func (s *Server) handleImportJob(w http.ResponseWriter, r *http.Request) {
 	s.importJob(w, r)
 }
 
-func (s *Server) handleImportBundle(w http.ResponseWriter, r *http.Request) {
-	s.importJob(w, r)
-}
-
-func (s *Server) exportJob(w http.ResponseWriter, r *http.Request, jobID, exportPath string) {
+func (s *Server) exportJob(w http.ResponseWriter, r *http.Request, jobID string) {
 	if s.bundleSvc == nil {
 		writeError(w, http.StatusInternalServerError, "bundle service is not configured")
 		return
@@ -3399,21 +3377,6 @@ func (s *Server) exportJob(w http.ResponseWriter, r *http.Request, jobID, export
 
 	if jobID == "" {
 		writeError(w, http.StatusBadRequest, "job_id is required")
-		return
-	}
-
-	if exportPath != "" {
-		manifest, err := s.bundleSvc.ExportBundleToFile(r.Context(), jobID, exportPath)
-		if err != nil {
-			s.writeBundleError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status":      "exported",
-			"job_id":      jobID,
-			"export_path": exportPath,
-			"manifest":    manifest,
-		})
 		return
 	}
 
@@ -3483,32 +3446,7 @@ func (s *Server) importJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. JSON body with bundle_path
-	var req struct {
-		BundlePath string `json:"bundle_path"`
-		Overwrite  bool   `json:"overwrite"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
-		return
-	}
-
-	if req.BundlePath == "" {
-		writeError(w, http.StatusBadRequest, "bundle_path is required")
-		return
-	}
-
-	manifest, err := s.bundleSvc.ImportBundleFromFile(r.Context(), req.BundlePath, service.ImportOptions{Overwrite: req.Overwrite})
-	if err != nil {
-		s.writeBundleError(w, err)
-		return
-	}
-
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"status":   "imported",
-		"job_id":   manifest.Job.ID,
-		"manifest": manifest,
-	})
+	writeError(w, http.StatusBadRequest, "unsupported content-type: multipart/form-data or application/zip required")
 }
 
 func (s *Server) writeBundleError(w http.ResponseWriter, err error) {
