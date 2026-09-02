@@ -5095,4 +5095,3 @@ func (s *DB) UpsertLocalizedVisualTrackIndex(ctx context.Context, idx LocalizedV
 	}
 	return nil
 }
-

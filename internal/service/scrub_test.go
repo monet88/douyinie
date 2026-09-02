@@ -192,4 +192,3 @@ func TestValidateManifest_MissingLicenseLayers(t *testing.T) {
 		t.Fatalf("expected ErrJobBundleLicenseIncomplete, got %v", err)
 	}
 }
-
