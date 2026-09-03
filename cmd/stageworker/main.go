@@ -351,6 +351,20 @@ func executeStage(ctx context.Context, cmd worker.Command, enc *worker.Encoder) 
 // silently faking model output. This is the smallest architecture-compliant
 // production StageWorker/provider-adapter path.
 func dispatchStage(ctx context.Context, cmd worker.Command, enc *worker.Encoder) (worker.ArtifactRef, error) {
+	// Validate model_snapshot envelope if present or if model snapshot is required (Issue #64)
+	if snapEnv, parseErr := worker.GetModelSnapshotEnvelope(cmd.Config); parseErr != nil {
+		return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+			fmt.Sprintf("invalid model_snapshot envelope: %v", parseErr), nil)
+	} else if snapEnv != nil {
+		if err := worker.ValidateSnapshotPaths(snapEnv); err != nil {
+			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				fmt.Sprintf("snapshot path validation failed: %v", err), nil)
+		}
+	} else if reqSnap, _ := cmd.Config["require_model_snapshot"].(bool); reqSnap {
+		return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+			"required model snapshot envelope missing from command config", nil)
+	}
+
 	switch cmd.Stage {
 	case "asr":
 		return runASRAdapter(ctx, cmd, enc)
@@ -561,6 +575,8 @@ func invokeCommand(ctx context.Context, binary string, args []string, req any, o
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	// Strict offline execution for model-backed requests (Issue #64)
+	cmd.Env = append(os.Environ(), "HF_HUB_OFFLINE=1", "TRANSFORMERS_OFFLINE=1", "MODELSCOPE_OFFLINE=1")
 	stageTarget := strings.ToLower(filepath.Base(binary))
 	if len(args) > 0 {
 		stageTarget = strings.ToLower(filepath.Base(args[0]))

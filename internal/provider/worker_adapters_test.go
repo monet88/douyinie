@@ -84,6 +84,17 @@ func TestProductionSpeechRegistry_ContainsAllRequiredCapabilities(t *testing.T) 
 	} else {
 		t.Fatal("diarizer does not implement VADModelInfo")
 	}
+
+	// Verify Finding 1: Every production model-backed provider requires a snapshot by default
+	for _, p := range reg.ListAll() {
+		rsp, ok := p.(interface{ RequiresSnapshot() bool })
+		if !ok {
+			t.Fatalf("production provider %s does not implement RequiresSnapshot()", p.ID())
+		}
+		if !rsp.RequiresSnapshot() {
+			t.Fatalf("expected production provider %s to require snapshot by default", p.ID())
+		}
+	}
 }
 
 // 1.7B is selected as primary due to higher quality score; on quality failure,
@@ -95,7 +106,7 @@ func TestRouter_ASRQualityFallback_17BTo06BObservable(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	reg, err := provider.NewProductionSpeechRegistry()
+	reg, err := provider.NewProductionSpeechRegistry(false) // disable snapshots for quality-fallback unit test
 	if err != nil {
 		t.Fatalf("NewProductionSpeechRegistry: %v", err)
 	}

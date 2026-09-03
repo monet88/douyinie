@@ -13,13 +13,14 @@ import (
 )
 
 type BaseFakeProvider struct {
-	ProviderID   string
-	ProviderType ProviderType
-	Policy       PolicyState
-	Healthy      bool
-	Cap          domain.ProviderCapability
-	ModelName    string
-	ModelVersion string
+	ProviderID           string
+	ProviderType         ProviderType
+	Policy               PolicyState
+	Healthy              bool
+	Cap                  domain.ProviderCapability
+	ModelName            string
+	ModelVersion         string
+	RequiresSnapshotFlag bool
 }
 
 func (b *BaseFakeProvider) ID() string                            { return b.ProviderID }
@@ -28,6 +29,8 @@ func (b *BaseFakeProvider) PolicyState() PolicyState              { return b.Pol
 func (b *BaseFakeProvider) IsHealthy() bool                       { return b.Healthy }
 func (b *BaseFakeProvider) Capability() domain.ProviderCapability { return b.Cap }
 func (b *BaseFakeProvider) ModelInfo() (string, string)           { return b.ModelName, b.ModelVersion }
+func (b *BaseFakeProvider) RequiresSnapshot() bool                { return b.RequiresSnapshotFlag }
+func (b *BaseFakeProvider) SetRequiresSnapshot(req bool)          { b.RequiresSnapshotFlag = req }
 
 // FakeASRProvider simulates Qwen3-ASR (1.7B quality attempt / 0.6B fallback).
 // Output is controllable per test: RawSegments overrides the default single

@@ -128,3 +128,14 @@ func (r *Registry) GetDefault(t ProviderType) (Provider, bool) {
 	}
 	return nil, false
 }
+
+// SetRequireSnapshots sets snapshot requirement on all registered providers that implement SetRequiresSnapshot.
+func (r *Registry) SetRequireSnapshots(require bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, p := range r.providers {
+		if sc, ok := p.(interface{ SetRequiresSnapshot(bool) }); ok {
+			sc.SetRequiresSnapshot(require)
+		}
+	}
+}

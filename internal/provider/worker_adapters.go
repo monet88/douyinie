@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/governance"
 	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/worker"
 )
@@ -77,9 +78,10 @@ type workerBridge struct {
 	handshakeTimeout time.Duration
 	runTimeout       time.Duration
 	leaseManager     *worker.GPULeaseManager
+	snapshotSvc      *governance.SnapshotService
 }
 
-func newWorkerBridge(leaseManager *worker.GPULeaseManager) (*workerBridge, error) {
+func newWorkerBridge(leaseManager *worker.GPULeaseManager, snapshotSvc *governance.SnapshotService) (*workerBridge, error) {
 	bin, err := resolveStageWorkerBinary()
 	if err != nil {
 		return nil, fmt.Errorf("stage worker binary unavailable: %w", err)
@@ -89,6 +91,7 @@ func newWorkerBridge(leaseManager *worker.GPULeaseManager) (*workerBridge, error
 		handshakeTimeout: defaultHandshakeTimeout,
 		runTimeout:       defaultRunTimeout,
 		leaseManager:     leaseManager,
+		snapshotSvc:      snapshotSvc,
 	}, nil
 }
 
@@ -100,6 +103,59 @@ func newWorkerBridge(leaseManager *worker.GPULeaseManager) (*workerBridge, error
 func (b *workerBridge) run(ctx context.Context, cmd worker.Command) ([]byte, error) {
 	runCtx, cancel := context.WithTimeout(ctx, b.runTimeout)
 	defer cancel()
+
+	// Verify snapshot bytes and check fingerprints BEFORE GPU lease acquisition (Issue #64)
+	if b.snapshotSvc != nil {
+		if cmd.Config != nil {
+			if _, ok := cmd.Config[worker.ConfigKeyModelSnapshot]; !ok {
+				mName, _ := cmd.Config[cfgModelName].(string)
+				mVer, _ := cmd.Config[cfgModelVersion].(string)
+				if mName != "" {
+					if primaryBinding, err := b.snapshotSvc.GetBinding(mName, mVer); err == nil && primaryBinding != nil {
+						envelope := worker.ModelSnapshotEnvelope{
+							Primary: worker.ModelSnapshotRef{
+								Role:                   "primary",
+								DependencyName:         primaryBinding.DependencyName,
+								Version:                primaryBinding.Version,
+								SnapshotManifestSHA256: primaryBinding.SnapshotManifestSHA256,
+								LocalPath:              primaryBinding.LocalPath,
+							},
+						}
+						if vadName, ok := cmd.Config["vad_model_name"].(string); ok && vadName != "" {
+							vadVer, _ := cmd.Config["vad_model_version"].(string)
+							if vadBinding, err := b.snapshotSvc.GetBinding(vadName, vadVer); err == nil && vadBinding != nil {
+								envelope.Dependencies = append(envelope.Dependencies, worker.ModelSnapshotRef{
+									Role:                   "vad",
+									DependencyName:         vadBinding.DependencyName,
+									Version:                vadBinding.Version,
+									SnapshotManifestSHA256: vadBinding.SnapshotManifestSHA256,
+									LocalPath:              vadBinding.LocalPath,
+								})
+							}
+						}
+						worker.SetModelSnapshotEnvelope(cmd.Config, envelope)
+					}
+				}
+			}
+		}
+	}
+
+	// Validate model_snapshot envelope and check fingerprints before GPU lease
+	if snapEnv, err := worker.GetModelSnapshotEnvelope(cmd.Config); err == nil && snapEnv != nil {
+		if b.snapshotSvc != nil {
+			if err := b.snapshotSvc.CheckBindingFingerprints(snapEnv.Primary.DependencyName, snapEnv.Primary.Version); err != nil {
+				return nil, fmt.Errorf("pre-invocation snapshot verification failed: %w", err)
+			}
+			for _, dep := range snapEnv.Dependencies {
+				if err := b.snapshotSvc.CheckBindingFingerprints(dep.DependencyName, dep.Version); err != nil {
+					return nil, fmt.Errorf("pre-invocation dependency snapshot verification failed (%s): %w", dep.DependencyName, err)
+				}
+			}
+		}
+		if err := worker.ValidateSnapshotPaths(snapEnv); err != nil {
+			return nil, fmt.Errorf("%w: %v", domain.ErrWorkerSnapshotPathRequired, err)
+		}
+	}
 
 	if b.leaseManager != nil {
 		leaseID, err := b.leaseManager.Acquire(runCtx, cmd.Family, nil)
@@ -147,11 +203,13 @@ func (b *workerBridge) run(ctx context.Context, cmd worker.Command) ([]byte, err
 // workerProviderBase carries the manifest-driven model identity and static
 // capability shared by all three adapters (Finding 2).
 type workerProviderBase struct {
-	id           string
-	modelName    string
-	modelVer     string
-	capability   domain.ProviderCapability
-	leaseManager *worker.GPULeaseManager
+	id               string
+	modelName        string
+	modelVer         string
+	capability       domain.ProviderCapability
+	leaseManager     *worker.GPULeaseManager
+	snapshotSvc      *governance.SnapshotService
+	requiresSnapshot bool
 }
 
 func (p *workerProviderBase) ID() string               { return p.id }
@@ -163,6 +221,15 @@ func (p *workerProviderBase) Capability() domain.ProviderCapability {
 func (p *workerProviderBase) ModelInfo() (string, string) { return p.modelName, p.modelVer }
 func (p *workerProviderBase) SetLeaseManager(mgr *worker.GPULeaseManager) {
 	p.leaseManager = mgr
+}
+func (p *workerProviderBase) SetSnapshotService(svc *governance.SnapshotService) {
+	p.snapshotSvc = svc
+}
+func (p *workerProviderBase) RequiresSnapshot() bool {
+	return p.requiresSnapshot
+}
+func (p *workerProviderBase) SetRequiresSnapshot(req bool) {
+	p.requiresSnapshot = req
 }
 
 // newCommand builds the StageWorker command skeleton with manifest-driven
@@ -206,9 +273,10 @@ func NewWorkerASRProvider(id, modelName, modelVersion string, qualityScore float
 		qualityScore = 0.8
 	}
 	return &WorkerASRProvider{workerProviderBase{
-		id:        id,
-		modelName: modelName,
-		modelVer:  modelVersion,
+		id:               id,
+		modelName:        modelName,
+		modelVer:         modelVersion,
+		requiresSnapshot: true,
 		capability: domain.ProviderCapability{
 			Stage:          "asr",
 			Languages:      []string{"zh"},
@@ -225,10 +293,17 @@ func NewWorkerASRProvider(id, modelName, modelVersion string, qualityScore float
 // worker-backed speech understanding providers (Qwen3-ASR 1.7B quality,
 // Qwen3-ASR 0.6B fallback, Qwen3-ForcedAligner, and conditional Diarization).
 // No fake providers are registered here (Issue #44 Finding 1).
-func NewProductionSpeechRegistry(leaseManager ...*worker.GPULeaseManager) (*Registry, error) {
+func NewProductionSpeechRegistry(opts ...any) (*Registry, error) {
 	var mgr *worker.GPULeaseManager
-	if len(leaseManager) > 0 {
-		mgr = leaseManager[0]
+	requireSnapshots := true // Fail-closed by default for production RC path (Finding 1)
+
+	for _, opt := range opts {
+		switch v := opt.(type) {
+		case *worker.GPULeaseManager:
+			mgr = v
+		case bool:
+			requireSnapshots = v
+		}
 	}
 	reg := NewRegistry()
 	asr17b, err := NewWorkerASRProvider("qwen3_asr_1_7b", "qwen3-asr", "1.7b", 0.9)
@@ -338,6 +413,9 @@ func NewProductionSpeechRegistry(leaseManager ...*worker.GPULeaseManager) (*Regi
 		return nil, err
 	}
 
+	if !requireSnapshots {
+		reg.SetRequireSnapshots(false)
+	}
 	return reg, nil
 }
 
@@ -346,7 +424,7 @@ type asrArtifact struct {
 }
 
 func (p *WorkerASRProvider) ProduceTranscript(ctx context.Context, audio worker.ArtifactRef) ([]domain.ASRRawSegment, error) {
-	bridge, err := newWorkerBridge(p.leaseManager)
+	bridge, err := newWorkerBridge(p.leaseManager, p.snapshotSvc)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrNoEligibleProvider, err)
 	}
@@ -385,17 +463,18 @@ func NewWorkerAlignerProvider(id, modelName, modelVersion string) (*WorkerAligne
 		return nil, fmt.Errorf("worker aligner provider requires id, model_name and model_version")
 	}
 	return &WorkerAlignerProvider{workerProviderBase{
-		id:        id,
-		modelName: modelName,
-		modelVer:  modelVersion,
+		id:               id,
+		modelName:        modelName,
+		modelVer:         modelVersion,
+		requiresSnapshot: true,
 		capability: domain.ProviderCapability{
 			Stage:          "aligner",
 			Languages:      []string{"zh"},
 			ExecutionTier:  "local",
 			CostPerUnit:    0,
-			QualityScore:   0.8,
+			QualityScore:   0.9,
 			MaxConcurrency: 1,
-			Features:       []string{"qwen3_forced_aligner"},
+			Features:       []string{"forced_alignment", "character_timestamps"},
 		},
 	}}, nil
 }
@@ -405,7 +484,7 @@ type alignerArtifact struct {
 }
 
 func (p *WorkerAlignerProvider) ProduceAlignment(ctx context.Context, audio worker.ArtifactRef, text string) ([]domain.WordTiming, error) {
-	bridge, err := newWorkerBridge(p.leaseManager)
+	bridge, err := newWorkerBridge(p.leaseManager, p.snapshotSvc)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrNoEligibleProvider, err)
 	}
@@ -456,9 +535,10 @@ func NewWorkerDiarizationProvider(id, modelName, modelVersion string, vadOpts ..
 	}
 	return &WorkerDiarizationProvider{
 		workerProviderBase: workerProviderBase{
-			id:        id,
-			modelName: modelName,
-			modelVer:  modelVersion,
+			id:               id,
+			modelName:        modelName,
+			modelVer:         modelVersion,
+			requiresSnapshot: true,
 			capability: domain.ProviderCapability{
 				Stage:          "diarizer",
 				Languages:      []string{"zh"},
@@ -515,7 +595,7 @@ func WithEmbeddingCosineThreshold(ctx context.Context, threshold float64) contex
 }
 
 func (p *WorkerDiarizationProvider) ProbeSpeakerEvidence(ctx context.Context, audio worker.ArtifactRef) (*domain.SpeakerEvidence, error) {
-	bridge, err := newWorkerBridge(p.leaseManager)
+	bridge, err := newWorkerBridge(p.leaseManager, p.snapshotSvc)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrNoEligibleProvider, err)
 	}
@@ -544,7 +624,7 @@ func (p *WorkerDiarizationProvider) ProbeSpeakerEvidence(ctx context.Context, au
 }
 
 func (p *WorkerDiarizationProvider) ProduceDiarization(ctx context.Context, audio worker.ArtifactRef) ([]domain.SpeakerAssignment, error) {
-	bridge, err := newWorkerBridge(p.leaseManager)
+	bridge, err := newWorkerBridge(p.leaseManager, p.snapshotSvc)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrNoEligibleProvider, err)
 	}
@@ -596,9 +676,10 @@ func NewWorkerTTSProvider(id, modelName, modelVersion string, languages []string
 	}
 	return &WorkerTTSProvider{
 		workerProviderBase: workerProviderBase{
-			id:        id,
-			modelName: modelName,
-			modelVer:  modelVersion,
+			id:               id,
+			modelName:        modelName,
+			modelVer:         modelVersion,
+			requiresSnapshot: true,
 			capability: domain.ProviderCapability{
 				Stage:          "tts",
 				Languages:      languages,
@@ -633,7 +714,7 @@ type ttsArtifact struct {
 }
 
 func (p *WorkerTTSProvider) SynthesizeSpeech(ctx context.Context, req TTSSynthesisRequest) (*TTSSynthesisResult, error) {
-	bridge, err := newWorkerBridge(p.leaseManager)
+	bridge, err := newWorkerBridge(p.leaseManager, p.snapshotSvc)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrNoEligibleProvider, err)
 	}
@@ -693,17 +774,18 @@ func NewWorkerSeparatorProvider(id, modelName, modelVer string, qualityScore flo
 		qualityScore = 0.94
 	}
 	return &WorkerSeparatorProvider{workerProviderBase{
-		id:        id,
-		modelName: modelName,
-		modelVer:  modelVer,
+		id:               id,
+		modelName:        modelName,
+		modelVer:         modelVer,
+		requiresSnapshot: true,
 		capability: domain.ProviderCapability{
-			Stage:          string(TypeSeparator),
+			Stage:          "separator",
 			Languages:      []string{"*"},
 			ExecutionTier:  "local",
 			CostPerUnit:    0,
 			QualityScore:   qualityScore,
 			MaxConcurrency: 1,
-			Features:       []string{"vocal_extraction", "bgm_preservation"},
+			Features:       []string{"stem_separation"},
 		},
 	}}, nil
 }
@@ -719,7 +801,7 @@ type separatorArtifact struct {
 }
 
 func (p *WorkerSeparatorProvider) SeparateStems(ctx context.Context, req SeparationRequest) (*SeparationResult, error) {
-	bridge, err := newWorkerBridge(p.leaseManager)
+	bridge, err := newWorkerBridge(p.leaseManager, p.snapshotSvc)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrNoEligibleProvider, err)
 	}
@@ -785,17 +867,18 @@ func NewWorkerOCRProvider(id, modelName, modelVer string, qualityScore float64) 
 		qualityScore = 0.92
 	}
 	return &WorkerOCRProvider{workerProviderBase{
-		id:        id,
-		modelName: modelName,
-		modelVer:  modelVer,
+		id:               id,
+		modelName:        modelName,
+		modelVer:         modelVer,
+		requiresSnapshot: true,
 		capability: domain.ProviderCapability{
-			Stage:          string(TypeOCR),
-			Languages:      []string{"*"},
+			Stage:          "ocr",
+			Languages:      []string{"zh", "en"},
 			ExecutionTier:  "local",
 			CostPerUnit:    0,
 			QualityScore:   qualityScore,
 			MaxConcurrency: 1,
-			Features:       []string{"region_classification", "fit_content_geometry"},
+			Features:       []string{"text_detection", "text_recognition"},
 		},
 	}}, nil
 }
@@ -808,7 +891,7 @@ type ocrArtifact struct {
 }
 
 func (p *WorkerOCRProvider) DetectRegions(ctx context.Context, req OCRRequest) (*OCRResult, error) {
-	bridge, err := newWorkerBridge(p.leaseManager)
+	bridge, err := newWorkerBridge(p.leaseManager, p.snapshotSvc)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrNoEligibleProvider, err)
 	}

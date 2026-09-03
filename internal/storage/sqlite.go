@@ -1106,6 +1106,46 @@ func (s *DB) migrate(ctx context.Context) error {
 			return fmt.Errorf("commit migration v16: %w", err)
 		}
 	}
+	// Migration v17: Snapshot Verification Events (Issue #64)
+	var countV17 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 17`).Scan(&countV17)
+	if err != nil {
+		return fmt.Errorf("check migration version 17: %w", err)
+	}
+
+	if countV17 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v17 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		schemaV17SQL := `
+		CREATE TABLE IF NOT EXISTS snapshot_verification_events (
+			id TEXT PRIMARY KEY,
+			dependency_name TEXT NOT NULL,
+			version TEXT NOT NULL,
+			snapshot_manifest_sha256 TEXT NOT NULL,
+			outcome TEXT NOT NULL,
+			error_message TEXT,
+			file_count INTEGER NOT NULL,
+			total_bytes INTEGER NOT NULL,
+			verifier_version TEXT NOT NULL,
+			verified_at TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_snapshot_verification_events_dep ON snapshot_verification_events(dependency_name, version);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (17, datetime('now'));
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaV17SQL); err != nil {
+			return fmt.Errorf("execute migration v17: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v17: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -5094,4 +5134,90 @@ func (s *DB) UpsertLocalizedVisualTrackIndex(ctx context.Context, idx LocalizedV
 		return fmt.Errorf("upsert localized visual track index: %w", err)
 	}
 	return nil
+}
+
+// RecordSnapshotVerificationEvent records an immutable snapshot verification event.
+func (s *DB) RecordSnapshotVerificationEvent(ctx context.Context, ev domain.SnapshotVerificationEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO snapshot_verification_events (
+			id, dependency_name, version, snapshot_manifest_sha256, outcome, error_message, file_count, total_bytes, verifier_version, verified_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		ev.ID,
+		ev.DependencyName,
+		ev.Version,
+		ev.SnapshotManifestSHA256,
+		ev.Outcome,
+		ev.ErrorMessage,
+		ev.FileCount,
+		ev.TotalBytes,
+		ev.VerifierVersion,
+		ev.VerifiedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("record snapshot verification event: %w", err)
+	}
+	return nil
+}
+
+// ListSnapshotVerificationEvents lists snapshot verification events, optionally filtered by dependency name.
+func (s *DB) ListSnapshotVerificationEvents(ctx context.Context, dependencyName string) ([]domain.SnapshotVerificationEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var rows *sql.Rows
+	var err error
+	if dependencyName != "" {
+		query := `
+			SELECT id, dependency_name, version, snapshot_manifest_sha256, outcome, error_message, file_count, total_bytes, verifier_version, verified_at
+			FROM snapshot_verification_events
+			WHERE dependency_name = ?
+			ORDER BY verified_at DESC
+		`
+		rows, err = s.db.QueryContext(ctx, query, dependencyName)
+	} else {
+		query := `
+			SELECT id, dependency_name, version, snapshot_manifest_sha256, outcome, error_message, file_count, total_bytes, verifier_version, verified_at
+			FROM snapshot_verification_events
+			ORDER BY verified_at DESC
+		`
+		rows, err = s.db.QueryContext(ctx, query)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list snapshot verification events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []domain.SnapshotVerificationEvent
+	for rows.Next() {
+		var ev domain.SnapshotVerificationEvent
+		var errMsg sql.NullString
+		var verifiedAtStr string
+		if err := rows.Scan(
+			&ev.ID,
+			&ev.DependencyName,
+			&ev.Version,
+			&ev.SnapshotManifestSHA256,
+			&ev.Outcome,
+			&errMsg,
+			&ev.FileCount,
+			&ev.TotalBytes,
+			&ev.VerifierVersion,
+			&verifiedAtStr,
+		); err != nil {
+			return nil, fmt.Errorf("scan snapshot verification event: %w", err)
+		}
+		if errMsg.Valid {
+			ev.ErrorMessage = errMsg.String
+		}
+		if t, parseErr := time.Parse(time.RFC3339Nano, verifiedAtStr); parseErr == nil {
+			ev.VerifiedAt = t
+		}
+		events = append(events, ev)
+	}
+	return events, rows.Err()
 }

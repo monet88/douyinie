@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -90,8 +91,35 @@ func main() {
 	polSvc := governance.NewPolicyService(db)
 	licSvc := governance.NewLicenseService(db)
 	credSvc := governance.NewCredentialService(db)
+	snapSvc := governance.NewSnapshotService(db, licSvc)
 	router := provider.NewRouter(reg, polSvc, licSvc, credSvc, nil, db)
+	router.SetSnapshotService(snapSvc)
 
+	// 5a. Verify configured RC model snapshots on startup (Issue #64)
+	snapshotBaseDir := os.Getenv("DOUYINIE_SNAPSHOT_DIR")
+	if snapshotBaseDir == "" {
+		snapshotBaseDir = filepath.Join(absDataDir, "snapshots")
+	}
+	if entries, err := os.ReadDir(snapshotBaseDir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			subDir := filepath.Join(snapshotBaseDir, e.Name())
+			manifestPath := filepath.Join(subDir, "snapshot_manifest.json")
+			if mBytes, mErr := os.ReadFile(manifestPath); mErr == nil {
+				var m domain.SnapshotManifest
+				if jsonErr := json.Unmarshal(mBytes, &m); jsonErr == nil {
+					binding, vErr := snapSvc.RegisterAndVerifySnapshot(context.Background(), m, subDir)
+					if vErr != nil {
+						log.Printf("[RuntimeHost] Warning: RC snapshot startup verification failed for %s: %v", e.Name(), vErr)
+					} else {
+						log.Printf("[RuntimeHost] Verified RC snapshot %s (%s): %s", binding.DependencyName, binding.Version, binding.SnapshotManifestSHA256)
+					}
+				}
+			}
+		}
+	}
 	// 5b. Douyin URL acquisition ladder (Issue #28): Jiji preferred -> F2
 	// parser fallback -> browser-assisted auth last. Adapters are fail-closed
 	// (REQUIRES_AUTHORIZATION) until an operator enables them for an
@@ -162,6 +190,7 @@ func main() {
 		VisualTextSvc:  visualTextSvc,
 		RenderSvc:      renderSvc,
 		BundleSvc:      service.NewBundleService(db, casStore, licSvc),
+		SnapshotSvc:    snapSvc,
 	})
 	go func() {
 		log.Printf("[RuntimeHost] API daemon listening on http://%s", addr)
