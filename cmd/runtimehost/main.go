@@ -84,14 +84,14 @@ func main() {
 	// Production registers concrete worker-backed providers (Qwen3-ASR 1.7B quality,
 	// Qwen3-ASR 0.6B fallback, Qwen3-ForcedAligner, and conditional Diarization)
 	// wired through the authoritative single-GPU lease path. No fake providers are registered.
-	reg, err := provider.NewProductionSpeechRegistry(gpuLeaseMgr)
-	if err != nil {
-		log.Fatalf("[RuntimeHost] failed to initialize production speech registry: %v", err)
-	}
 	polSvc := governance.NewPolicyService(db)
 	licSvc := governance.NewLicenseService(db)
 	credSvc := governance.NewCredentialService(db)
 	snapSvc := governance.NewSnapshotService(db, licSvc)
+	reg, err := provider.NewProductionSpeechRegistry(gpuLeaseMgr, snapSvc, credSvc.MaterializeSecret)
+	if err != nil {
+		log.Fatalf("[RuntimeHost] failed to initialize production speech registry: %v", err)
+	}
 	router := provider.NewRouter(reg, polSvc, licSvc, credSvc, nil, db)
 	router.SetSnapshotService(snapSvc)
 

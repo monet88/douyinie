@@ -229,7 +229,9 @@ func (s *DB) migrate(ctx context.Context) error {
 			error_message TEXT,
 			latency_ms INTEGER NOT NULL,
 			cost_units REAL NOT NULL,
-			created_at TEXT NOT NULL
+			created_at TEXT NOT NULL,
+			observed_model TEXT,
+			service_baseline_id TEXT
 		);
 
 		CREATE TABLE IF NOT EXISTS selection_decisions (
@@ -1146,6 +1148,71 @@ func (s *DB) migrate(ctx context.Context) error {
 			return fmt.Errorf("commit migration v17: %w", err)
 		}
 	}
+	// Migration v18: Provider Attempt and Translation Provenance (Issue #66)
+	var countV18 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 18`).Scan(&countV18)
+	if err != nil {
+		return fmt.Errorf("check migration version 18: %w", err)
+	}
+
+	if countV18 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v18 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		var tableCount int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='provider_attempts'`).Scan(&tableCount); err != nil {
+			return fmt.Errorf("check provider_attempts table for migration v18: %w", err)
+		}
+		if tableCount > 0 {
+			rows, err := tx.QueryContext(ctx, `PRAGMA table_info(provider_attempts)`)
+			if err != nil {
+				return fmt.Errorf("query table_info provider_attempts: %w", err)
+			}
+			hasObservedModel := false
+			hasServiceBaselineID := false
+			for rows.Next() {
+				var cid int
+				var name, colType string
+				var notnull, pk int
+				var dfltValue sql.NullString
+				if err := rows.Scan(&cid, &name, &colType, &notnull, &dfltValue, &pk); err == nil {
+					if name == "observed_model" {
+						hasObservedModel = true
+					}
+					if name == "service_baseline_id" {
+						hasServiceBaselineID = true
+					}
+				}
+			}
+			rows.Close()
+
+			if !hasObservedModel {
+				if _, err := tx.ExecContext(ctx, `ALTER TABLE provider_attempts ADD COLUMN observed_model TEXT;`); err != nil {
+					if !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+						return fmt.Errorf("add observed_model column: %w", err)
+					}
+				}
+			}
+			if !hasServiceBaselineID {
+				if _, err := tx.ExecContext(ctx, `ALTER TABLE provider_attempts ADD COLUMN service_baseline_id TEXT;`); err != nil {
+					if !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+						return fmt.Errorf("add service_baseline_id column: %w", err)
+					}
+				}
+			}
+		}
+
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (18, datetime('now'));`); err != nil {
+			return fmt.Errorf("record migration v18: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v18: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -2033,8 +2100,8 @@ func (s *DB) RecordProviderAttempt(ctx context.Context, attempt domain.ProviderA
 	defer s.mu.Unlock()
 
 	query := `
-		INSERT INTO provider_attempts (id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO provider_attempts (id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at, observed_model, service_baseline_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 	_, err := s.db.ExecContext(ctx, query,
 		attempt.ID,
@@ -2050,6 +2117,8 @@ func (s *DB) RecordProviderAttempt(ctx context.Context, attempt domain.ProviderA
 		attempt.LatencyMs,
 		attempt.CostUnits,
 		attempt.CreatedAt.Format(time.RFC3339Nano),
+		attempt.ObservedModel,
+		attempt.ServiceBaselineID,
 	)
 	if err != nil {
 		return fmt.Errorf("insert provider_attempt: %w", err)
@@ -2065,13 +2134,13 @@ func (s *DB) ListProviderAttempts(ctx context.Context, runID string, stage strin
 	var query string
 	var args []any
 	if stage != "" {
-		query = `SELECT id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at FROM provider_attempts WHERE run_id = ? AND stage = ? ORDER BY attempt_number ASC, created_at ASC, id ASC`
+		query = `SELECT id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at, COALESCE(observed_model, ''), COALESCE(service_baseline_id, '') FROM provider_attempts WHERE run_id = ? AND stage = ? ORDER BY attempt_number ASC, created_at ASC, id ASC`
 		args = []any{runID, stage}
 	} else if runID != "" {
-		query = `SELECT id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at FROM provider_attempts WHERE run_id = ? ORDER BY attempt_number ASC, created_at ASC, id ASC`
+		query = `SELECT id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at, COALESCE(observed_model, ''), COALESCE(service_baseline_id, '') FROM provider_attempts WHERE run_id = ? ORDER BY attempt_number ASC, created_at ASC, id ASC`
 		args = []any{runID}
 	} else {
-		query = `SELECT id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at FROM provider_attempts ORDER BY created_at DESC, id ASC LIMIT 100`
+		query = `SELECT id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at, COALESCE(observed_model, ''), COALESCE(service_baseline_id, '') FROM provider_attempts ORDER BY created_at DESC, id ASC LIMIT 100`
 	}
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -2085,7 +2154,7 @@ func (s *DB) ListProviderAttempts(ctx context.Context, runID string, stage strin
 		var a domain.ProviderAttempt
 		var createdStr string
 		var errMsg sql.NullString
-		if err := rows.Scan(&a.ID, &a.RunID, &a.Stage, &a.ProviderID, &a.ModelName, &a.ModelVersion, &a.InputHash, &a.AttemptNumber, &a.Status, &errMsg, &a.LatencyMs, &a.CostUnits, &createdStr); err != nil {
+		if err := rows.Scan(&a.ID, &a.RunID, &a.Stage, &a.ProviderID, &a.ModelName, &a.ModelVersion, &a.InputHash, &a.AttemptNumber, &a.Status, &errMsg, &a.LatencyMs, &a.CostUnits, &createdStr, &a.ObservedModel, &a.ServiceBaselineID); err != nil {
 			return nil, fmt.Errorf("scan provider_attempt: %w", err)
 		}
 		if errMsg.Valid {
@@ -4804,8 +4873,8 @@ func (s *DB) UpsertProviderAttempt(ctx context.Context, attempt domain.ProviderA
 	defer s.mu.Unlock()
 
 	query := `
-		INSERT INTO provider_attempts (id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO provider_attempts (id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at, observed_model, service_baseline_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING
 	`
 	_, err := s.db.ExecContext(ctx, query,
@@ -4813,6 +4882,7 @@ func (s *DB) UpsertProviderAttempt(ctx context.Context, attempt domain.ProviderA
 		attempt.ModelName, attempt.ModelVersion, attempt.InputHash,
 		attempt.AttemptNumber, attempt.Status, attempt.ErrorMessage,
 		attempt.LatencyMs, attempt.CostUnits, attempt.CreatedAt.Format(time.RFC3339Nano),
+		attempt.ObservedModel, attempt.ServiceBaselineID,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert provider_attempt: %w", err)

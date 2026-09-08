@@ -463,3 +463,237 @@ func TestSnapshot_CheckBindingFingerprints_RejectSymlinkReplacement(t *testing.T
 		t.Fatalf("expected ErrSnapshotMutatedRehashRequired, got: %v", err)
 	}
 }
+
+func TestSnapshot_RegisterAndVerifySnapshot_DoesNotFabricateRuntimeEvidence(t *testing.T) {
+	ctx := context.Background()
+	db, snapSvc, licSvc := setupTestSnapshotService(t)
+	defer db.Close()
+
+	dir := t.TempDir()
+	content := "fake_uvr_weights"
+	_ = os.WriteFile(filepath.Join(dir, "UVR-MDX-NET-Inst_HQ_4.onnx"), []byte(content), 0644)
+	h := sha256.Sum256([]byte(content))
+
+	manifest := domain.SnapshotManifest{
+		SchemaVersion: "1.0",
+		ModelID:       "UVR-MDX-NET-Inst_HQ_4.onnx",
+		ModelVersion:  "v3",
+		Files: []domain.SnapshotFileEntry{
+			{
+				RelativePath: "UVR-MDX-NET-Inst_HQ_4.onnx",
+				SHA256:       hex.EncodeToString(h[:]),
+				SizeBytes:    int64(len(content)),
+			},
+		},
+	}
+	cSHA, _ := domain.ComputeSnapshotManifestSHA256(&manifest)
+	manifest.SnapshotManifestSHA256 = cSHA
+	_ = licSvc.RegisterManifest(ctx, domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: manifest.ModelID,
+		Version:        manifest.ModelVersion,
+		SHA256:         cSHA,
+		CodeLicense:    "MIT",
+		ModelLicense:   "MIT",
+		DataLicense:    "Common-Voice",
+		ServiceTerms:   "Local-Offline",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	// Requirement 1: Successful snapshot verification alone leaves runtime identity UNSET
+	binding, err := snapSvc.RegisterAndVerifySnapshot(ctx, manifest, dir)
+	if err != nil {
+		t.Fatalf("RegisterAndVerifySnapshot failed: %v", err)
+	}
+	if binding.RuntimeIdentity != nil {
+		t.Fatalf("expected RuntimeIdentity to be nil after RegisterAndVerifySnapshot, got: %+v", binding.RuntimeIdentity)
+	}
+}
+
+func TestSnapshot_SetRuntimeIdentity_HardenValidation(t *testing.T) {
+	ctx := context.Background()
+	db, snapSvc, licSvc := setupTestSnapshotService(t)
+	defer db.Close()
+
+	dir := t.TempDir()
+	content := "fake_uvr_weights"
+	_ = os.WriteFile(filepath.Join(dir, "UVR-MDX-NET-Inst_HQ_4.onnx"), []byte(content), 0644)
+	h := sha256.Sum256([]byte(content))
+
+	manifest := domain.SnapshotManifest{
+		SchemaVersion: "1.0",
+		ModelID:       "UVR-MDX-NET-Inst_HQ_4.onnx",
+		ModelVersion:  "v3",
+		Files: []domain.SnapshotFileEntry{
+			{
+				RelativePath: "UVR-MDX-NET-Inst_HQ_4.onnx",
+				SHA256:       hex.EncodeToString(h[:]),
+				SizeBytes:    int64(len(content)),
+			},
+		},
+	}
+	cSHA, _ := domain.ComputeSnapshotManifestSHA256(&manifest)
+	manifest.SnapshotManifestSHA256 = cSHA
+	_ = licSvc.RegisterManifest(ctx, domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: manifest.ModelID,
+		Version:        manifest.ModelVersion,
+		SHA256:         cSHA,
+		CodeLicense:    "MIT",
+		ModelLicense:   "MIT",
+		DataLicense:    "Common-Voice",
+		ServiceTerms:   "Local-Offline",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	binding, err := snapSvc.RegisterAndVerifySnapshot(ctx, manifest, dir)
+	if err != nil {
+		t.Fatalf("RegisterAndVerifySnapshot failed: %v", err)
+	}
+
+	// 1. Rejects wrong primary snapshot digest
+	badSnapRT := domain.NewUVRRuntimeIdentity("wrong_snap_digest_sha256", nil)
+	err = snapSvc.SetRuntimeIdentity(manifest.ModelID, manifest.ModelVersion, badSnapRT)
+	if !errors.Is(err, domain.ErrSnapshotDigestMismatch) {
+		t.Fatalf("expected ErrSnapshotDigestMismatch for wrong primary snapshot digest, got: %v", err)
+	}
+
+	// 2. Rejects inconsistent RuntimeManifestSHA256
+	badManifestRT := domain.NewUVRRuntimeIdentity(binding.SnapshotManifestSHA256, nil)
+	badManifestRT.RuntimeManifestSHA256 = strings.Repeat("f", 64)
+	err = snapSvc.SetRuntimeIdentity(manifest.ModelID, manifest.ModelVersion, badManifestRT)
+	if !errors.Is(err, domain.ErrSnapshotDigestMismatch) {
+		t.Fatalf("expected ErrSnapshotDigestMismatch for wrong runtime manifest SHA, got: %v", err)
+	}
+
+	// 3. Rejects wrong source revision for UVR
+	badSourceRT := domain.NewUVRRuntimeIdentity(binding.SnapshotManifestSHA256, nil)
+	badSourceRT.SourceRevision = "unverified_commit_hash"
+	badSourceRT.RuntimeManifestSHA256 = badSourceRT.ComputeRuntimeManifestSHA256()
+	err = snapSvc.SetRuntimeIdentity(manifest.ModelID, manifest.ModelVersion, badSourceRT)
+	if !errors.Is(err, domain.ErrSnapshotUnverified) {
+		t.Fatalf("expected ErrSnapshotUnverified for wrong UVR source revision, got: %v", err)
+	}
+
+	// 4. Rejects wrong package version for UVR
+	badPkgRT := domain.NewUVRRuntimeIdentity(binding.SnapshotManifestSHA256, nil)
+	badPkgRT.RuntimeVersions["audio-separator"] = "9.9.9"
+	badPkgRT.RuntimeManifestSHA256 = badPkgRT.ComputeRuntimeManifestSHA256()
+	err = snapSvc.SetRuntimeIdentity(manifest.ModelID, manifest.ModelVersion, badPkgRT)
+	if !errors.Is(err, domain.ErrSnapshotUnverified) {
+		t.Fatalf("expected ErrSnapshotUnverified for wrong UVR package version, got: %v", err)
+	}
+
+	// 5. Explicitly validated runtime evidence succeeds
+	validRT := domain.NewUVRRuntimeIdentity(binding.SnapshotManifestSHA256, nil)
+	err = snapSvc.SetRuntimeIdentity(manifest.ModelID, manifest.ModelVersion, validRT)
+	if err != nil {
+		t.Fatalf("expected SetRuntimeIdentity to succeed with valid evidence, got: %v", err)
+	}
+	if binding.RuntimeIdentity == nil {
+		t.Fatal("expected binding to have attached RuntimeIdentity")
+	}
+	if binding.RuntimeIdentity.SourceRevision != domain.PinnedUVRSourceRevision {
+		t.Fatalf("expected %s, got %s", domain.PinnedUVRSourceRevision, binding.RuntimeIdentity.SourceRevision)
+	}
+}
+
+func TestSnapshot_SetRuntimeIdentity_ExactPackageVersion_SuffixRejection(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	db, snapSvc, licSvc := setupTestSnapshotService(t)
+	defer db.Close()
+
+	uvrDir := filepath.Join(tmpDir, "uvr")
+	_ = os.MkdirAll(uvrDir, 0755)
+	content := "fake_uvr_weights"
+	_ = os.WriteFile(filepath.Join(uvrDir, "UVR-MDX-NET-Inst_HQ_4.onnx"), []byte(content), 0644)
+	h := sha256.Sum256([]byte(content))
+
+	manifest := domain.SnapshotManifest{
+		SchemaVersion: "1.0",
+		ModelID:       "UVR-MDX-NET-Inst_HQ_4.onnx",
+		ModelVersion:  "v3",
+		Files: []domain.SnapshotFileEntry{
+			{
+				RelativePath: "UVR-MDX-NET-Inst_HQ_4.onnx",
+				SHA256:       hex.EncodeToString(h[:]),
+				SizeBytes:    int64(len(content)),
+			},
+		},
+	}
+	cSHA, _ := domain.ComputeSnapshotManifestSHA256(&manifest)
+	manifest.SnapshotManifestSHA256 = cSHA
+	_ = licSvc.RegisterManifest(ctx, domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: manifest.ModelID,
+		Version:        manifest.ModelVersion,
+		SHA256:         cSHA,
+		CodeLicense:    "MIT",
+		ModelLicense:   "MIT",
+		DataLicense:    "Common-Voice",
+		ServiceTerms:   "Local-Offline",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	})
+	binding, err := snapSvc.RegisterAndVerifySnapshot(ctx, manifest, uvrDir)
+	if err != nil {
+		t.Fatalf("RegisterAndVerifySnapshot: %v", err)
+	}
+
+	// Suffixes such as +modified or .post1 must fail closed
+	for _, badVer := range []string{"0.47.0+modified", "0.47.0.post1", "0.47.0-beta"} {
+		rt := domain.NewUVRRuntimeIdentity(binding.SnapshotManifestSHA256, nil)
+		rt.RuntimeVersions["audio-separator"] = badVer
+		rt.RuntimeManifestSHA256 = rt.ComputeRuntimeManifestSHA256()
+		err = snapSvc.SetRuntimeIdentity(manifest.ModelID, manifest.ModelVersion, rt)
+		if !errors.Is(err, domain.ErrSnapshotUnverified) {
+			t.Fatalf("expected ErrSnapshotUnverified for UVR suffix version %q, got: %v", badVer, err)
+		}
+	}
+
+	// Test Demucs suffix rejection
+	demucsDir := filepath.Join(tmpDir, "demucs")
+	_ = os.MkdirAll(demucsDir, 0755)
+	demucsContent := "demucs checkpoint bytes"
+	dh := sha256.Sum256([]byte(demucsContent))
+	_ = os.WriteFile(filepath.Join(demucsDir, "955717e8-8726e21a.th"), []byte(demucsContent), 0644)
+	demucsManifest := domain.SnapshotManifest{
+		SchemaVersion: "1.0",
+		ModelID:       "htdemucs",
+		ModelVersion:  "v4",
+		Files: []domain.SnapshotFileEntry{
+			{RelativePath: "955717e8-8726e21a.th", SHA256: hex.EncodeToString(dh[:]), SizeBytes: int64(len(demucsContent))},
+		},
+	}
+	dSHA, _ := domain.ComputeSnapshotManifestSHA256(&demucsManifest)
+	demucsManifest.SnapshotManifestSHA256 = dSHA
+	_ = licSvc.RegisterManifest(ctx, domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: "htdemucs",
+		Version:        "v4",
+		SHA256:         dSHA,
+		CodeLicense:    "MIT",
+		ModelLicense:   "MIT",
+		DataLicense:    "Common-Voice",
+		ServiceTerms:   "Local-Offline",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	})
+	demucsBinding, err := snapSvc.RegisterAndVerifySnapshot(ctx, demucsManifest, demucsDir)
+	if err != nil {
+		t.Fatalf("RegisterAndVerifySnapshot demucs: %v", err)
+	}
+
+	for _, badVer := range []string{"4.1.0a2.post1", "4.1.0a2+custom", "4.1.0a2-rc1"} {
+		rt := domain.NewDemucsRuntimeIdentity(demucsBinding.SnapshotManifestSHA256, nil)
+		rt.RuntimeVersions["demucs"] = badVer
+		rt.RuntimeManifestSHA256 = rt.ComputeRuntimeManifestSHA256()
+		err = snapSvc.SetRuntimeIdentity(demucsManifest.ModelID, demucsManifest.ModelVersion, rt)
+		if !errors.Is(err, domain.ErrSnapshotUnverified) {
+			t.Fatalf("expected ErrSnapshotUnverified for Demucs suffix version %q, got: %v", badVer, err)
+		}
+	}
+}

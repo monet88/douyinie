@@ -26,7 +26,13 @@ import (
 // Executor defines an injected execution seam for stage provider execution.
 type Executor func(ctx context.Context, p provider.Provider, attemptNumber int) error
 
-// Server encapsulates the RuntimeHost HTTP daemon.
+// runtimeHostWriteTimeout bounds the HTTP response-write window. Localhost
+// synchronous ML endpoints may run multiple bounded worker invocations
+// (each capped by its own per-worker timeout) before the handler first
+// writes the response, so this must stay finite yet well above the
+// multi-minute worst case. Per-worker timeouts still bound execution.
+const runtimeHostWriteTimeout = 30 * time.Minute
+
 type Server struct {
 	db             *storage.DB
 	casStore       *cas.Store
@@ -185,7 +191,7 @@ func New(cfg Config) *Server {
 		Addr:         cfg.Addr,
 		Handler:      s.mux,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		WriteTimeout: runtimeHostWriteTimeout,
 	}
 
 	return s
@@ -850,6 +856,7 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 		Segments              []domain.TranslationInputSegment `json:"segments,omitempty"`
 		ExecutionProfile      domain.ExecutionProfile          `json:"execution_profile,omitempty"`
 		AuthorizedCredentials []string                         `json:"authorized_credentials,omitempty"`
+		ConsentGranted        bool                             `json:"consent_granted,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
@@ -874,6 +881,7 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 		Segments:              body.Segments,
 		ExecutionProfile:      body.ExecutionProfile,
 		AuthorizedCredentials: body.AuthorizedCredentials,
+		ConsentGranted:        body.ConsentGranted,
 	}
 
 	variant, err := s.translationSvc.Translate(r.Context(), in)
@@ -2499,9 +2507,13 @@ func (s *Server) handleLocalizeVisualTrack(w http.ResponseWriter, r *http.Reques
 		RunID                 string                        `json:"run_id"`
 		JobID                 string                        `json:"job_id,omitempty"`
 		TargetLanguage        string                        `json:"target_language"`
+		TranslationVariantCAS string                        `json:"translation_variant_cas,omitempty"`
 		Overrides             []domain.RegionOverride       `json:"overrides,omitempty"`
 		InpaintingFallbacks   []string                      `json:"inpainting_fallbacks,omitempty"`
 		SceneProtectedRegions []domain.SceneProtectedRegion `json:"scene_protected_regions,omitempty"`
+		ExecutionProfile      domain.ExecutionProfile       `json:"execution_profile,omitempty"`
+		AuthorizedCredentials []string                      `json:"authorized_credentials,omitempty"`
+		ConsentGranted        bool                          `json:"consent_granted,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
 		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
@@ -2518,9 +2530,13 @@ func (s *Server) handleLocalizeVisualTrack(w http.ResponseWriter, r *http.Reques
 		AssetID:               asset.ID,
 		JobID:                 body.JobID,
 		TargetLanguage:        targetLang,
+		TranslationVariantCAS: body.TranslationVariantCAS,
 		Overrides:             body.Overrides,
 		InpaintingFallbacks:   body.InpaintingFallbacks,
 		SceneProtectedRegions: body.SceneProtectedRegions,
+		ExecutionProfile:      body.ExecutionProfile,
+		AuthorizedCredentials: body.AuthorizedCredentials,
+		ConsentGranted:        body.ConsentGranted,
 	}
 
 	track, err := s.visualTextSvc.LocalizeVisualTrack(r.Context(), in)

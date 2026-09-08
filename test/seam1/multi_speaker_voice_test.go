@@ -367,8 +367,7 @@ func TestSeam1_VoiceChange_InvalidationScope_And_SpeakerScopedRegeneration(t *te
 	licResp.Body.Close()
 
 	// 4. Explicit operator voice change: reassign SPEAKER_00 only to CosyVoice3 preset
-	viPresets := provider.DefaultPresetVoices("vi")
-	newVoiceForSpk0 := viPresets[2] // CosyVoice3 VI Female
+	newVoiceForSpk0 := fakeCosy.VoiceCatalog()[0] // CosyVoice3 VI Female
 	respReassign, assign2 := runReassignVoices(t, h, assetID, map[string]any{
 		"run_id":          runID,
 		"target_language": "vi",
@@ -525,8 +524,7 @@ func TestSeam1_VoiceChange_DubScriptChangeForcesSynthesisEvenWithSupersession(t 
 	licResp.Body.Close()
 
 	// Reassign SPEAKER_00 voice -> assign2 (supersedes assign1, invalidates SPEAKER_00)
-	viPresets := provider.DefaultPresetVoices("vi")
-	newVoiceForSpk0 := viPresets[2]
+	newVoiceForSpk0 := fakeCosy.VoiceCatalog()[0] // CosyVoice3 VI Female
 	respReassign, assign2 := runReassignVoices(t, h, assetID, map[string]any{
 		"run_id":          runID,
 		"target_language": "vi",

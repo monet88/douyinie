@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -102,8 +103,15 @@ func TestSeam1_BenchmarkRunner_ResumableSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute acquisition failed: %v", err)
 	}
-	if acqEvidence.Status != "PASS" {
-		t.Fatalf("expected acquisition PASS, got %s (err: %s)", acqEvidence.Status, acqEvidence.ErrorMessage)
+	// Invariant (Issue #70 Finding 2): Local substitution finishes with terminal FAIL on evidence
+	if acqEvidence.Status != "FAIL" {
+		t.Fatalf("expected acquisition local substitution to be terminal FAIL, got %s", acqEvidence.Status)
+	}
+	if !acqEvidence.IsLocalSubstitution {
+		t.Fatalf("expected IsLocalSubstitution to be true")
+	}
+	if acqEvidence.ErrorMessage != "local-file substitution is prohibited for scored acquisition benchmark" {
+		t.Fatalf("unexpected error message: %s", acqEvidence.ErrorMessage)
 	}
 	if acqEvidence.SourceAssetID == "" || acqEvidence.SourceAssetCASHash == "" {
 		t.Errorf("expected non-empty asset ID and CAS hash: ID=%s CAS=%s", acqEvidence.SourceAssetID, acqEvidence.SourceAssetCASHash)
@@ -111,7 +119,6 @@ func TestSeam1_BenchmarkRunner_ResumableSession(t *testing.T) {
 	if !acqEvidence.IntegrityPassed {
 		t.Errorf("expected integrity passed on acquisition evidence")
 	}
-
 	// Invariant: Re-executing already completed acquisition immediately reuses evidence
 	reusedAcq, err := runner.ExecuteAcquisition(ctx, acqInput)
 	if err != nil {
@@ -120,7 +127,9 @@ func TestSeam1_BenchmarkRunner_ResumableSession(t *testing.T) {
 	if reusedAcq.SourceAssetID != acqEvidence.SourceAssetID {
 		t.Errorf("expected reused acquisition asset ID %s, got %s", acqEvidence.SourceAssetID, reusedAcq.SourceAssetID)
 	}
-
+	if reusedAcq.Status != "FAIL" {
+		t.Errorf("expected reused acquisition to preserve terminal FAIL, got %s", reusedAcq.Status)
+	}
 	// 2. Execute Quality Case
 	qcMediaPath := createSyntheticMedia(t, h.dir, "qc_test_01.mp4")
 	segments := []domain.TranslationInputSegment{
@@ -169,6 +178,22 @@ func TestSeam1_BenchmarkRunner_ResumableSession(t *testing.T) {
 	}
 	if qcEvidence.Status != "COMPLETED" {
 		t.Errorf("expected quality case status COMPLETED, got %s", qcEvidence.Status)
+	}
+
+	// Invariant (#65): the native LocalizationRun must carry the same semantic
+	// config snapshot that is frozen into the benchmark-session identity. A
+	// benchmark-labeled profile with an empty product RunConfigSnapshot is not
+	// acceptable release evidence.
+	persistedRun, err := client.GetRun(ctx, qcEvidence.RunID)
+	if err != nil {
+		t.Fatalf("get persisted localization run: %v", err)
+	}
+	wantRunConfig, err := benchmark.CanonicalizeConfig(identity.ConfigSnapshot)
+	if err != nil {
+		t.Fatalf("canonicalize expected run config: %v", err)
+	}
+	if persistedRun.ConfigSnapshotJSON != wantRunConfig {
+		t.Fatalf("run config snapshot = %s, want session-bound %s", persistedRun.ConfigSnapshotJSON, wantRunConfig)
 	}
 
 	// Invariant: All required pipeline stages executed and emitted CAS artifact hashes
@@ -274,5 +299,42 @@ func TestSeam1_BenchmarkRunner_ResumableSession(t *testing.T) {
 	}
 	if newSession.ID == session.ID {
 		t.Errorf("expected distinct session ID for different identity, got %s", newSession.ID)
+	}
+}
+
+func TestSeam1_BenchmarkRunner_RejectsQualityProfileMismatch(t *testing.T) {
+	h := setupHarness(t)
+	store, err := benchmark.NewFileStore(filepath.Join(h.dir, "profile_mismatch_sessions"))
+	if err != nil {
+		t.Fatalf("create benchmark store: %v", err)
+	}
+	identity := testBenchmarkIdentity()
+	identity.ExecutionProfile = "local"
+	identity.ConfigSnapshot = map[string]any{"profile": "local", "zero_overrun_strict": true}
+	session, err := store.Resume(identity)
+	if err != nil {
+		t.Fatalf("resume local session: %v", err)
+	}
+	runner, err := benchmark.NewBenchmarkRunner(benchmark.RunnerConfig{
+		Client:  benchmark.NewRuntimeHostClient(h.server.URL, h.server.Client()),
+		Store:   store,
+		Session: session,
+	})
+	if err != nil {
+		t.Fatalf("create runner: %v", err)
+	}
+
+	_, err = runner.ExecuteQualityCase(context.Background(), benchmark.QualityCaseInput{
+		CaseID:          "hybrid_case_in_local_session",
+		SourceVideoID:   "video_profile_mismatch",
+		PrimaryCategory: "clean_single_speaker",
+		TargetLanguage:  "vi",
+		Profile:         "hybrid",
+	})
+	if err == nil || !strings.Contains(err.Error(), "profile mismatch") {
+		t.Fatalf("expected profile mismatch rejection before product execution, got %v", err)
+	}
+	if len(session.QualityCases) != 0 {
+		t.Fatalf("profile mismatch must not create benchmark evidence, got %d case(s)", len(session.QualityCases))
 	}
 }

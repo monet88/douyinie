@@ -78,42 +78,66 @@ type RelationalQCEvidence struct {
 
 // AcquisitionEntryEvidence captures execution evidence for one URL in the acquisition benchmark.
 type AcquisitionEntryEvidence struct {
-	EntryID             string                 `json:"entry_id"` // stable aweme_id or canonical URL key
-	CanonicalURL        string                 `json:"canonical_url"`
-	ExpectedAwemeID     string                 `json:"expected_aweme_id"`
-	ObservedAwemeID     string                 `json:"observed_aweme_id,omitempty"`
-	SourceAssetID       string                 `json:"source_asset_id,omitempty"`       // Native SourceAsset UUID
-	SourceAssetCASHash  string                 `json:"source_asset_cas_hash,omitempty"` // Immutable CAS hash
-	IntegrityPassed     bool                   `json:"integrity_passed"`
-	ExpectedDurationMs  int64                  `json:"expected_duration_ms"`
-	ObservedDurationMs  int64                  `json:"observed_duration_ms"`
-	DurationToleranceMs int64                  `json:"duration_tolerance_ms"`
-	HTTPStatusCode      int                    `json:"http_status_code"`
-	Status              string                 `json:"status"` // "PASS", "FAIL", "CONTENT_UNAVAILABLE", "DISAPPEARED"
-	ErrorMessage        string                 `json:"error_message,omitempty"`
-	Attempts            []ProviderAttemptRef   `json:"attempts,omitempty"`
-	Decisions           []SelectionDecisionRef `json:"decisions,omitempty"`
-	Timestamp           time.Time              `json:"timestamp"`
+	EntryID              string                    `json:"entry_id"` // stable aweme_id or canonical URL key
+	CanonicalURL         string                    `json:"canonical_url"`
+	ExpectedAwemeID      string                    `json:"expected_aweme_id"`
+	ObservedAwemeID      string                    `json:"observed_aweme_id,omitempty"`
+	SourceAssetID        string                    `json:"source_asset_id,omitempty"`       // Native SourceAsset UUID
+	SourceAssetCASHash   string                    `json:"source_asset_cas_hash,omitempty"` // Immutable CAS hash
+	IntegrityPassed      bool                      `json:"integrity_passed"`
+	AudioIntegrityPassed bool                      `json:"audio_integrity_passed,omitempty"`
+	IsLocalSubstitution  bool                      `json:"is_local_substitution,omitempty"`
+	ExpectedDurationMs   int64                     `json:"expected_duration_ms"`
+	ObservedDurationMs   int64                     `json:"observed_duration_ms"`
+	DurationToleranceMs  int64                     `json:"duration_tolerance_ms"`
+	HTTPStatusCode       int                       `json:"http_status_code"`
+	AcquiredMediaType    string                    `json:"acquired_media_type,omitempty"`
+	ProviderID           string                    `json:"provider_id,omitempty"`
+	Method               string                    `json:"method,omitempty"`
+	Status               string                    `json:"status"` // "PASS", "FAIL", "CONTENT_UNAVAILABLE", "DISAPPEARED"
+	ErrorMessage         string                    `json:"error_message,omitempty"`
+	DisappearanceProof   *OracleDisappearanceProof `json:"disappearance_proof,omitempty"`
+	Attempts             []ProviderAttemptRef      `json:"attempts,omitempty"`
+	Decisions            []SelectionDecisionRef    `json:"decisions,omitempty"`
+	Timestamp            time.Time                 `json:"timestamp"`
+}
+
+// CaseMeasuredStageArtifacts holds typed stage artifacts returned by public RuntimeHost endpoints.
+type CaseMeasuredStageArtifacts struct {
+	Transcript             *domain.TranscriptArtifact     `json:"transcript,omitempty"`
+	Translation            *domain.TranslationVariant     `json:"translation,omitempty"`
+	DubScript              *domain.DubScriptVariant       `json:"dub_script,omitempty"`
+	VoiceAssignment        *domain.VoiceAssignment        `json:"voice_assignment,omitempty"`
+	DubSegments            *domain.DubSegmentsVariant     `json:"dub_segments,omitempty"`
+	DubMix                 *domain.DubMixArtifact         `json:"dub_mix,omitempty"`
+	LocalizedVisualTrack   *domain.LocalizedVisualTrack   `json:"localized_visual_track,omitempty"`
+	LocalizedSubtitleTrack *domain.LocalizedSubtitleTrack `json:"localized_subtitle_track,omitempty"`
+	FinalRender            *domain.FinalRenderArtifact    `json:"final_render,omitempty"`
 }
 
 // QualityCaseEvidence captures full execution evidence for one quality corpus case
 // (Source video x target language x profile).
 type QualityCaseEvidence struct {
-	CaseID             string                            `json:"case_id"` // e.g. "video_01_vi"
-	SourceVideoID      string                            `json:"source_video_id"`
-	PrimaryCategory    string                            `json:"primary_category"`
-	TargetLanguage     string                            `json:"target_language"`
-	Profile            string                            `json:"profile"` // "local", "hybrid"
-	JobID              string                            `json:"job_id"`  // Native LocalizationJob UUID
-	RunID              string                            `json:"run_id"`  // Native LocalizationRun UUID
-	SourceAssetID      string                            `json:"source_asset_id"`
-	SourceAssetCASHash string                            `json:"source_asset_cas_hash"`
-	Stages             map[string]StageExecutionEvidence `json:"stages"`
-	RelationalQC       RelationalQCEvidence              `json:"relational_qc"`
-	Decisions          []SelectionDecisionRef            `json:"decisions,omitempty"`
-	Telemetry          []ResourceTelemetrySample         `json:"telemetry,omitempty"`
-	Status             string                            `json:"status"` // "PENDING", "IN_PROGRESS", "COMPLETED", "FAILED"
-	ErrorMessage       string                            `json:"error_message,omitempty"`
-	CreatedAt          time.Time                         `json:"created_at"`
-	CompletedAt        *time.Time                        `json:"completed_at,omitempty"`
+	CaseID              string                            `json:"case_id"` // e.g. "video_01_vi"
+	SourceVideoID       string                            `json:"source_video_id"`
+	PrimaryCategory     string                            `json:"primary_category"`
+	TargetLanguage      string                            `json:"target_language"`
+	Profile             string                            `json:"profile"` // "local", "hybrid"
+	JobID               string                            `json:"job_id"`  // Native LocalizationJob UUID
+	RunID               string                            `json:"run_id"`  // Native LocalizationRun UUID
+	SourceAssetID       string                            `json:"source_asset_id"`
+	SourceAssetCASHash  string                            `json:"source_asset_cas_hash"`
+	Stages              map[string]StageExecutionEvidence `json:"stages"`
+	RelationalQC        RelationalQCEvidence              `json:"relational_qc"`
+	Decisions           []SelectionDecisionRef            `json:"decisions,omitempty"`
+	Telemetry           []ResourceTelemetrySample         `json:"telemetry,omitempty"`
+	Status              string                            `json:"status"` // "PENDING", "IN_PROGRESS", "COMPLETED", "FAILED"
+	ErrorMessage        string                            `json:"error_message,omitempty"`
+	CreatedAt           time.Time                         `json:"created_at"`
+	CompletedAt         *time.Time                        `json:"completed_at,omitempty"`
+	StageArtifacts      *CaseMeasuredStageArtifacts       `json:"stage_artifacts,omitempty"`
+	ReferencePackID     string                            `json:"reference_pack_id,omitempty"`
+	ReferencePackDigest string                            `json:"reference_pack_digest,omitempty"`
+	IsNoDub             bool                              `json:"is_no_dub,omitempty"`
+	Metrics             *CaseQualityMetrics               `json:"metrics,omitempty"`
 }

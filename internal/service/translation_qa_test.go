@@ -76,6 +76,87 @@ func TestMeaningFirstQAGate_NumberCorruption(t *testing.T) {
 	}
 }
 
+func TestMeaningFirstQAGate_AcceptsEnglishFrequencyCountWords(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+
+	if nums := service.ExtractNumbers("tie it twice", "en"); !nums["2"] {
+		t.Fatalf("expected ExtractNumbers to contain 2, got %v", nums)
+	}
+
+	source := "交叉绑提手两次就能滴水不漏"
+	target := "Cross the handles and tie it twice so it will not leak."
+	res := qa.ValidateSegment(source, target, "zh", "en")
+	if !res.Passed {
+		t.Fatalf("expected twice to satisfy 两次, got violations: %v, err: %v", res.Violations, res.Err)
+	}
+}
+
+func TestExtractNumbers_ChineseAspectualYiNotQuantity(t *testing.T) {
+	// Aspectual/action 一+verb, adverbials, ordinals, labels: no hard 1.
+	for _, src := range []string{
+		"手机手电筒一照", "手 机 手 电 筒 一 照",
+		"当你想要看洗浴用品余量只需要用手机手电筒一照",
+		"一拉", "一 拉", "一剥", "一 剥", "一扯", "一 扯",
+		"感受一下这期", "人物一直輸出", "都不一样", "都不一樣",
+		"在了一起", "准备一些音乐", "用力一切不破",
+		"放一点补充", "时间一分一秒的流失",
+		"话一和话六", "第一件事先去化妆", "第十名",
+	} {
+		if nums := service.ExtractNumbers(src, "zh"); nums["1"] {
+			t.Errorf("expected no hard 1 in %q, got %v", src, nums)
+		}
+	}
+}
+
+func TestExtractNumbers_ChineseExplicitQuantity(t *testing.T) {
+	cases := []struct {
+		src  string
+		want string
+	}{
+		{"交叉绑提手两次", "2"},
+		{"交叉绑提手两 次", "2"},
+		{"微波炉高火二十秒", "20"},
+		{"微波炉高火二 十 秒", "20"},
+		{"只需要一个衣架", "1"},
+		{"只需要一 个 衣 架", "1"},
+		{"温度调到二十五度", "25"},
+		{"温度调到二 十 五 度", "25"},
+		{"三天三夜", "3"},
+		{"十分钟吃饭", "10"},
+		{"这还真是八小时工作制", "8"},
+		{"我呼气得有一斤多", "1"},
+		{"二斤", "2"},
+		{"只需要一個一架", "1"},
+		{"大家三种技巧", "3"},
+		{"七种画面处理方式", "7"},
+		{"複製一層畫面", "1"},
+		{"贏得了一粒點球", "1"},
+	}
+	for _, tc := range cases {
+		if nums := service.ExtractNumbers(tc.src, "zh"); !nums[tc.want] {
+			t.Errorf("expected %s in %q, got %v", tc.want, tc.src, nums)
+		}
+	}
+
+	// Spaced enumerations stay separate numerals without quantity context.
+	if nums := service.ExtractNumbers("一 二 三", "zh"); len(nums) != 0 {
+		t.Errorf("expected no hard numbers in enumeration, got %v", nums)
+	}
+}
+
+func TestMeaningFirstQAGate_ChineseAspectualYiPasses(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+
+	res := qa.ValidateSegment(
+		"当你想要看洗浴用品余量只需要用手机手电筒一照",
+		"dùng đèn pin điện thoại để chiếu vào",
+		"zh", "vi",
+	)
+	if !res.Passed {
+		t.Fatalf("expected aspectual 一照 to pass number gate, got violations=%v err=%v", res.Violations, res.Err)
+	}
+}
+
 func TestMeaningFirstQAGate_NegationInversion(t *testing.T) {
 	qa := service.NewMeaningFirstQAGate()
 
@@ -100,6 +181,68 @@ func TestMeaningFirstQAGate_NegationInversion(t *testing.T) {
 	if !errors.Is(res2.Err, domain.ErrNegationInverted) {
 		t.Errorf("expected ErrNegationInverted, got: %v", res2.Err)
 	}
+
+	// 3. Proper-name & transliteration controls with standalone "Phi" (should NOT trigger negation inversion)
+	for _, nameCase := range []struct {
+		src string
+		tgt string
+	}{
+		{"王菲在北京开演唱会", "Vương Phi tổ chức hòa nhạc tại Bắc Kinh."},
+		{"黄飞鸿是武术大师", "Hoàng Phi Hồng là bậc thầy võ thuật."},
+		{"刘德华在电影里表演", "Lưu Đức Hoa biểu diễn trong phim điện ảnh."},
+		{"张飞是蜀汉名将", "Trương Phi là danh tướng Thục Hán."},
+		{"燕飞在天空中自由翱翔", "Yến phi tự do lượn trên bầu trời."},
+		{"陈飞宇参演了新电影", "Trần Phi Vũ tham gia phim mới."},
+		{"这是李菲的个人作品", "Đây là tác phẩm cá nhân của Lý Phi."},
+		{"飞鸟在森林里唱歌", "Phi điểu ca hát trong rừng rậm."},
+	} {
+		res := qa.ValidateSegment(nameCase.src, nameCase.tgt, "zh", "vi")
+		if !res.Passed {
+			t.Errorf("expected proper name / non-negating token with 'Phi' in %q -> %q to pass QA, but failed: %v (err: %v)",
+				nameCase.src, nameCase.tgt, res.Violations, res.Err)
+		}
+	}
+
+	// 4. Genuine Vietnamese negation controls (MUST REMAIN FAIL-CLOSED)
+	// 4a: Source affirmative translated with sentence-level negator -> MUST FAIL
+	for _, falseNegCase := range []struct {
+		src string
+		tgt string
+	}{
+		{"我们去吃晚餐", "Chúng ta không đi ăn tối."},
+		{"大家一起看电影", "Mọi người chưa xem phim."},
+		{"你可以打开大门", "Bạn đừng mở cửa lớn."},
+		{"这里允许吸烟", "Ở đây cấm hút thuốc."},
+		{"该行为符合法律规定", "Hành vi đó là phi pháp."},
+		{"他的解释非常合理", "Lời giải thích của anh ấy là vô lý."},
+	} {
+		res := qa.ValidateSegment(falseNegCase.src, falseNegCase.tgt, "zh", "vi")
+		if res.Passed {
+			t.Errorf("expected added negation in %q -> %q to FAIL QA, but passed", falseNegCase.src, falseNegCase.tgt)
+		}
+		if !errors.Is(res.Err, domain.ErrNegationInverted) {
+			t.Errorf("expected ErrNegationInverted for %q -> %q, got: %v", falseNegCase.src, falseNegCase.tgt, res.Err)
+		}
+	}
+
+	// 4b: Source negative translated affirmatively -> MUST FAIL
+	for _, droppedNegCase := range []struct {
+		src string
+		tgt string
+	}{
+		{"他不喜欢这个礼物", "Anh ấy thích món quà này."},
+		{"我们还没有完成任务", "Chúng tôi đã hoàn thành nhiệm vụ."},
+		{"严禁在此处拍照", "Được phép chụp ảnh ở đây."},
+		{"不要随意走动", "Hãy đi lại thoải mái."},
+	} {
+		res := qa.ValidateSegment(droppedNegCase.src, droppedNegCase.tgt, "zh", "vi")
+		if res.Passed {
+			t.Errorf("expected dropped negation in %q -> %q to FAIL QA, but passed", droppedNegCase.src, droppedNegCase.tgt)
+		}
+		if !errors.Is(res.Err, domain.ErrNegationInverted) {
+			t.Errorf("expected ErrNegationInverted for %q -> %q, got: %v", droppedNegCase.src, droppedNegCase.tgt, res.Err)
+		}
+	}
 }
 
 func TestMeaningFirstQAGate_NameCorruption(t *testing.T) {
@@ -115,6 +258,13 @@ func TestMeaningFirstQAGate_NameCorruption(t *testing.T) {
 	if !errors.Is(res.Err, domain.ErrNameCorrupted) {
 		t.Errorf("expected ErrNameCorrupted, got: %v", res.Err)
 	}
+
+	// Diacritic-decorated latin transliterations of protected ASCII names (e.g. VörtexBrand -> VortexBrand)
+	// must pass QA as valid matching names.
+	resDiacritic := qa.ValidateSegment("VortexBrand", "VörtexBrand", "zh", "vi")
+	if !resDiacritic.Passed {
+		t.Fatalf("expected diacritic-decorated transliteration 'VörtexBrand' to match 'VortexBrand', got violations: %v", resDiacritic.Violations)
+	}
 }
 
 func TestMeaningFirstQAGate_EmptyFact(t *testing.T) {
@@ -129,5 +279,426 @@ func TestMeaningFirstQAGate_EmptyFact(t *testing.T) {
 	}
 	if !errors.Is(res.Err, domain.ErrFactCorrupted) {
 		t.Errorf("expected ErrFactCorrupted, got: %v", res.Err)
+	}
+}
+
+func TestMeaningFirstQAGate_AllCapsLexicalWordsNotProtected(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+
+	// "TOTAL DAMAGE CAE" translated naturally to Vietnamese where TOTAL and DAMAGE
+	// are translated as "Tổng thiệt hại" but short acronym CAE is preserved.
+	source := "TOTAL DAMAGE CAE"
+	naturalTarget := "Tổng thiệt hại CAE"
+
+	res := qa.ValidateSegment(source, naturalTarget, "en", "vi")
+	if !res.Passed {
+		t.Fatalf("expected natural translation of 'TOTAL DAMAGE CAE' to pass, but got violations: %v, err: %v", res.Violations, res.Err)
+	}
+
+	// If the short acronym CAE is dropped/corrupted, it MUST still fail
+	corruptedTarget := "Tổng thiệt hại hoàn toàn"
+	resCorrupted := qa.ValidateSegment(source, corruptedTarget, "en", "vi")
+	if resCorrupted.Passed {
+		t.Fatalf("expected dropped acronym CAE to fail QA gate, but it passed")
+	}
+	if !errors.Is(resCorrupted.Err, domain.ErrNameCorrupted) {
+		t.Errorf("expected ErrNameCorrupted for dropped CAE, got: %v", resCorrupted.Err)
+	}
+}
+
+func TestMeaningFirstQAGate_ProtectedASCIIFormsRetained(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+
+	// 1. Short acronym (HD) preserved
+	resHD := qa.ValidateSegment("Video quay ở chế độ HD sắc nét.", "Video shot in HD is sharp.", "vi", "en")
+	if !resHD.Passed {
+		t.Fatalf("expected HD preserved to pass, got: %v", resHD.Err)
+	}
+	resHDDrop := qa.ValidateSegment("Video quay ở chế độ HD sắc nét.", "Video shot in high definition is sharp.", "vi", "en")
+	if resHDDrop.Passed {
+		t.Fatalf("expected dropped HD to fail, but passed")
+	}
+
+	// 2. Digit-bearing token (4K) preserved
+	res4K := qa.ValidateSegment("Hỗ trợ xuất video 4K siêu nét.", "Supports 4K video export.", "vi", "en")
+	if !res4K.Passed {
+		t.Fatalf("expected 4K preserved to pass, got: %v", res4K.Err)
+	}
+	res4KDrop := qa.ValidateSegment("Hỗ trợ xuất video 4K siêu nét.", "Supports ultra high resolution video export.", "vi", "en")
+	if res4KDrop.Passed {
+		t.Fatalf("expected dropped 4K to fail, but passed")
+	}
+
+	// 3. Known entity brand (SUPOR) remains protected even though >= 4 chars all-caps
+	resSupor := qa.ValidateSegment("SUPOR电饭煲", "Nồi cơm điện SUPOR", "zh", "vi")
+	if !resSupor.Passed {
+		t.Fatalf("expected SUPOR preserved to pass, got: %v", resSupor.Err)
+	}
+	resSuporDrop := qa.ValidateSegment("SUPOR电饭煲", "Nồi cơm điện cao cấp", "zh", "vi")
+	if resSuporDrop.Passed {
+		t.Fatalf("expected dropped SUPOR to fail, but passed")
+	}
+
+	// 4. Mixed-case brand (iPhone) preserved
+	resIPhone := qa.ValidateSegment("使用iPhone拍摄", "Quay bằng iPhone", "zh", "vi")
+	if !resIPhone.Passed {
+		t.Fatalf("expected iPhone preserved to pass, got: %v", resIPhone.Err)
+	}
+	resIPhoneDrop := qa.ValidateSegment("使用iPhone拍摄", "Quay bằng điện thoại", "zh", "vi")
+	if resIPhoneDrop.Passed {
+		t.Fatalf("expected dropped iPhone to fail, but passed")
+	}
+}
+
+func TestMeaningFirstQAGate_ThreeDigitGroupNumberEquivalence(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+
+	// 1. Observed pair: "6 909999520" -> "6 909 999 520" passes
+	resObserved := qa.ValidateSegment("6 909999520", "6 909 999 520", "zh", "vi")
+	if !resObserved.Passed {
+		t.Fatalf("expected observed pair '6 909999520' -> '6 909 999 520' to pass, got violations: %v, err: %v", resObserved.Violations, resObserved.Err)
+	}
+
+	// 2. Exact 9-digit sequence: "909999520" -> "909 999 520" passes
+	resGrouped := qa.ValidateSegment("909999520", "909 999 520", "zh", "vi")
+	if !resGrouped.Passed {
+		t.Fatalf("expected '909999520' -> '909 999 520' to pass, got violations: %v, err: %v", resGrouped.Violations, resGrouped.Err)
+	}
+
+	// 3. Merged direction: "909 999 520" -> "909999520" passes
+	resMerged := qa.ValidateSegment("909 999 520", "909999520", "zh", "vi")
+	if !resMerged.Passed {
+		t.Fatalf("expected '909 999 520' -> '909999520' to pass, got violations: %v, err: %v", resMerged.Violations, resMerged.Err)
+	}
+
+	// 4. Changed final digit fails: "909999520" -> "909 999 521"
+	resDiffFinal := qa.ValidateSegment("909999520", "909 999 521", "zh", "vi")
+	if resDiffFinal.Passed {
+		t.Fatalf("expected changed final digit '909999520' -> '909 999 521' to fail, but it passed")
+	}
+	if !errors.Is(resDiffFinal.Err, domain.ErrNumberCorrupted) {
+		t.Errorf("expected ErrNumberCorrupted, got: %v", resDiffFinal.Err)
+	}
+
+	// 5. Short numbers: "10 20" -> "1020" still fails
+	resShort := qa.ValidateSegment("10 20", "1020", "zh", "vi")
+	if resShort.Passed {
+		t.Fatalf("expected '10 20' -> '1020' to fail, but it passed")
+	}
+	if !errors.Is(resShort.Err, domain.ErrNumberCorrupted) {
+		t.Errorf("expected ErrNumberCorrupted, got: %v", resShort.Err)
+	}
+}
+
+func TestMeaningFirstQAGate_PlainTitleCaseNotProtected(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+
+	// 1. Plain TitleCase: Shift -> Chuyển đổi PASS
+	resShift := qa.ValidateSegment("Shift", "Chuyển đổi", "zh", "vi")
+	if !resShift.Passed {
+		t.Fatalf("expected 'Shift' -> 'Chuyển đổi' to pass, got violations: %v, err: %v", resShift.Violations, resShift.Err)
+	}
+
+	// 2. Plain TitleCase: Total -> Tổng PASS
+	resTotal := qa.ValidateSegment("Total", "Tổng", "en", "vi")
+	if !resTotal.Passed {
+		t.Fatalf("expected 'Total' -> 'Tổng' to pass, got violations: %v, err: %v", resTotal.Violations, resTotal.Err)
+	}
+
+	// 3. Dropping iPhone or YouTube FAIL
+	resIPhoneDrop := qa.ValidateSegment("iPhone", "Điện thoại", "en", "vi")
+	if resIPhoneDrop.Passed {
+		t.Fatalf("expected dropping iPhone to fail QA gate, but passed")
+	}
+	if !errors.Is(resIPhoneDrop.Err, domain.ErrNameCorrupted) {
+		t.Errorf("expected ErrNameCorrupted for dropped iPhone, got: %v", resIPhoneDrop.Err)
+	}
+
+	resYouTubeDrop := qa.ValidateSegment("YouTube", "Trang video", "en", "vi")
+	if resYouTubeDrop.Passed {
+		t.Fatalf("expected dropping YouTube to fail QA gate, but passed")
+	}
+	if !errors.Is(resYouTubeDrop.Err, domain.ErrNameCorrupted) {
+		t.Errorf("expected ErrNameCorrupted for dropped YouTube, got: %v", resYouTubeDrop.Err)
+	}
+
+	// 4. Dropping SUPOR or Matcha FAIL
+	resSuporDrop := qa.ValidateSegment("SUPOR", "Nồi cơm điện", "zh", "vi")
+	if resSuporDrop.Passed {
+		t.Fatalf("expected dropping SUPOR to fail QA gate, but passed")
+	}
+	if !errors.Is(resSuporDrop.Err, domain.ErrNameCorrupted) {
+		t.Errorf("expected ErrNameCorrupted for dropped SUPOR, got: %v", resSuporDrop.Err)
+	}
+
+	resMatchaDrop := qa.ValidateSegment("Matcha", "Trà xanh", "zh", "vi")
+	if resMatchaDrop.Passed {
+		t.Fatalf("expected dropping Matcha to fail QA gate, but passed")
+	}
+	if !errors.Is(resMatchaDrop.Err, domain.ErrNameCorrupted) {
+		t.Errorf("expected ErrNameCorrupted for dropped Matcha, got: %v", resMatchaDrop.Err)
+	}
+}
+
+func TestMeaningFirstQAGate_QuantityCompoundTokensNotProtectedAsNames(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+
+	// 1. "3MINUTE" -> "3 phút" PASS (exact quantity token)
+	resMinute := qa.ValidateSegment("3MINUTE", "3 phút", "zh", "vi")
+	if !resMinute.Passed {
+		t.Fatalf("expected '3MINUTE' -> '3 phút' to pass, got violations: %v, err: %v", resMinute.Violations, resMinute.Err)
+	}
+	// 2. OCR-tolerant quantity tokens against whitelisted unit words (edit distance <= 1):
+	// 2a. Deletion: "3DY" (deletion of 'A' from DAY) -> "3 ngày" PASS
+	resDyVi := qa.ValidateSegment("3DY", "3 ngày", "zh", "vi")
+	if !resDyVi.Passed {
+		t.Fatalf("expected '3DY' -> '3 ngày' to pass, got violations: %v, err: %v", resDyVi.Violations, resDyVi.Err)
+	}
+	resDyEn := qa.ValidateSegment("3DY", "3 days", "zh", "en")
+	if !resDyEn.Passed {
+		t.Fatalf("expected '3DY' -> '3 days' to pass, got violations: %v, err: %v", resDyEn.Violations, resDyEn.Err)
+	}
+	// 2b. Deletion: "3MINUE" (deletion of 'T' from MINUTE) -> "3 phút" PASS
+	resMinue := qa.ValidateSegment("3MINUE", "3 phút", "zh", "vi")
+	if !resMinue.Passed {
+		t.Fatalf("expected '3MINUE' -> '3 phút' to pass, got violations: %v, err: %v", resMinue.Violations, resMinue.Err)
+	}
+	// 2c. Insertion: "5MINUTEE" (insertion of 'E' in MINUTE) -> "5 phút" PASS
+	resMinutee := qa.ValidateSegment("5MINUTEE", "5 phút", "zh", "vi")
+	if !resMinutee.Passed {
+		t.Fatalf("expected '5MINUTEE' -> '5 phút' to pass, got violations: %v, err: %v", resMinutee.Violations, resMinutee.Err)
+	}
+	// 2d. Substitution: "3DEY" (substitution 'A'->'E' in DAY) -> "3 ngày" PASS
+	resDey := qa.ValidateSegment("3DEY", "3 ngày", "zh", "vi")
+	if !resDey.Passed {
+		t.Fatalf("expected '3DEY' -> '3 ngày' to pass, got violations: %v, err: %v", resDey.Violations, resDey.Err)
+	}
+	// 3. "20KG" and "500ML" PASS
+	resKg := qa.ValidateSegment("20KG", "20 kg", "en", "vi")
+	if !resKg.Passed {
+		t.Fatalf("expected '20KG' -> '20 kg' to pass, got violations: %v, err: %v", resKg.Violations, resKg.Err)
+	}
+	resMl := qa.ValidateSegment("500ML", "500 ml", "en", "vi")
+	if !resMl.Passed {
+		t.Fatalf("expected '500ML' -> '500 ml' to pass, got violations: %v, err: %v", resMl.Violations, resMl.Err)
+	}
+
+	// 4. "3MINUE" -> "4 phút" FAIL number preservation
+	resMinueCorrupt := qa.ValidateSegment("3MINUE", "4 phút", "zh", "vi")
+	if resMinueCorrupt.Passed {
+		t.Fatalf("expected '3MINUE' -> '4 phút' to fail number preservation, but passed")
+	}
+	if !errors.Is(resMinueCorrupt.Err, domain.ErrNumberCorrupted) {
+		t.Errorf("expected ErrNumberCorrupted for '3MINUE' -> '4 phút', got: %v", resMinueCorrupt.Err)
+	}
+
+	// 5. Arbitrary "3BRAND" and short-unit typos (e.g. 3KGG) stay protected as brand/name
+	resBrandTrans := qa.ValidateSegment("3BRAND", "3 nhãn hiệu", "zh", "vi")
+	if resBrandTrans.Passed {
+		t.Fatalf("expected translated '3BRAND' -> '3 nhãn hiệu' to fail name preservation, but passed")
+	}
+	if !errors.Is(resBrandTrans.Err, domain.ErrNameCorrupted) {
+		t.Errorf("expected ErrNameCorrupted for translated '3BRAND', got: %v", resBrandTrans.Err)
+	}
+
+	resBrandDrop := qa.ValidateSegment("3BRAND", "nhãn hiệu", "zh", "vi")
+	if resBrandDrop.Passed {
+		t.Fatalf("expected dropped '3BRAND' -> 'nhãn hiệu' to fail, but passed")
+	}
+	if !errors.Is(resBrandDrop.Err, domain.ErrNameCorrupted) && !errors.Is(resBrandDrop.Err, domain.ErrNumberCorrupted) {
+		t.Errorf("expected ErrNameCorrupted or ErrNumberCorrupted for dropped '3BRAND', got: %v", resBrandDrop.Err)
+	}
+
+	// Short unit typo like "3KGG" or "3KGS" must not be fuzzied into a quantity token
+	resKgg := qa.ValidateSegment("3KGG", "3 kg", "zh", "vi")
+	if resKgg.Passed {
+		t.Fatalf("expected short-unit typo '3KGG' -> '3 kg' to fail name preservation, but passed")
+	}
+	if !errors.Is(resKgg.Err, domain.ErrNameCorrupted) {
+		t.Errorf("expected ErrNameCorrupted for short-unit typo '3KGG', got: %v", resKgg.Err)
+	}
+	// 6. Protected tokens: 4K, MP4, H264, iPhone, YouTube, SUPOR stay protected
+	for _, protected := range []struct {
+		src string
+		tgt string
+		tok string
+	}{
+		{"Video 4K", "Video 4 siêu nét", "4K"},
+		{"Định dạng MP4", "Định dạng 4 video", "MP4"},
+		{"Chuẩn nén H264", "Chuẩn nén 264 video", "H264"},
+		{"Điện thoại iPhone", "Điện thoại thông minh", "iPhone"},
+		{"Kênh YouTube", "Kênh video", "YouTube"},
+		{"SUPOR电饭煲", "Nồi cơm điện", "SUPOR"},
+	} {
+		res := qa.ValidateSegment(protected.src, protected.tgt, "zh", "vi")
+		if res.Passed {
+			t.Fatalf("expected dropping '%s' in '%s' -> '%s' to fail name preservation, but passed", protected.tok, protected.src, protected.tgt)
+		}
+		if !errors.Is(res.Err, domain.ErrNameCorrupted) {
+			t.Errorf("expected ErrNameCorrupted for '%s', got: %v", protected.tok, res.Err)
+		}
+	}
+
+	// 7. Dropping the number "3" entirely from "3MINUTE" fails number check
+	resDropNum := qa.ValidateSegment("3MINUTE", "vài phút", "zh", "vi")
+	if resDropNum.Passed {
+		t.Fatalf("expected dropping number in '3MINUTE' -> 'vài phút' to fail, but passed")
+	}
+	if !errors.Is(resDropNum.Err, domain.ErrNumberCorrupted) {
+		t.Errorf("expected ErrNumberCorrupted, got: %v", resDropNum.Err)
+	}
+}
+func TestMeaningFirstQAGate_QuestionTagNegationNotPolarityInverted(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+
+	// Case 1: "他应该是喜欢你不" ends with question tag where "不" is an interrogative modal particle ("right?", "isn't he?").
+	// Translating to affirmative "Anh ấy chắc là thích cậu" must pass QA and NOT trigger negation polarity inversion.
+	src := "他应该是喜欢你不"
+	tgt := "Anh ấy chắc là thích cậu."
+	res := qa.ValidateSegment(src, tgt, "zh", "vi")
+	if !res.Passed {
+		t.Fatalf("expected question particle '不' in %q not to trigger negation inversion, got: %v (err: %v)", src, res.Violations, res.Err)
+	}
+
+	// Case 2 (The Authoritative 7679392272936389915 Segment 21 shape):
+	// In unpunctuated ASR streams, a clause-final question tag with 不 is followed immediately
+	// by a new clause (e.g. "他应该是喜欢你不你长得真帅").
+	// The interrogative tag 不 must not be treated as semantic negation.
+	srcUnpunct := "他应该是喜欢你不你长得真帅"
+	tgtUnpunct := "Anh ấy chắc là thích cậu, cậu đẹp trai thật."
+	resUnpunct := qa.ValidateSegment(srcUnpunct, tgtUnpunct, "zh", "vi")
+	if !resUnpunct.Passed {
+		t.Fatalf("expected clause-final question tag '不' followed by new clause in %q not to trigger negation inversion, got: %v (err: %v)", srcUnpunct, resUnpunct.Violations, resUnpunct.Err)
+	}
+
+	// Case 3: Other dialectal/colloquial tag-question markers with clause-level boundary in unpunctuated streams:
+	// e.g. "...行不行...", "...好不好...", "...对不对..." or clause-boundary "...好不我走了", "...对不你说呢"
+	for _, tagSrc := range []struct {
+		src string
+		tgt string
+	}{
+		{"你明天来不我们一起去", "Ngày mai cậu tới chứ, chúng ta cùng đi nhé."},
+		{"这件衣服好看不行的话就换", "Bộ đồ này đẹp nhỉ, được thì lấy không thì đổi."},
+		{"这道菜好吃不对吧", "Món này ngon đúng không."},
+	} {
+		r := qa.ValidateSegment(tagSrc.src, tagSrc.tgt, "zh", "vi")
+		if !r.Passed {
+			t.Errorf("expected tag question %q to pass QA, got: %v", tagSrc.src, r.Violations)
+		}
+	}
+
+	// Negative Controls (Fail-closed verification):
+	// Genuine negation using 不 must REMAIN fail-closed when translated affirmatively!
+	for _, negSrc := range []struct {
+		src string
+		tgt string
+	}{
+		{"他不喜欢你你长得不帅", "Anh ấy thích cậu, cậu đẹp trai."},
+		{"我不会去参加这个会议", "Tôi sẽ tham gia cuộc họp này."},
+		{"不能打开窗户", "Có thể mở cửa sổ."},
+		{"不仅如此他还不吃肉", "Hơn nữa anh ấy thích ăn thịt."},
+		{"他不是学生", "Anh ấy là học sinh."},
+		{"走不走", "Đi thôi."},
+	} {
+		r := qa.ValidateSegment(negSrc.src, negSrc.tgt, "zh", "vi")
+		if r.Passed {
+			t.Errorf("expected genuine negation %q translated affirmatively as %q to FAIL QA, but passed", negSrc.src, negSrc.tgt)
+		}
+		if !errors.Is(r.Err, domain.ErrNegationInverted) {
+			t.Errorf("expected ErrNegationInverted for %q, got: %v", negSrc.src, r.Err)
+		}
+	}
+}
+
+// TestMeaningFirstQAGate_ProtectedASCIITokenPassThrough is the production
+// regression for asset 7674828203650994041 region-036: the OCR brand fragment
+// "CH" must pass through verbatim. A hallucinated negation sentence over that
+// brand must stay fail-closed.
+func TestMeaningFirstQAGate_ProtectedASCIITokenPassThrough(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+
+	// Verbatim pass-through of the protected-ASCII brand fragment.
+	rt := qa.ValidateSegment("CH", "CH", "zh", "vi")
+	if !rt.Passed {
+		t.Fatalf("expected bare protected-ASCII brand 'CH' -> 'CH' to pass QA, got: %v (err: %v)", rt.Violations, rt.Err)
+	}
+	if rt.Confidence < 0.9 {
+		t.Fatalf("expected high confidence for verbatim CH pass-through, got %v", rt.Confidence)
+	}
+
+	// Hallucinated negation over the brand must remain fail-closed.
+	rtNeg := qa.ValidateSegment("CH", "Tôi không biết", "zh", "vi")
+	if rtNeg.Passed {
+		t.Fatalf("expected hallucinated negation translation of 'CH' to FAIL QA")
+	}
+	if !errors.Is(rtNeg.Err, domain.ErrNegationInverted) {
+		t.Fatalf("expected ErrNegationInverted for hallucinated negation over 'CH', got: %v", rtNeg.Err)
+	}
+}
+
+// TestMeaningFirstQAGate_Seg21ProductionCandidate is the production regression
+// for asset 7679392272936389915 segment 21: the adverbial "一直" must not be
+// treated as a quantity, and the clause-final tag-particle "不" must not be
+// treated as semantic negation, so the Vietnamese candidate passes.
+func TestMeaningFirstQAGate_Seg21ProductionCandidate(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+	src := "我 也 是 对 了 哥 们 我 咋 咋 一 直 朝 咱 这 儿 看 呢 他 应 该 是 喜 欢 你 不 你 长 得 真 帅"
+	tgt := "Phải rồi anh bạn, sao nó cứ nhìn về chúng ta mãi vậy, chắc nó thích anh đúng không, anh trông thật bảnh"
+	res := qa.ValidateSegment(src, tgt, "zh", "vi")
+	if !res.Passed {
+		t.Fatalf("expected segment 21 candidate to pass QA, got: %v (err: %v)", res.Violations, res.Err)
+	}
+	if res.Confidence < 0.9 {
+		t.Fatalf("expected high confidence for seg21 candidate, got %v", res.Confidence)
+	}
+}
+
+// TestMeaningFirstQAGate_TraditionalNegationMarker is the production regression
+// for asset 7674828203650994041 visual-track region-103/170: the source uses
+// traditional "沒" (U+6C92), not simplified "没" (U+6CA1). The QA gate's zh
+// negator lexicon must recognize both forms, otherwise correctly-negative
+// translations are wrongly rejected (affirmative -> negative) and genuine
+// inversions slip through.
+func TestMeaningFirstQAGate_TraditionalNegationMarker(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+
+	// 1. Correctly-negative translation of traditional 沒 source must PASS.
+	res := qa.ValidateSegment(
+		"沒吃完可以这样密封起来",
+		"Có thể đóng kín như thế này nếu chưa ăn hết",
+		"zh", "vi",
+	)
+	if !res.Passed {
+		t.Fatalf("expected correctly-negative translation of traditional 沒 source to pass QA, got violations: %v, err: %v", res.Violations, res.Err)
+	}
+	if res.Confidence < 0.9 {
+		t.Fatalf("expected high confidence for traditional 沒 candidate, got %v", res.Confidence)
+	}
+	if !res.NegationPolarity {
+		t.Fatalf("expected source to be detected as negation for traditional 沒, got affirmative")
+	}
+
+	// 2. Simplified 沒 variant must behave identically.
+	resSimp := qa.ValidateSegment(
+		"没吃完可以这样密封起来",
+		"Có thể đóng kín như thế này nếu chưa ăn hết",
+		"zh", "vi",
+	)
+	if !resSimp.Passed {
+		t.Fatalf("expected correctly-negative translation of simplified 没 source to pass QA, got violations: %v, err: %v", resSimp.Violations, resSimp.Err)
+	}
+
+	// 3. Genuine inversion of traditional 沒 source (target drops negation) must
+	// remain fail-closed.
+	resInvert := qa.ValidateSegment(
+		"沒吃完可以这样密封起来",
+		"Có thể đóng kín như thế này",
+		"zh", "vi",
+	)
+	if resInvert.Passed {
+		t.Fatalf("expected genuine negation-drop inversion of traditional 沒 source to FAIL QA, but it passed")
+	}
+	if !errors.Is(resInvert.Err, domain.ErrNegationInverted) {
+		t.Fatalf("expected ErrNegationInverted for genuine inversion, got: %v", resInvert.Err)
 	}
 }

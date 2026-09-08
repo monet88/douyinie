@@ -290,7 +290,8 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 
 		// License checkpoint validation (versioned & fail-closed)
 		modelName, modelVer := p.ModelInfo()
-		if modelName != "" && r.licenseSvc != nil {
+		primaryRequired := primaryCheckpointRequired(p)
+		if primaryRequired && modelName != "" && r.licenseSvc != nil {
 			if err := r.licenseSvc.VerifyCheckpoint(ctx, modelName, modelVer, ""); err != nil {
 				// If manifest is missing or unverified, fail closed
 				eval.Eligible = false
@@ -310,7 +311,7 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 			requiresSnapshot = true
 		}
 
-		if requiresSnapshot && modelName != "" {
+		if primaryRequired && requiresSnapshot && modelName != "" {
 			if r.snapshotSvc == nil {
 				eval.Eligible = false
 				eval.RejectionCode = "SNAPSHOT_UNVERIFIED"
@@ -400,7 +401,8 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 			continue
 		}
 
-		if req.Language != "" && len(cap.Languages) > 0 && !containsFold(cap.Languages, req.Language) {
+		reqLang := strings.TrimSpace(req.Language)
+		if reqLang != "" && reqLang != "*" && len(cap.Languages) > 0 && !containsFold(cap.Languages, reqLang) {
 			eval.Eligible = false
 			eval.RejectionCode = "LANGUAGE_NOT_SUPPORTED"
 			eval.Reason = fmt.Sprintf("language %s not supported", req.Language)
@@ -423,6 +425,15 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 				evaluations = append(evaluations, eval)
 				continue
 			}
+		}
+
+		// Profile tier gating: Local profile hard-excludes every remote/cloud provider candidate
+		if req.ExecutionProfile == domain.ExecutionProfileLocal && !strings.EqualFold(cap.ExecutionTier, "local") {
+			eval.Eligible = false
+			eval.RejectionCode = "PROFILE_TIER_EXCLUDED"
+			eval.Reason = fmt.Sprintf("execution profile local hard-excludes non-local tier %s", cap.ExecutionTier)
+			evaluations = append(evaluations, eval)
+			continue
 		}
 
 		// 3. Runtime Health & Circuit Breaker Check
@@ -448,7 +459,7 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 		}
 
 		// 4. Profile / Quality / Cost Scoring
-		score := calculateScore(cap, req.ExecutionProfile)
+		score := calculateScore(p.ID(), cap, req.ExecutionProfile)
 		if req.PreferredProviderID != "" {
 			pref := strings.ToLower(req.PreferredProviderID)
 			pid := strings.ToLower(p.ID())
@@ -531,8 +542,7 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 		Decision:         decision,
 	}, nil
 }
-
-func calculateScore(cap domain.ProviderCapability, profile domain.ExecutionProfile) float64 {
+func calculateScore(providerID string, cap domain.ProviderCapability, profile domain.ExecutionProfile) float64 {
 	var baseScore float64
 
 	switch profile {
@@ -555,16 +565,37 @@ func calculateScore(cap domain.ProviderCapability, profile domain.ExecutionProfi
 	case domain.ExecutionProfileHybrid:
 		fallthrough
 	default:
-		// Cost-First Hybrid Default:
-		if strings.EqualFold(cap.ExecutionTier, "local") {
-			baseScore += 6.0
-		} else if strings.EqualFold(cap.ExecutionTier, "hybrid") {
-			baseScore += 5.0
+		// Translation stage has approved frozen hybrid ordering (Issue #66):
+		// gateway gemini-3.8-flash -> gateway deepseek/deepseek-v4-flash-vision-exp -> local Qwen fallback.
+		// Uses exact provider IDs with deterministic score separation so lane ordering
+		// is explicitly guaranteed regardless of minor quality score deltas.
+		if strings.EqualFold(cap.Stage, string(TypeTranslation)) || strings.EqualFold(cap.Stage, "translation") {
+			switch providerID {
+			case GatewayGeminiTranslationProviderID:
+				baseScore += 1000.0
+			case GatewayDeepSeekTranslationProviderID:
+				baseScore += 500.0
+			case WorkerQwenTranslationProviderID, "translation_fake_qwen":
+				baseScore += 100.0
+			default:
+				if strings.EqualFold(cap.ExecutionTier, "cloud") || strings.EqualFold(cap.ExecutionTier, "hybrid") {
+					baseScore += 50.0
+				} else {
+					baseScore += 10.0
+				}
+			}
 		} else {
-			baseScore += 3.0
+			// Cost-First Hybrid Default:
+			if strings.EqualFold(cap.ExecutionTier, "local") {
+				baseScore += 6.0
+			} else if strings.EqualFold(cap.ExecutionTier, "hybrid") {
+				baseScore += 5.0
+			} else {
+				baseScore += 3.0
+			}
+			// Cost penalty
+			baseScore -= cap.CostPerUnit * 10.0
 		}
-		// Cost penalty
-		baseScore -= cap.CostPerUnit * 10.0
 	}
 
 	// Quality boost
@@ -631,6 +662,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 
 	for idx, p := range candidates {
 		modelName, modelVer := p.ModelInfo()
+		primaryRequired := primaryCheckpointRequired(p)
 		var effectivePolicy domain.PolicyState
 
 		// When moving to an alternate candidate (idx > 0), re-evaluate policy eligibility and append selection decision provenance
@@ -662,7 +694,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 				continue
 			}
 
-			if modelName != "" && r.licenseSvc != nil {
+			if primaryRequired && modelName != "" && r.licenseSvc != nil {
 				if err := r.licenseSvc.VerifyCheckpoint(ctx, modelName, modelVer, ""); err != nil {
 					lastErr = err
 					continue
@@ -675,7 +707,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 			if !requiresSnapshot && r.snapshotSvc != nil && r.snapshotSvc.HasBinding(modelName, modelVer) {
 				requiresSnapshot = true
 			}
-			if requiresSnapshot && modelName != "" {
+			if primaryRequired && requiresSnapshot && modelName != "" {
 				if r.snapshotSvc == nil {
 					lastErr = domain.ErrSnapshotUnverified
 					continue
@@ -695,7 +727,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 		if !requiresSnapshot && r.snapshotSvc != nil && r.snapshotSvc.HasBinding(modelName, modelVer) {
 			requiresSnapshot = true
 		}
-		if requiresSnapshot && modelName != "" {
+		if primaryRequired && requiresSnapshot && modelName != "" {
 			if r.snapshotSvc == nil {
 				lastErr = domain.ErrSnapshotUnverified
 				continue
@@ -722,6 +754,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 				CostUnits:     0.0,
 				CreatedAt:     time.Now().UTC(),
 			}
+			enrichAttemptMetadata(&pa, p)
 			if r.db != nil {
 				if err := r.db.RecordProviderAttempt(ctx, pa); err != nil {
 					return fmt.Errorf("fail-closed: record circuit_broken attempt provenance: %w", err)
@@ -745,7 +778,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 						PolicyState:   string(effectivePolicy),
 						HealthOK:      p.IsHealthy(),
 						CircuitClosed: true,
-						Score:         calculateScore(p.Capability(), req.ExecutionProfile),
+						Score:         calculateScore(p.ID(), p.Capability(), req.ExecutionProfile),
 						Reason:        "selected alternate fallback candidate after prior failure",
 					},
 				},
@@ -790,6 +823,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 					CostUnits:     p.Capability().CostPerUnit,
 					CreatedAt:     time.Now().UTC(),
 				}
+				enrichAttemptMetadata(&pa, p)
 				if r.db != nil {
 					if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
 						return fmt.Errorf("fail-closed: record succeeded attempt provenance: %w", errDB)
@@ -828,6 +862,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 					CostUnits:     0.0,
 					CreatedAt:     time.Now().UTC(),
 				}
+				enrichAttemptMetadata(&pa, p)
 				if r.db != nil {
 					if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
 						return fmt.Errorf("fail-closed: record policy_rejected attempt provenance: %w (original: %v)", errDB, err)
@@ -853,6 +888,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 					CostUnits:     p.Capability().CostPerUnit,
 					CreatedAt:     time.Now().UTC(),
 				}
+				enrichAttemptMetadata(&pa, p)
 				if r.db != nil {
 					if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
 						return fmt.Errorf("fail-closed: record quality_failed attempt provenance: %w", errDB)
@@ -877,6 +913,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 				CostUnits:     0.0,
 				CreatedAt:     time.Now().UTC(),
 			}
+			enrichAttemptMetadata(&pa, p)
 			if r.db != nil {
 				if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
 					return fmt.Errorf("fail-closed: record failed attempt provenance: %w", errDB)
@@ -889,4 +926,10 @@ func (r *Router) ExecuteRoutedWithRetry(
 	}
 
 	return fmt.Errorf("all provider candidates failed for stage %s: %w", req.Stage, lastErr)
+}
+
+func enrichAttemptMetadata(pa *domain.ProviderAttempt, p Provider) {
+	prov := ExtractRemoteProvenance(p)
+	pa.ObservedModel = prov.ObservedModel
+	pa.ServiceBaselineID = prov.ServiceBaselineID
 }

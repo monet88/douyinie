@@ -2742,3 +2742,82 @@ func TestDubbingService_SynthesizeAndFit_NoDubPlan_ReturnsErrNoDubbingRequired(t
 		t.Errorf("expected ErrNoDubbingRequired, got %v", err)
 	}
 }
+
+func TestDubbingService_SynthesizeAndFit_ZeroDurationSlot_FlaggedForReview_NeverReachesMixer(t *testing.T) {
+	dubSvc, db, casStore, reg, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, assetID, runID, "vi")
+
+	// Setup DubScriptVariant with 1 zero-duration slot (start_ms == end_ms == 29680)
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          12,
+				SourceText:     "啊",
+				MeaningText:    "A",
+				SpokenText:     "A",
+				SpeakerID:      "SPEAKER_00",
+				StartMs:        29680,
+				EndMs:          29680,
+				SlotDurationMs: 0,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	scriptData, _ := json.Marshal(dubScript)
+	scriptObj, _ := casStore.Put(bytes.NewReader(scriptData))
+	dubScript.CASHash = scriptObj.SHA256
+	_ = db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+		ID:             dubScript.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        scriptObj.SHA256,
+		ProvenanceHash: "prov_script_zero_slot",
+		CreatedAt:      dubScript.CreatedAt,
+	})
+
+	voiceAssign, _ := dubSvc.AssignVoices(context.Background(), domain.VoiceAssignmentInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+
+	// Configure fake provider with measured duration 640ms (like Kokoro/VieNeu synthesized audio)
+	fakeTTS, _ := reg.Get("fake_vieneu_tts_vi")
+	fakeProv := fakeTTS.(*provider.FakeTTSProvider)
+	fakeProv.DurationMs = 640
+
+	jobIn := domain.DubbingJobInput{
+		RunID:               runID,
+		AssetID:             assetID,
+		TargetLanguage:      "vi",
+		DubScriptVariantCAS: dubScript.CASHash,
+		VoiceAssignmentCAS:  voiceAssign.CASHash,
+	}
+
+	dubSegments, err := dubSvc.SynthesizeAndFit(context.Background(), jobIn)
+	if err != nil {
+		t.Fatalf("SynthesizeAndFit failed: %v", err)
+	}
+
+	// Invariant: degenerate 0ms slot cannot fit synthesized audio; MUST NOT reach mixer selected segments!
+	if len(dubSegments.Segments) != 0 {
+		t.Errorf("zero-duration candidate MUST NOT be selected into Segments (mixer input), got %d segments", len(dubSegments.Segments))
+	}
+	if len(dubSegments.ReviewSegments) != 1 {
+		t.Fatalf("expected 1 review segment for zero-duration slot, got %d", len(dubSegments.ReviewSegments))
+	}
+	if dubSegments.OverallStatus != "REVIEW_REQUIRED" {
+		t.Errorf("expected OverallStatus REVIEW_REQUIRED, got %s", dubSegments.OverallStatus)
+	}
+}

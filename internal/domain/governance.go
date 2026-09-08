@@ -22,6 +22,10 @@ var (
 	ErrSnapshotMutatedRehashRequired = errors.New("fail-closed: snapshot mutated since verification; rehash required")
 	ErrDependencySnapshotInvalid     = errors.New("fail-closed: dependency snapshot invalid or unverified")
 	ErrWorkerSnapshotPathRequired    = errors.New("fail-closed: worker snapshot path required but missing or unverified")
+	ErrSnapshotEntrypointAbsent      = errors.New("fail-closed: expected manifest-declared GGUF entrypoint is absent")
+	ErrSnapshotEntrypointAmbiguous   = errors.New("fail-closed: expected manifest-declared GGUF entrypoint is ambiguous")
+	ErrTTSVoiceAssetMissing          = errors.New("fail-closed: selected voice asset missing or unverified in snapshot")
+	ErrSeparatorModelAssetMissing    = errors.New("fail-closed: selected separator model asset missing, unverified, or invalid in snapshot")
 )
 
 // PolicyState represents the four governance states for provider/model routing.
@@ -129,19 +133,21 @@ type SelectionDecision struct {
 
 // ProviderAttempt records an immutable invocation attempt for auditing and retry provenance.
 type ProviderAttempt struct {
-	ID            string    `json:"id"`
-	RunID         string    `json:"run_id"`
-	Stage         string    `json:"stage"`
-	ProviderID    string    `json:"provider_id"`
-	ModelName     string    `json:"model_name"`
-	ModelVersion  string    `json:"model_version"`
-	InputHash     string    `json:"input_hash"`
-	AttemptNumber int       `json:"attempt_number"`
-	Status        string    `json:"status"` // "succeeded", "failed", "quality_failed", "policy_rejected", "circuit_broken"
-	ErrorMessage  string    `json:"error_message,omitempty"`
-	LatencyMs     int64     `json:"latency_ms"`
-	CostUnits     float64   `json:"cost_units"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID                string    `json:"id"`
+	RunID             string    `json:"run_id"`
+	Stage             string    `json:"stage"`
+	ProviderID        string    `json:"provider_id"`
+	ModelName         string    `json:"model_name"`
+	ModelVersion      string    `json:"model_version"`
+	InputHash         string    `json:"input_hash"`
+	AttemptNumber     int       `json:"attempt_number"`
+	Status            string    `json:"status"` // "succeeded", "failed", "quality_failed", "policy_rejected", "circuit_broken"
+	ErrorMessage      string    `json:"error_message,omitempty"`
+	LatencyMs         int64     `json:"latency_ms"`
+	CostUnits         float64   `json:"cost_units"`
+	ObservedModel     string    `json:"observed_model,omitempty"`
+	ServiceBaselineID string    `json:"service_baseline_id,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 // StageCacheIdentityInput encapsulates all components required to compute a deterministic stage CAS cache key.

@@ -429,3 +429,81 @@ func TestComputeCompactSubtitleBounds_Selector(t *testing.T) {
 		t.Errorf("expected safe fallback inside frame, got (%d, %d)", cueOOB.X, cueOOB.Y)
 	}
 }
+func TestGetProtectedBoxesForTimeWindow_TransientZeroTimestamp(t *testing.T) {
+	// A transient protected region observed at t=66000ms only (first_seen_ms=66000, last_seen_ms=66000)
+	// must NOT protect time window [0, 0] (transient observation at t=0ms).
+	regions := []domain.TrackedTextRegion{
+		{
+			ID:          "region-094",
+			FirstSeenMs: 66000,
+			LastSeenMs:  66000,
+			ProtectedMetadata: domain.ProtectedRegionMetadata{
+				IsProtected: true,
+			},
+			Keyframes: []domain.RegionKeyframe{
+				{
+					TimestampMs: 66000,
+					Box:         domain.BoundingBox{X: 816, Y: 168, Width: 129, Height: 117},
+				},
+			},
+		},
+	}
+
+	boxes := domain.GetProtectedBoxesForTimeWindow(regions, nil, 0, 0, "region-002")
+	if len(boxes) != 0 {
+		t.Fatalf("expected 0 protected boxes for window [0, 0] when protected region is at 66000ms, got %d", len(boxes))
+	}
+}
+
+func TestClassifyRegion_SpatioTemporalInstability(t *testing.T) {
+	cfg := domain.DefaultTextRegionClassifyConfig(1920, 1080)
+
+	// Control 1: Moving pseudo-text with 3+ adjacent observations, overlapping/near boxes, materially changing Latin gibberish => IgnoreNoise
+	box1 := domain.BoundingBox{X: 1600, Y: 200, Width: 120, Height: 25}
+	nearbyGibberish := []domain.NearbyObservation{
+		{Text: "XybVqwer", TimestampMs: 19000, Box: domain.BoundingBox{X: 1650, Y: 185, Width: 125, Height: 25}},
+		{Text: "ZopTyuik", TimestampMs: 20000, Box: domain.BoundingBox{X: 1550, Y: 220, Width: 120, Height: 25}},
+	}
+	role1, prot1, _, reason1 := domain.ClassifyRegionWithInstability("MnoPlkjh", box1, 0.58, cfg, nearbyGibberish)
+	if role1 != domain.TextRoleIgnoreNoise {
+		t.Errorf("Control 1: expected IgnoreNoise for unstable pseudo-text sequence, got %v (reason: %s)", role1, reason1)
+	}
+	if prot1.IsProtected {
+		t.Errorf("Control 1: expected IsProtected=false for noise")
+	}
+
+	// Control 2: Stable unknown brand across frames => preserved semantic/brand path
+	box2 := domain.BoundingBox{X: 500, Y: 300, Width: 150, Height: 40}
+	nearbyStableBrand := []domain.NearbyObservation{
+		{Text: "NovaBrandX", TimestampMs: 1000, Box: domain.BoundingBox{X: 502, Y: 301, Width: 150, Height: 40}},
+		{Text: "NovaBrandX", TimestampMs: 1500, Box: domain.BoundingBox{X: 504, Y: 302, Width: 150, Height: 40}},
+	}
+	role2, _, _, _ := domain.ClassifyRegionWithInstability("NovaBrandX", box2, 0.58, cfg, nearbyStableBrand)
+	if role2 == domain.TextRoleIgnoreNoise {
+		t.Errorf("Control 2: stable unknown brand must NOT be classified IgnoreNoise, got %v", role2)
+	}
+	if role2 != domain.TextRoleSemanticText {
+		t.Errorf("Control 2: expected SemanticText for stable brand, got %v", role2)
+	}
+
+	// Control 3: Isolated single-frame unknown text => not automatically noise
+	box3 := domain.BoundingBox{X: 800, Y: 400, Width: 100, Height: 30}
+	role3, _, _, _ := domain.ClassifyRegionWithInstability("UniqueSign", box3, 0.55, cfg, nil)
+	if role3 == domain.TextRoleIgnoreNoise {
+		t.Errorf("Control 3: isolated single-frame unknown text must NOT be automatically noise, got %v", role3)
+	}
+
+	// Control 4: Real subtitle in subtitle band => not noise
+	box4 := domain.BoundingBox{X: 400, Y: 900, Width: 500, Height: 60}
+	role4, _, _, _ := domain.ClassifyRegionWithInstability("这是一个字幕句子", box4, 0.55, cfg, nearbyGibberish)
+	if role4 != domain.TextRoleSpeechSubtitle {
+		t.Errorf("Control 4: subtitle band text must be classified SpeechSubtitle, got %v", role4)
+	}
+
+	// Control 5: Existing low-confidence floor behavior unchanged
+	box5 := domain.BoundingBox{X: 500, Y: 300, Width: 150, Height: 40}
+	role5, _, _, reason5 := domain.ClassifyRegionWithInstability("SomeText", box5, 0.25, cfg, nil)
+	if role5 != domain.TextRoleIgnoreNoise || reason5 != "confidence_below_noise_floor" {
+		t.Errorf("Control 5: expected low-confidence floor IgnoreNoise, got %v (reason: %s)", role5, reason5)
+	}
+}

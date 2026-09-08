@@ -240,18 +240,20 @@ func TestStorage_SQLiteFlow(t *testing.T) {
 
 	// 9. Provider Attempts & Selection Decisions
 	pa := domain.ProviderAttempt{
-		ID:            uuid.NewString(),
-		RunID:         runID,
-		Stage:         "tts",
-		ProviderID:    "fake_vieneu_tts_vi",
-		ModelName:     "vieneu-v1",
-		ModelVersion:  "1.0.0",
-		InputHash:     "hash123",
-		AttemptNumber: 1,
-		Status:        "succeeded",
-		LatencyMs:     120,
-		CostUnits:     0.0,
-		CreatedAt:     time.Now().UTC(),
+		ID:                uuid.NewString(),
+		RunID:             runID,
+		Stage:             "tts",
+		ProviderID:        "fake_vieneu_tts_vi",
+		ModelName:         "vieneu-v1",
+		ModelVersion:      "1.0.0",
+		InputHash:         "hash123",
+		AttemptNumber:     1,
+		Status:            "succeeded",
+		LatencyMs:         120,
+		CostUnits:         0.0,
+		ObservedModel:     "observed-model-1",
+		ServiceBaselineID: "baseline-1",
+		CreatedAt:         time.Now().UTC(),
 	}
 	if err := db.RecordProviderAttempt(ctx, pa); err != nil {
 		t.Fatalf("RecordProviderAttempt failed: %v", err)
@@ -259,6 +261,9 @@ func TestStorage_SQLiteFlow(t *testing.T) {
 	attempts, err := db.ListProviderAttempts(ctx, runID, "tts")
 	if err != nil || len(attempts) != 1 {
 		t.Fatalf("ListProviderAttempts failed: %v, got %d", err, len(attempts))
+	}
+	if attempts[0].ObservedModel != "observed-model-1" || attempts[0].ServiceBaselineID != "baseline-1" {
+		t.Fatalf("ListProviderAttempts provenance mismatch: got observed=%q baseline=%q", attempts[0].ObservedModel, attempts[0].ServiceBaselineID)
 	}
 
 	sd := domain.SelectionDecision{

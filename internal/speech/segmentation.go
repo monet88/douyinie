@@ -122,14 +122,66 @@ func BuildSpeechBlocks(words []domain.WordTiming, cfg domain.SegmentRuleConfig) 
 		text := joinWords(seg)
 		speaker := dominantSpeaker(seg)
 		conf := avgConfidence(seg)
+		segType := domain.SpeechBlockTypeSpeech
+		if domain.IsPathologicalRepetitionNoise(text) {
+			segType = domain.SpeechBlockTypeNoise
+		}
+		startMs := seg[0].StartMs
+		endMs := seg[len(seg)-1].EndMs
+		if endMs <= startMs {
+			// A degenerate aligned word (endMs <= startMs) must never create a
+			// zero/negative dub slot, must never invent time beyond the actually
+			// available source interval, and must never overlap adjacent words.
+			nextStart := int64(-1)
+			if end < len(words) {
+				nextStart = words[end].StartMs
+			}
+			prevEnd := int64(0)
+			if len(blocks) > 0 {
+				prevEnd = blocks[len(blocks)-1].EndMs
+			}
+
+			backwardGap := startMs - prevEnd
+			claimLimit := int64(200)
+			if nextStart >= 0 {
+				forwardGap := nextStart - startMs
+				if forwardGap > 0 {
+					claim := forwardGap
+					if claim > claimLimit {
+						claim = claimLimit
+					}
+					endMs = startMs + claim
+				} else if backwardGap > 0 {
+					borrow := backwardGap
+					if borrow > claimLimit {
+						borrow = claimLimit
+					}
+					startMs -= borrow
+				} else {
+					blockStart = end
+					return
+				}
+			} else {
+				if backwardGap > 0 {
+					borrow := backwardGap
+					if borrow > claimLimit {
+						borrow = claimLimit
+					}
+					startMs -= borrow
+				} else {
+					blockStart = end
+					return
+				}
+			}
+		}
 		blocks = append(blocks, domain.SpeechBlock{
-			StartMs:           seg[0].StartMs,
-			EndMs:             seg[len(seg)-1].EndMs,
+			StartMs:           startMs,
+			EndMs:             endMs,
 			SpeakerID:         speaker,
 			SourceText:        text,
 			TokenTimings:      seg,
 			SpeakerConfidence: conf,
-			SegmentType:       domain.SpeechBlockTypeSpeech,
+			SegmentType:       segType,
 		})
 		blockStart = end
 	}

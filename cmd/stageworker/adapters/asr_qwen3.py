@@ -201,11 +201,26 @@ def run_asr(
     audio_path: str,
     model_name: str,
     model_version: str,
+    model_path: str = "",
+    require_model_snapshot: bool = False,
 ) -> Dict[str, Any]:
     """Execute Qwen3-ASR model inference over input audio."""
-    ModelClass = get_qwen3_asr_model_class()
-    model_id = resolve_model_identifier(model_name, model_version)
+    # Verified local snapshot is the source of truth. Under strict snapshot
+    # requirement a missing/inaccessible model_path fails closed with
+    # WORKER_SNAPSHOT_PATH_REQUIRED — Hub/model-ID fallback is prohibited.
+    snapshot_path = (model_path or "").strip()
+    if require_model_snapshot:
+        if not snapshot_path or not os.path.exists(snapshot_path):
+            raise RuntimeError(
+                f"WORKER_SNAPSHOT_PATH_REQUIRED: verified local snapshot model_path missing or inaccessible: {model_path!r}; Hub fallback is strictly prohibited"
+            )
+        model_id = snapshot_path
+    elif snapshot_path and os.path.exists(snapshot_path):
+        model_id = snapshot_path
+    else:
+        model_id = resolve_model_identifier(model_name, model_version)
 
+    ModelClass = get_qwen3_asr_model_class()
     try:
         model = ModelClass.from_pretrained(model_id, **qwen_runtime_load_kwargs())
     except Exception as exc:
@@ -268,8 +283,11 @@ def main() -> None:
     model_name = req.get("model_name", "")
     model_version = req.get("model_version", "")
 
+    model_path = req.get("model_path", "")
+    require_model_snapshot = req.get("require_model_snapshot", False)
+
     try:
-        resp = run_asr(audio_path, model_name, model_version)
+        resp = run_asr(audio_path, model_name, model_version, model_path, require_model_snapshot)
         sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
         sys.stdout.flush()
     except Exception as exc:

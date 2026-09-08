@@ -126,7 +126,14 @@ func (s *VisualTextService) DetectAndTrackText(ctx context.Context, input Visual
 					continue
 				}
 				mName, mVer := p.ModelInfo()
-				if expectedProvHash, err := domain.ComputeTextRegionPlanProvenanceHash(input.AssetID, p.ID(), mName, mVer, stepMs); err == nil {
+				var extraIdentities []string
+				if snapProv, ok := p.(provider.OCRSnapshotProvider); ok {
+					detSHA, recSHA, oriSHA, runtimeID := snapProv.OCRSnapshotDigests()
+					if detSHA != "" || recSHA != "" || oriSHA != "" || runtimeID != "" {
+						extraIdentities = []string{detSHA, recSHA, oriSHA, runtimeID}
+					}
+				}
+				if expectedProvHash, err := domain.ComputeTextRegionPlanProvenanceHash(input.AssetID, p.ID(), mName, mVer, stepMs, extraIdentities...); err == nil {
 					if existingIdx, err := s.db.GetTextRegionPlanByProvenance(ctx, expectedProvHash); err == nil && existingIdx != nil && existingIdx.CASHash != "" {
 						reader, err := s.cas.Get(existingIdx.CASHash)
 						if err == nil {
@@ -134,6 +141,33 @@ func (s *VisualTextService) DetectAndTrackText(ctx context.Context, input Visual
 							var cached domain.TextRegionPlan
 							if err := json.NewDecoder(reader).Decode(&cached); err == nil {
 								cached.CASHash = existingIdx.CASHash
+								if input.RunID != "" && s.db != nil {
+									execs, err := s.db.ListStageExecutions(ctx, input.RunID)
+									hasStage := false
+									if err == nil {
+										for _, e := range execs {
+											if e.Stage == "visual_text" && e.Status == "succeeded" {
+												hasStage = true
+												break
+											}
+										}
+									}
+									if !hasStage {
+										now := time.Now().UTC()
+										stageExec := domain.StageExecution{
+											ID:             uuid.NewString(),
+											RunID:          input.RunID,
+											Stage:          "visual_text",
+											Status:         "succeeded",
+											ArtifactSHA256: cached.CASHash,
+											StartedAt:      &cached.CreatedAt,
+											CompletedAt:    &now,
+											CreatedAt:      cached.CreatedAt,
+											UpdatedAt:      now,
+										}
+										_ = s.db.CreateStageExecution(ctx, stageExec)
+									}
+								}
 								return &cached, nil
 							}
 						}
@@ -205,23 +239,31 @@ func (s *VisualTextService) DetectAndTrackText(ctx context.Context, input Visual
 	trackedRegions := buildAndInterpolateTracks(res.Detections, stepMs, cfg)
 
 	// 2. Compute provenance hash (source-derived, no target language)
-	provHash, err := domain.ComputeTextRegionPlanProvenanceHash(input.AssetID, res.ProviderID, res.ModelName, res.ModelVersion, stepMs)
+	var extraIdentities []string
+	if res.DetSnapshotDigest != "" || res.RecSnapshotDigest != "" || res.OriSnapshotDigest != "" || res.RuntimeIdentity != "" {
+		extraIdentities = []string{res.DetSnapshotDigest, res.RecSnapshotDigest, res.OriSnapshotDigest, res.RuntimeIdentity}
+	}
+	provHash, err := domain.ComputeTextRegionPlanProvenanceHash(input.AssetID, res.ProviderID, res.ModelName, res.ModelVersion, stepMs, extraIdentities...)
 	if err != nil {
 		return nil, fmt.Errorf("compute provenance hash: %w", err)
 	}
 
 	plan := domain.TextRegionPlan{
-		ID:             uuid.NewString(),
-		SchemaVersion:  domain.TextRegionPlanSchemaVersion,
-		AssetID:        input.AssetID,
-		ProviderID:     res.ProviderID,
-		ModelName:      res.ModelName,
-		ModelVersion:   res.ModelVersion,
-		FrameWidth:     w,
-		FrameHeight:    h,
-		Regions:        trackedRegions,
-		ProvenanceHash: provHash,
-		CreatedAt:      time.Now().UTC(),
+		ID:                uuid.NewString(),
+		SchemaVersion:     domain.TextRegionPlanSchemaVersion,
+		AssetID:           input.AssetID,
+		ProviderID:        res.ProviderID,
+		ModelName:         res.ModelName,
+		ModelVersion:      res.ModelVersion,
+		FrameWidth:        w,
+		FrameHeight:       h,
+		Regions:           trackedRegions,
+		DetSnapshotDigest: res.DetSnapshotDigest,
+		RecSnapshotDigest: res.RecSnapshotDigest,
+		OriSnapshotDigest: res.OriSnapshotDigest,
+		RuntimeIdentity:   res.RuntimeIdentity,
+		ProvenanceHash:    provHash,
+		CreatedAt:         time.Now().UTC(),
 	}
 
 	// 3. Store in CAS
@@ -248,6 +290,23 @@ func (s *VisualTextService) DetectAndTrackText(ctx context.Context, input Visual
 	})
 	if err != nil {
 		return nil, fmt.Errorf("save text region plan index: %w", err)
+	}
+
+	// 5. Record succeeded stage execution in SQLite if RunID is present
+	if input.RunID != "" && s.db != nil {
+		now := time.Now().UTC()
+		stageExec := domain.StageExecution{
+			ID:             uuid.NewString(),
+			RunID:          input.RunID,
+			Stage:          "visual_text",
+			Status:         "succeeded",
+			ArtifactSHA256: plan.CASHash,
+			StartedAt:      &plan.CreatedAt,
+			CompletedAt:    &now,
+			CreatedAt:      plan.CreatedAt,
+			UpdatedAt:      now,
+		}
+		_ = s.db.CreateStageExecution(ctx, stageExec)
 	}
 
 	return &plan, nil
@@ -327,10 +386,29 @@ func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, c
 		avgBox.Width /= obsCount
 		avgBox.Height /= obsCount
 		meanConf := confSum / float64(obsCount)
+		// Collect spatio-temporally nearby observations from other detections (adjacent frames within +/- 4 steps, spatial overlap)
+		var nearbyObs []domain.NearbyObservation
+		for _, d := range dets {
+			if d.FrameIndex >= firstObs.FrameIndex-4 && d.FrameIndex <= lastObs.FrameIndex+4 {
+				// Check if spatial overlap with cluster avgBox
+				expandedBox := domain.BoundingBox{
+					X:      avgBox.X - avgBox.Width/2,
+					Y:      avgBox.Y - avgBox.Height/2,
+					Width:  avgBox.Width * 2,
+					Height: avgBox.Height * 2,
+				}
+				if domain.BoxesOverlap(expandedBox, d.Box) {
+					nearbyObs = append(nearbyObs, domain.NearbyObservation{
+						Text:        d.Text,
+						TimestampMs: d.TimestampMs,
+						Box:         d.Box,
+					})
+				}
+			}
+		}
 
-		// Classify role deterministically
-		role, protectedMeta, reviewReq, reviewReason := domain.ClassifyRegion(cl.text, avgBox, meanConf, cfg)
-
+		// Classify role deterministically with spatio-temporal instability tracking
+		role, protectedMeta, reviewReq, reviewReason := domain.ClassifyRegionWithInstability(cl.text, avgBox, meanConf, cfg, nearbyObs)
 		// Build keyframes with linear interpolation for frame gaps <= 2 steps
 		var keyframes []domain.RegionKeyframe
 		interpolatedCount := 0
@@ -429,10 +507,14 @@ type LocalizeVisualTrackInput struct {
 	AssetID               string                           `json:"asset_id"`
 	JobID                 string                           `json:"job_id,omitempty"`
 	TargetLanguage        string                           `json:"target_language"`
+	TranslationVariantCAS string                           `json:"translation_variant_cas,omitempty"`
 	Overrides             []domain.RegionOverride          `json:"overrides,omitempty"`
 	InpaintingFallbacks   []string                         `json:"inpainting_fallbacks,omitempty"` // Region IDs where inpainting fallback is explicitly requested
 	SceneProtectedRegions []domain.SceneProtectedRegion    `json:"scene_protected_regions,omitempty"`
 	PlacementSelector     domain.SubtitlePlacementSelector `json:"-"`
+	ExecutionProfile      domain.ExecutionProfile          `json:"execution_profile,omitempty"`
+	AuthorizedCredentials []string                         `json:"authorized_credentials,omitempty"`
+	ConsentGranted        bool                             `json:"consent_granted,omitempty"`
 }
 
 // ApplyRegionOverrides applies direct-manipulation overrides (drag/resize/reclassify/text) to a TextRegionPlan.
@@ -647,15 +729,22 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 	for _, reg := range activePlan.Regions {
 		switch reg.Role {
 		case domain.TextRoleSemanticText:
+			trimmedText := strings.TrimSpace(reg.Text)
+			if trimmedText == "" || domain.IsPathologicalRepetitionNoise(trimmedText) {
+				continue
+			}
 			if s.translationSvc == nil {
 				return nil, fmt.Errorf("translation service is required to localize semantic text %q: %w", reg.Text, domain.ErrTranslationFailed)
 			}
 			tRes, err := s.translationSvc.Translate(ctx, domain.TranslationJobInput{
-				RunID:          in.RunID,
-				AssetID:        in.AssetID,
-				JobID:          in.JobID,
-				SourceLanguage: "zh",
-				TargetLanguage: in.TargetLanguage,
+				RunID:                 in.RunID,
+				AssetID:               in.AssetID,
+				JobID:                 in.JobID,
+				SourceLanguage:        "zh",
+				TargetLanguage:        in.TargetLanguage,
+				ExecutionProfile:      in.ExecutionProfile,
+				AuthorizedCredentials: in.AuthorizedCredentials,
+				ConsentGranted:        in.ConsentGranted,
 				Segments: []domain.TranslationInputSegment{
 					{Index: 0, SourceText: reg.Text, StartMs: reg.FirstSeenMs, EndMs: reg.LastSeenMs},
 				},
@@ -719,15 +808,22 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			})
 
 		case domain.TextRoleInstructionalUIText:
+			trimmedText := strings.TrimSpace(reg.Text)
+			if trimmedText == "" || domain.IsPathologicalRepetitionNoise(trimmedText) {
+				continue
+			}
 			if s.translationSvc == nil {
 				return nil, fmt.Errorf("translation service is required to localize instructional UI text %q: %w", reg.Text, domain.ErrTranslationFailed)
 			}
 			tRes, err := s.translationSvc.Translate(ctx, domain.TranslationJobInput{
-				RunID:          in.RunID,
-				AssetID:        in.AssetID,
-				JobID:          in.JobID,
-				SourceLanguage: "zh",
-				TargetLanguage: in.TargetLanguage,
+				RunID:                 in.RunID,
+				AssetID:               in.AssetID,
+				JobID:                 in.JobID,
+				SourceLanguage:        "zh",
+				TargetLanguage:        in.TargetLanguage,
+				ExecutionProfile:      in.ExecutionProfile,
+				AuthorizedCredentials: in.AuthorizedCredentials,
+				ConsentGranted:        in.ConsentGranted,
 				Segments: []domain.TranslationInputSegment{
 					{Index: 0, SourceText: reg.Text, StartMs: reg.FirstSeenMs, EndMs: reg.LastSeenMs},
 				},

@@ -248,7 +248,6 @@ func (ss *SnapshotService) RegisterAndVerifySnapshot(ctx context.Context, manife
 		Fingerprints:           fingerprints,
 		VerificationEventID:    eventID,
 	}
-
 	key := makeSnapshotKey(manifest.ModelID, manifest.ModelVersion)
 	ss.mu.Lock()
 	ss.bindings[key] = binding
@@ -372,7 +371,7 @@ func (ss *SnapshotService) Reverify(ctx context.Context, dependencyName, version
 	return ss.RegisterAndVerifySnapshot(ctx, b.Manifest, b.LocalPath)
 }
 
-// SetRuntimeIdentity associates runtime identity with an existing snapshot binding.
+// SetRuntimeIdentity associates validated runtime identity with an existing snapshot binding.
 func (ss *SnapshotService) SetRuntimeIdentity(dependencyName, version string, rt domain.RuntimeIdentity) error {
 	key := makeSnapshotKey(dependencyName, version)
 
@@ -383,6 +382,53 @@ func (ss *SnapshotService) SetRuntimeIdentity(dependencyName, version string, rt
 	if !ok || b == nil {
 		return fmt.Errorf("%w: %s (%s)", domain.ErrSnapshotUnverified, dependencyName, version)
 	}
+
+	// 1. Primary snapshot digest must match the binding
+	if rt.PrimarySnapshotSHA256 == "" || !strings.EqualFold(rt.PrimarySnapshotSHA256, b.SnapshotManifestSHA256) {
+		return fmt.Errorf("%w: runtime primary snapshot digest mismatch: expected %s, got %s",
+			domain.ErrSnapshotDigestMismatch, b.SnapshotManifestSHA256, rt.PrimarySnapshotSHA256)
+	}
+
+	// 2. RuntimeManifestSHA256 must recompute correctly and match if provided
+	expectedManifestSHA := rt.ComputeRuntimeManifestSHA256()
+	if rt.RuntimeManifestSHA256 != "" && !strings.EqualFold(rt.RuntimeManifestSHA256, expectedManifestSHA) {
+		return fmt.Errorf("%w: runtime manifest SHA mismatch: expected %s, got %s",
+			domain.ErrSnapshotDigestMismatch, expectedManifestSHA, rt.RuntimeManifestSHA256)
+	}
+	rt.RuntimeManifestSHA256 = expectedManifestSHA
+
+	// 3. For separator dependencies: validate frozen source revision and package version
+	lowerDep := strings.ToLower(dependencyName)
+	if strings.Contains(lowerDep, "demucs") {
+		if rt.SourceRevision != domain.PinnedDemucsSourceRevision {
+			return fmt.Errorf("%w: Demucs runtime source revision mismatch: expected %s, got %s",
+				domain.ErrSnapshotUnverified, domain.PinnedDemucsSourceRevision, rt.SourceRevision)
+		}
+		ver, ok := rt.RuntimeVersions["demucs"]
+		if !ok || strings.TrimSpace(ver) != domain.PinnedDemucsPackageVersion {
+			return fmt.Errorf("%w: Demucs runtime package version mismatch: expected exact %s, got %s",
+				domain.ErrSnapshotUnverified, domain.PinnedDemucsPackageVersion, ver)
+		}
+	} else if strings.Contains(lowerDep, "uvr") || strings.Contains(lowerDep, "mdx") {
+		if rt.SourceRevision != domain.PinnedUVRSourceRevision {
+			return fmt.Errorf("%w: UVR runtime source revision mismatch: expected %s, got %s",
+				domain.ErrSnapshotUnverified, domain.PinnedUVRSourceRevision, rt.SourceRevision)
+		}
+		ver, ok := rt.RuntimeVersions["audio-separator"]
+		if !ok || strings.TrimSpace(ver) != domain.PinnedUVRPackageVersion {
+			return fmt.Errorf("%w: UVR runtime package version mismatch: expected exact %s, got %s",
+				domain.ErrSnapshotUnverified, domain.PinnedUVRPackageVersion, ver)
+		}
+	}
+
+	// 4. Validate dependency snapshot SHAs consistency if declared
+	for _, depSHA := range rt.DependencySnapshotSHAs {
+		if strings.TrimSpace(depSHA) == "" || len(depSHA) != 64 {
+			return fmt.Errorf("%w: invalid dependency snapshot digest %q in runtime identity",
+				domain.ErrSnapshotDigestMismatch, depSHA)
+		}
+	}
+
 	b.RuntimeIdentity = &rt
 	return nil
 }

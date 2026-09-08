@@ -18,14 +18,27 @@ import os
 import struct
 import sys
 import wave
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+# Frozen Phase 1.1 RC Model Identities & Allowed Voices (Issue #68)
+VIENEU_MODEL_ID = "pnnbao-ump/VieNeu-TTS-v3-Turbo"
+VIENEU_MODEL_VERSION = "v3.2.9"
+VIENEU_MODEL_DIGEST = "1278db0090b98ccf23e56f2423857fc9d32a5118"
+VIENEU_SDK_COMMIT = "149ff16a6a50093a0cad1b75d5edf9e9d81d97f4"
+VIENEU_ALLOWED_VOICES = {"Trúc Ly", "Phạm Tuyên", "Đoan Trang", "Xuân Vĩnh"}
+
+KOKORO_MODEL_ID = "hexgrad/Kokoro-82M"
+KOKORO_MODEL_VERSION = "v1.0"
+KOKORO_MODEL_DIGEST = "f3ff3571791e39611d31c381e3a41a3af07b4987"
+KOKORO_CHECKPOINT_SHA256 = "496dba118d1a58f5f3db2efc88dbdc216e0483fc89fe6e47ee1f2c53f18ad1e4"
+KOKORO_ALLOWED_VOICES = {"af_heart", "am_michael", "af_bella", "am_fenrir"}
 
 # Pluggable factory hooks for deterministic testing without full ML packages
 _VIENEU_MODEL_FACTORY = None
 _COSYVOICE_MODEL_FACTORY = None
 _KOKORO_MODEL_FACTORY = None
 _CHATTERBOX_MODEL_FACTORY = None
-
 
 def _instantiate_model(factory: Any, default_kwargs: Optional[Dict[str, Any]] = None) -> Any:
     """Instantiate model class or factory callable into an active instance."""
@@ -189,6 +202,8 @@ def run_vieneu_tts(
     speed: float,
     model_name: str = "vieneu-tts",
     model_version: str = "1.0.0",
+    model_path: Optional[str] = None,
+    entrypoint_file: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     VieNeu-TTS (Vietnamese baseline) inference adapter.
@@ -198,8 +213,92 @@ def run_vieneu_tts(
     - voice_data = engine.get_preset_voice(voice_id)
     - audio = engine.infer(text=text, voice=voice_data)
     """
+    if not voice_id or voice_id not in VIENEU_ALLOWED_VOICES:
+        raise ValueError(
+            f"TTS_VOICE_ASSET_MISSING: unverified or unknown VieNeu voice preset {voice_id!r} "
+            f"(must be one of {sorted(list(VIENEU_ALLOWED_VOICES))})"
+        )
+
+    if model_path:
+        mp = Path(model_path).resolve()
+        if not mp.exists():
+            raise RuntimeError(f"WORKER_SNAPSHOT_PATH_REQUIRED: snapshot path does not exist: {model_path}")
+
+        # Strictly resolve within verified snapshot root without parent/cache fallback.
+        # Require exact canonical upstream catalog relative path: src/vieneu/assets/voices_v3_turbo.json.
+        # Alternate catalog entrypoints are strictly rejected.
+        canonical_catalog = (mp / "src" / "vieneu" / "assets" / "voices_v3_turbo.json").resolve()
+        catalog_file = None
+        if entrypoint_file:
+            ep = Path(entrypoint_file).resolve()
+            try:
+                ep.relative_to(mp)
+            except ValueError:
+                raise RuntimeError(
+                    f"TTS_MODEL_ASSET_MISSING: VieNeu catalog entrypoint escapes snapshot root: {entrypoint_file} (root: {model_path})"
+                )
+            if ep != canonical_catalog:
+                raise RuntimeError(
+                    f"TTS_MODEL_ASSET_MISSING: alternate or unverified VieNeu catalog entrypoint rejected: {entrypoint_file} (expected canonical: {canonical_catalog})"
+                )
+            if ep.is_file():
+                catalog_file = ep
+
+        if catalog_file is None:
+            if canonical_catalog.is_file():
+                catalog_file = canonical_catalog
+
+        if catalog_file is None:
+            raise RuntimeError(
+                f"TTS_VOICE_ASSET_MISSING: VieNeu v3 Turbo voice catalog (src/vieneu/assets/voices_v3_turbo.json) missing in snapshot: {model_path}"
+            )
+        try:
+            with open(catalog_file, "r", encoding="utf-8") as f:
+                cat_data = json.load(f)
+        except Exception as exc:
+            raise RuntimeError(
+                f"TTS_VOICE_ASSET_MISSING: failed to parse VieNeu voice catalog {catalog_file}: {exc}"
+            ) from exc
+
+        available_voices = set()
+        if isinstance(cat_data, dict):
+            presets = cat_data.get("presets", {})
+            if isinstance(presets, dict):
+                available_voices.update(presets.keys())
+                for pk, pv in presets.items():
+                    if isinstance(pv, dict):
+                        if "id" in pv:
+                            available_voices.add(str(pv["id"]))
+                        if "name" in pv:
+                            available_voices.add(str(pv["name"]))
+            available_voices.update(cat_data.keys())
+            if "voices" in cat_data and isinstance(cat_data["voices"], list):
+                for item in cat_data["voices"]:
+                    if isinstance(item, dict):
+                        if "id" in item:
+                            available_voices.add(str(item["id"]))
+                        if "name" in item:
+                            available_voices.add(str(item["name"]))
+        elif isinstance(cat_data, list):
+            for item in cat_data:
+                if isinstance(item, dict):
+                    if "id" in item:
+                        available_voices.add(str(item["id"]))
+                    if "name" in item:
+                        available_voices.add(str(item["name"]))
+                elif isinstance(item, str):
+                    available_voices.add(item)
+
+        if voice_id not in available_voices:
+            raise RuntimeError(
+                f"TTS_VOICE_ASSET_MISSING: requested voice {voice_id!r} not found in VieNeu catalog {catalog_file}"
+            )
     factory = _VIENEU_MODEL_FACTORY
     if factory is None:
+        if not model_path:
+            raise RuntimeError(
+                "WORKER_SNAPSHOT_PATH_REQUIRED: VieNeu in production RC requires a verified local snapshot model_path, unverified user cache / default Hub execution is strictly prohibited"
+            )
         try:
             from vieneu import Vieneu
             factory = Vieneu
@@ -207,41 +306,89 @@ def run_vieneu_tts(
             raise RuntimeError(
                 "vieneu package not found: install VieNeu-TTS (pip install vieneu) to enable VieNeu synthesis"
             ) from exc
-    engine = _instantiate_model(factory, {"mode": "v3turbo"})
+    # Offline defense-in-depth: guarantee no default HF repos are contacted at request time
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_DATASETS_OFFLINE"] = "1"
+
+    init_kwargs = {"mode": "v3turbo"}
+    if model_path:
+        mp = Path(model_path).resolve()
+        # Pinned VieNeu factory forwards kwargs to V3TurboVieNeuTTS, whose actual local model arg is backbone_repo
+        init_kwargs["backbone_repo"] = str(mp)
+        init_kwargs["model_path"] = str(mp)
+
+        # Fixed in-root verified MOSS tokenizer layout (moss_tokenizer/).
+        # Strictly no mp.parent or unverified discovery outside the snapshot root.
+        moss_cand = mp / "moss_tokenizer"
+        if not moss_cand.exists():
+            raise RuntimeError(
+                f"TTS_MODEL_ASSET_MISSING: verified local MOSS tokenizer missing in snapshot {model_path} (expected {moss_cand}); Hub fallback is strictly prohibited"
+            )
+        try:
+            moss_cand.resolve().relative_to(mp)
+        except ValueError:
+            raise RuntimeError(
+                f"TTS_MODEL_ASSET_MISSING: verified local MOSS tokenizer escapes snapshot root: {moss_cand}"
+            )
+        init_kwargs["moss_tokenizer"] = str(moss_cand)
+    engine = _instantiate_model(factory, init_kwargs)
     if not hasattr(engine, "infer") and not callable(engine):
         raise RuntimeError("VieNeu engine instance missing required 'infer' method")
 
-    # Resolve preset voice data if available
+    # The synthesis voice data must come from the verified snapshot catalog
+    # so the selected VoiceID actually uses snapshot-contained speaker_emb/codes,
+    # rather than calling engine.get_preset_voice() which reads the installed SDK package catalog.
     voice_target = None
-    if voice_id:
-        if hasattr(engine, "get_preset_voice"):
-            try:
-                voice_target = engine.get_preset_voice(voice_id)
-            except Exception:
-                # If custom voice_id not in presets, map female/male keywords or fallback to default preset
-                female_keywords = ["female", "nu", "nữ", "f1", "girl", "duyen", "ly", "linh", "trang", "anh"]
-                is_female = any(k in voice_id.lower() for k in female_keywords)
-                fallback_name = "Thục Đoan" if is_female else "Minh Đức"
-                try:
-                    voice_target = engine.get_preset_voice(fallback_name)
-                except Exception:
-                    voice_target = None
-        else:
-            voice_target = voice_id
+    if model_path and catalog_file is not None:
+        voice_entry = None
+        if isinstance(cat_data, dict):
+            presets = cat_data.get("presets", {})
+            if isinstance(presets, dict):
+                if voice_id in presets:
+                    voice_entry = presets[voice_id]
+                else:
+                    for pk, pv in presets.items():
+                        if isinstance(pv, dict) and (pv.get("id") == voice_id or pv.get("name") == voice_id):
+                            voice_entry = pv
+                            break
+            if voice_entry is None and voice_id in cat_data:
+                voice_entry = cat_data[voice_id]
+        elif isinstance(cat_data, list):
+            for item in cat_data:
+                if isinstance(item, dict) and (item.get("id") == voice_id or item.get("name") == voice_id):
+                    voice_entry = item
+                    break
 
-    # Call official infer method
-    if hasattr(engine, "infer"):
-        if voice_target is not None:
-            audio = engine.infer(text=text, voice=voice_target)
-        else:
-            audio = engine.infer(text=text)
+        if voice_entry is not None:
+            # Pinned V3Turbo _resolve_ref accepts a preset dict and needs both speaker_emb and codes.
+            # Do NOT reduce the verified catalog entry to codes or speaker_emb; pass the full
+            # snapshot-derived preset dict (with arrays converted as needed), or inject it then
+            # resolve from that verified dict.
+            voice_target = dict(voice_entry) if isinstance(voice_entry, dict) else voice_entry
+            if isinstance(voice_target, dict):
+                if "speaker_emb" not in voice_target and "embedding" in voice_target:
+                    voice_target["speaker_emb"] = voice_target["embedding"]
+                if "codes" not in voice_target and "ref_codes" in voice_target:
+                    voice_target["codes"] = voice_target["ref_codes"]
+        # Also inject verified snapshot presets into engine if it maintains internal presets
+        if hasattr(engine, "preset_voices") and isinstance(engine.preset_voices, dict):
+            engine.preset_voices = cat_data.get("presets", cat_data)
+        if hasattr(engine, "_preset_voices") and isinstance(engine._preset_voices, dict):
+            engine._preset_voices = cat_data.get("presets", cat_data)
+    elif hasattr(engine, "get_preset_voice"):
+        voice_target = engine.get_preset_voice(voice_id)
     else:
-        # Callable fallback
-        if voice_target is not None:
-            audio = engine(text=text, voice=voice_target)
-        else:
-            audio = engine(text=text)
+        voice_target = voice_id
 
+    if voice_target is None:
+        voice_target = voice_id
+
+    # Call official infer method with verified snapshot voice data
+    if hasattr(engine, "infer"):
+        audio = engine.infer(text=text, voice=voice_target)
+    else:
+        audio = engine(text=text, voice=voice_target)
     # Determine audio array and sample rate (VieNeu v3 turbo is 48 kHz float32)
     sr = 48000
     if isinstance(audio, tuple) and len(audio) == 2:
@@ -407,32 +554,130 @@ def run_kokoro_tts(
     speed: float,
     model_name: str = "kokoro-tts",
     model_version: str = "1.0.0",
+    model_path: Optional[str] = None,
+    entrypoint_file: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Kokoro-TTS (English baseline) inference adapter.
     Uses official kokoro / KPipeline API:
     - from kokoro import KPipeline
     - pipeline = KPipeline(lang_code='a')
-    - for result in pipeline(text, voice=target_voice, speed=speed):
+    - for result in pipeline(text, voice=voice_id, speed=speed):
     -     audio = result.audio
     """
-    factory = _KOKORO_MODEL_FACTORY
-    if factory is None:
+    if not voice_id or voice_id not in KOKORO_ALLOWED_VOICES:
+        raise ValueError(
+            f"TTS_VOICE_ASSET_MISSING: unverified or unknown Kokoro voice preset {voice_id!r} "
+            f"(must be one of {sorted(list(KOKORO_ALLOWED_VOICES))})"
+        )
+
+    config_file = None
+    weights_file = None
+    voice_file = None
+    if model_path:
+        mp = Path(model_path).resolve()
+        if not mp.exists():
+            raise RuntimeError(f"WORKER_SNAPSHOT_PATH_REQUIRED: snapshot path does not exist: {model_path}")
+
+        # 1. Validate checkpoint sha256 within snapshot root
+        for cand in [mp / "kokoro-v1_0.pth", mp / "kokoro-v1.0.pth", mp / "kokoro.pth", mp / "model.pth"]:
+            if cand.is_file():
+                try:
+                    cand.resolve().relative_to(mp)
+                except ValueError:
+                    raise RuntimeError(f"TTS_MODEL_ASSET_MISSING: Kokoro weights file escapes snapshot root: {cand}")
+                weights_file = cand
+                h = hashlib.sha256()
+                with open(cand, "rb") as f:
+                    while chunk := f.read(65536):
+                        h.update(chunk)
+                if h.hexdigest() != KOKORO_CHECKPOINT_SHA256:
+                    raise RuntimeError(
+                        f"TTS_VOICE_ASSET_MISSING: Kokoro checkpoint sha256 mismatch: expected {KOKORO_CHECKPOINT_SHA256}, got {h.hexdigest()}"
+                    )
+                break
+
+        # 2. Verify voice asset file exists in snapshot root (canonical path: voices/<voiceID>.pt)
+        canonical_voice = (mp / "voices" / f"{voice_id}.pt").resolve()
+        if entrypoint_file:
+            ep = Path(entrypoint_file).resolve()
+            try:
+                ep.relative_to(mp)
+            except ValueError:
+                raise RuntimeError(
+                    f"TTS_VOICE_ASSET_MISSING: Kokoro voice entrypoint escapes snapshot root: {entrypoint_file} (root: {model_path})"
+                )
+            if ep != canonical_voice:
+                raise RuntimeError(
+                    f"TTS_VOICE_ASSET_MISSING: alternate or unverified Kokoro voice entrypoint rejected: {entrypoint_file} (expected canonical: {canonical_voice})"
+                )
+            if ep.is_file():
+                voice_file = ep
+
+        if voice_file is None:
+            if not canonical_voice.is_file():
+                raise RuntimeError(
+                    f"TTS_VOICE_ASSET_MISSING: Kokoro voice asset missing from snapshot: {canonical_voice}"
+                )
+            voice_file = canonical_voice
+        # 3. Check config.json strictly in root (no parent fallback)
+        config_cand = mp / "config.json"
+        if not config_cand.is_file():
+            raise RuntimeError(f"TTS_MODEL_ASSET_MISSING: Kokoro config.json missing in snapshot: {model_path}")
         try:
-            from kokoro import KPipeline
-            factory = KPipeline
+            config_cand.resolve().relative_to(mp)
+        except ValueError:
+            raise RuntimeError(f"TTS_MODEL_ASSET_MISSING: Kokoro config.json escapes snapshot root: {config_cand}")
+        config_file = config_cand
+    lang_code = "a" if language in ("en", "en-us") else "b" if language == "en-gb" else "a"
+    factory = _KOKORO_MODEL_FACTORY
+    voice_target = voice_id
+    if factory is not None:
+        init_kwargs = {"lang_code": lang_code}
+        pipeline = _instantiate_model(factory, init_kwargs)
+        if voice_file is not None:
+            voice_target = str(voice_file)
+    else:
+        try:
+            from kokoro import KPipeline, KModel
         except ImportError as exc:
             raise RuntimeError(
                 "kokoro package not found: install Kokoro (pip install kokoro misaki) to enable Kokoro synthesis"
             ) from exc
 
-    lang_code = "a" if language in ("en", "en-us") else "b" if language == "en-gb" else "a"
-    pipeline = _instantiate_model(factory, {"lang_code": lang_code})
+        # Fail closed: Kokoro in production RC requires a verified snapshot model_path
+        if not model_path:
+            raise RuntimeError("WORKER_SNAPSHOT_PATH_REQUIRED: Kokoro requires verified local snapshot paths; Hub fallback is strictly prohibited")
+        if config_file is None:
+            raise RuntimeError(f"TTS_MODEL_ASSET_MISSING: Kokoro config.json missing in snapshot: {model_path}")
+        if weights_file is None:
+            raise RuntimeError(f"TTS_MODEL_ASSET_MISSING: Kokoro model weights (.pth) missing in snapshot: {model_path}")
 
-    target_voice = voice_id or "af_heart"
+        # Strictly local-only path: zero request-time Hub/network download
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+        try:
+            kmodel = KModel(config=str(config_file), model=str(weights_file))
+        except Exception as e:
+            raise RuntimeError(
+                f"TTS_VOICE_ASSET_MISSING: failed to initialize local Kokoro KModel from snapshot {model_path}: {e}"
+            ) from e
+
+        pipeline = KPipeline(lang_code=lang_code, model=kmodel)
+        # KPipeline accepts local .pt path directly
+        voice_target = str(voice_file)
+        try:
+            import torch
+            loaded_voice = torch.load(str(voice_file), weights_only=True)
+            pipeline.voices[voice_id] = loaded_voice
+            pipeline.voices[str(voice_file)] = loaded_voice
+        except Exception:
+            pass
+
     chunks = []
     if callable(pipeline):
-        gen = pipeline(text, voice=target_voice, speed=speed)
+        gen = pipeline(text, voice=voice_target, speed=speed)
         for res in gen:
             # Official KPipeline yields Result objects with .audio property
             if hasattr(res, "audio") and res.audio is not None:
@@ -452,7 +697,6 @@ def run_kokoro_tts(
     # Kokoro native sample rate is 24000 Hz
     wav_bytes, dur_ms = encode_audio_to_wav(audio, sample_rate=24000)
     return build_tts_response(wav_bytes, dur_ms, model_name, model_version)
-
 
 def run_chatterbox_tts(
     text: str,
@@ -519,9 +763,11 @@ def run_tts(req: Dict[str, Any]) -> Dict[str, Any]:
     slot_duration_ms = int(req.get("slot_duration_ms", 0))
     model_name = req.get("model_name", "vieneu-tts").lower()
     model_version = req.get("model_version", "1.0.0")
+    model_path = req.get("model_path")
+    entrypoint_file = req.get("entrypoint_file")
 
     # Explicit recognized model names take precedence over language fallback
-    if "vieneu" in model_name:
+    if "vieneu" in model_name or "pnnbao" in model_name:
         return run_vieneu_tts(
             text=text,
             language=language,
@@ -529,6 +775,8 @@ def run_tts(req: Dict[str, Any]) -> Dict[str, Any]:
             speed=speed,
             model_name=model_name,
             model_version=model_version,
+            model_path=model_path,
+            entrypoint_file=entrypoint_file,
         )
     elif "cosyvoice" in model_name or "cosy" in model_name:
         return run_cosyvoice_tts(
@@ -548,6 +796,8 @@ def run_tts(req: Dict[str, Any]) -> Dict[str, Any]:
             speed=speed,
             model_name=model_name,
             model_version=model_version,
+            model_path=model_path,
+            entrypoint_file=entrypoint_file,
         )
     elif "chatterbox" in model_name:
         return run_chatterbox_tts(
@@ -561,13 +811,19 @@ def run_tts(req: Dict[str, Any]) -> Dict[str, Any]:
     else:
         # Default to VieNeu for VI, Kokoro for EN, CosyVoice for others
         if language == "en":
-            return run_kokoro_tts(text, language, voice_id, speed, model_name, model_version)
+            return run_kokoro_tts(
+                text, language, voice_id, speed, model_name, model_version, model_path=model_path, entrypoint_file=entrypoint_file
+            )
         elif language == "vi":
-            return run_vieneu_tts(text, language, voice_id, speed, model_name, model_version)
+            return run_vieneu_tts(
+                text, language, voice_id, speed, model_name, model_version, model_path=model_path, entrypoint_file=entrypoint_file
+            )
         elif language == "zh":
             return run_cosyvoice_tts(text, language, voice_id, speed, slot_duration_ms, model_name, model_version)
         else:
-            return run_vieneu_tts(text, language, voice_id, speed, model_name, model_version)
+            return run_vieneu_tts(
+                text, language, voice_id, speed, model_name, model_version, model_path=model_path, entrypoint_file=entrypoint_file
+            )
 
 def main():
     if hasattr(sys.stdin, "reconfigure"):

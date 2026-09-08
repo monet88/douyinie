@@ -127,58 +127,113 @@ def parse_speaker_segments(result: Any) -> List[Dict[str, Any]]:
     return assignments
 
 
+def resolve_verified_model_cache_dir(
+    model_name: str,
+    model_path: Optional[str],
+    vad_model_name: str,
+    vad_model_path: Optional[str],
+    require_model_snapshot: bool,
+) -> Optional[str]:
+    """
+    Resolve common ModelScope cache root from verified primary and VAD snapshot paths.
+    Upstream speakerlab download_model_from_modelscope expects ROOT/<model_id>/configuration.json.
+    If ROOT/<model_id>/configuration.json exists, it uses the local path without downloading.
+    """
+    if not model_path or not vad_model_path:
+        if require_model_snapshot:
+            raise RuntimeError(
+                "WORKER_SNAPSHOT_PATH_REQUIRED: both primary model_path and vad_model_path are required"
+            )
+        return None
+
+    m_id = (model_name or DEFAULT_MODEL_NAME).strip().replace("\\", "/")
+    v_id = (vad_model_name or DEFAULT_VAD_MODEL).strip().replace("\\", "/")
+
+    norm_m_path = os.path.normpath(model_path)
+    norm_v_path = os.path.normpath(vad_model_path)
+
+    # Check if norm_m_path ends with m_id components (e.g., .../iic/speech_campplus_sv_zh_en_16k-common_advanced)
+    m_parts = m_id.split("/")
+    v_parts = v_id.split("/")
+
+    m_suffix = os.path.join(*m_parts)
+    v_suffix = os.path.join(*v_parts)
+
+    root_m = None
+    if norm_m_path.endswith(m_suffix):
+        cand = norm_m_path[:-len(m_suffix)].rstrip(os.sep)
+        if cand and os.path.isdir(cand):
+            root_m = cand
+
+    root_v = None
+    if norm_v_path.endswith(v_suffix):
+        cand = norm_v_path[:-len(v_suffix)].rstrip(os.sep)
+        if cand and os.path.isdir(cand):
+            root_v = cand
+
+    # If both paths share the identical parent root and configuration.json exists in both:
+    if root_m and root_v and os.path.samefile(root_m, root_v):
+        m_cfg = os.path.join(root_m, m_suffix, "configuration.json")
+        v_cfg = os.path.join(root_m, v_suffix, "configuration.json")
+        if os.path.isfile(m_cfg) and os.path.isfile(v_cfg):
+            return root_m
+
+    if require_model_snapshot:
+        raise RuntimeError(
+            f"WORKER_SNAPSHOT_PATH_REQUIRED: snapshot paths ({model_path}, {vad_model_path}) do not resolve to a common ROOT/<model_id>/configuration.json structure"
+        )
+    return None
+
+
 def run_diarization(
     audio_path: str,
     model_name: str,
     model_version: str,
     vad_model_name: str,
     vad_model_version: str,
+    model_path: Optional[str] = None,
+    vad_model_path: Optional[str] = None,
+    require_model_snapshot: bool = False,
 ) -> List[Dict[str, Any]]:
     """Execute 3D-Speaker Diarization3Dspeaker non-overlap diarization."""
+    if require_model_snapshot or (model_path and vad_model_path):
+        os.environ["MODELSCOPE_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    cache_root = resolve_verified_model_cache_dir(
+        model_name, model_path, vad_model_name, vad_model_path, require_model_snapshot
+    )
+
     DiarizationClass = get_diarization_class()
 
     diarizer = None
-    init_attempts = [
-        lambda: DiarizationClass(
-            model_id=model_name or DEFAULT_MODEL_NAME,
-            model_revision=model_version or DEFAULT_MODEL_VERSION,
-            vad_model_id=vad_model_name or DEFAULT_VAD_MODEL,
-            vad_model_revision=vad_model_version or DEFAULT_VAD_VERSION,
-        ),
-        lambda: DiarizationClass(
-            model=model_name or DEFAULT_MODEL_NAME,
-            vad_model=vad_model_name or DEFAULT_VAD_MODEL,
-        ),
-        lambda: DiarizationClass(
-            embedding_model=model_name or DEFAULT_MODEL_NAME,
-            vad_model=vad_model_name or DEFAULT_VAD_MODEL,
-        ),
-        lambda: DiarizationClass(
-            conf={
-                "model_id": model_name or DEFAULT_MODEL_NAME,
-                "model_revision": model_version or DEFAULT_MODEL_VERSION,
-                "vad_model_id": vad_model_name or DEFAULT_VAD_MODEL,
-                "vad_model_revision": vad_model_version or DEFAULT_VAD_VERSION,
-            }
-        ),
-        lambda: DiarizationClass(),
-    ]
-
     last_err = None
-    for attempt in init_attempts:
+    try:
+        if cache_root:
+            diarizer = DiarizationClass(model_cache_dir=cache_root)
+        else:
+            diarizer = DiarizationClass()
+    except TypeError as exc:
+        if require_model_snapshot:
+            raise RuntimeError(
+                f"WORKER_SNAPSHOT_PATH_REQUIRED: Diarization3Dspeaker does not accept verified model_cache_dir: {exc}"
+            ) from exc
+        # Fallback only for non-strict/mock execution where no verified snapshot is required
         try:
-            diarizer = attempt()
-            break
-        except TypeError as err:
-            last_err = err
-            continue
-        except Exception as err:
-            last_err = err
-            break
+            diarizer = DiarizationClass()
+        except Exception as exc2:
+            last_err = exc2
+    except Exception as exc:
+        if require_model_snapshot:
+            raise RuntimeError(
+                f"WORKER_SNAPSHOT_PATH_REQUIRED: failed to initialize Diarization3Dspeaker with verified snapshot cache ({cache_root}): {exc}"
+            ) from exc
+        last_err = exc
 
     if diarizer is None:
-        raise RuntimeError(f"failed to initialize 3D-Speaker Diarization3Dspeaker: {last_err}")
-
+        prefix = "WORKER_SNAPSHOT_PATH_REQUIRED: " if require_model_snapshot else ""
+        raise RuntimeError(f"{prefix}failed to initialize 3D-Speaker Diarization3Dspeaker: {last_err}")
     try:
         if callable(diarizer):
             result = diarizer(audio_path)
@@ -214,12 +269,24 @@ def run_evidence_probe(
     vad_model_name: str,
     vad_model_version: str,
     embedding_cosine_threshold: float,
+    model_path: Optional[str] = None,
+    vad_model_path: Optional[str] = None,
+    require_model_snapshot: bool = False,
 ) -> Dict[str, Any]:
     """
     Execute pre-diarization speaker evidence probe.
     Does NOT emit final speaker assignments or run full spectral clustering pipeline.
     Probes bounded speech windows / embeddings for conservative speaker change cues.
     """
+    if require_model_snapshot or (model_path and vad_model_path):
+        os.environ["MODELSCOPE_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    cache_root = resolve_verified_model_cache_dir(
+        model_name, model_path, vad_model_name, vad_model_path, require_model_snapshot
+    )
+
     DiarizationClass, load_audio_fn = get_diarization_class_and_audio_loader()
     source_tag = (
         f"{model_name or DEFAULT_MODEL_NAME}@{model_version or DEFAULT_MODEL_VERSION}"
@@ -227,23 +294,32 @@ def run_evidence_probe(
     )
 
     diarizer = None
-    for attempt in [
-        lambda: DiarizationClass(
-            model_id=model_name or DEFAULT_MODEL_NAME,
-            model_revision=model_version or DEFAULT_MODEL_VERSION,
-            vad_model_id=vad_model_name or DEFAULT_VAD_MODEL,
-            vad_model_revision=vad_model_version or DEFAULT_VAD_VERSION,
-        ),
-        lambda: DiarizationClass(),
-    ]:
+    last_err = None
+    try:
+        if cache_root:
+            diarizer = DiarizationClass(model_cache_dir=cache_root)
+        else:
+            diarizer = DiarizationClass()
+    except TypeError as exc:
+        if require_model_snapshot:
+            raise RuntimeError(
+                f"WORKER_SNAPSHOT_PATH_REQUIRED: Diarization3Dspeaker does not accept verified model_cache_dir: {exc}"
+            ) from exc
+        # Fallback only for non-strict/mock execution where no verified snapshot is required
         try:
-            diarizer = attempt()
-            break
-        except Exception:
-            continue
+            diarizer = DiarizationClass()
+        except Exception as exc2:
+            last_err = exc2
+    except Exception as exc:
+        if require_model_snapshot:
+            raise RuntimeError(
+                f"WORKER_SNAPSHOT_PATH_REQUIRED: failed to initialize Diarization3Dspeaker with verified snapshot cache ({cache_root}): {exc}"
+            ) from exc
+        last_err = exc
 
     if diarizer is None:
-        raise RuntimeError("failed to initialize speakerlab for evidence probe")
+        prefix = "WORKER_SNAPSHOT_PATH_REQUIRED: " if require_model_snapshot else ""
+        raise RuntimeError(f"{prefix}failed to initialize speakerlab for evidence probe: {last_err}")
 
     # 1. First-party ModelScope 3D-Speaker Diarization3Dspeaker execution:
     # Upstream speakerlab.bin.infer_diarization exposes:
@@ -416,11 +492,22 @@ def main() -> None:
         if embedding_cosine_threshold <= 0 or embedding_cosine_threshold > 1:
             sys.stderr.write("Error: embedding_cosine_threshold must be in (0, 1]\n")
             sys.exit(1)
+    model_path = req.get("model_path")
+    vad_model_path = req.get("vad_model_path")
+    require_model_snapshot = bool(req.get("require_model_snapshot", False))
 
     try:
         if mode == "evidence":
             evidence = run_evidence_probe(
-                audio_path, model_name, model_version, vad_model_name, vad_model_version, embedding_cosine_threshold
+                audio_path,
+                model_name,
+                model_version,
+                vad_model_name,
+                vad_model_version,
+                embedding_cosine_threshold,
+                model_path=model_path,
+                vad_model_path=vad_model_path,
+                require_model_snapshot=require_model_snapshot,
             )
             resp = {
                 "speaker_evidence": evidence,
@@ -431,7 +518,14 @@ def main() -> None:
             }
         else:
             assignments = run_diarization(
-                audio_path, model_name, model_version, vad_model_name, vad_model_version
+                audio_path,
+                model_name,
+                model_version,
+                vad_model_name,
+                vad_model_version,
+                model_path=model_path,
+                vad_model_path=vad_model_path,
+                require_model_snapshot=require_model_snapshot,
             )
             if not assignments:
                 sys.stderr.write("Error: 3D-Speaker diarization produced no speaker assignments\n")

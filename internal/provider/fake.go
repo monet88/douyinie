@@ -240,12 +240,18 @@ func (p *FakeTTSProvider) VoiceCatalog() []domain.VoiceProfile {
 	}
 	var voices []domain.VoiceProfile
 	for _, l := range p.Cap.Languages {
-		for _, v := range DefaultPresetVoices(l) {
-			if v.ProviderID == p.ProviderID || (p.ProviderID == "fake_vieneu_tts_vi" && v.ProviderID == "vieneu_tts_vi") ||
-				(p.ProviderID == "fake_kokoro_tts_en" && v.ProviderID == "kokoro_tts_en") ||
-				(p.ProviderID == "fake_cosyvoice3_tts" && v.ProviderID == "cosyvoice3_tts") {
+		if strings.Contains(p.ProviderID, "cosyvoice") {
+			for _, v := range CosyVoicePresetVoices(l) {
 				v.ProviderID = p.ProviderID
 				voices = append(voices, v)
+			}
+		} else {
+			for _, v := range DefaultPresetVoices(l) {
+				if v.ProviderID == p.ProviderID || (p.ProviderID == "fake_vieneu_tts_vi" && v.ProviderID == "vieneu_tts_vi") ||
+					(p.ProviderID == "fake_kokoro_tts_en" && v.ProviderID == "kokoro_tts_en") {
+					v.ProviderID = p.ProviderID
+					voices = append(voices, v)
+				}
 			}
 		}
 	}

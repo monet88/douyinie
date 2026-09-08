@@ -56,7 +56,7 @@ func TestSeam2_TTSStage_RealVieNeuSynthesisAndDurationProbe(t *testing.T) {
 			"model_name":       "vieneu-tts",
 			"model_version":    "1.0.0",
 			"language":         "vi",
-			"voice_id":         "vi_female_natural",
+			"voice_id":         "Trúc Ly",
 			"speed":            "1.0",
 			"slot_duration_ms": "5000",
 		},

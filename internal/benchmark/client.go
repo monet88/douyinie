@@ -22,6 +22,38 @@ type RuntimeHostClient struct {
 	httpClient *http.Client
 }
 
+// StageRouteOptions carries the non-secret routing context that must accompany
+// benchmark requests whose production behavior varies by execution profile.
+// Credential values remain behind RuntimeHost credential references or runtime
+// environment resolution; only safe credential reference IDs are transported.
+type StageRouteOptions struct {
+	ExecutionProfile      domain.ExecutionProfile
+	AuthorizedCredentials []string
+	ConsentGranted        bool
+}
+
+func applyStageRouteOptions(payload map[string]any, opts StageRouteOptions, includeConsent bool) {
+	if opts.ExecutionProfile != "" {
+		payload["execution_profile"] = opts.ExecutionProfile
+	}
+	if len(opts.AuthorizedCredentials) > 0 {
+		payload["authorized_credentials"] = append([]string(nil), opts.AuthorizedCredentials...)
+	}
+	if includeConsent {
+		payload["consent_granted"] = opts.ConsentGranted
+	}
+}
+
+// HTTPError captures the actual HTTP status code and response body from RuntimeHost.
+type HTTPError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Body)
+}
+
 // NewRuntimeHostClient constructs a new public Seam 1 client.
 func NewRuntimeHostClient(baseURL string, httpClient *http.Client) *RuntimeHostClient {
 	if httpClient == nil {
@@ -64,7 +96,7 @@ func (c *RuntimeHostClient) doJSON(ctx context.Context, method, path string, req
 	}
 
 	if resp.StatusCode >= 400 {
-		return resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBytes))
+		return resp.StatusCode, &HTTPError{StatusCode: resp.StatusCode, Body: string(respBytes)}
 	}
 
 	if respOut != nil && len(respBytes) > 0 {
@@ -217,13 +249,14 @@ func (c *RuntimeHostClient) RunSpeechUnderstand(ctx context.Context, assetID, ru
 }
 
 // RunTranslation calls POST /api/v1/assets/{id}/translate.
-func (c *RuntimeHostClient) RunTranslation(ctx context.Context, assetID, runID, jobID, targetLang string, segments []domain.TranslationInputSegment) (*domain.TranslationVariant, error) {
+func (c *RuntimeHostClient) RunTranslation(ctx context.Context, assetID, runID, jobID, targetLang string, segments []domain.TranslationInputSegment, opts StageRouteOptions) (*domain.TranslationVariant, error) {
 	payload := map[string]any{
 		"run_id":          runID,
 		"job_id":          jobID,
 		"target_language": targetLang,
 		"segments":        segments,
 	}
+	applyStageRouteOptions(payload, opts, true)
 	var res struct {
 		TranslationVariant domain.TranslationVariant `json:"translation_variant"`
 	}
@@ -234,7 +267,7 @@ func (c *RuntimeHostClient) RunTranslation(ctx context.Context, assetID, runID, 
 }
 
 // RunDubScript calls POST /api/v1/assets/{id}/dub-script.
-func (c *RuntimeHostClient) RunDubScript(ctx context.Context, assetID, runID, jobID, targetLang, transCAS string, segments []domain.TranslationInputSegment) (*domain.DubScriptVariant, error) {
+func (c *RuntimeHostClient) RunDubScript(ctx context.Context, assetID, runID, jobID, targetLang, transCAS string, segments []domain.TranslationInputSegment, opts StageRouteOptions) (*domain.DubScriptVariant, error) {
 	payload := map[string]any{
 		"run_id":                  runID,
 		"job_id":                  jobID,
@@ -242,6 +275,7 @@ func (c *RuntimeHostClient) RunDubScript(ctx context.Context, assetID, runID, jo
 		"translation_variant_cas": transCAS,
 		"segments":                segments,
 	}
+	applyStageRouteOptions(payload, opts, false)
 	var res struct {
 		DubScriptVariant domain.DubScriptVariant `json:"dub_script_variant"`
 	}
@@ -252,12 +286,13 @@ func (c *RuntimeHostClient) RunDubScript(ctx context.Context, assetID, runID, jo
 }
 
 // AssignVoices calls POST /api/v1/assets/{id}/voice-assignment.
-func (c *RuntimeHostClient) AssignVoices(ctx context.Context, assetID, runID, jobID, targetLang string) (*domain.VoiceAssignment, error) {
+func (c *RuntimeHostClient) AssignVoices(ctx context.Context, assetID, runID, jobID, targetLang string, opts StageRouteOptions) (*domain.VoiceAssignment, error) {
 	payload := map[string]any{
 		"run_id":          runID,
 		"job_id":          jobID,
 		"target_language": targetLang,
 	}
+	applyStageRouteOptions(payload, opts, false)
 	var res struct {
 		VoiceAssignment domain.VoiceAssignment `json:"voice_assignment"`
 	}
@@ -268,7 +303,7 @@ func (c *RuntimeHostClient) AssignVoices(ctx context.Context, assetID, runID, jo
 }
 
 // RunDubSynthesize calls POST /api/v1/assets/{id}/dub-synthesize.
-func (c *RuntimeHostClient) RunDubSynthesize(ctx context.Context, assetID, runID, jobID, targetLang, voiceAssignCAS, dubScriptCAS string) (*domain.DubSegmentsVariant, error) {
+func (c *RuntimeHostClient) RunDubSynthesize(ctx context.Context, assetID, runID, jobID, targetLang, voiceAssignCAS, dubScriptCAS string, opts StageRouteOptions) (*domain.DubSegmentsVariant, error) {
 	payload := map[string]any{
 		"run_id":               runID,
 		"job_id":               jobID,
@@ -276,6 +311,7 @@ func (c *RuntimeHostClient) RunDubSynthesize(ctx context.Context, assetID, runID
 		"voice_assignment_cas": voiceAssignCAS,
 		"dub_script_cas":       dubScriptCAS,
 	}
+	applyStageRouteOptions(payload, opts, false)
 	var res struct {
 		DubSegmentsVariant domain.DubSegmentsVariant `json:"dub_segments_variant"`
 	}
@@ -286,8 +322,9 @@ func (c *RuntimeHostClient) RunDubSynthesize(ctx context.Context, assetID, runID
 }
 
 // SeparateStems calls POST /api/v1/assets/{id}/separate-stems.
-func (c *RuntimeHostClient) SeparateStems(ctx context.Context, assetID, runID string) (*domain.AudioStemArtifacts, error) {
+func (c *RuntimeHostClient) SeparateStems(ctx context.Context, assetID, runID string, opts StageRouteOptions) (*domain.AudioStemArtifacts, error) {
 	payload := map[string]any{"run_id": runID}
+	applyStageRouteOptions(payload, opts, false)
 	var res struct {
 		Stems domain.AudioStemArtifacts `json:"audio_stems"`
 	}
@@ -298,7 +335,7 @@ func (c *RuntimeHostClient) SeparateStems(ctx context.Context, assetID, runID st
 }
 
 // RunAudioMix calls POST /api/v1/assets/{id}/audio-mix.
-func (c *RuntimeHostClient) RunAudioMix(ctx context.Context, assetID, runID, jobID, targetLang, dubSegmentsCAS, audioStemsCAS string) (*domain.DubMixArtifact, error) {
+func (c *RuntimeHostClient) RunAudioMix(ctx context.Context, assetID, runID, jobID, targetLang, dubSegmentsCAS, audioStemsCAS string, opts StageRouteOptions) (*domain.DubMixArtifact, error) {
 	payload := map[string]any{
 		"run_id":           runID,
 		"job_id":           jobID,
@@ -306,6 +343,7 @@ func (c *RuntimeHostClient) RunAudioMix(ctx context.Context, assetID, runID, job
 		"dub_segments_cas": dubSegmentsCAS,
 		"audio_stems_cas":  audioStemsCAS,
 	}
+	applyStageRouteOptions(payload, opts, false)
 	var res struct {
 		DubMix domain.DubMixArtifact `json:"dub_mix"`
 	}
@@ -316,8 +354,9 @@ func (c *RuntimeHostClient) RunAudioMix(ctx context.Context, assetID, runID, job
 }
 
 // DetectText calls POST /api/v1/assets/{id}/detect-text.
-func (c *RuntimeHostClient) DetectText(ctx context.Context, assetID, runID string) (*domain.TextRegionPlan, error) {
+func (c *RuntimeHostClient) DetectText(ctx context.Context, assetID, runID string, opts StageRouteOptions) (*domain.TextRegionPlan, error) {
 	payload := map[string]any{"run_id": runID}
+	applyStageRouteOptions(payload, opts, false)
 	var res struct {
 		TextRegionPlan domain.TextRegionPlan `json:"text_region_plan"`
 	}
@@ -328,7 +367,7 @@ func (c *RuntimeHostClient) DetectText(ctx context.Context, assetID, runID strin
 }
 
 // LocalizeVisualTrack calls POST /api/v1/assets/{id}/visual-track.
-func (c *RuntimeHostClient) LocalizeVisualTrack(ctx context.Context, assetID, runID, jobID, targetLang, textRegionCAS, transCAS string) (*domain.LocalizedVisualTrack, *domain.LocalizedSubtitleTrack, error) {
+func (c *RuntimeHostClient) LocalizeVisualTrack(ctx context.Context, assetID, runID, jobID, targetLang, textRegionCAS, transCAS string, opts StageRouteOptions) (*domain.LocalizedVisualTrack, *domain.LocalizedSubtitleTrack, error) {
 	payload := map[string]any{
 		"run_id":                  runID,
 		"job_id":                  jobID,
@@ -336,6 +375,7 @@ func (c *RuntimeHostClient) LocalizeVisualTrack(ctx context.Context, assetID, ru
 		"text_region_plan_cas":    textRegionCAS,
 		"translation_variant_cas": transCAS,
 	}
+	applyStageRouteOptions(payload, opts, true)
 	var res struct {
 		VisualTrack   domain.LocalizedVisualTrack   `json:"localized_visual_track"`
 		SubtitleTrack domain.LocalizedSubtitleTrack `json:"localized_subtitle_track"`
@@ -379,6 +419,17 @@ func (c *RuntimeHostClient) RenderFinal(ctx context.Context, assetID, runID, job
 		return nil, fmt.Errorf("render final: %w", err)
 	}
 	return &res.FinalRender, nil
+}
+
+// PostQualityResult calls POST /api/v1/quality-results.
+func (c *RuntimeHostClient) PostQualityResult(ctx context.Context, qr domain.QualityResult) (*domain.QualityResult, error) {
+	var res struct {
+		QualityResult domain.QualityResult `json:"quality_result"`
+	}
+	if _, err := c.doJSON(ctx, http.MethodPost, "/api/v1/quality-results", qr, &res); err != nil {
+		return nil, fmt.Errorf("post quality result: %w", err)
+	}
+	return &res.QualityResult, nil
 }
 
 // GetRunQualityResults calls GET /api/v1/runs/{id}/quality-results.

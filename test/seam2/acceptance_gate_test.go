@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/monet88/douyinie/internal/benchmark"
 	"github.com/monet88/douyinie/internal/worker"
 )
 
@@ -124,5 +125,110 @@ func TestSeam2_AcceptanceGate_ArtifactTransportContract(t *testing.T) {
 	}
 	if marker.ModelName != "qwen3-asr-1.7b" || marker.ModelVersion != "1.7b" {
 		t.Fatalf("artifact model identity mismatch: got %s@%s", marker.ModelName, marker.ModelVersion)
+	}
+}
+// TestSeam2_QualityCorpus_ProfileIsolationAndResourceTelemetry exercises the StageWorker
+// execution contract under Local and Hybrid profiles, verifying that WDDM GPU resource sampling
+// captures device-wide baseline/peak VRAM bound to stage execution timestamps.
+func TestSeam2_QualityCorpus_ProfileIsolationAndResourceTelemetry(t *testing.T) {
+	binDir := buildFakeModel(t, "qwen3-asr")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	exe := buildStageWorker(t)
+	sup := worker.NewSupervisor()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := sup.Spawn(ctx, "asr", exe, "-family", "asr", "-heartbeat-ms", "1000"); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	client := worker.NewClient(sup)
+	if _, err := client.Handshake(ctx, 5*time.Second); err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("handshake: %v", err)
+	}
+	defer func() { _ = client.Shutdown() }()
+
+	audioPath := filepath.Join(t.TempDir(), "audio.wav")
+	if err := os.WriteFile(audioPath, []byte("fake audio data for telemetry"), 0644); err != nil {
+		t.Fatalf("write input audio: %v", err)
+	}
+	// 1. Initialize WDDM GPU collector and start sampling
+	collector := benchmark.NewWDDMGPUCollector(20 * time.Millisecond)
+	_ = collector.Start()
+	defer collector.Stop()
+	// 2. Execute StageWorker command under Local profile
+	outPathLocal := filepath.Join(t.TempDir(), "local-artifact.json")
+	cmdLocal := worker.Command{
+		ID:         "seam2-qc-local-cmd",
+		Family:     "asr",
+		Stage:      "asr",
+		AttemptID:  "seam2-qc-attempt-local",
+		RunID:      "seam2-qc-run-local",
+		Inputs:     []worker.ArtifactRef{{SHA256: "audio", Path: audioPath}},
+		OutputPath: outPathLocal,
+		Config: map[string]any{
+			"model_name":        "qwen3-asr-1.7b",
+			"model_version":     "1.7b",
+			"execution_profile": "local",
+		},
+	}
+
+	startLocal := time.Now().UTC()
+	artifactLocal, err := client.Run(ctx, cmdLocal, 5*time.Second, 5*time.Second)
+	if err != nil {
+		t.Fatalf("local run: %v", err)
+	}
+	elapsedLocal := time.Since(startLocal).Milliseconds()
+
+	sampleLocal, ok := collector.SampleStage("speech_understand", startLocal, elapsedLocal)
+	if !ok {
+		t.Fatalf("expected telemetry sample for speech_understand stage")
+	}
+	if sampleLocal.Stage != "speech_understand" {
+		t.Errorf("expected stage 'speech_understand', got %s", sampleLocal.Stage)
+	}
+	if sampleLocal.DeviceBaselineVRAMBytes == 0 {
+		t.Errorf("expected non-zero device baseline VRAM bytes on WDDM")
+	}
+
+	// 3. Execute StageWorker command under Hybrid profile
+	outPathHybrid := filepath.Join(t.TempDir(), "hybrid-artifact.json")
+	cmdHybrid := worker.Command{
+		ID:         "seam2-qc-hybrid-cmd",
+		Family:     "asr",
+		Stage:      "asr",
+		AttemptID:  "seam2-qc-attempt-hybrid",
+		RunID:      "seam2-qc-run-hybrid",
+		Inputs:     []worker.ArtifactRef{{SHA256: "audio", Path: audioPath}},
+		OutputPath: outPathHybrid,
+		Config: map[string]any{
+			"model_name":        "qwen3-asr-1.7b",
+			"model_version":     "1.7b",
+			"execution_profile": "hybrid",
+		},
+	}
+
+	startHybrid := time.Now().UTC()
+	artifactHybrid, err := client.Run(ctx, cmdHybrid, 5*time.Second, 5*time.Second)
+	if err != nil {
+		t.Fatalf("hybrid run: %v", err)
+	}
+	elapsedHybrid := time.Since(startHybrid).Milliseconds()
+
+	sampleHybrid, ok := collector.SampleStage("speech_understand", startHybrid, elapsedHybrid)
+	if !ok {
+		t.Fatalf("expected telemetry sample for hybrid speech_understand stage")
+	}
+	if sampleHybrid.DevicePeakVRAMBytes < sampleHybrid.DeviceBaselineVRAMBytes {
+		t.Errorf("peak VRAM %d cannot be less than baseline %d", sampleHybrid.DevicePeakVRAMBytes, sampleHybrid.DeviceBaselineVRAMBytes)
+	}
+
+	// Invariant: Both profiles produced valid on-disk artifacts without colliding
+	if artifactLocal.Path == artifactHybrid.Path {
+		t.Errorf("local and hybrid output paths must be isolated, got same path: %s", artifactLocal.Path)
+	}
+	if artifactLocal.SHA256 == "" || artifactHybrid.SHA256 == "" {
+		t.Errorf("both artifacts must carry valid SHA256 hashes")
 	}
 }

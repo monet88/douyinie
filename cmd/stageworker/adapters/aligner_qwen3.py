@@ -141,17 +141,43 @@ def run_aligner(
     text: str,
     model_name: str,
     model_version: str,
+    model_path: str = "",
+    require_model_snapshot: bool = False,
 ) -> Dict[str, Any]:
     """Execute Qwen3ForcedAligner model inference over input audio and accepted text."""
+    # Verified local snapshot is the source of truth. Under strict snapshot
+    # requirement a missing/inaccessible model_path fails closed with
+    # WORKER_SNAPSHOT_PATH_REQUIRED — Hub/model-ID fallback is prohibited.
+    snapshot_path = (model_path or "").strip()
+    if require_model_snapshot:
+        if not snapshot_path or not os.path.exists(snapshot_path):
+            raise RuntimeError(
+                f"WORKER_SNAPSHOT_PATH_REQUIRED: verified local snapshot model_path missing or inaccessible: {model_path!r}; Hub fallback is strictly prohibited"
+            )
+        model_id = snapshot_path
+        init_fns = [
+            lambda: AlignerClass.from_pretrained(model_id, **qwen_runtime_load_kwargs()),
+            lambda: AlignerClass(model_id),
+        ]
+    elif snapshot_path and os.path.exists(snapshot_path):
+        model_id = snapshot_path
+        init_fns = [
+            lambda: AlignerClass.from_pretrained(model_id, **qwen_runtime_load_kwargs()),
+            lambda: AlignerClass(model_id),
+            lambda: AlignerClass(),
+        ]
+    else:
+        model_id = resolve_aligner_identifier(model_name, model_version)
+        init_fns = [
+            lambda: AlignerClass.from_pretrained(model_id, **qwen_runtime_load_kwargs()),
+            lambda: AlignerClass(model_id),
+            lambda: AlignerClass(),
+        ]
+
     AlignerClass = get_qwen3_forced_aligner_class()
-    model_id = resolve_aligner_identifier(model_name, model_version)
 
     aligner = None
-    for init_fn in [
-        lambda: AlignerClass.from_pretrained(model_id, **qwen_runtime_load_kwargs()),
-        lambda: AlignerClass(model_id),
-        lambda: AlignerClass(),
-    ]:
+    for init_fn in init_fns:
         try:
             aligner = init_fn()
             break
@@ -159,6 +185,8 @@ def run_aligner(
             continue
 
     if aligner is None:
+        if require_model_snapshot:
+            raise RuntimeError(f"WORKER_SNAPSHOT_PATH_REQUIRED: failed to initialize Qwen3ForcedAligner with verified snapshot ({model_id})")
         raise RuntimeError(f"failed to initialize Qwen3ForcedAligner with checkpoint '{model_id}'")
 
     raw_results = None
@@ -212,9 +240,11 @@ def main() -> None:
 
     model_name = req.get("model_name", "")
     model_version = req.get("model_version", "")
+    model_path = req.get("model_path", "")
+    require_model_snapshot = req.get("require_model_snapshot", False)
 
     try:
-        resp = run_aligner(audio_path, text, model_name, model_version)
+        resp = run_aligner(audio_path, text, model_name, model_version, model_path, require_model_snapshot)
         sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
         sys.stdout.flush()
     except Exception as exc:

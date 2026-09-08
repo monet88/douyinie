@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -706,5 +707,530 @@ func TestSeam1_ProductionRegistry_FailsClosedWhenSnapshotAbsent(t *testing.T) {
 
 	if decideResult2.SelectedProviderID != "qwen3_asr_1_7b" {
 		t.Fatalf("expected qwen3_asr_1_7b to be selected after verification, got: %s", decideResult2.SelectedProviderID)
+	}
+}
+func TestSeam1_Snapshot_OCR_RegistrationAndVerification(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+	casStore, err := cas.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("setup cas: %v", err)
+	}
+
+	licSvc := governance.NewLicenseService(db)
+	snapSvc := governance.NewSnapshotService(db, licSvc)
+	queueSvc := queue.NewService(db)
+	resScheduler := scheduler.New()
+
+	srv := server.New(server.Config{
+		Addr:        "127.0.0.1:0",
+		DB:          db,
+		CASStore:    casStore,
+		LicenseSvc:  licSvc,
+		SnapshotSvc: snapSvc,
+		QueueSvc:    queueSvc,
+		Scheduler:   resScheduler,
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	// 1. Create 3 independent verified snapshot directories: det, rec, ori
+	detDir, detManifest := createSnapshotDirWithFiles(t, map[string]string{
+		"inference.pdmodel":   "det_model_bytes",
+		"inference.pdiparams": "det_params_bytes",
+	})
+	detManifest.ModelID = "PP-OCRv6_medium_det"
+	detManifest.ModelVersion = "v6"
+	detSHA, err := domain.ComputeSnapshotManifestSHA256(&detManifest)
+	if err != nil {
+		t.Fatalf("compute det sha: %v", err)
+	}
+	detManifest.SnapshotManifestSHA256 = detSHA
+
+	recDir, recManifest := createSnapshotDirWithFiles(t, map[string]string{
+		"inference.pdmodel":   "rec_model_bytes",
+		"inference.pdiparams": "rec_params_bytes",
+	})
+	recManifest.ModelID = "PP-OCRv6_medium_rec"
+	recManifest.ModelVersion = "v6"
+	recSHA, err := domain.ComputeSnapshotManifestSHA256(&recManifest)
+	if err != nil {
+		t.Fatalf("compute rec sha: %v", err)
+	}
+	recManifest.SnapshotManifestSHA256 = recSHA
+
+	oriDir, oriManifest := createSnapshotDirWithFiles(t, map[string]string{
+		"inference.pdmodel":   "ori_model_bytes",
+		"inference.pdiparams": "ori_params_bytes",
+	})
+	oriManifest.ModelID = "PP-LCNet_x1_0_textline_ori"
+	oriManifest.ModelVersion = "v1"
+	oriSHA, err := domain.ComputeSnapshotManifestSHA256(&oriManifest)
+	if err != nil {
+		t.Fatalf("compute ori sha: %v", err)
+	}
+	oriManifest.SnapshotManifestSHA256 = oriSHA
+	// Register 4-layer license manifests for all 3 OCR dependencies
+	initCtx := context.Background()
+	for _, m := range []struct {
+		name, ver, sha string
+	}{
+		{"PP-OCRv6_medium_det", "v6", detSHA},
+		{"PP-OCRv6_medium_rec", "v6", recSHA},
+		{"PP-LCNet_x1_0_textline_ori", "v1", oriSHA},
+	} {
+		_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+			ID:             uuid.NewString(),
+			DependencyName: m.name,
+			Version:        m.ver,
+			SHA256:         m.sha,
+			CodeLicense:    "Apache-2.0",
+			ModelLicense:   "Community-License",
+			DataLicense:    "Open-Data",
+			ServiceTerms:   "Self-Hosted",
+			Verified:       true,
+			CreatedAt:      time.Now().UTC(),
+		})
+	}
+
+	// 2. Verify all 3 snapshots through public API
+	for _, pair := range []struct {
+		m domain.SnapshotManifest
+		p string
+	}{
+		{detManifest, detDir},
+		{recManifest, recDir},
+		{oriManifest, oriDir},
+	} {
+		payload, _ := json.Marshal(map[string]any{
+			"manifest":   pair.m,
+			"local_path": pair.p,
+		})
+		vResp, err := http.Post(ts.URL+"/api/v1/snapshots/verify", "application/json", bytes.NewReader(payload))
+		if err != nil {
+			t.Fatalf("POST verify %s failed: %v", pair.m.ModelID, err)
+		}
+		if vResp.StatusCode != http.StatusCreated {
+			b, _ := io.ReadAll(vResp.Body)
+			vResp.Body.Close()
+			t.Fatalf("expected 201 Created from verify %s, got %d: %s", pair.m.ModelID, vResp.StatusCode, string(b))
+		}
+		vResp.Body.Close()
+	}
+
+	// 3. WorkerOCRProvider binds verified snapshots and exposes full provenance
+	ppocr, err := provider.NewWorkerOCRProvider("ppocr_v6", "paddleocr-v6", "v6", 0.92)
+	if err != nil {
+		t.Fatalf("new worker ocr provider: %v", err)
+	}
+	ppocr.SetSnapshotService(snapSvc)
+
+	gotDetSHA, gotRecSHA, gotOriSHA, runtimeIdentity := ppocr.OCRSnapshotDigests()
+	if gotDetSHA != detSHA {
+		t.Fatalf("got det sha %s, want %s", gotDetSHA, detSHA)
+	}
+	if gotRecSHA != recSHA {
+		t.Fatalf("got rec sha %s, want %s", gotRecSHA, recSHA)
+	}
+	if gotOriSHA != oriSHA {
+		t.Fatalf("got ori sha %s, want %s", gotOriSHA, oriSHA)
+	}
+	if runtimeIdentity != "paddleocr:3.7.0@b03f46425e8ff4442b268ce449e3eef758146cd4" {
+		t.Fatalf("unexpected runtime identity: %s", runtimeIdentity)
+	}
+
+	obs := ppocr.ObservedModel()
+	if !strings.Contains(obs, detSHA[:8]) || !strings.Contains(obs, recSHA[:8]) || !strings.Contains(obs, oriSHA[:8]) {
+		t.Fatalf("observed model does not contain snapshot prefixes: %s", obs)
+	}
+	if ppocr.ServiceBaselineID() != "paddleocr-3.7.0-b03f46425e8ff4442b268ce449e3eef758146cd4" {
+		t.Fatalf("unexpected baseline id: %s", ppocr.ServiceBaselineID())
+	}
+
+	deps := ppocr.ModelDependencies()
+	if len(deps) != 3 {
+		t.Fatalf("expected 3 model dependencies, got %d", len(deps))
+	}
+
+	// 4. Mutating any file in a snapshot causes CheckBindingFingerprints to fail closed
+	if err := os.WriteFile(filepath.Join(detDir, "inference.pdmodel"), []byte("mutated_det_bytes"), 0644); err != nil {
+		t.Fatalf("write mutated file: %v", err)
+	}
+	if err := snapSvc.CheckBindingFingerprints("PP-OCRv6_medium_det", "v6"); err == nil {
+		t.Fatalf("expected mutated snapshot to fail CheckBindingFingerprints, got nil")
+	} else if !strings.Contains(err.Error(), "mutated") {
+		t.Fatalf("expected mutated error, got: %v", err)
+	}
+}
+
+func TestSeam1_Snapshot_OCR_ProvenanceAndCacheIsolation(t *testing.T) {
+	h1, err := domain.ComputeTextRegionPlanProvenanceHash(
+		"asset-1", "ppocr_v6", "paddleocr-v6", "v6", 500,
+		"det_sha_1", "rec_sha_1", "ori_sha_1", "paddleocr:3.7.0@b03f46425e8ff4442b268ce449e3eef758146cd4",
+	)
+	if err != nil {
+		t.Fatalf("compute h1: %v", err)
+	}
+
+	// Changing any snapshot digest changes the provenance hash
+	h2, err := domain.ComputeTextRegionPlanProvenanceHash(
+		"asset-1", "ppocr_v6", "paddleocr-v6", "v6", 500,
+		"det_sha_2_different", "rec_sha_1", "ori_sha_1", "paddleocr:3.7.0@b03f46425e8ff4442b268ce449e3eef758146cd4",
+	)
+	if err != nil {
+		t.Fatalf("compute h2: %v", err)
+	}
+
+	if h1 == h2 {
+		t.Fatalf("expected distinct provenance hashes for different snapshot digests, got identical %s", h1)
+	}
+
+	// Backward compatibility: omitting extraIdentities produces hash matching empty extraIdentities
+	hBase1, err := domain.ComputeTextRegionPlanProvenanceHash("asset-1", "fake_ocr", "paddleocr", "v4", 500)
+	if err != nil {
+		t.Fatalf("compute hBase1: %v", err)
+	}
+	hBase2, err := domain.ComputeTextRegionPlanProvenanceHash("asset-1", "fake_ocr", "paddleocr", "v4", 500)
+	if err != nil {
+		t.Fatalf("compute hBase2: %v", err)
+	}
+	if hBase1 != hBase2 {
+		t.Fatalf("base provenance hash not deterministic")
+	}
+	if hBase1 == h1 {
+		t.Fatalf("base hash unexpectedly collided with snapshot-enriched hash")
+	}
+}
+
+func TestSeam1_Snapshot_TTS_RegistrationAndVerification(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_tts_snap.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	licSvc := governance.NewLicenseService(db)
+	snapSvc := governance.NewSnapshotService(db, licSvc)
+
+	// 1. Verify default preset voice rotations (Issue #68)
+	viVoices := provider.DefaultPresetVoices("vi")
+	if len(viVoices) != 4 {
+		t.Fatalf("expected exactly 4 VieNeu preset voices in default rotation, got %d", len(viVoices))
+	}
+	expectedVI := []string{"Trúc Ly", "Phạm Tuyên", "Đoan Trang", "Xuân Vĩnh"}
+	for i, exp := range expectedVI {
+		if viVoices[i].VoiceID != exp {
+			t.Errorf("vi voice [%d] expected %s, got %s", i, exp, viVoices[i].VoiceID)
+		}
+		if viVoices[i].ProviderID != provider.VieNeuProviderID {
+			t.Errorf("vi voice [%d] provider expected %s, got %s", i, provider.VieNeuProviderID, viVoices[i].ProviderID)
+		}
+	}
+
+	enVoices := provider.DefaultPresetVoices("en")
+	if len(enVoices) != 4 {
+		t.Fatalf("expected exactly 4 Kokoro preset voices in default rotation, got %d", len(enVoices))
+	}
+	expectedEN := []string{"af_heart", "am_michael", "af_bella", "am_fenrir"}
+	for i, exp := range expectedEN {
+		if enVoices[i].VoiceID != exp {
+			t.Errorf("en voice [%d] expected %s, got %s", i, exp, enVoices[i].VoiceID)
+		}
+		if enVoices[i].ProviderID != provider.KokoroProviderID {
+			t.Errorf("en voice [%d] provider expected %s, got %s", i, provider.KokoroProviderID, enVoices[i].ProviderID)
+		}
+	}
+
+	// 2. Fabricated VieNeu snapshot with generic config.json or voices/*.pt must fail validation
+	fabDir, fabManifest := createSnapshotDirWithFiles(t, map[string]string{
+		"config.json":          `{"model_type": "vieneu_v3_turbo"}`,
+		"model.safetensors":    "fake_vieneu_weights_bytes_1278db00",
+		"voices/Trúc Ly.pt":    "voice_truc_ly_data",
+		"voices/Phạm Tuyên.pt": "voice_pham_tuyen_data",
+	})
+	fabManifest.ModelID = provider.VieNeuModelID
+	fabManifest.ModelVersion = provider.VieNeuModelVersion
+	if _, err := domain.ResolveTTSVoiceEntrypoint(fabManifest, fabDir, provider.VieNeuModelID, "Trúc Ly"); err == nil {
+		t.Fatalf("expected fabricated voices/*.pt without voices_v3_turbo.json to fail validation")
+	}
+
+	// 2b. Register genuine VieNeu model snapshot using v3 Turbo catalog
+	vieneuDir, vieneuManifest := createSnapshotDirWithFiles(t, map[string]string{
+		"src/vieneu/assets/voices_v3_turbo.json": `{"presets": {"Trúc Ly": {"id": "Trúc Ly"}, "Phạm Tuyên": {"id": "Phạm Tuyên"}, "Đoan Trang": {"id": "Đoan Trang"}, "Xuân Vĩnh": {"id": "Xuân Vĩnh"}}}`,
+		"model.safetensors":                      "fake_vieneu_weights_bytes_1278db00",
+		"moss_tokenizer/tokenizer.json":          "{}",
+	})
+	vieneuManifest.ModelID = provider.VieNeuModelID
+	vieneuManifest.ModelVersion = provider.VieNeuModelVersion
+	vSHA, err := domain.ComputeSnapshotManifestSHA256(&vieneuManifest)
+	if err != nil {
+		t.Fatalf("compute vieneu manifest sha: %v", err)
+	}
+	vieneuManifest.SnapshotManifestSHA256 = vSHA
+
+	_ = licSvc.RegisterManifest(context.Background(), domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: provider.VieNeuModelID,
+		Version:        provider.VieNeuModelVersion,
+		SHA256:         vSHA,
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Local-Offline",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	vBinding, err := snapSvc.RegisterAndVerifySnapshot(context.Background(), vieneuManifest, vieneuDir)
+	if err != nil {
+		t.Fatalf("RegisterAndVerifySnapshot for VieNeu failed: %v", err)
+	}
+	if vBinding.DependencyName != provider.VieNeuModelID {
+		t.Fatalf("expected dependency name %s, got %s", provider.VieNeuModelID, vBinding.DependencyName)
+	}
+
+	// All 4 voices resolve
+	for _, vID := range expectedVI {
+		ep, epErr := domain.ResolveTTSVoiceEntrypoint(vieneuManifest, vieneuDir, provider.VieNeuModelID, vID)
+		if epErr != nil {
+			t.Errorf("expected voice %s to resolve, got err: %v", vID, epErr)
+		}
+		expectedCatalogPath := filepath.Join(vieneuDir, "src", "vieneu", "assets", "voices_v3_turbo.json")
+		if ep != expectedCatalogPath {
+			t.Errorf("expected resolved ep %s, got %s", expectedCatalogPath, ep)
+		}
+	}
+
+	// Unverified voice fails closed
+	if _, err := domain.ResolveTTSVoiceEntrypoint(vieneuManifest, vieneuDir, provider.VieNeuModelID, "unverified_voice"); err == nil {
+		t.Fatalf("expected unverified VieNeu voice to fail closed")
+	}
+	// 3. Kokoro model snapshot: synthetic fake checkpoint bytes cannot pass the pinned RC SHA-256 (fail-closed proof)
+	kokoroDir, kokoroManifest := createSnapshotDirWithFiles(t, map[string]string{
+		"config.json":          `{"model_type": "kokoro"}`,
+		"kokoro-v1_0.pth":      "fake_synthetic_kokoro_checkpoint_bytes",
+		"voices/af_heart.pt":   "voice_af_heart_data",
+		"voices/am_michael.pt": "voice_am_michael_data",
+		"voices/af_bella.pt":   "voice_af_bella_data",
+		"voices/am_fenrir.pt":  "voice_am_fenrir_data",
+	})
+	kokoroManifest.ModelID = provider.KokoroModelID
+	kokoroManifest.ModelVersion = provider.KokoroModelVersion
+	kSHA, err := domain.ComputeSnapshotManifestSHA256(&kokoroManifest)
+	if err != nil {
+		t.Fatalf("compute kokoro manifest sha: %v", err)
+	}
+	kokoroManifest.SnapshotManifestSHA256 = kSHA
+
+	// Case A: If manifest truthfully records the fake bytes' hash, ResolveTTSVoiceEntrypoint fails closed
+	// because the checkpoint SHA does not match the immutable pinned RC checkpoint pin.
+	if _, err := domain.ResolveTTSVoiceEntrypoint(kokoroManifest, kokoroDir, provider.KokoroModelID, "af_heart"); !errors.Is(err, domain.ErrSnapshotDigestMismatch) {
+		t.Fatalf("expected fake checkpoint bytes to fail closed with ErrSnapshotDigestMismatch, got: %v", err)
+	}
+
+	// Case B: If manifest claims the pinned RC SHA but on-disk bytes are fake, RegisterAndVerifySnapshot fails closed
+	// with snapshot digest mismatch without mutating the pin.
+	fraudulentManifest := kokoroManifest
+	for i, f := range fraudulentManifest.Files {
+		if f.RelativePath == "kokoro-v1_0.pth" {
+			fraudulentManifest.Files[i].SHA256 = "496dba118d1a58f5f3db2efc88dbdc216e0483fc89fe6e47ee1f2c53f18ad1e4"
+		}
+	}
+	fSHA, err := domain.ComputeSnapshotManifestSHA256(&fraudulentManifest)
+	if err != nil {
+		t.Fatalf("compute fraudulent manifest sha: %v", err)
+	}
+	fraudulentManifest.SnapshotManifestSHA256 = fSHA
+	_ = licSvc.RegisterManifest(context.Background(), domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: provider.KokoroModelID,
+		Version:        provider.KokoroModelVersion,
+		SHA256:         fSHA,
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Local-Offline",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	})
+	if _, err := snapSvc.RegisterAndVerifySnapshot(context.Background(), fraudulentManifest, kokoroDir); !errors.Is(err, domain.ErrSnapshotDigestMismatch) {
+		t.Fatalf("expected unverified fake checkpoint on disk to fail RegisterAndVerifySnapshot, got: %v", err)
+	}
+
+	// Unverified Kokoro voice fails closed
+	if _, err := domain.ResolveTTSVoiceEntrypoint(kokoroManifest, kokoroDir, provider.KokoroModelID, "unverified_voice"); err == nil {
+		t.Fatalf("expected unverified Kokoro voice to fail closed")
+	}
+
+	// Unmanifested Kokoro config.json fails closed
+	noConfigKokoroManifest := kokoroManifest
+	var filteredFiles []domain.SnapshotFileEntry
+	for _, f := range kokoroManifest.Files {
+		if f.RelativePath != "config.json" {
+			filteredFiles = append(filteredFiles, f)
+		}
+	}
+	noConfigKokoroManifest.Files = filteredFiles
+	if _, err := domain.ResolveTTSVoiceEntrypoint(noConfigKokoroManifest, kokoroDir, provider.KokoroModelID, "af_heart"); err == nil {
+		t.Fatalf("expected Kokoro without manifest-declared config.json to fail closed")
+	}
+
+	// Unmanifested VieNeu MOSS tokenizer fails closed
+	noMossVieNeuManifest := vieneuManifest
+	var filteredVieNeuFiles []domain.SnapshotFileEntry
+	for _, f := range vieneuManifest.Files {
+		if !strings.HasPrefix(f.RelativePath, "moss_tokenizer") {
+			filteredVieNeuFiles = append(filteredVieNeuFiles, f)
+		}
+	}
+	noMossVieNeuManifest.Files = filteredVieNeuFiles
+	if _, err := domain.ResolveTTSVoiceEntrypoint(noMossVieNeuManifest, vieneuDir, provider.VieNeuModelID, "Trúc Ly"); err == nil {
+		t.Fatalf("expected VieNeu without manifest-declared MOSS tokenizer to fail closed")
+	}
+}
+
+func TestSeam1_Snapshot_Separator_RegistrationAndVerification(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_separator_snap.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("create sqlite db: %v", err)
+	}
+	defer db.Close()
+
+	licSvc := governance.NewLicenseService(db)
+	snapSvc := governance.NewSnapshotService(db, licSvc)
+
+	// 1. UVR model snapshot: synthetic fake checkpoint bytes cannot pass the pinned RC SHA-256 (fail-closed proof)
+	uvrDir, uvrManifest := createSnapshotDirWithFiles(t, map[string]string{
+		provider.UVRModelID: "fake_synthetic_uvr_onnx_bytes",
+	})
+	uvrManifest.ModelID = provider.UVRModelID
+	uvrManifest.ModelVersion = provider.UVRModelVersion
+	uSHA, err := domain.ComputeSnapshotManifestSHA256(&uvrManifest)
+	if err != nil {
+		t.Fatalf("compute uvr manifest sha: %v", err)
+	}
+	uvrManifest.SnapshotManifestSHA256 = uSHA
+
+	// Case A: If manifest truthfully records the fake bytes' hash, ResolveSeparatorEntrypoint fails closed
+	// because the ONNX SHA does not match the immutable pinned RC checkpoint pin.
+	if _, err := domain.ResolveSeparatorEntrypoint(uvrManifest, uvrDir, provider.UVRModelID); !errors.Is(err, domain.ErrSnapshotDigestMismatch) {
+		t.Fatalf("expected fake ONNX bytes to fail closed with ErrSnapshotDigestMismatch, got: %v", err)
+	}
+
+	// Case B: If manifest claims the pinned RC SHA but on-disk bytes are fake, RegisterAndVerifySnapshot fails closed
+	fraudulentUVRManifest := uvrManifest
+	for i, f := range fraudulentUVRManifest.Files {
+		if f.RelativePath == provider.UVRModelID {
+			fraudulentUVRManifest.Files[i].SHA256 = domain.PinnedUVRArtifactSHA256
+		}
+	}
+	fUVRSha, err := domain.ComputeSnapshotManifestSHA256(&fraudulentUVRManifest)
+	if err != nil {
+		t.Fatalf("compute fraudulent uvr manifest sha: %v", err)
+	}
+	fraudulentUVRManifest.SnapshotManifestSHA256 = fUVRSha
+	_ = licSvc.RegisterManifest(context.Background(), domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: provider.UVRModelID,
+		Version:        provider.UVRModelVersion,
+		SHA256:         fUVRSha,
+		CodeLicense:    "MIT",
+		ModelLicense:   "MIT",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Local-Offline",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	})
+	if _, err := snapSvc.RegisterAndVerifySnapshot(context.Background(), fraudulentUVRManifest, uvrDir); !errors.Is(err, domain.ErrSnapshotDigestMismatch) {
+		t.Fatalf("expected unverified fake UVR file on disk to fail RegisterAndVerifySnapshot, got: %v", err)
+	}
+
+	// Case C: Genuine UVR snapshot where manifest records the pinned RC SHA
+	genuineUVRManifest := uvrManifest
+	genuineUVRManifest.Files = []domain.SnapshotFileEntry{
+		{
+			RelativePath: provider.UVRModelID,
+			SHA256:       domain.PinnedUVRArtifactSHA256,
+			SizeBytes:    1024,
+		},
+	}
+	ep, err := domain.ResolveSeparatorEntrypoint(genuineUVRManifest, uvrDir, provider.UVRModelID)
+	if err != nil {
+		t.Fatalf("expected genuine UVR entrypoint to resolve, got: %v", err)
+	}
+	if filepath.Base(ep) != provider.UVRModelID {
+		t.Fatalf("expected entrypoint file %s, got %s", provider.UVRModelID, ep)
+	}
+
+	// 2. Demucs model snapshot:
+	demucsDir, demucsManifest := createSnapshotDirWithFiles(t, map[string]string{
+		"955717e8-8726e21a.th": "fake_synthetic_demucs_th_bytes",
+	})
+	demucsManifest.ModelID = provider.DemucsModelID
+	demucsManifest.ModelVersion = provider.DemucsModelVersion
+	dSHA, err := domain.ComputeSnapshotManifestSHA256(&demucsManifest)
+	if err != nil {
+		t.Fatalf("compute demucs manifest sha: %v", err)
+	}
+	demucsManifest.SnapshotManifestSHA256 = dSHA
+
+	// Case A: Fake bytes' hash fails closed
+	if _, err := domain.ResolveSeparatorEntrypoint(demucsManifest, demucsDir, provider.DemucsModelID); !errors.Is(err, domain.ErrSnapshotDigestMismatch) {
+		t.Fatalf("expected fake Demucs checkpoint bytes to fail closed with ErrSnapshotDigestMismatch, got: %v", err)
+	}
+
+	// Case B: Genuine Demucs snapshot where manifest records the pinned RC SHA
+	genuineDemucsManifest := demucsManifest
+	genuineDemucsManifest.Files = []domain.SnapshotFileEntry{
+		{
+			RelativePath: "955717e8-8726e21a.th",
+			SHA256:       domain.PinnedDemucsCheckpointSHA,
+			SizeBytes:    2048,
+		},
+	}
+	dep, err := domain.ResolveSeparatorEntrypoint(genuineDemucsManifest, demucsDir, provider.DemucsModelID)
+	if err != nil {
+		t.Fatalf("expected genuine Demucs entrypoint to resolve, got: %v", err)
+	}
+	if filepath.Base(dep) != "955717e8-8726e21a.th" {
+		t.Fatalf("expected entrypoint file 955717e8-8726e21a.th, got %s", dep)
+	}
+
+	// Case C: Reject htdemucs_ft
+	if _, err := domain.ResolveSeparatorEntrypoint(genuineDemucsManifest, demucsDir, "htdemucs_ft"); !errors.Is(err, domain.ErrSeparatorModelAssetMissing) {
+		t.Fatalf("expected htdemucs_ft rejection, got: %v", err)
+	}
+
+	// Case D: Unmanifested UVR file fails closed
+	emptyUVRManifest := genuineUVRManifest
+	emptyUVRManifest.Files = nil
+	if _, err := domain.ResolveSeparatorEntrypoint(emptyUVRManifest, uvrDir, provider.UVRModelID); !errors.Is(err, domain.ErrSeparatorModelAssetMissing) {
+		t.Fatalf("expected empty manifest to fail ResolveSeparatorEntrypoint, got: %v", err)
+	}
+
+	// Case E: Genuine complete Demucs local repo with htdemucs.yaml bag definition
+	if err := os.WriteFile(filepath.Join(demucsDir, "htdemucs.yaml"), []byte("models: ['955717e8']\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	completeDemucsManifest := genuineDemucsManifest
+	completeDemucsManifest.Files = append(completeDemucsManifest.Files, domain.SnapshotFileEntry{
+		RelativePath: "htdemucs.yaml",
+		SHA256:       domain.PinnedDemucsBagYAMLSHA256,
+		SizeBytes:    21,
+	})
+	depComplete, err := domain.ResolveSeparatorEntrypoint(completeDemucsManifest, demucsDir, provider.DemucsModelID)
+	if err != nil {
+		t.Fatalf("expected genuine complete Demucs repo to resolve, got: %v", err)
+	}
+	if filepath.Base(depComplete) != "955717e8-8726e21a.th" {
+		t.Fatalf("expected entrypoint file 955717e8-8726e21a.th, got %s", depComplete)
 	}
 }
