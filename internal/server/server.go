@@ -26,7 +26,13 @@ import (
 // Executor defines an injected execution seam for stage provider execution.
 type Executor func(ctx context.Context, p provider.Provider, attemptNumber int) error
 
-// Server encapsulates the RuntimeHost HTTP daemon.
+// runtimeHostWriteTimeout bounds the HTTP response-write window. Localhost
+// synchronous ML endpoints may run multiple bounded worker invocations
+// (each capped by its own per-worker timeout) before the handler first
+// writes the response, so this must stay finite yet well above the
+// multi-minute worst case. Per-worker timeouts still bound execution.
+const runtimeHostWriteTimeout = 30 * time.Minute
+
 type Server struct {
 	db             *storage.DB
 	casStore       *cas.Store
@@ -36,6 +42,7 @@ type Server struct {
 	policySvc      *governance.PolicyService
 	licenseSvc     *governance.LicenseService
 	credSvc        *governance.CredentialService
+	snapshotSvc    *governance.SnapshotService
 	router         *provider.Router
 	queueSvc       *queue.Service
 	scheduler      *scheduler.Scheduler
@@ -64,6 +71,7 @@ type Config struct {
 	LicenseSvc     *governance.LicenseService
 	CredSvc        *governance.CredentialService
 	Router         *provider.Router
+	SnapshotSvc    *governance.SnapshotService // RC executable model snapshot verification service (Issue #64)
 	QueueSvc       *queue.Service
 	Scheduler      *scheduler.Scheduler
 	Executor       Executor                    // Injected execution seam for testing and custom worker dispatch
@@ -88,8 +96,17 @@ func New(cfg Config) *Server {
 	if cfg.CredSvc == nil && cfg.DB != nil {
 		cfg.CredSvc = governance.NewCredentialService(cfg.DB)
 	}
+	if cfg.SnapshotSvc == nil && cfg.DB != nil {
+		cfg.SnapshotSvc = governance.NewSnapshotService(cfg.DB, cfg.LicenseSvc)
+	}
+	if cfg.Router != nil && cfg.SnapshotSvc != nil && cfg.Router.SnapshotService() == nil {
+		cfg.Router.SetSnapshotService(cfg.SnapshotSvc)
+	}
 	if cfg.Router == nil && cfg.Registry != nil {
 		cfg.Router = provider.NewRouter(cfg.Registry, cfg.PolicySvc, cfg.LicenseSvc, cfg.CredSvc, nil, cfg.DB)
+		if cfg.SnapshotSvc != nil {
+			cfg.Router.SetSnapshotService(cfg.SnapshotSvc)
+		}
 	}
 	if cfg.QueueSvc == nil && cfg.DB != nil {
 		cfg.QueueSvc = queue.NewService(cfg.DB)
@@ -154,6 +171,7 @@ func New(cfg Config) *Server {
 		licenseSvc:     cfg.LicenseSvc,
 		credSvc:        cfg.CredSvc,
 		router:         cfg.Router,
+		snapshotSvc:    cfg.SnapshotSvc,
 		queueSvc:       cfg.QueueSvc,
 		scheduler:      cfg.Scheduler,
 		executor:       cfg.Executor,
@@ -173,7 +191,7 @@ func New(cfg Config) *Server {
 		Addr:         cfg.Addr,
 		Handler:      s.mux,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		WriteTimeout: runtimeHostWriteTimeout,
 	}
 
 	return s
@@ -345,6 +363,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PUT /api/v1/policies/{id}", s.handleSetPolicy)
 	s.mux.HandleFunc("GET /api/v1/licenses", s.handleListLicenses)
 	s.mux.HandleFunc("POST /api/v1/licenses", s.handleRegisterLicense)
+	// Model Snapshots (Issue #64)
+	s.mux.HandleFunc("GET /api/v1/snapshots", s.handleListSnapshots)
+	s.mux.HandleFunc("POST /api/v1/snapshots/verify", s.handleVerifySnapshot)
+	s.mux.HandleFunc("GET /api/v1/snapshots/events", s.handleListSnapshotEvents)
+	s.mux.HandleFunc("GET /api/v1/snapshots/{dependency}", s.handleGetSnapshot)
+	s.mux.HandleFunc("POST /api/v1/snapshots/{dependency}/reverify", s.handleReverifySnapshot)
 
 	// Credential References
 	s.mux.HandleFunc("GET /api/v1/credentials", s.handleListCredentials)
@@ -832,6 +856,7 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 		Segments              []domain.TranslationInputSegment `json:"segments,omitempty"`
 		ExecutionProfile      domain.ExecutionProfile          `json:"execution_profile,omitempty"`
 		AuthorizedCredentials []string                         `json:"authorized_credentials,omitempty"`
+		ConsentGranted        bool                             `json:"consent_granted,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
@@ -856,6 +881,7 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 		Segments:              body.Segments,
 		ExecutionProfile:      body.ExecutionProfile,
 		AuthorizedCredentials: body.AuthorizedCredentials,
+		ConsentGranted:        body.ConsentGranted,
 	}
 
 	variant, err := s.translationSvc.Translate(r.Context(), in)
@@ -2017,6 +2043,107 @@ func (s *Server) handleRegisterLicense(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"license_manifest": body})
 }
 
+func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
+	if s.snapshotSvc == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"bindings": []any{}})
+		return
+	}
+	bindings := s.snapshotSvc.ListBindings()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"bindings": bindings,
+	})
+}
+
+func (s *Server) handleVerifySnapshot(w http.ResponseWriter, r *http.Request) {
+	if s.snapshotSvc == nil {
+		writeError(w, http.StatusInternalServerError, "snapshot service not initialized")
+		return
+	}
+	var body struct {
+		Manifest  domain.SnapshotManifest `json:"manifest"`
+		LocalPath string                  `json:"local_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	binding, err := s.snapshotSvc.RegisterAndVerifySnapshot(r.Context(), body.Manifest, body.LocalPath)
+	if err != nil {
+		if errors.Is(err, domain.ErrLicenseManifestMissing) ||
+			errors.Is(err, domain.ErrSnapshotDigestMismatch) ||
+			errors.Is(err, domain.ErrSnapshotFileCorrupted) {
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"status":  "verified",
+		"binding": binding,
+	})
+}
+
+func (s *Server) handleGetSnapshot(w http.ResponseWriter, r *http.Request) {
+	if s.snapshotSvc == nil {
+		writeError(w, http.StatusInternalServerError, "snapshot service not initialized")
+		return
+	}
+	dep := r.PathValue("dependency")
+	ver := r.URL.Query().Get("version")
+	evidence, err := s.snapshotSvc.GetPortableEvidence(r.Context(), dep, ver)
+	if err != nil {
+		if errors.Is(err, domain.ErrSnapshotUnverified) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrSnapshotMutatedRehashRequired) {
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"evidence": evidence,
+	})
+}
+
+func (s *Server) handleReverifySnapshot(w http.ResponseWriter, r *http.Request) {
+	if s.snapshotSvc == nil {
+		writeError(w, http.StatusInternalServerError, "snapshot service not initialized")
+		return
+	}
+	dep := r.PathValue("dependency")
+	ver := r.URL.Query().Get("version")
+	binding, err := s.snapshotSvc.Reverify(r.Context(), dep, ver)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "reverified",
+		"binding": binding,
+	})
+}
+
+func (s *Server) handleListSnapshotEvents(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"events": []any{}})
+		return
+	}
+	depName := r.URL.Query().Get("dependency_name")
+	events, err := s.db.ListSnapshotVerificationEvents(r.Context(), depName)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if events == nil {
+		events = []domain.SnapshotVerificationEvent{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": events})
+}
+
 func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
 	list, err := s.credSvc.ListCredentialRefs(r.Context())
 	if err != nil {
@@ -2380,9 +2507,13 @@ func (s *Server) handleLocalizeVisualTrack(w http.ResponseWriter, r *http.Reques
 		RunID                 string                        `json:"run_id"`
 		JobID                 string                        `json:"job_id,omitempty"`
 		TargetLanguage        string                        `json:"target_language"`
+		TranslationVariantCAS string                        `json:"translation_variant_cas,omitempty"`
 		Overrides             []domain.RegionOverride       `json:"overrides,omitempty"`
 		InpaintingFallbacks   []string                      `json:"inpainting_fallbacks,omitempty"`
 		SceneProtectedRegions []domain.SceneProtectedRegion `json:"scene_protected_regions,omitempty"`
+		ExecutionProfile      domain.ExecutionProfile       `json:"execution_profile,omitempty"`
+		AuthorizedCredentials []string                      `json:"authorized_credentials,omitempty"`
+		ConsentGranted        bool                          `json:"consent_granted,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
 		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
@@ -2399,9 +2530,13 @@ func (s *Server) handleLocalizeVisualTrack(w http.ResponseWriter, r *http.Reques
 		AssetID:               asset.ID,
 		JobID:                 body.JobID,
 		TargetLanguage:        targetLang,
+		TranslationVariantCAS: body.TranslationVariantCAS,
 		Overrides:             body.Overrides,
 		InpaintingFallbacks:   body.InpaintingFallbacks,
 		SceneProtectedRegions: body.SceneProtectedRegions,
+		ExecutionProfile:      body.ExecutionProfile,
+		AuthorizedCredentials: body.AuthorizedCredentials,
+		ConsentGranted:        body.ConsentGranted,
 	}
 
 	track, err := s.visualTextSvc.LocalizeVisualTrack(r.Context(), in)

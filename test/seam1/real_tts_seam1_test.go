@@ -180,9 +180,9 @@ func TestSeam1_WorkerTTSProvider_RealStageWorkerSynthesis(t *testing.T) {
 		Text:         "Xin chào, đây là kiểm tra WorkerTTSProvider thực tế qua StageWorker.",
 		Language:     "vi",
 		Voice: domain.VoiceProfile{
-			ID:         "vieneu_vi_female_1",
+			ID:         "vieneu_vi_truc_ly",
 			ProviderID: "vieneu_tts_vi",
-			VoiceID:    "vi_female_natural",
+			VoiceID:    "Trúc Ly",
 			Language:   "vi",
 		},
 		Speed:          1.0,

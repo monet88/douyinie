@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 var (
@@ -379,12 +380,11 @@ func GetProtectedBoxesForTimeWindow(
 			continue
 		}
 		for _, kf := range reg.Keyframes {
-			if (startMs == 0 && endMs == 0) || (kf.TimestampMs >= startMs && kf.TimestampMs <= endMs) || len(reg.Keyframes) == 1 {
+			if (startMs == 0 && endMs == 0 && reg.FirstSeenMs == 0 && reg.LastSeenMs == 0) || (kf.TimestampMs >= startMs && kf.TimestampMs <= endMs) || (len(reg.Keyframes) == 1 && reg.FirstSeenMs == 0 && reg.LastSeenMs == 0) {
 				result = append(result, kf.Box)
 			}
 		}
 	}
-
 	// 2. From SceneProtectedRegions (faces, tap targets, timeline controls, etc.)
 	for _, sp := range sceneProtected {
 		if TimeWindowsOverlap(sp.StartMs, sp.EndMs, startMs, endMs) {
@@ -631,37 +631,43 @@ func ComputeLocalizedVisualTrackProvenanceHash(
 // TextRegionPlan is the immutable source-derived artifact containing tracked and classified text regions.
 // It is reusable across target languages (VI/EN) for the same source media asset.
 type TextRegionPlan struct {
-	ID             string              `json:"id"`
-	SchemaVersion  int                 `json:"schema_version"`
-	AssetID        string              `json:"asset_id"`
-	ProviderID     string              `json:"provider_id"`
-	ModelName      string              `json:"model_name"`
-	ModelVersion   string              `json:"model_version"`
-	FrameWidth     int                 `json:"frame_width"`
-	FrameHeight    int                 `json:"frame_height"`
-	Regions        []TrackedTextRegion `json:"regions"`
-	CASHash        string              `json:"cas_hash,omitempty"`
-	ProvenanceHash string              `json:"provenance_hash"`
-	CreatedAt      time.Time           `json:"created_at"`
+	ID                string              `json:"id"`
+	SchemaVersion     int                 `json:"schema_version"`
+	AssetID           string              `json:"asset_id"`
+	ProviderID        string              `json:"provider_id"`
+	ModelName         string              `json:"model_name"`
+	ModelVersion      string              `json:"model_version"`
+	FrameWidth        int                 `json:"frame_width"`
+	FrameHeight       int                 `json:"frame_height"`
+	Regions           []TrackedTextRegion `json:"regions"`
+	DetSnapshotDigest string              `json:"det_snapshot_digest,omitempty"`
+	RecSnapshotDigest string              `json:"rec_snapshot_digest,omitempty"`
+	OriSnapshotDigest string              `json:"ori_snapshot_digest,omitempty"`
+	RuntimeIdentity   string              `json:"runtime_identity,omitempty"`
+	CASHash           string              `json:"cas_hash,omitempty"`
+	ProvenanceHash    string              `json:"provenance_hash"`
+	CreatedAt         time.Time           `json:"created_at"`
 }
 
 // ComputeTextRegionPlanProvenanceHash computes a deterministic SHA-256 identity over the source-derived inputs.
 // Crucially, target language is NOT included: the plan is source-derived and language-reusable across VI/EN.
-func ComputeTextRegionPlanProvenanceHash(assetID, providerID, modelName, modelVersion string, sampleStepMs int64) (string, error) {
+func ComputeTextRegionPlanProvenanceHash(assetID, providerID, modelName, modelVersion string, sampleStepMs int64, extraIdentities ...string) (string, error) {
 	payload := struct {
-		AssetID      string `json:"asset_id"`
-		ProviderID   string `json:"provider_id"`
-		ModelName    string `json:"model_name"`
-		ModelVersion string `json:"model_version"`
-		SampleStepMs int64  `json:"sample_step_ms"`
-		SchemaVer    int    `json:"schema_version"`
+		AssetID         string   `json:"asset_id"`
+		ProviderID      string   `json:"provider_id"`
+		ModelName       string   `json:"model_name"`
+		ModelVersion    string   `json:"model_version"`
+		SampleStepMs    int64    `json:"sample_step_ms"`
+		SchemaVer       int      `json:"schema_version"`
+		ExtraIdentities []string `json:"extra_identities,omitempty"`
 	}{
-		AssetID:      assetID,
-		ProviderID:   providerID,
-		ModelName:    modelName,
-		ModelVersion: modelVersion,
-		SampleStepMs: sampleStepMs,
-		SchemaVer:    TextRegionPlanSchemaVersion,
+		AssetID:         assetID,
+		ProviderID:      providerID,
+		ModelName:       modelName,
+		ModelVersion:    modelVersion,
+		SampleStepMs:    sampleStepMs,
+		SchemaVer:       TextRegionPlanSchemaVersion,
+		ExtraIdentities: extraIdentities,
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -741,8 +747,27 @@ func DefaultTextRegionClassifyConfig(w, h int) TextRegionClassifyConfig {
 	}
 }
 
+// NearbyObservation represents a spatio-temporally adjacent OCR detection for tracking stability evaluation.
+type NearbyObservation struct {
+	Text        string      `json:"text"`
+	TimestampMs int64       `json:"timestamp_ms"`
+	Box         BoundingBox `json:"box"`
+}
+
 // ClassifyRegion determines the operational role of a tracked text region deterministically.
 func ClassifyRegion(text string, avgBox BoundingBox, avgConfidence float64, cfg TextRegionClassifyConfig) (TextRegionRole, ProtectedRegionMetadata, bool, string) {
+	return ClassifyRegionWithInstability(text, avgBox, avgConfidence, cfg, nil)
+}
+
+// ClassifyRegionWithInstability determines the operational role of a tracked text region deterministically,
+// incorporating spatio-temporal OCR stability across nearby observations.
+func ClassifyRegionWithInstability(
+	text string,
+	avgBox BoundingBox,
+	avgConfidence float64,
+	cfg TextRegionClassifyConfig,
+	nearby []NearbyObservation,
+) (TextRegionRole, ProtectedRegionMetadata, bool, string) {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return TextRoleIgnoreNoise, ProtectedRegionMetadata{IsProtected: false}, false, ""
@@ -786,11 +811,59 @@ func ClassifyRegion(text string, avgBox BoundingBox, avgConfidence float64, cfg 
 		return TextRoleSpeechSubtitle, ProtectedRegionMetadata{IsProtected: false}, reviewReq, reviewReason
 	}
 
-	// 5. Default: semantic text (titles, step badges, ingredients, floating callouts)
+	// 5. Spatio-temporal OCR instability check:
+	// If an unknown text token is observed with low-to-moderate confidence (e.g. < 0.65),
+	// and there is a sequence of 3+ total observations across adjacent sampled frames whose
+	// bounding boxes are spatially nearby/overlapping, but whose text changes materially
+	// (Latin pseudo-text / background scribble hallucination), classify as IgnoreNoise.
+	if len(nearby) >= 2 && avgConfidence < 0.65 {
+		var texts []string
+		texts = append(texts, trimmed)
+		allLatin := isAllLatinOrPunct(trimmed)
+		for _, nb := range nearby {
+			nbTrimmed := strings.TrimSpace(nb.Text)
+			if nbTrimmed != "" {
+				texts = append(texts, nbTrimmed)
+				if !isAllLatinOrPunct(nbTrimmed) {
+					allLatin = false
+				}
+			}
+		}
+		// Total observations >= 3
+		if len(texts) >= 3 && allLatin {
+			distinctCount := countDistinctNormalizedTexts(texts)
+			if distinctCount >= 3 {
+				return TextRoleIgnoreNoise, ProtectedRegionMetadata{IsProtected: false}, false, "spatio_temporal_ocr_instability_noise"
+			}
+		}
+	}
+
+	// 6. Default: semantic text (titles, step badges, ingredients, floating callouts)
 	reviewReq := avgConfidence < cfg.MinConfidence
 	var reviewReason string
 	if reviewReq {
 		reviewReason = "low_ocr_confidence_semantic_text"
 	}
 	return TextRoleSemanticText, ProtectedRegionMetadata{IsProtected: false}, reviewReq, reviewReason
+}
+
+func isAllLatinOrPunct(s string) bool {
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || unicode.IsPunct(r) || unicode.IsSpace(r) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func countDistinctNormalizedTexts(texts []string) int {
+	seen := make(map[string]bool)
+	for _, t := range texts {
+		norm := strings.ToLower(strings.TrimSpace(t))
+		if norm != "" {
+			seen[norm] = true
+		}
+	}
+	return len(seen)
 }

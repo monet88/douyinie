@@ -98,6 +98,42 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 	}
 	sort.Strings(speakers)
 
+	// 1.5 Check if a VoiceAssignment is already frozen for this exact run.
+	if s.db != nil {
+		if existingIdx, err := s.db.GetVoiceAssignmentIndexByRun(ctx, in.AssetID, in.RunID, targetLang); err == nil && existingIdx != nil {
+			var existing domain.VoiceAssignment
+			loaded := false
+			if s.cas != nil && existingIdx.CASHash != "" {
+				if rc, err := s.cas.Get(existingIdx.CASHash); err == nil {
+					defer rc.Close()
+					if err := json.NewDecoder(rc).Decode(&existing); err == nil {
+						existing.CASHash = existingIdx.CASHash
+						loaded = true
+					}
+				}
+			}
+			if !loaded && existingIdx.AssignmentsJSON != "" {
+				if err := json.Unmarshal([]byte(existingIdx.AssignmentsJSON), &existing); err == nil {
+					existing.CASHash = existingIdx.CASHash
+					loaded = true
+				}
+			}
+
+			if loaded {
+				if in.UseSameVoiceForAll != existing.UseSameVoiceForAll {
+					return nil, domain.ErrVoiceAssignmentFrozen
+				}
+				for spk, custom := range in.CustomAssignments {
+					existingProf, ok := existing.Assignments[spk]
+					if !ok || !domain.VoiceProfileEquivalent(existingProf, custom) {
+						return nil, domain.ErrVoiceAssignmentFrozen
+					}
+				}
+				return &existing, nil
+			}
+		}
+	}
+
 	// 2. Build or validate assignments
 	assignments := make(map[string]domain.VoiceProfile)
 	presetVoices := provider.DefaultPresetVoices(targetLang)
@@ -130,6 +166,9 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 			sort.Strings(customKeys)
 			for _, k := range customKeys {
 				if v := in.CustomAssignments[k]; v.ID != "" {
+					if v.ProviderID != "" && v.VoiceID != "" && !provider.IsVerifiedTTSVoice(v.ProviderID, v.VoiceID) {
+						return nil, fmt.Errorf("%w: custom voice assignment for speaker %s has unverified voice %q on provider %s", domain.ErrTTSVoiceAssetMissing, k, v.VoiceID, v.ProviderID)
+					}
 					chosenVoice = v
 					break
 				}
@@ -145,6 +184,9 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 		// Assign distinct preset voices per speaker
 		for i, spk := range speakers {
 			if custom, ok := in.CustomAssignments[spk]; ok && custom.ID != "" {
+				if custom.ProviderID != "" && custom.VoiceID != "" && !provider.IsVerifiedTTSVoice(custom.ProviderID, custom.VoiceID) {
+					return nil, fmt.Errorf("%w: custom voice assignment for speaker %s has unverified voice %q on provider %s", domain.ErrTTSVoiceAssetMissing, spk, custom.VoiceID, custom.ProviderID)
+				}
 				assignments[spk] = custom
 			} else {
 				presetIdx := i % len(distinctPresets)
@@ -153,36 +195,6 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 		}
 	}
 	distinguishabilityQC := domain.EvaluateVoiceDistinguishability(assignments, in.UseSameVoiceForAll)
-	// Check if a VoiceAssignment is already frozen for this exact run.
-	if s.db != nil {
-		if existingIdx, err := s.db.GetVoiceAssignmentIndexByRun(ctx, in.AssetID, in.RunID, targetLang); err == nil && existingIdx != nil {
-			var existing domain.VoiceAssignment
-			loaded := false
-			if s.cas != nil && existingIdx.CASHash != "" {
-				if rc, err := s.cas.Get(existingIdx.CASHash); err == nil {
-					defer rc.Close()
-					if err := json.NewDecoder(rc).Decode(&existing); err == nil {
-						existing.CASHash = existingIdx.CASHash
-						loaded = true
-					}
-				}
-			}
-			if !loaded && existingIdx.AssignmentsJSON != "" {
-				if err := json.Unmarshal([]byte(existingIdx.AssignmentsJSON), &existing); err == nil {
-					existing.CASHash = existingIdx.CASHash
-					loaded = true
-				}
-			}
-
-			if loaded {
-				// Equivalence check: any change to speaker->VoiceProfile mapping or UseSameVoiceForAll fails closed
-				if !isVoiceAssignmentEquivalent(&existing, assignments, in.UseSameVoiceForAll) {
-					return nil, domain.ErrVoiceAssignmentFrozen
-				}
-				return &existing, nil
-			}
-		}
-	}
 
 	// 3. Compute deterministic provenance hash
 	provenanceHash, err := s.computeVoiceAssignmentProvenanceHash(in, assignments)
@@ -328,6 +340,9 @@ func (s *DubbingService) ReassignVoice(ctx context.Context, in domain.VoiceAssig
 		var singleVoice domain.VoiceProfile
 		for _, k := range customKeys {
 			if v := in.CustomAssignments[k]; v.ID != "" {
+				if v.ProviderID != "" && v.VoiceID != "" && !provider.IsVerifiedTTSVoice(v.ProviderID, v.VoiceID) {
+					return nil, fmt.Errorf("%w: custom voice reassignment for speaker %s has unverified voice %q on provider %s", domain.ErrTTSVoiceAssetMissing, k, v.VoiceID, v.ProviderID)
+				}
 				singleVoice = v
 				break
 			}
@@ -340,6 +355,9 @@ func (s *DubbingService) ReassignVoice(ctx context.Context, in domain.VoiceAssig
 	} else {
 		for spk, custom := range in.CustomAssignments {
 			if _, ok := newAssignments[spk]; ok && custom.ID != "" {
+				if custom.ProviderID != "" && custom.VoiceID != "" && !provider.IsVerifiedTTSVoice(custom.ProviderID, custom.VoiceID) {
+					return nil, fmt.Errorf("%w: custom voice reassignment for speaker %s has unverified voice %q on provider %s", domain.ErrTTSVoiceAssetMissing, spk, custom.VoiceID, custom.ProviderID)
+				}
 				newAssignments[spk] = custom
 			}
 		}
@@ -1097,7 +1115,8 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 			}
 		}
 
-		slotDurationMs := seg.EndMs - seg.StartMs
+		actualSlotDur := seg.EndMs - seg.StartMs
+		slotDurationMs := actualSlotDur
 		if slotDurationMs <= 0 {
 			slotDurationMs = 1000
 		}
@@ -1497,11 +1516,15 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 		}
 
 		// Check zero overrun selection gate:
-		// A candidate that strictly overruns the slot cannot be accepted into selected Segments
-		if finalCandidate.MeasuredDurationMs > slotDurationMs {
+		// A candidate that strictly overruns the slot or has non-positive duration cannot be accepted into selected Segments
+		if actualSlotDur <= 0 || finalCandidate.MeasuredDurationMs > actualSlotDur {
 			finalRequiresReview = true
 			if finalReviewReason == "" {
-				finalReviewReason = "DURATION_OVERRUN"
+				if actualSlotDur <= 0 {
+					finalReviewReason = "ZERO_DURATION_SLOT"
+				} else {
+					finalReviewReason = "DURATION_OVERRUN"
+				}
 			}
 			finalDecision = domain.FitActionReview
 			overallStatus = "REVIEW_REQUIRED"
@@ -1517,14 +1540,14 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 			naturalGapAfter = nextTurnStartMs - (seg.StartMs + finalCandidate.MeasuredDurationMs)
 		}
 
-		if finalDecision == domain.FitActionAccept && !finalRequiresReview && finalCandidate.MeasuredDurationMs <= slotDurationMs {
+		if finalDecision == domain.FitActionAccept && !finalRequiresReview && actualSlotDur > 0 && finalCandidate.MeasuredDurationMs <= actualSlotDur {
 			dubSeg := domain.DubSegment{
 				Index:              seg.Index,
 				SpeechBlockIndices: []int{seg.Index},
 				SpeakerID:          spkID,
 				StartMs:            seg.StartMs,
 				EndMs:              seg.EndMs,
-				SlotDurationMs:     slotDurationMs,
+				SlotDurationMs:     actualSlotDur,
 				SourceText:         seg.SourceText,
 				SpokenText:         currentText,
 				AudioCASPath:       finalCandidate.AudioCASPath,
@@ -1544,7 +1567,7 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 				SpeakerID:          spkID,
 				StartMs:            seg.StartMs,
 				EndMs:              seg.EndMs,
-				SlotDurationMs:     slotDurationMs,
+				SlotDurationMs:     actualSlotDur,
 				SourceText:         seg.SourceText,
 				SpokenText:         currentText,
 				AudioCASPath:       finalCandidate.AudioCASPath,
@@ -1553,7 +1576,6 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 				Voice:              voice,
 				FitDecision:        finalDecision,
 				ReviewReason:       finalReviewReason,
-				AttemptCount:       attempt,
 			}
 			reviewSegments = append(reviewSegments, revSeg)
 			overallStatus = "REVIEW_REQUIRED"

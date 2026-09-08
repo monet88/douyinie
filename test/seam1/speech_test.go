@@ -603,7 +603,7 @@ func TestSeam1_SpeechUnderstand_ProductionComposition_NoInjectedHooks(t *testing
 	leaseMgr := worker.NewGPULeaseManager(resScheduler)
 
 	// Production registry (NO fake providers!)
-	prodRegistry, err := provider.NewProductionSpeechRegistry(leaseMgr)
+	prodRegistry, err := provider.NewProductionSpeechRegistry(leaseMgr, false)
 	if err != nil {
 		t.Fatalf("NewProductionSpeechRegistry: %v", err)
 	}
@@ -803,7 +803,7 @@ func TestSeam1_SpeechUnderstand_ProductionComposition_SingleSpeakerNoEvidence(t 
 	resScheduler := scheduler.New()
 	leaseMgr := worker.NewGPULeaseManager(resScheduler)
 
-	prodRegistry, err := provider.NewProductionSpeechRegistry(leaseMgr)
+	prodRegistry, err := provider.NewProductionSpeechRegistry(leaseMgr, false)
 	if err != nil {
 		t.Fatalf("NewProductionSpeechRegistry: %v", err)
 	}
@@ -956,7 +956,7 @@ func TestSeam1_SpeechUnderstand_ProductionComposition_TwoSpeakerTwoTurnEvidence(
 	resScheduler := scheduler.New()
 	leaseMgr := worker.NewGPULeaseManager(resScheduler)
 
-	prodRegistry, err := provider.NewProductionSpeechRegistry(leaseMgr)
+	prodRegistry, err := provider.NewProductionSpeechRegistry(leaseMgr, false)
 	if err != nil {
 		t.Fatalf("NewProductionSpeechRegistry: %v", err)
 	}
@@ -1112,7 +1112,7 @@ func TestSeam1_SpeechUnderstand_ProductionComposition_ProbeErrorFailsClosed(t *t
 	resScheduler := scheduler.New()
 	leaseMgr := worker.NewGPULeaseManager(resScheduler)
 
-	prodRegistry, err := provider.NewProductionSpeechRegistry(leaseMgr)
+	prodRegistry, err := provider.NewProductionSpeechRegistry(leaseMgr, false)
 	if err != nil {
 		t.Fatalf("NewProductionSpeechRegistry: %v", err)
 	}
@@ -1343,7 +1343,7 @@ class Diarization3Dspeaker:
 	resScheduler := scheduler.New()
 	leaseMgr := worker.NewGPULeaseManager(resScheduler)
 
-	prodRegistry, err := provider.NewProductionSpeechRegistry(leaseMgr)
+	prodRegistry, err := provider.NewProductionSpeechRegistry(leaseMgr, false)
 	if err != nil {
 		t.Fatalf("NewProductionSpeechRegistry: %v", err)
 	}

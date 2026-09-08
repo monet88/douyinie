@@ -13,13 +13,14 @@ import (
 )
 
 type BaseFakeProvider struct {
-	ProviderID   string
-	ProviderType ProviderType
-	Policy       PolicyState
-	Healthy      bool
-	Cap          domain.ProviderCapability
-	ModelName    string
-	ModelVersion string
+	ProviderID           string
+	ProviderType         ProviderType
+	Policy               PolicyState
+	Healthy              bool
+	Cap                  domain.ProviderCapability
+	ModelName            string
+	ModelVersion         string
+	RequiresSnapshotFlag bool
 }
 
 func (b *BaseFakeProvider) ID() string                            { return b.ProviderID }
@@ -28,6 +29,8 @@ func (b *BaseFakeProvider) PolicyState() PolicyState              { return b.Pol
 func (b *BaseFakeProvider) IsHealthy() bool                       { return b.Healthy }
 func (b *BaseFakeProvider) Capability() domain.ProviderCapability { return b.Cap }
 func (b *BaseFakeProvider) ModelInfo() (string, string)           { return b.ModelName, b.ModelVersion }
+func (b *BaseFakeProvider) RequiresSnapshot() bool                { return b.RequiresSnapshotFlag }
+func (b *BaseFakeProvider) SetRequiresSnapshot(req bool)          { b.RequiresSnapshotFlag = req }
 
 // FakeASRProvider simulates Qwen3-ASR (1.7B quality attempt / 0.6B fallback).
 // Output is controllable per test: RawSegments overrides the default single
@@ -237,12 +240,18 @@ func (p *FakeTTSProvider) VoiceCatalog() []domain.VoiceProfile {
 	}
 	var voices []domain.VoiceProfile
 	for _, l := range p.Cap.Languages {
-		for _, v := range DefaultPresetVoices(l) {
-			if v.ProviderID == p.ProviderID || (p.ProviderID == "fake_vieneu_tts_vi" && v.ProviderID == "vieneu_tts_vi") ||
-				(p.ProviderID == "fake_kokoro_tts_en" && v.ProviderID == "kokoro_tts_en") ||
-				(p.ProviderID == "fake_cosyvoice3_tts" && v.ProviderID == "cosyvoice3_tts") {
+		if strings.Contains(p.ProviderID, "cosyvoice") {
+			for _, v := range CosyVoicePresetVoices(l) {
 				v.ProviderID = p.ProviderID
 				voices = append(voices, v)
+			}
+		} else {
+			for _, v := range DefaultPresetVoices(l) {
+				if v.ProviderID == p.ProviderID || (p.ProviderID == "fake_vieneu_tts_vi" && v.ProviderID == "vieneu_tts_vi") ||
+					(p.ProviderID == "fake_kokoro_tts_en" && v.ProviderID == "kokoro_tts_en") {
+					v.ProviderID = p.ProviderID
+					voices = append(voices, v)
+				}
 			}
 		}
 	}

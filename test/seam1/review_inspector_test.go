@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/monet88/douyinie/internal/benchmark"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/service"
@@ -470,6 +472,277 @@ func TestSeam1_MultimodalQualityResults_DecoupledFromExecutionState(t *testing.T
 	}
 }
 
+// TestSeam1_MultimodalQualityResults_AutomatedRunDerivationAndCapture verifies:
+// 1. Client helper PostQualityResult posts domain.QualityResult through /api/v1/quality-results.
+// 2. GET /api/v1/runs/{id}/quality-results captures the newly persisted result.
+// 3. EvaluateCaseQuality projects QC FAIL and REVIEW_REQUIRED into metrics without fabricating status.
+func TestSeam1_MultimodalQualityResults_AutomatedRunDerivationAndCapture(t *testing.T) {
+	h := setupHarness(t)
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	client := benchmark.NewRuntimeHostClient(h.server.URL, h.server.Client())
+	ctx := context.Background()
+
+	// 1. Post automated QualityResult via public Client helper
+	qr := domain.QualityResult{
+		ID:             "qr-auto-seam1-01",
+		RunID:          runID,
+		JobID:          jobID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Stage:          "multimodal_qc",
+		OverallStatus:  domain.QualityStatusReviewRequired,
+		Metrics: []domain.QualityMetric{
+			{Name: "soundtrack_preservation", Score: 1.0, Passed: true},
+			{Name: "burned_in_subtitle_replacement", Score: 0.5, Passed: false, Description: "uncovered regions"},
+		},
+		Issues: []domain.ReviewItem{
+			{
+				ID:             "rev-auto-burned-1",
+				RunID:          runID,
+				AssetID:        assetID,
+				TargetLanguage: "vi",
+				Type:           domain.ReviewItemTypeVisualOcclusion,
+				Stage:          "multimodal_qc",
+				Severity:       "warning",
+				Reason:         "burned-in subtitle region lacks temporal cue coverage",
+				Status:         domain.ReviewItemStatusPending,
+				CreatedAt:      time.Now().UTC(),
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+
+	posted, err := client.PostQualityResult(ctx, qr)
+	if err != nil {
+		t.Fatalf("PostQualityResult failed: %v", err)
+	}
+	if posted.ID != qr.ID {
+		t.Errorf("expected ID %s, got %s", qr.ID, posted.ID)
+	}
+
+	// 2. Fetch by run ID using public Client helper
+	runQRs, err := client.GetRunQualityResults(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunQualityResults failed: %v", err)
+	}
+	if len(runQRs) != 1 || runQRs[0].ID != qr.ID {
+		t.Fatalf("expected 1 quality result with ID %s, got %+v", qr.ID, runQRs)
+	}
+	if runQRs[0].OverallStatus != domain.QualityStatusReviewRequired {
+		t.Errorf("expected REVIEW_REQUIRED, got %s", runQRs[0].OverallStatus)
+	}
+
+	// 3. EvaluateCaseQuality projects QC status into case metrics
+	caseEv := &benchmark.QualityCaseEvidence{
+		CaseID:          "case_test_qc_proj",
+		SourceVideoID:   "video_qc_proj",
+		PrimaryCategory: "clean_single_speaker",
+		TargetLanguage:  "vi",
+		Profile:         "hybrid",
+		Status:          "COMPLETED",
+		RelationalQC: benchmark.RelationalQCEvidence{
+			QualityResultIDs: []string{runQRs[0].ID},
+			QualityResults:   runQRs,
+		},
+	}
+	metrics := benchmark.EvaluateCaseQuality(caseEv, &benchmark.ReferenceAnnotationPack{
+		PackID:  "dummy_pack",
+		AssetID: assetID,
+	})
+	if metrics.Status != "REVIEW_REQUIRED" {
+		t.Errorf("expected EvaluateCaseQuality to project REVIEW_REQUIRED, got %s", metrics.Status)
+	}
+	if len(metrics.ReviewReasons) == 0 || !strings.Contains(metrics.ReviewReasons[0], "QC multimodal_qc REVIEW_REQUIRED") {
+		t.Errorf("expected review reason for multimodal_qc, got %v", metrics.ReviewReasons)
+	}
+}
+
+// TestSeam1_MultimodalQualityResults_ResumeSafeAndFailClosedCapture verifies:
+// 1. One unowned multimodal_qc + zero benchmark-owned: runner creates exactly one benchmark-owned result.
+// 2. Retry reuses that marked result without appending duplicate.
+// 3. Multiple marked benchmark-owned results strictly fail closed.
+// 4. All QC results (both unowned and benchmark-owned) are captured into RelationalQC.
+func TestSeam1_MultimodalQualityResults_ResumeSafeAndFailClosedCapture(t *testing.T) {
+	h := setupHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	storeDir := filepath.Join(h.dir, "benchmark_sessions_resume_test")
+	store, err := benchmark.NewFileStore(storeDir)
+	if err != nil {
+		t.Fatalf("create benchmark store: %v", err)
+	}
+
+	identity := testBenchmarkIdentity()
+	session, err := store.Resume(identity)
+	if err != nil {
+		t.Fatalf("initial session resume: %v", err)
+	}
+
+	client := benchmark.NewRuntimeHostClient(h.server.URL, nil)
+	runner, err := benchmark.NewBenchmarkRunner(benchmark.RunnerConfig{
+		Client:  client,
+		Store:   store,
+		Session: session,
+	})
+	if err != nil {
+		t.Fatalf("create benchmark runner: %v", err)
+	}
+
+	qcMediaPath := createSyntheticMedia(t, h.dir, "qc_resume_01.mp4")
+	segments := []domain.TranslationInputSegment{
+		{Index: 0, SourceText: "测试语句", SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 2000},
+	}
+	audioRoleSegments := []domain.AudioSegment{
+		{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleNarrationDialogue},
+	}
+
+	// 1. Ingest asset, create job and run beforehand to inject an unowned multimodal_qc result
+	asset, err := client.IngestAsset(ctx, qcMediaPath, "test_operator", true)
+	if err != nil {
+		t.Fatalf("ingest asset: %v", err)
+	}
+	job, err := client.CreateJob(ctx, asset.ID, "vi")
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	run, err := client.CreateRun(ctx, job.ID, "{}")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	// Post an unowned multimodal_qc result (e.g. from manual/production review)
+	unownedQR := domain.QualityResult{
+		ID:             "qr-unowned-production-01",
+		RunID:          run.ID,
+		JobID:          job.ID,
+		AssetID:        asset.ID,
+		TargetLanguage: "vi",
+		Stage:          "multimodal_qc",
+		OverallStatus:  domain.QualityStatusPass,
+		CreatedAt:      time.Now().UTC(),
+		Details:        map[string]any{"source": "external_production_eval"}, // No benchmark producer/schema marker
+	}
+	if _, err := client.PostQualityResult(ctx, unownedQR); err != nil {
+		t.Fatalf("post unowned quality result: %v", err)
+	}
+
+	qcInput := benchmark.QualityCaseInput{
+		CaseID:            "video_resume_vi",
+		SourceVideoID:     "video_resume_01",
+		PrimaryCategory:   "lifestyle_narration",
+		TargetLanguage:    "vi",
+		Profile:           "local",
+		MediaFilePath:     qcMediaPath,
+		SourceAssetID:     asset.ID,
+		Segments:          segments,
+		AudioRoleSegments: audioRoleSegments,
+	}
+
+	// Pre-seed the run in session so ExecuteQualityCase attaches to this existing run
+	qcPre := benchmark.QualityCaseEvidence{
+		CaseID:          qcInput.CaseID,
+		SourceVideoID:   qcInput.SourceVideoID,
+		PrimaryCategory: qcInput.PrimaryCategory,
+		TargetLanguage:  qcInput.TargetLanguage,
+		Profile:         "local",
+		Status:          "IN_PROGRESS",
+		CreatedAt:       time.Now().UTC(),
+		SourceAssetID:   asset.ID,
+		JobID:           job.ID,
+		RunID:           run.ID,
+		Stages:          make(map[string]benchmark.StageExecutionEvidence),
+	}
+	session.RecordQualityCase(qcPre)
+
+	// Step 1: Execute quality case with 1 unowned multimodal_qc + 0 benchmark-owned
+	// Runner must NOT suppress creation and must create exactly 1 benchmark-owned result
+	qcEv, err := runner.ExecuteQualityCase(ctx, qcInput)
+	if err != nil {
+		t.Fatalf("initial ExecuteQualityCase failed: %v", err)
+	}
+
+	qrs1, err := client.GetRunQualityResults(ctx, qcEv.RunID)
+	if err != nil {
+		t.Fatalf("GetRunQualityResults failed: %v", err)
+	}
+	if len(qrs1) != 2 {
+		t.Fatalf("expected 2 quality results on run (1 unowned + 1 benchmark-owned), got %d", len(qrs1))
+	}
+	var benchmarkOwnedCount int
+	var autoQRID string
+	for _, qr := range qrs1 {
+		if benchmark.IsBenchmarkOwnedQualityResult(qr, qcEv.RunID, qcEv.JobID, qcEv.SourceAssetID, qcEv.TargetLanguage) {
+			benchmarkOwnedCount++
+			autoQRID = qr.ID
+		}
+	}
+	if benchmarkOwnedCount != 1 {
+		t.Fatalf("expected exactly 1 benchmark-owned QualityResult, got %d", benchmarkOwnedCount)
+	}
+	if len(qcEv.RelationalQC.QualityResults) != 2 {
+		t.Fatalf("expected both unowned and benchmark-owned results captured in RelationalQC, got %d", len(qcEv.RelationalQC.QualityResults))
+	}
+
+	// Step 2: Retry reuses that marked result without appending duplicates
+	qcEv.Status = "IN_PROGRESS"
+	session.RecordQualityCase(*qcEv)
+
+	qcEv2, err := runner.ExecuteQualityCase(ctx, qcInput)
+	if err != nil {
+		t.Fatalf("re-executing QualityCase on resume failed: %v", err)
+	}
+	qrs2, err := client.GetRunQualityResults(ctx, qcEv2.RunID)
+	if err != nil {
+		t.Fatalf("GetRunQualityResults after retry failed: %v", err)
+	}
+	if len(qrs2) != 2 {
+		t.Fatalf("retry appended duplicate QualityResult: expected exactly 2 results on run, got %d", len(qrs2))
+	}
+	var benchmarkOwnedCount2 int
+	for _, qr := range qrs2 {
+		if benchmark.IsBenchmarkOwnedQualityResult(qr, qcEv.RunID, qcEv.JobID, qcEv.SourceAssetID, qcEv.TargetLanguage) {
+			benchmarkOwnedCount2++
+			if qr.ID != autoQRID {
+				t.Fatalf("expected reused benchmark-owned ID %s, got %s", autoQRID, qr.ID)
+			}
+		}
+	}
+	if benchmarkOwnedCount2 != 1 {
+		t.Fatalf("expected exactly 1 benchmark-owned QualityResult after retry, got %d", benchmarkOwnedCount2)
+	}
+
+	// Step 3: Multiple marked benchmark-owned results fail closed
+	secondBenchmarkQR := domain.QualityResult{
+		ID:             "qr-benchmark-duplicate-02",
+		RunID:          qcEv.RunID,
+		JobID:          qcEv.JobID,
+		AssetID:        qcEv.SourceAssetID,
+		TargetLanguage: qcEv.TargetLanguage,
+		Stage:          "multimodal_qc",
+		OverallStatus:  domain.QualityStatusPass,
+		CreatedAt:      time.Now().UTC(),
+		Details: map[string]any{
+			benchmark.BenchmarkQCProducerKey: benchmark.BenchmarkQCProducerValue,
+			benchmark.BenchmarkQCSchemaKey:   benchmark.BenchmarkQCSchemaVersion,
+		},
+	}
+	if _, err := client.PostQualityResult(ctx, secondBenchmarkQR); err != nil {
+		t.Fatalf("post second benchmark-owned quality result: %v", err)
+	}
+	qcEv.Status = "IN_PROGRESS"
+	session.RecordQualityCase(*qcEv)
+
+	_, err = runner.ExecuteQualityCase(ctx, qcInput)
+	if err == nil || !strings.Contains(err.Error(), "multiple (2) benchmark-owned multimodal_qc results already exist") {
+		t.Fatalf("expected fail-closed error for multiple benchmark-owned multimodal_qc results, got %v", err)
+	}
+}
+
 // TestSeam1_TargetedInvalidation_StrictReuseOfSourceArtifacts verifies:
 //  1. Correcting target text triggers rerun only for declared downstream descendants:
 //     TTS -> DubSegment -> DubMix -> LocalizedSubtitleTrack -> Render.
@@ -872,8 +1145,7 @@ func TestSeam1_VoiceReassign_TargetedInvalidation_And_DownstreamRerun(t *testing
 	licResp.Body.Close()
 
 	// 4. Execute inspector voice reassignment via POST /api/v1/assets/{id}/inspector/reassign-voice
-	viPresets := provider.DefaultPresetVoices("vi")
-	newVoiceForSpk0 := viPresets[2]
+	newVoiceForSpk0 := fakeCosy.VoiceCatalog()[0]
 
 	reassignPayload := map[string]any{
 		"run_id":          runID,

@@ -6,16 +6,26 @@ import (
 )
 
 var (
-	ErrPolicyBlocked          = errors.New("fail-closed: provider is blocked by governance policy")
-	ErrConsentRequired        = errors.New("provider requires explicit operator consent for execution")
-	ErrAuthRequired           = errors.New("fail-closed: provider requires valid credential authorization reference")
-	ErrNoEligibleProvider     = errors.New("no eligible provider found satisfying policy, capability, and health")
-	ErrLicenseManifestMissing = errors.New("fail-closed: missing or unverified license manifest entry for dependency")
-	ErrCircuitOpen            = errors.New("circuit breaker is open for provider due to repeated failures")
-	ErrRawSecretForbidden     = errors.New("storing or persisting raw secrets is forbidden; use safe credential reference")
-	ErrQualityRejected        = errors.New("candidate output rejected by quality evaluation gate")
-	ErrInvalidPolicyState     = errors.New("invalid policy state: must be ALLOWED, REQUIRES_EXPLICIT_CONSENT, REQUIRES_AUTHORIZATION, or BLOCKED")
-	ErrUnsupportedStorageType = errors.New("unsupported storage_type: must be 'env_ref' or 'os_credential_store'")
+	ErrPolicyBlocked                 = errors.New("fail-closed: provider is blocked by governance policy")
+	ErrConsentRequired               = errors.New("provider requires explicit operator consent for execution")
+	ErrAuthRequired                  = errors.New("fail-closed: provider requires valid credential authorization reference")
+	ErrNoEligibleProvider            = errors.New("no eligible provider found satisfying policy, capability, and health")
+	ErrLicenseManifestMissing        = errors.New("fail-closed: missing or unverified license manifest entry for dependency")
+	ErrCircuitOpen                   = errors.New("circuit breaker is open for provider due to repeated failures")
+	ErrRawSecretForbidden            = errors.New("storing or persisting raw secrets is forbidden; use safe credential reference")
+	ErrQualityRejected               = errors.New("candidate output rejected by quality evaluation gate")
+	ErrInvalidPolicyState            = errors.New("invalid policy state: must be ALLOWED, REQUIRES_EXPLICIT_CONSENT, REQUIRES_AUTHORIZATION, or BLOCKED")
+	ErrUnsupportedStorageType        = errors.New("unsupported storage_type: must be 'env_ref' or 'os_credential_store'")
+	ErrSnapshotUnverified            = errors.New("fail-closed: snapshot unverified in current runtime process")
+	ErrSnapshotDigestMismatch        = errors.New("fail-closed: snapshot digest mismatch")
+	ErrSnapshotFileCorrupted         = errors.New("fail-closed: snapshot file corrupted or missing")
+	ErrSnapshotMutatedRehashRequired = errors.New("fail-closed: snapshot mutated since verification; rehash required")
+	ErrDependencySnapshotInvalid     = errors.New("fail-closed: dependency snapshot invalid or unverified")
+	ErrWorkerSnapshotPathRequired    = errors.New("fail-closed: worker snapshot path required but missing or unverified")
+	ErrSnapshotEntrypointAbsent      = errors.New("fail-closed: expected manifest-declared GGUF entrypoint is absent")
+	ErrSnapshotEntrypointAmbiguous   = errors.New("fail-closed: expected manifest-declared GGUF entrypoint is ambiguous")
+	ErrTTSVoiceAssetMissing          = errors.New("fail-closed: selected voice asset missing or unverified in snapshot")
+	ErrSeparatorModelAssetMissing    = errors.New("fail-closed: selected separator model asset missing, unverified, or invalid in snapshot")
 )
 
 // PolicyState represents the four governance states for provider/model routing.
@@ -123,19 +133,21 @@ type SelectionDecision struct {
 
 // ProviderAttempt records an immutable invocation attempt for auditing and retry provenance.
 type ProviderAttempt struct {
-	ID            string    `json:"id"`
-	RunID         string    `json:"run_id"`
-	Stage         string    `json:"stage"`
-	ProviderID    string    `json:"provider_id"`
-	ModelName     string    `json:"model_name"`
-	ModelVersion  string    `json:"model_version"`
-	InputHash     string    `json:"input_hash"`
-	AttemptNumber int       `json:"attempt_number"`
-	Status        string    `json:"status"` // "succeeded", "failed", "quality_failed", "policy_rejected", "circuit_broken"
-	ErrorMessage  string    `json:"error_message,omitempty"`
-	LatencyMs     int64     `json:"latency_ms"`
-	CostUnits     float64   `json:"cost_units"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID                string    `json:"id"`
+	RunID             string    `json:"run_id"`
+	Stage             string    `json:"stage"`
+	ProviderID        string    `json:"provider_id"`
+	ModelName         string    `json:"model_name"`
+	ModelVersion      string    `json:"model_version"`
+	InputHash         string    `json:"input_hash"`
+	AttemptNumber     int       `json:"attempt_number"`
+	Status            string    `json:"status"` // "succeeded", "failed", "quality_failed", "policy_rejected", "circuit_broken"
+	ErrorMessage      string    `json:"error_message,omitempty"`
+	LatencyMs         int64     `json:"latency_ms"`
+	CostUnits         float64   `json:"cost_units"`
+	ObservedModel     string    `json:"observed_model,omitempty"`
+	ServiceBaselineID string    `json:"service_baseline_id,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 // StageCacheIdentityInput encapsulates all components required to compute a deterministic stage CAS cache key.

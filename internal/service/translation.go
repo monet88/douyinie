@@ -94,6 +94,16 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 			in.TranscriptArtifactCAS = transcriptCAS
 		}
 	}
+	if len(in.Segments) > 0 {
+		filtered := make([]domain.TranslationInputSegment, 0, len(in.Segments))
+		for _, seg := range in.Segments {
+			text := strings.TrimSpace(seg.SourceText)
+			if text != "" && !domain.IsPathologicalRepetitionNoise(text) {
+				filtered = append(filtered, seg)
+			}
+		}
+		in.Segments = filtered
+	}
 
 	if len(in.Segments) == 0 {
 		return nil, domain.ErrEmptyTranslationInput
@@ -132,8 +142,39 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 					if err == nil {
 						var cachedVariant domain.TranslationVariant
 						if err := json.Unmarshal(data, &cachedVariant); err == nil {
-							cachedVariant.CASHash = cachedIdx.CASHash
+							if cachedVariant.AssetID != in.AssetID {
+								cachedVariant.ID = uuid.NewString()
+								cachedVariant.AssetID = in.AssetID
+								cachedVariant.RunID = in.RunID
+								cachedVariant.JobID = in.JobID
+								cachedVariant.CreatedAt = time.Now().UTC()
+								payload, err := json.MarshalIndent(&cachedVariant, "", "  ")
+								if err == nil {
+									if obj, err := s.cas.Put(bytes.NewReader(payload)); err == nil {
+										cachedVariant.CASHash = obj.SHA256
+									}
+								}
+							} else {
+								cachedVariant.CASHash = cachedIdx.CASHash
+							}
 							cachedVariant.ProvenanceHash = cachedIdx.ProvenanceHash
+
+							if s.db != nil {
+								_ = s.db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+									ID:             cachedVariant.ID,
+									AssetID:        in.AssetID,
+									RunID:          in.RunID,
+									JobID:          in.JobID,
+									TargetLanguage: in.TargetLanguage,
+									CASHash:        cachedVariant.CASHash,
+									ProvenanceHash: cachedVariant.ProvenanceHash,
+									ProviderID:     cachedVariant.ProviderID,
+									ModelName:      cachedVariant.ModelName,
+									ModelVersion:   cachedVariant.ModelVersion,
+									OverallQAScore: cachedVariant.OverallQAScore,
+									CreatedAt:      time.Now().UTC(),
+								})
+							}
 							return &cachedVariant, nil
 						}
 					}
@@ -144,7 +185,7 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 
 	// 4. Provider invocation uses Router-owned retry/fallback semantics so
 	// ProviderAttempt and alternate SelectionDecision provenance stay complete.
-	result, selectedProv, err := s.invokeTranslationWithFallback(ctx, in, routeRes)
+	result, selectedProv, validatedSegments, overallQAScore, err := s.invokeTranslationWithFallback(ctx, in, routeRes)
 	if err != nil {
 		return nil, fmt.Errorf("translation provider execution failed: %w", err)
 	}
@@ -153,33 +194,7 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 		return nil, fmt.Errorf("compute selected translation cache identity: %w", err)
 	}
 
-	// 5. Meaning-First QA Gate: Validate facts, names, numbers, negation
-	var validatedSegments []domain.TranslationSegment
-	var totalConfidence float64
-
-	for _, seg := range result.Segments {
-		qaRes := s.qaGate.ValidateSegment(seg.SourceText, seg.TargetText, in.SourceLanguage, in.TargetLanguage)
-		if !qaRes.Passed {
-			if qaRes.Err != nil {
-				return nil, fmt.Errorf("translation QA gate rejected segment %d: %w", seg.Index, qaRes.Err)
-			}
-			return nil, fmt.Errorf("translation QA gate rejected segment %d: %w", seg.Index, domain.ErrMeaningPreservationFailed)
-		}
-
-		seg.PassedQAGate = true
-		seg.QAConfidence = qaRes.Confidence
-		seg.KeyFacts = qaRes.ExtractedFacts
-		seg.NegationPolarity = qaRes.NegationPolarity
-		totalConfidence += qaRes.Confidence
-
-		validatedSegments = append(validatedSegments, seg)
-	}
-
-	overallQAScore := 1.0
-	if len(validatedSegments) > 0 {
-		overallQAScore = totalConfidence / float64(len(validatedSegments))
-	}
-
+	// 5. Meaning-First QA Gate: Evaluated per candidate attempt inside invokeTranslationWithFallback.
 	provID := selectedProv.ID()
 	modelName, modelVersion := selectedProv.ModelInfo()
 	if result.ProviderID != "" {
@@ -192,22 +207,39 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 		modelVersion = result.ModelVersion
 	}
 
+	serviceBaselineID := result.ServiceBaselineID
+	observedModel := result.ObservedModel
+	systemFingerprint := result.SystemFingerprint
+	rp := provider.ExtractRemoteProvenance(selectedProv)
+	if serviceBaselineID == "" {
+		serviceBaselineID = rp.ServiceBaselineID
+	}
+	if observedModel == "" {
+		observedModel = rp.ObservedModel
+	}
+	if systemFingerprint == "" {
+		systemFingerprint = rp.SystemFingerprint
+	}
+
 	// 6. Build immutable TranslationVariant
 	variant := &domain.TranslationVariant{
-		ID:             uuid.NewString(),
-		SchemaVersion:  domain.TranslationSchemaVersion,
-		AssetID:        in.AssetID,
-		RunID:          in.RunID,
-		JobID:          in.JobID,
-		SourceLanguage: in.SourceLanguage,
-		TargetLanguage: in.TargetLanguage,
-		Segments:       validatedSegments,
-		ProviderID:     provID,
-		ModelName:      modelName,
-		ModelVersion:   modelVersion,
-		ProvenanceHash: provenanceHash,
-		OverallQAScore: overallQAScore,
-		CreatedAt:      time.Now().UTC(),
+		ID:                uuid.NewString(),
+		SchemaVersion:     domain.TranslationSchemaVersion,
+		AssetID:           in.AssetID,
+		RunID:             in.RunID,
+		JobID:             in.JobID,
+		SourceLanguage:    in.SourceLanguage,
+		TargetLanguage:    in.TargetLanguage,
+		Segments:          validatedSegments,
+		ProviderID:        provID,
+		ModelName:         modelName,
+		ModelVersion:      modelVersion,
+		ServiceBaselineID: serviceBaselineID,
+		ObservedModel:     observedModel,
+		SystemFingerprint: systemFingerprint,
+		ProvenanceHash:    provenanceHash,
+		OverallQAScore:    overallQAScore,
+		CreatedAt:         time.Now().UTC(),
 	}
 
 	// 7. Persist to CAS & SQLite index
@@ -285,8 +317,11 @@ func (s *TranslationService) loadSegmentsFromTranscript(ctx context.Context, ass
 
 	var segments []domain.TranslationInputSegment
 	for _, block := range transcript.SpeechBlocks {
+		if block.SegmentType != "" && block.SegmentType != domain.SpeechBlockTypeSpeech {
+			continue
+		}
 		text := strings.TrimSpace(block.SourceText)
-		if text == "" {
+		if text == "" || domain.IsPathologicalRepetitionNoise(text) {
 			continue
 		}
 		segments = append(segments, domain.TranslationInputSegment{
@@ -297,7 +332,6 @@ func (s *TranslationService) loadSegmentsFromTranscript(ctx context.Context, ass
 			EndMs:      block.EndMs,
 		})
 	}
-
 	return segments, idx.CASHash, nil
 }
 
@@ -318,10 +352,18 @@ func (s *TranslationService) computeProvenanceHash(in domain.TranslationJobInput
 	return cas.ComputeStageCacheKey(domain.StageCacheIdentityInput{
 		Stage:       string(provider.TypeTranslation),
 		InputHashes: inputHashes,
-		SemanticConfig: map[string]any{
-			"source_language":  in.SourceLanguage,
-			"meaning_contract": "facts_names_numbers_negation_v1",
-		},
+		SemanticConfig: func() map[string]any {
+			cfg := map[string]any{
+				"source_language":  in.SourceLanguage,
+				"meaning_contract": "facts_names_numbers_negation_v1",
+			}
+			if bp, ok := p.(interface{ ServiceBaselineID() string }); ok {
+				if baseline := strings.TrimSpace(bp.ServiceBaselineID()); baseline != "" {
+					cfg["service_baseline_id"] = baseline
+				}
+			}
+			return cfg
+		}(),
 		ProviderID:    p.ID(),
 		ModelName:     modelName,
 		ModelVersion:  modelVersion,
@@ -351,7 +393,10 @@ func (s *TranslationService) computeTranslationInputHash(in domain.TranslationJo
 }
 
 // invokeTranslationWithFallback routes and executes translation attempts with policy-checked fallback.
-func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, in domain.TranslationJobInput, routeRes *provider.RouteResult) (*provider.TranslationResult, provider.Provider, error) {
+// Meaning-first QA rejection runs inside the Router.ExecuteRoutedWithRetry attempt so that
+// any QA failure returns an error wrapping domain.ErrQualityRejected plus the specific QA error.
+// This ensures the Router records quality_failed for that attempt and advances to the next fallback candidate.
+func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, in domain.TranslationJobInput, routeRes *provider.RouteResult) (*provider.TranslationResult, provider.Provider, []domain.TranslationSegment, float64, error) {
 	if s.TranslateInvoke != nil {
 		// Custom hook installed (e.g. for unit tests)
 		var p provider.Provider = &provider.BaseFakeProvider{
@@ -363,11 +408,21 @@ func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, 
 			ModelVersion: "1.0",
 		}
 		res, err := s.TranslateInvoke(ctx, p, in)
-		return res, p, err
+		if err != nil {
+			return nil, nil, nil, 0, err
+		}
+		if res == nil {
+			return nil, nil, nil, 0, fmt.Errorf("custom translation hook returned nil result")
+		}
+		validSegs, score, qaErr := s.validateMeaningQA(in, res.Segments)
+		if qaErr != nil {
+			return nil, nil, nil, 0, qaErr
+		}
+		return res, p, validSegs, score, nil
 	}
 
 	if s.router == nil {
-		return nil, nil, fmt.Errorf("provider router is not configured")
+		return nil, nil, nil, 0, fmt.Errorf("provider router is not configured")
 	}
 
 	routeReq := translationRouteRequest(in)
@@ -375,36 +430,84 @@ func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, 
 		var err error
 		routeRes, err = s.router.Route(ctx, routeReq)
 		if err != nil {
-			return nil, nil, fmt.Errorf("routing translation provider failed: %w", err)
+			return nil, nil, nil, 0, fmt.Errorf("routing translation provider failed: %w", err)
 		}
 	}
 
 	inputHash, err := s.computeTranslationInputHash(in)
 	if err != nil {
-		return nil, nil, fmt.Errorf("compute translation input hash: %w", err)
+		return nil, nil, nil, 0, fmt.Errorf("compute translation input hash: %w", err)
 	}
 
 	var result *provider.TranslationResult
 	var selected provider.Provider
+	var validatedSegments []domain.TranslationSegment
+	var overallQAScore float64
+
 	err = s.router.ExecuteRoutedWithRetry(ctx, routeReq, routeRes, inputHash, 1, func(cand provider.Provider, _ int) error {
 		res, invokeErr := s.invokeProvider(ctx, cand, in)
 		if invokeErr != nil {
 			return invokeErr
 		}
 		if res == nil {
-			return fmt.Errorf("translation provider %s returned nil result", cand.ID())
+			return fmt.Errorf("%w: translation provider %s returned nil result", domain.ErrQualityRejected, cand.ID())
+		}
+		validSegs, score, qaErr := s.validateMeaningQA(in, res.Segments)
+		if qaErr != nil {
+			return qaErr
 		}
 		result = res
 		selected = cand
+		validatedSegments = validSegs
+		overallQAScore = score
 		return nil
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, 0, err
 	}
 	if result == nil || selected == nil {
-		return nil, nil, fmt.Errorf("translation execution completed without a selected provider result")
+		return nil, nil, nil, 0, fmt.Errorf("translation execution completed without a selected provider result")
 	}
-	return result, selected, nil
+	return result, selected, validatedSegments, overallQAScore, nil
+}
+
+// validateMeaningQA evaluates the meaning preservation QA gate for all segments.
+// If any segment fails QA, it returns an error wrapping domain.ErrQualityRejected
+// and the specific QA error, allowing the router to record quality_failed and
+// advance to the next fallback candidate.
+func (s *TranslationService) validateMeaningQA(in domain.TranslationJobInput, segments []domain.TranslationSegment) ([]domain.TranslationSegment, float64, error) {
+	if len(segments) == 0 {
+		return nil, 0, fmt.Errorf("%w: translation produced no segments", domain.ErrQualityRejected)
+	}
+
+	var validatedSegments []domain.TranslationSegment
+	var totalConfidence float64
+
+	for _, seg := range segments {
+		qaRes := s.qaGate.ValidateSegment(seg.SourceText, seg.TargetText, in.SourceLanguage, in.TargetLanguage)
+		if !qaRes.Passed {
+			qaErr := qaRes.Err
+			if qaErr == nil {
+				qaErr = domain.ErrMeaningPreservationFailed
+			}
+			return nil, 0, fmt.Errorf("%w: translation QA gate rejected segment %d: %w", domain.ErrQualityRejected, seg.Index, qaErr)
+		}
+
+		seg.PassedQAGate = true
+		seg.QAConfidence = qaRes.Confidence
+		seg.KeyFacts = qaRes.ExtractedFacts
+		seg.NegationPolarity = qaRes.NegationPolarity
+		totalConfidence += qaRes.Confidence
+
+		validatedSegments = append(validatedSegments, seg)
+	}
+
+	overallQAScore := 1.0
+	if len(validatedSegments) > 0 {
+		overallQAScore = totalConfidence / float64(len(validatedSegments))
+	}
+
+	return validatedSegments, overallQAScore, nil
 }
 
 func translationRouteRequest(in domain.TranslationJobInput) provider.RouteRequest {
@@ -414,6 +517,7 @@ func translationRouteRequest(in domain.TranslationJobInput) provider.RouteReques
 		Language:              in.TargetLanguage,
 		ExecutionProfile:      in.ExecutionProfile,
 		AuthorizedCredentials: in.AuthorizedCredentials,
+		ConsentGranted:        in.ConsentGranted,
 	}
 }
 
@@ -425,10 +529,11 @@ func (s *TranslationService) invokeProvider(ctx context.Context, p provider.Prov
 	}
 
 	req := provider.TranslationRequest{
-		RunID:          in.RunID,
-		SourceLanguage: in.SourceLanguage,
-		TargetLanguage: in.TargetLanguage,
-		Segments:       in.Segments,
+		RunID:                 in.RunID,
+		SourceLanguage:        in.SourceLanguage,
+		TargetLanguage:        in.TargetLanguage,
+		Segments:              in.Segments,
+		AuthorizedCredentials: in.AuthorizedCredentials,
 	}
 
 	return textProv.TranslateText(ctx, req)

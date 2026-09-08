@@ -139,6 +139,107 @@ func TestVisualTextService_DetectAndTrackText(t *testing.T) {
 	}
 }
 
+func TestVisualTextService_SpatioTemporalOCRInstability_FilteredAsNoise(t *testing.T) {
+	svc, db, _, assetID := setupVisualTextService(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	reg := provider.NewSeam1FakeRegistry()
+	polSvc := governance.NewPolicyService(db)
+	licSvc := governance.NewLicenseService(db)
+	initCtx := context.Background()
+	for _, p := range reg.ListAll() {
+		mName, mVer := p.ModelInfo()
+		if mName != "" {
+			_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+				DependencyName: mName,
+				Version:        mVer,
+				SHA256:         "sha256_mock_" + mName,
+				SourceRepo:     "github.com/monet88/douyinie/models/" + mName,
+				CodeLicense:    "Apache-2.0",
+				ModelLicense:   "Apache-2.0",
+				DataLicense:    "OpenData",
+				ServiceTerms:   "Standard",
+				Verified:       true,
+				CreatedAt:      time.Now().UTC(),
+			})
+		}
+	}
+	credSvc := governance.NewCredentialService(db)
+	router := provider.NewRouter(reg, polSvc, licSvc, credSvc, nil, db)
+	svc.ConfigureRouter(router)
+
+	// Mock OCR returning:
+	// 1. Spatio-temporal unstable pseudo-text in top-right (frames 10, 11, 12, changing gibberish, conf ~0.58)
+	// 2. Stable unknown brand in top-left (frames 10, 11, 12, "NovaBrandX", conf ~0.58)
+	// 3. Isolated single-frame unknown text in center (frame 10, "UniqueSign", conf ~0.58)
+	svc.OCRInvoke = func(ctx context.Context, p provider.Provider, req provider.OCRRequest) (*provider.OCRResult, error) {
+		return &provider.OCRResult{
+			ProviderID:   "fake_ppocr",
+			ModelName:    "paddleocr",
+			ModelVersion: "v4",
+			FrameWidth:   1920,
+			FrameHeight:  1080,
+			Detections: []provider.RawTextDetection{
+				// Pseudo-text sequence (unstable across frames)
+				{FrameIndex: 10, TimestampMs: 5000, Text: "XybVqwer", Box: domain.BoundingBox{X: 1650, Y: 185, Width: 125, Height: 25}, Confidence: 0.55},
+				{FrameIndex: 11, TimestampMs: 5500, Text: "MnoPlkjh", Box: domain.BoundingBox{X: 1600, Y: 200, Width: 120, Height: 25}, Confidence: 0.58},
+				{FrameIndex: 12, TimestampMs: 6000, Text: "ZopTyuik", Box: domain.BoundingBox{X: 1550, Y: 220, Width: 120, Height: 25}, Confidence: 0.57},
+				// Stable unknown brand (same text across frames)
+				{FrameIndex: 10, TimestampMs: 5000, Text: "NovaBrandX", Box: domain.BoundingBox{X: 500, Y: 300, Width: 150, Height: 40}, Confidence: 0.58},
+				{FrameIndex: 11, TimestampMs: 5500, Text: "NovaBrandX", Box: domain.BoundingBox{X: 502, Y: 301, Width: 150, Height: 40}, Confidence: 0.58},
+				{FrameIndex: 12, TimestampMs: 6000, Text: "NovaBrandX", Box: domain.BoundingBox{X: 504, Y: 302, Width: 150, Height: 40}, Confidence: 0.58},
+				// Isolated single-frame unknown text
+				{FrameIndex: 10, TimestampMs: 5000, Text: "UniqueSign", Box: domain.BoundingBox{X: 800, Y: 400, Width: 100, Height: 30}, Confidence: 0.58},
+			},
+		}, nil
+	}
+
+	plan, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:             "run-instability-test",
+		AssetID:           assetID,
+		FrameSampleStepMs: 500,
+	})
+	if err != nil {
+		t.Fatalf("DetectAndTrackText failed: %v", err)
+	}
+
+	var foundUnstableAsNoise, foundStableBrandSemantic, foundIsolatedSemantic bool
+	for _, reg := range plan.Regions {
+		if reg.Text == "XybVqwer" || reg.Text == "MnoPlkjh" || reg.Text == "ZopTyuik" {
+			if reg.Role != domain.TextRoleIgnoreNoise {
+				t.Errorf("expected unstable pseudo-text %q to be IgnoreNoise, got %v", reg.Text, reg.Role)
+			} else {
+				foundUnstableAsNoise = true
+			}
+		}
+		if reg.Text == "NovaBrandX" {
+			if reg.Role != domain.TextRoleSemanticText {
+				t.Errorf("expected stable brand %q to be SemanticText, got %v", reg.Text, reg.Role)
+			} else {
+				foundStableBrandSemantic = true
+			}
+		}
+		if reg.Text == "UniqueSign" {
+			if reg.Role != domain.TextRoleSemanticText {
+				t.Errorf("expected isolated text %q to be SemanticText, got %v", reg.Text, reg.Role)
+			} else {
+				foundIsolatedSemantic = true
+			}
+		}
+	}
+
+	if !foundUnstableAsNoise {
+		t.Errorf("did not find unstable pseudo-text classified as IgnoreNoise")
+	}
+	if !foundStableBrandSemantic {
+		t.Errorf("did not find stable brand classified as SemanticText")
+	}
+	if !foundIsolatedSemantic {
+		t.Errorf("did not find isolated text classified as SemanticText")
+	}
+}
+
 func TestVisualTextService_ProvenanceCacheReuse(t *testing.T) {
 	svc, db, _, assetID := setupVisualTextService(t)
 	defer db.Close()
@@ -1237,5 +1338,105 @@ func TestVisualTextService_LocalizeVisualTrack_EmptyTranslationIndexCASHash_Fail
 	}
 	if !errors.Is(err, domain.ErrTranslationVariantNotFound) {
 		t.Fatalf("expected ErrTranslationVariantNotFound for empty translation CASHash, got %v", err)
+	}
+}
+
+func TestVisualTextService_LocalizeVisualTrack_ForwardsRoutingContextToTranslationJobInput(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+
+	ctx := context.Background()
+
+	var capturedInputs []domain.TranslationJobInput
+	transSvc := service.NewTranslationService(db, casStore)
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		capturedInputs = append(capturedInputs, req)
+		target := "Xuất"
+		if strings.Contains(req.Segments[0].SourceText, "1") || strings.Contains(req.Segments[0].SourceText, "Bước") {
+			target = "Bước 1: Chuẩn bị nguyên liệu (đã dịch)"
+		}
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "qwen_trans",
+			ModelVersion: "v1",
+			Segments: []domain.TranslationSegment{
+				{
+					Index:      0,
+					SourceText: req.Segments[0].SourceText,
+					TargetText: target,
+				},
+			},
+		}, nil
+	}
+	svc.SetTranslationService(transSvc)
+
+	// 1. Text detection creates regions including instructional UI and semantic text
+	_, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:   "run-forward-ctx",
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+
+	// 2. Localize visual track with Hybrid profile, consent, and credential refs
+	capturedInputs = nil
+	visTrack, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:                 "run-forward-ctx",
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		ExecutionProfile:      domain.ExecutionProfileHybrid,
+		AuthorizedCredentials: []string{"cred_gateway_1", "cred_gateway_2"},
+		ConsentGranted:        true,
+	})
+	if err != nil {
+		t.Fatalf("LocalizeVisualTrack failed: %v", err)
+	}
+	if visTrack == nil {
+		t.Fatal("expected non-nil visual track")
+	}
+
+	// Verify that translation was called and all calls received the routing context
+	if len(capturedInputs) == 0 {
+		t.Fatal("expected at least one nested translation call for visual text")
+	}
+	for i, captured := range capturedInputs {
+		if captured.ExecutionProfile != domain.ExecutionProfileHybrid {
+			t.Errorf("call %d: expected execution profile %s, got %s", i, domain.ExecutionProfileHybrid, captured.ExecutionProfile)
+		}
+		if !captured.ConsentGranted {
+			t.Errorf("call %d: expected consent_granted=true, got false", i)
+		}
+		if len(captured.AuthorizedCredentials) != 2 || captured.AuthorizedCredentials[0] != "cred_gateway_1" || captured.AuthorizedCredentials[1] != "cred_gateway_2" {
+			t.Errorf("call %d: expected credentials [cred_gateway_1, cred_gateway_2], got %v", i, captured.AuthorizedCredentials)
+		}
+	}
+
+	// 3. Verify existing callers without those fields still work (backward compatibility)
+	capturedInputs = nil
+	visTrackLegacy, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-forward-legacy",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err != nil {
+		t.Fatalf("LocalizeVisualTrack without routing fields failed: %v", err)
+	}
+	if visTrackLegacy == nil {
+		t.Fatal("expected non-nil visual track for legacy caller")
+	}
+	if len(capturedInputs) == 0 {
+		t.Fatal("expected nested translation call for legacy caller")
+	}
+	for i, captured := range capturedInputs {
+		if captured.ExecutionProfile != "" {
+			t.Errorf("call %d: expected empty execution profile, got %s", i, captured.ExecutionProfile)
+		}
+		if captured.ConsentGranted {
+			t.Errorf("call %d: expected consent_granted=false, got true", i)
+		}
+		if len(captured.AuthorizedCredentials) != 0 {
+			t.Errorf("call %d: expected empty credentials, got %v", i, captured.AuthorizedCredentials)
+		}
 	}
 }

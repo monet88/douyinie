@@ -1,7 +1,9 @@
 package service_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -323,5 +325,64 @@ func TestTranslationService_QAGate_Rejection(t *testing.T) {
 	}
 	if !errors.Is(err, domain.ErrNumberCorrupted) {
 		t.Errorf("expected ErrNumberCorrupted in error chain, got: %v", err)
+	}
+}
+
+func TestTranslationService_PathologicalASRRepetition_SkippedFromTranslation(t *testing.T) {
+	db, casStore, router, _ := setupTranslationTestEnv(t)
+	svc := service.NewTranslationService(db, casStore)
+	svc.ConfigureRouter(router)
+
+	ctx := context.Background()
+	runID := uuid.NewString()
+	assetID := uuid.NewString()
+	attID := uuid.NewString()
+
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION", TermsAccepted: true, ConfirmedAt: time.Now().UTC()})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{ID: assetID, RightsAttestationID: attID, SHA256: "fake-sha", ByteSize: 100, CreatedAt: time.Now().UTC()})
+	_ = db.CreateJob(ctx, domain.LocalizationJob{ID: "j1", SourceAssetID: assetID, TargetLanguage: "en", CreatedAt: time.Now().UTC()})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: "j1", Status: "running", CreatedAt: time.Now().UTC()})
+
+	// Save transcript containing real speech and pathological repetition noise
+	transcript := domain.TranscriptArtifact{
+		ID:      uuid.NewString(),
+		AssetID: assetID,
+		RunID:   runID,
+		SpeechBlocks: []domain.SpeechBlock{
+			{Index: 0, StartMs: 0, EndMs: 2000, SourceText: "这快递居然这么快", SegmentType: domain.SpeechBlockTypeSpeech},
+			{Index: 1, StartMs: 2000, EndMs: 5000, SourceText: "ってるチュルチュンチュンチュンチュンチュルチュンチュルチュンチュンチュンチュンチュルチュンチュルチュンチュンチュンチュンチュルチュンマカナペンキの", SegmentType: domain.SpeechBlockTypeSpeech},
+			{Index: 2, StartMs: 5000, EndMs: 7000, SourceText: "老天爷我终于瘦了", SegmentType: domain.SpeechBlockTypeSpeech},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(transcript)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	_ = db.SaveTranscriptArtifactIndex(ctx, storage.TranscriptArtifactIndex{
+		ID:             transcript.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		CASHash:        tObj.SHA256,
+		ProvenanceHash: "prov-test",
+		CreatedAt:      transcript.CreatedAt,
+	})
+
+	input := domain.TranslationJobInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		JobID:          "j1",
+		SourceLanguage: "zh",
+		TargetLanguage: "en",
+	}
+
+	variant, err := svc.Translate(ctx, input)
+	if err != nil {
+		t.Fatalf("Translate failed unexpectedly: %v", err)
+	}
+
+	if len(variant.Segments) != 2 {
+		t.Fatalf("expected exactly 2 real speech segments (pathological noise skipped), got %d", len(variant.Segments))
+	}
+	if variant.Segments[0].Index != 0 || variant.Segments[1].Index != 2 {
+		t.Errorf("expected segments [0, 2], got indices [%d, %d]", variant.Segments[0].Index, variant.Segments[1].Index)
 	}
 }

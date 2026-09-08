@@ -2,6 +2,7 @@ package seam1_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -549,5 +550,170 @@ func TestSeam1_LocalizedVisualTrack_NonOcclusion_And_SceneEvidence(t *testing.T)
 	defer overlayBlockResp.Body.Close()
 	if overlayBlockResp.StatusCode != http.StatusUnprocessableEntity {
 		t.Errorf("expected 422 Unprocessable Entity when overlay occludes protected region, got %d", overlayBlockResp.StatusCode)
+	}
+}
+
+type mockSnapshotOCRProvider struct {
+	*provider.FakeOCRProvider
+	detSHA    string
+	recSHA    string
+	oriSHA    string
+	runtimeID string
+}
+
+func (p *mockSnapshotOCRProvider) OCRSnapshotDigests() (detSHA, recSHA, oriSHA, runtimeIdentity string) {
+	return p.detSHA, p.recSHA, p.oriSHA, p.runtimeID
+}
+func (p *mockSnapshotOCRProvider) DetectRegions(ctx context.Context, req provider.OCRRequest) (*provider.OCRResult, error) {
+	res, err := p.FakeOCRProvider.DetectRegions(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	res.DetSnapshotDigest = p.detSHA
+	res.RecSnapshotDigest = p.recSHA
+	res.OriSnapshotDigest = p.oriSHA
+	res.RuntimeIdentity = p.runtimeID
+	return res, nil
+}
+
+func TestSeam1_TextRegionPlan_SnapshotProvenanceBindingAndCacheIsolation(t *testing.T) {
+	h := setupHarness(t)
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// Wrap fake OCR provider with mock snapshot digests
+	mockProv := &mockSnapshotOCRProvider{
+		FakeOCRProvider: provider.NewFakeOCRProvider("fake_paddle_ocr"),
+		detSHA:          "det_sha_256_mock_11223344",
+		recSHA:          "rec_sha_256_mock_55667788",
+		oriSHA:          "ori_sha_256_mock_99aabbcc",
+		runtimeID:       "paddleocr:3.7.0@b03f46425e8ff4442b268ce449e3eef758146cd4",
+	}
+	h.registry.Register(mockProv)
+
+	// 1. First execution creates plan and binds snapshot provenance
+	detectPayload := map[string]any{
+		"run_id":               runID,
+		"frame_sample_step_ms": 500,
+	}
+	body, _ := json.Marshal(detectPayload)
+	resp, err := http.Post(
+		fmt.Sprintf("%s/api/v1/assets/%s/detect-text", h.server.URL, assetID),
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatalf("POST detect-text failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d", resp.StatusCode)
+	}
+
+	var res struct {
+		Plan domain.TextRegionPlan `json:"text_region_plan"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	plan := res.Plan
+	if plan.DetSnapshotDigest != mockProv.detSHA {
+		t.Errorf("got det digest %q, want %q", plan.DetSnapshotDigest, mockProv.detSHA)
+	}
+	if plan.RecSnapshotDigest != mockProv.recSHA {
+		t.Errorf("got rec digest %q, want %q", plan.RecSnapshotDigest, mockProv.recSHA)
+	}
+	if plan.OriSnapshotDigest != mockProv.oriSHA {
+		t.Errorf("got ori digest %q, want %q", plan.OriSnapshotDigest, mockProv.oriSHA)
+	}
+	if plan.RuntimeIdentity != mockProv.runtimeID {
+		t.Errorf("got runtime identity %q, want %q", plan.RuntimeIdentity, mockProv.runtimeID)
+	}
+	if plan.ProvenanceHash == "" {
+		t.Error("expected non-empty provenance hash")
+	}
+
+	// 2. Second execution hits CAS cache directly via provenance hash
+	resp2, err := http.Post(
+		fmt.Sprintf("%s/api/v1/assets/%s/detect-text", h.server.URL, assetID),
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatalf("POST detect-text 2 failed: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created from cached call, got %d", resp2.StatusCode)
+	}
+
+	var res2 struct {
+		Plan domain.TextRegionPlan `json:"text_region_plan"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&res2); err != nil {
+		t.Fatalf("decode cached response: %v", err)
+	}
+
+	if res2.Plan.CASHash != plan.CASHash {
+		t.Fatalf("cached call did not return matching CAS hash: got %s, want %s", res2.Plan.CASHash, plan.CASHash)
+	}
+	if res2.Plan.ProvenanceHash != plan.ProvenanceHash {
+		t.Fatalf("cached call did not return matching provenance hash: got %s, want %s", res2.Plan.ProvenanceHash, plan.ProvenanceHash)
+	}
+
+	// 3. Verify stage execution record in DB
+	execs, err := h.db.ListStageExecutions(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("list stage executions: %v", err)
+	}
+	var foundVisualText bool
+	for _, e := range execs {
+		if e.Stage == "visual_text" && e.Status == "succeeded" {
+			foundVisualText = true
+			if e.ArtifactSHA256 != plan.CASHash {
+				t.Errorf("stage execution artifact %s != plan CAS hash %s", e.ArtifactSHA256, plan.CASHash)
+			}
+		}
+	}
+	if !foundVisualText {
+		t.Errorf("visual_text stage execution not found in DB")
+	}
+
+	// 4. Mutation test: provider weights change -> cache must NOT hit old CAS
+	mockProvChanged := &mockSnapshotOCRProvider{
+		FakeOCRProvider: provider.NewFakeOCRProvider("fake_paddle_ocr"),
+		detSHA:          "det_sha_256_mock_CHANGED_99999",
+		recSHA:          mockProv.recSHA,
+		oriSHA:          mockProv.oriSHA,
+		runtimeID:       mockProv.runtimeID,
+	}
+	h.registry.Register(mockProvChanged)
+
+	resp3, err := http.Post(
+		fmt.Sprintf("%s/api/v1/assets/%s/detect-text", h.server.URL, assetID),
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatalf("POST detect-text 3 failed: %v", err)
+	}
+	defer resp3.Body.Close()
+	if resp3.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created from changed snapshot call, got %d", resp3.StatusCode)
+	}
+	var res3 struct {
+		Plan domain.TextRegionPlan `json:"text_region_plan"`
+	}
+	if err := json.NewDecoder(resp3.Body).Decode(&res3); err != nil {
+		t.Fatalf("decode changed response: %v", err)
+	}
+	if res3.Plan.ProvenanceHash == plan.ProvenanceHash {
+		t.Fatalf("changed snapshot digest must produce different provenance hash, got identical %s", plan.ProvenanceHash)
+	}
+	if res3.Plan.DetSnapshotDigest != "det_sha_256_mock_CHANGED_99999" {
+		t.Fatalf("expected changed det digest, got %s", res3.Plan.DetSnapshotDigest)
 	}
 }

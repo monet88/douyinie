@@ -121,3 +121,151 @@ func TestBuildSpeechBlocks_PreservesCompleteExplicitSilence(t *testing.T) {
 		t.Errorf("silence block must span the COMPLETE explicit gap [1000,6000], got [%d,%d]", sil.StartMs, sil.EndMs)
 	}
 }
+
+func TestBuildSpeechBlocks_ZeroDurationWordClampedToAvailableGap(t *testing.T) {
+	cfg := domain.SegmentRuleConfig{
+		MinSpeechBlockMs:   500,
+		MaxSpeechBlockMs:   15000,
+		PauseSplitMs:       400,
+		MinSilenceMs:       300,
+		MinSpeakerChangeMs: 100,
+		PunctuationSplit:   true,
+	}
+	// Case from 7679392272936389915 segment 12: an isolated interjection word "啊"
+	// where ASR/alignment output start_ms == end_ms == 29680.
+	// Silence precedes it (ends at 27840), and silence follows it (next word starts at 32160).
+	words := []domain.WordTiming{
+		{Word: "喂", StartMs: 22480, EndMs: 22560, Confidence: 0.95, SpeakerID: "SPEAKER_00"},
+		{Word: "啊", StartMs: 29680, EndMs: 29680, Confidence: 0.90, SpeakerID: "SPEAKER_00"},
+		{Word: "我", StartMs: 32160, EndMs: 32720, Confidence: 0.95, SpeakerID: "SPEAKER_00"},
+	}
+
+	blocks := BuildSpeechBlocks(words, cfg)
+	for _, b := range blocks {
+		if b.SegmentType == domain.SpeechBlockTypeSpeech {
+			dur := b.EndMs - b.StartMs
+			if dur <= 0 {
+				t.Fatalf("speech block %d (%q) has zero or negative duration: start_ms=%d end_ms=%d",
+					b.Index, b.SourceText, b.StartMs, b.EndMs)
+			}
+		}
+	}
+}
+
+func assertNoOverlapAndPositiveDuration(t *testing.T, blocks []domain.SpeechBlock) {
+	t.Helper()
+	for idx, b := range blocks {
+		t.Logf("block %d (%s: %q) [%d, %d]", idx, b.SegmentType, b.SourceText, b.StartMs, b.EndMs)
+		if b.EndMs <= b.StartMs {
+			t.Fatalf("block %d (%s: %q) has zero or negative duration: [%d, %d]",
+				idx, b.SegmentType, b.SourceText, b.StartMs, b.EndMs)
+		}
+		if idx > 0 {
+			prev := blocks[idx-1]
+			if prev.EndMs > b.StartMs {
+				t.Fatalf("block %d [%d, %d] overlaps next block %d [%d, %d]",
+					idx-1, prev.StartMs, prev.EndMs, idx, b.StartMs, b.EndMs)
+			}
+		}
+	}
+}
+
+func TestBuildSpeechBlocks_DegenerateWord_ZeroNextGap(t *testing.T) {
+	cfg := domain.SegmentRuleConfig{
+		MinSpeechBlockMs:   500,
+		MaxSpeechBlockMs:   15000,
+		PauseSplitMs:       400,
+		MinSilenceMs:       300,
+		MinSpeakerChangeMs: 0,
+		PunctuationSplit:   true,
+	}
+	// Word 0 ends at 1800. Gap of 1200ms. Word 1 is degenerate [3000, 3000].
+	// Word 2 starts at 3000 with a speaker change (next gap = 0).
+	words := []domain.WordTiming{
+		{Word: "喂。", StartMs: 1000, EndMs: 1800, Confidence: 0.95, SpeakerID: "SPEAKER_00"},
+		{Word: "啊。", StartMs: 3000, EndMs: 3000, Confidence: 0.90, SpeakerID: "SPEAKER_00"},
+		{Word: "走。", StartMs: 3000, EndMs: 4000, Confidence: 0.95, SpeakerID: "SPEAKER_01"},
+	}
+
+	blocks := BuildSpeechBlocks(words, cfg)
+	assertNoOverlapAndPositiveDuration(t, blocks)
+}
+
+func TestBuildSpeechBlocks_DegenerateWord_ShortNextGap(t *testing.T) {
+	cfg := domain.SegmentRuleConfig{
+		MinSpeechBlockMs:   500,
+		MaxSpeechBlockMs:   15000,
+		MinSilenceMs:       300,
+		MinSpeakerChangeMs: 0,
+		PunctuationSplit:   true,
+	}
+	// Word 0 ends at 1800. Gap of 1200ms. Word 1 is degenerate [3000, 3000].
+	// Word 2 starts at 3050 (next gap = 50ms < 200ms) with a speaker change.
+	words := []domain.WordTiming{
+		{Word: "喂。", StartMs: 1000, EndMs: 1800, Confidence: 0.95, SpeakerID: "SPEAKER_00"},
+		{Word: "啊。", StartMs: 3000, EndMs: 3000, Confidence: 0.90, SpeakerID: "SPEAKER_00"},
+		{Word: "走。", StartMs: 3050, EndMs: 4000, Confidence: 0.95, SpeakerID: "SPEAKER_01"},
+	}
+
+	blocks := BuildSpeechBlocks(words, cfg)
+	assertNoOverlapAndPositiveDuration(t, blocks)
+}
+
+func TestBuildSpeechBlocks_DegenerateWord_FinalWord(t *testing.T) {
+	cfg := domain.SegmentRuleConfig{
+		MinSpeechBlockMs:   500,
+		MaxSpeechBlockMs:   15000,
+		PauseSplitMs:       400,
+		MinSilenceMs:       300,
+		MinSpeakerChangeMs: 100,
+		PunctuationSplit:   true,
+	}
+	// Word 0 ends at 1800. Word 1 is the final word and degenerate [3000, 3000].
+	words := []domain.WordTiming{
+		{Word: "喂。", StartMs: 1000, EndMs: 1800, Confidence: 0.95, SpeakerID: "SPEAKER_00"},
+		{Word: "啊。", StartMs: 3000, EndMs: 3000, Confidence: 0.90, SpeakerID: "SPEAKER_00"},
+	}
+
+	blocks := BuildSpeechBlocks(words, cfg)
+	assertNoOverlapAndPositiveDuration(t, blocks)
+}
+
+func TestBuildSpeechBlocks_DegenerateWord_ZeroAvailableInterval(t *testing.T) {
+	cfg := domain.SegmentRuleConfig{
+		MinSpeechBlockMs:   500,
+		MaxSpeechBlockMs:   15000,
+		PauseSplitMs:       400,
+		MinSilenceMs:       300,
+		MinSpeakerChangeMs: 0,
+		PunctuationSplit:   true,
+	}
+	// Previous block ends at 2000. Degenerate word is [2000, 2000]. Next word starts at 2000.
+	// Both forwardGap <= 0 and backwardGap <= 0.
+	words := []domain.WordTiming{
+		{Word: "喂。", StartMs: 1000, EndMs: 2000, Confidence: 0.95, SpeakerID: "SPEAKER_00"},
+		{Word: "啊。", StartMs: 2000, EndMs: 2000, Confidence: 0.90, SpeakerID: "SPEAKER_01"},
+		{Word: "走。", StartMs: 2000, EndMs: 3000, Confidence: 0.95, SpeakerID: "SPEAKER_02"},
+	}
+
+	blocks := BuildSpeechBlocks(words, cfg)
+	assertNoOverlapAndPositiveDuration(t, blocks)
+}
+
+func TestBuildSpeechBlocks_DegenerateWord_FinalWordZeroBackwardGap(t *testing.T) {
+	cfg := domain.SegmentRuleConfig{
+		MinSpeechBlockMs:   500,
+		MaxSpeechBlockMs:   15000,
+		PauseSplitMs:       400,
+		MinSilenceMs:       300,
+		MinSpeakerChangeMs: 0,
+		PunctuationSplit:   true,
+	}
+	// Word 0 ends at 2000. Word 1 is degenerate [2000, 2000] and final (backwardGap = 0, no next word).
+	words := []domain.WordTiming{
+		{Word: "喂。", StartMs: 1000, EndMs: 2000, Confidence: 0.95, SpeakerID: "SPEAKER_00"},
+		{Word: "啊。", StartMs: 2000, EndMs: 2000, Confidence: 0.90, SpeakerID: "SPEAKER_01"},
+	}
+
+	blocks := BuildSpeechBlocks(words, cfg)
+	assertNoOverlapAndPositiveDuration(t, blocks)
+}

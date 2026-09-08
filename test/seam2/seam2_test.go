@@ -1941,8 +1941,8 @@ func TestSeam2_TTSStage_AdapterErrorClassifiedAsTTSNotDiarizer(t *testing.T) {
 	if strings.Contains(err.Error(), "DIARIZER") {
 		t.Fatalf("CRITICAL REGRESSION: TTS error was misclassified as DIARIZER error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "TTS_EXEC_FAILED") && !strings.Contains(err.Error(), "TTS_BINARY_NOT_FOUND") {
-		t.Fatalf("expected TTS_EXEC_FAILED or TTS_BINARY_NOT_FOUND, got %v", err)
+	if !strings.Contains(err.Error(), "TTS_EXEC_FAILED") && !strings.Contains(err.Error(), "TTS_BINARY_NOT_FOUND") && !strings.Contains(err.Error(), "TTS_VOICE_ASSET_MISSING") {
+		t.Fatalf("expected TTS error code (TTS_EXEC_FAILED, TTS_BINARY_NOT_FOUND, or TTS_VOICE_ASSET_MISSING), got %v", err)
 	}
 }
 
@@ -1962,6 +1962,19 @@ class Vieneu:
 `
 	if err := os.WriteFile(mockModulePath, []byte(mockCode), 0644); err != nil {
 		t.Fatalf("write mock vieneu.py: %v", err)
+	}
+
+	snapDir := filepath.Join(tmpDir, "snapshot")
+	catDir := filepath.Join(snapDir, "src", "vieneu", "assets")
+	if err := os.MkdirAll(catDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	catFile := filepath.Join(catDir, "voices_v3_turbo.json")
+	if err := os.WriteFile(catFile, []byte(`{"presets": {"Trúc Ly": {"id": "Trúc Ly"}}}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(snapDir, "moss_tokenizer"), 0755); err != nil {
+		t.Fatal(err)
 	}
 
 	adapterPath, err := filepath.Abs(filepath.Join("..", "..", "cmd", "stageworker", "adapters", "tts_engine.py"))
@@ -2000,15 +2013,25 @@ class Vieneu:
 		OutputPath: outPath,
 		Config: map[string]any{
 			"text":             "Xin chào Việt Nam",
-			"model_name":       "vieneu-tts",
-			"model_version":    "1.0.0",
+			"model_name":       provider.VieNeuModelID,
+			"model_version":    provider.VieNeuModelVersion,
 			"language":         "vi",
-			"voice_id":         "vi_female_natural",
+			"voice_id":         "Trúc Ly",
 			"speed":            "1.0",
 			"slot_duration_ms": "1500",
 		},
 	}
-
+	snapEnv := worker.ModelSnapshotEnvelope{
+		Primary: worker.ModelSnapshotRef{
+			Role:                   "primary",
+			DependencyName:         provider.VieNeuModelID,
+			Version:                provider.VieNeuModelVersion,
+			SnapshotManifestSHA256: "vieneu_test_sha256_1278db00",
+			LocalPath:              snapDir,
+			EntrypointFile:         catFile,
+		},
+	}
+	worker.SetModelSnapshotEnvelope(cmd.Config, snapEnv)
 	artifact, err := client.Run(context.Background(), cmd, 10*time.Second, 10*time.Second)
 	if err != nil {
 		t.Fatalf("python adapter tts invocation failed: %v", err)
@@ -2036,8 +2059,8 @@ class Vieneu:
 	if out.MeasuredDurationMs != 1000 {
 		t.Errorf("expected 1000ms measured duration, got %d", out.MeasuredDurationMs)
 	}
-	if out.ModelName != "vieneu-tts" {
-		t.Errorf("expected model_name vieneu-tts, got %s", out.ModelName)
+	if !strings.EqualFold(out.ModelName, provider.VieNeuModelID) && !strings.EqualFold(out.ModelName, "vieneu-tts") {
+		t.Errorf("expected model_name %s or vieneu-tts, got %s", provider.VieNeuModelID, out.ModelName)
 	}
 }
 

@@ -52,6 +52,25 @@ type DependentModelProvider interface {
 	ModelDependencies() []ModelDependency
 }
 
+// PrimaryCheckpointProvider is an optional contract distinguishing whether
+// ModelInfo() names a real primary checkpoint requiring checkpoint governance.
+// Providers that do not implement it default to true (existing fail-closed behavior).
+// A composite provider (e.g. OCR logical/runtime family identity paddleocr-v6:v6
+// backed by real det/rec/ori checkpoints) implements it and returns false to skip
+// only the top-level checkpoint checks; dependency checks remain mandatory.
+type PrimaryCheckpointProvider interface {
+	PrimaryCheckpointRequired() bool
+}
+
+// primaryCheckpointRequired reports whether p requires top-level checkpoint
+// governance for its ModelInfo(). Default true when unimplemented.
+func primaryCheckpointRequired(p Provider) bool {
+	if pc, ok := p.(PrimaryCheckpointProvider); ok {
+		return pc.PrimaryCheckpointRequired()
+	}
+	return true
+}
+
 // Registry maintains available providers indexed by ID and Type.
 type Registry struct {
 	mu        sync.RWMutex
@@ -127,4 +146,40 @@ func (r *Registry) GetDefault(t ProviderType) (Provider, bool) {
 		}
 	}
 	return nil, false
+}
+
+// SetRequireSnapshots sets snapshot requirement on all registered providers that implement SetRequiresSnapshot.
+func (r *Registry) SetRequireSnapshots(require bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, p := range r.providers {
+		if sc, ok := p.(interface{ SetRequiresSnapshot(bool) }); ok {
+			sc.SetRequiresSnapshot(require)
+		}
+	}
+}
+
+// RemoteProvenance carries optional observed metadata from remote provider implementations.
+type RemoteProvenance struct {
+	ObservedModel     string
+	ServiceBaselineID string
+	SystemFingerprint string
+}
+
+// ExtractRemoteProvenance extracts observed model, baseline ID, and system fingerprint from a provider if exposed.
+func ExtractRemoteProvenance(p Provider) RemoteProvenance {
+	var prov RemoteProvenance
+	if p == nil {
+		return prov
+	}
+	if op, ok := p.(interface{ ObservedModel() string }); ok {
+		prov.ObservedModel = op.ObservedModel()
+	}
+	if bp, ok := p.(interface{ ServiceBaselineID() string }); ok {
+		prov.ServiceBaselineID = bp.ServiceBaselineID()
+	}
+	if fp, ok := p.(interface{ SystemFingerprint() string }); ok {
+		prov.SystemFingerprint = fp.SystemFingerprint()
+	}
+	return prov
 }

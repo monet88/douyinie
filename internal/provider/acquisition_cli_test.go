@@ -152,7 +152,9 @@ func TestCLIProbeStructuralStates(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/video/7300000000000000000", func(w http.ResponseWriter, r *http.Request) {})
 	mux.HandleFunc("/forbidden", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusForbidden) })
+	mux.HandleFunc("/ratelimit", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusTooManyRequests) })
 	mux.HandleFunc("/missing", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	mux.HandleFunc("/gone", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusGone) })
 	mux.HandleFunc("/empty", func(w http.ResponseWriter, r *http.Request) {})
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
@@ -174,8 +176,10 @@ func TestCLIProbeStructuralStates(t *testing.T) {
 		path string
 		want domain.AcquisitionState
 	}{
-		{"403", "/forbidden", domain.AcquisitionContentUnavailable},
-		{"404", "/missing", domain.AcquisitionContentUnavailable},
+		{"403-waf-challenge", "/forbidden", domain.AcquisitionAntiBotOrEmpty},
+		{"429-rate-limit", "/ratelimit", domain.AcquisitionAntiBotOrEmpty},
+		{"404-missing", "/missing", domain.AcquisitionContentUnavailable},
+		{"410-gone", "/gone", domain.AcquisitionContentUnavailable},
 		{"empty-200", "/empty", domain.AcquisitionAntiBotOrEmpty},
 	} {
 		_, err := adapter.Probe(ctx, domain.SourceLocator{Type: "douyin_url", Location: ts.URL + tc.path}, "")

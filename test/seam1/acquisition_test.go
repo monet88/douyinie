@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -40,8 +41,14 @@ func (p *candidateSplitProber) Probe(ctx context.Context, filePath string, expec
 		return nil, err
 	}
 	report := &domain.PreflightReport{
+		ID:                     uuid.NewString(),
 		DurationMs:             1000,
 		DurationSec:            1.0,
+		VideoCodec:             "h264",
+		AudioCodec:             "aac",
+		Width:                  1080,
+		Height:                 1920,
+		FrameRate:              30.0,
 		ContainerFormat:        "mp4",
 		ContainerValid:         true,
 		FingerprintMatch:       true,

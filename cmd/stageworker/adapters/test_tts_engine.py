@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import MagicMock
 import wave
 
 # Ensure adapters directory is on path
@@ -105,18 +106,17 @@ class TestTTSEngineUpstreamContracts(unittest.TestCase):
         resp = run_vieneu_tts(
             text="Xin chào Việt Nam",
             language="vi",
-            voice_id="phuong_nam",
+            voice_id="Trúc Ly",
             speed=1.0,
         )
 
         self.assertEqual(resp["measured_duration_ms"], 1000)
         self.assertEqual(resp["model_name"], "vieneu-tts")
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0], ("get_preset_voice", "phuong_nam"))
+        self.assertEqual(calls[0], ("get_preset_voice", "Trúc Ly"))
         self.assertEqual(calls[1][0], "infer")
         self.assertEqual(calls[1][1], "Xin chào Việt Nam")
         self.assertEqual(calls[1][2], {"codes": [1, 2, 3], "text": "ref_sample"})
-
     def test_run_vieneu_tts_fails_if_only_synthesize_method(self):
         """VieNeu adapter must reject fake models that only have synthesize instead of infer."""
         class MockOldVieNeu:
@@ -126,7 +126,7 @@ class TestTTSEngineUpstreamContracts(unittest.TestCase):
         tts_engine._VIENEU_MODEL_FACTORY = MockOldVieNeu
 
         with self.assertRaises(RuntimeError) as ctx:
-            run_vieneu_tts("Text", "vi", "voice", 1.0)
+            run_vieneu_tts("Text", "vi", "Trúc Ly", 1.0)
         self.assertIn("missing required 'infer' method", str(ctx.exception))
 
     def test_run_cosyvoice_tts_exact_upstream_contract_and_speed_fit(self):
@@ -259,35 +259,57 @@ class TestTTSEngineUpstreamContracts(unittest.TestCase):
     def test_fail_closed_on_missing_package(self):
         import unittest.mock as mock
 
-        # Hide packages from import system using mock.patch.dict
-        with mock.patch.dict(
-            "sys.modules",
-            {
-                "vieneu": None,
-                "vieneu.Vieneu": None,
-                "cosyvoice": None,
-                "cosyvoice.cli": None,
-                "cosyvoice.cli.cosyvoice": None,
-                "kokoro": None,
-                "chatterbox": None,
-                "chatterbox.tts": None,
-            },
-        ):
-            with self.assertRaises(RuntimeError) as ctx:
-                run_vieneu_tts("Text", "vi", "voice", 1.0)
-            self.assertIn("vieneu package not found", str(ctx.exception))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create valid snapshot layouts so missing package errors can be tested
+            v_cat = os.path.join(tmpdir, "src", "vieneu", "assets")
+            os.makedirs(v_cat, exist_ok=True)
+            with open(os.path.join(v_cat, "voices_v3_turbo.json"), "w", encoding="utf-8") as f:
+                json.dump({"presets": {"Trúc Ly": {"id": "Trúc Ly"}}}, f)
+            os.makedirs(os.path.join(tmpdir, "moss_tokenizer"), exist_ok=True)
 
-            with self.assertRaises(RuntimeError) as ctx:
-                run_cosyvoice_tts("Text", "zh", "voice", 1.0)
-            self.assertIn("cosyvoice package not found", str(ctx.exception))
+            with open(os.path.join(tmpdir, "config.json"), "w") as f:
+                f.write("{}")
+            orig_sha = tts_engine.KOKORO_CHECKPOINT_SHA256
+            tts_engine.KOKORO_CHECKPOINT_SHA256 = hashlib.sha256(b"").hexdigest()
+            with open(os.path.join(tmpdir, "kokoro-v1_0.pth"), "wb") as f:
+                f.write(b"")
+            v_dir = os.path.join(tmpdir, "voices")
+            os.makedirs(v_dir, exist_ok=True)
+            with open(os.path.join(v_dir, "af_heart.pt"), "wb") as f:
+                f.write(b"")
 
-            with self.assertRaises(RuntimeError) as ctx:
-                run_kokoro_tts("Text", "en", "voice", 1.0)
-            self.assertIn("kokoro package not found", str(ctx.exception))
+            try:
+                with mock.patch.dict(
+                    "sys.modules",
+                    {
+                        "vieneu": None,
+                        "vieneu.Vieneu": None,
+                        "cosyvoice": None,
+                        "cosyvoice.cli": None,
+                        "cosyvoice.cli.cosyvoice": None,
+                        "kokoro": None,
+                        "chatterbox": None,
+                        "chatterbox.tts": None,
+                    },
+                ):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        run_vieneu_tts("Text", "vi", "Trúc Ly", 1.0, model_path=tmpdir)
+                    self.assertIn("vieneu package not found", str(ctx.exception))
 
-            with self.assertRaises(RuntimeError) as ctx:
-                run_chatterbox_tts("Text", "en", "voice", 1.0)
-            self.assertIn("chatterbox package not found", str(ctx.exception))
+                    with self.assertRaises(RuntimeError) as ctx:
+                        run_cosyvoice_tts("Text", "zh", "voice", 1.0)
+                    self.assertIn("cosyvoice package not found", str(ctx.exception))
+
+                    with self.assertRaises(RuntimeError) as ctx:
+                        run_kokoro_tts("Text", "en", "af_heart", 1.0, model_path=tmpdir)
+                    self.assertIn("kokoro package not found", str(ctx.exception))
+
+                    with self.assertRaises(RuntimeError) as ctx:
+                        run_chatterbox_tts("Text", "en", "voice", 1.0)
+                    self.assertIn("chatterbox package not found", str(ctx.exception))
+            finally:
+                tts_engine.KOKORO_CHECKPOINT_SHA256 = orig_sha
+
     def test_cli_execution_via_stdin_stdout(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create a mock vieneu.py module adhering to official Vieneu interface
@@ -296,30 +318,34 @@ class TestTTSEngineUpstreamContracts(unittest.TestCase):
                 f.write(
                     """
 class Vieneu:
-    def __init__(self, mode="v3turbo"):
-        self.mode = mode
-
+    def __init__(self, **kwargs):
+        self.mode = kwargs.get("mode")
     def get_preset_voice(self, voice_id):
-        return voice_id
-
-    def infer(self, text, voice=None):
-        return [0.01] * 48000
+        return {"id": voice_id}
+    def infer(self, text, voice=None, **kwargs):
+        return [0.0] * 48000
 """
                 )
 
-            adapter_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "tts_engine.py"
-            )
+            # Setup verified snapshot structure in tmpdir
+            v_cat = os.path.join(tmpdir, "src", "vieneu", "assets")
+            os.makedirs(v_cat, exist_ok=True)
+            with open(os.path.join(v_cat, "voices_v3_turbo.json"), "w", encoding="utf-8") as f:
+                json.dump({"presets": {"Trúc Ly": {"id": "Trúc Ly", "codes": [1, 2], "speaker_emb": [0.1]}}}, f)
+            os.makedirs(os.path.join(tmpdir, "moss_tokenizer"), exist_ok=True)
 
+            adapter_path = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "tts_engine.py")
+            )
             req = {
                 "text": "Kiểm tra CLI adapter",
                 "model_name": "vieneu-tts",
                 "model_version": "1.0.0",
+                "model_path": tmpdir,
                 "language": "vi",
-                "voice_id": "phuong_nam",
+                "voice_id": "Trúc Ly",
                 "speed": "1.0",
             }
-
             env = os.environ.copy()
             env["PYTHONPATH"] = tmpdir + os.pathsep + env.get("PYTHONPATH", "")
 
@@ -395,6 +421,351 @@ class Vieneu:
             })
             mock_vieneu.assert_called_once()
 
+    def test_unverified_voice_fails_closed(self):
+        """Unverified voice presets must fail closed with TTS_VOICE_ASSET_MISSING."""
+        with self.assertRaises(ValueError) as ctx:
+            run_vieneu_tts("Text", "vi", "unknown_voice", 1.0)
+        self.assertIn("TTS_VOICE_ASSET_MISSING", str(ctx.exception))
 
+        with self.assertRaises(ValueError) as ctx:
+            run_kokoro_tts("Text", "en", "unknown_voice", 1.0)
+        self.assertIn("TTS_VOICE_ASSET_MISSING", str(ctx.exception))
+
+    def test_kokoro_checkpoint_sha256_mismatch_fails_closed(self):
+        """Kokoro checkpoint with mismatched sha256 must fail closed."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt = os.path.join(tmpdir, "kokoro-v1_0.pth")
+            with open(ckpt, "wb") as f:
+                f.write(b"corrupted bytes")
+            voices_dir = os.path.join(tmpdir, "voices")
+            os.makedirs(voices_dir, exist_ok=True)
+            with open(os.path.join(voices_dir, "af_heart.pt"), "wb") as f:
+                f.write(b"voice data")
+
+            with self.assertRaises(RuntimeError) as ctx:
+                run_kokoro_tts("Text", "en", "af_heart", 1.0, model_path=tmpdir)
+            self.assertIn("TTS_VOICE_ASSET_MISSING", str(ctx.exception))
+            self.assertIn("sha256 mismatch", str(ctx.exception))
+
+    def test_kokoro_missing_voice_asset_fails_closed(self):
+        """Kokoro snapshot missing requested voice asset must fail closed."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(RuntimeError) as ctx:
+                run_kokoro_tts("Text", "en", "af_heart", 1.0, model_path=tmpdir)
+            self.assertIn("TTS_VOICE_ASSET_MISSING", str(ctx.exception))
+            self.assertIn("missing from snapshot", str(ctx.exception))
+
+    def test_vieneu_missing_snapshot_catalog_fails_closed(self):
+        """VieNeu snapshot missing voices_v3_turbo.json must fail closed."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            empty_sub = os.path.join(tmpdir, "empty_model")
+            os.makedirs(empty_sub, exist_ok=True)
+            with self.assertRaises(RuntimeError) as ctx:
+                run_vieneu_tts("Text", "vi", "Trúc Ly", 1.0, model_path=empty_sub)
+            self.assertIn("TTS_VOICE_ASSET_MISSING", str(ctx.exception))
+            self.assertIn("voices_v3_turbo.json", str(ctx.exception))
+
+    def test_vieneu_fabricated_voices_pt_fails_closed(self):
+        """VieNeu snapshot with fabricated voices/*.pt or generic config.json must fail closed."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create fake config.json and voices/Trúc Ly.pt
+            with open(os.path.join(tmpdir, "config.json"), "w") as f:
+                f.write('{"model_type": "vieneu_v3_turbo"}')
+            voices_dir = os.path.join(tmpdir, "voices")
+            os.makedirs(voices_dir, exist_ok=True)
+            with open(os.path.join(voices_dir, "Trúc Ly.pt"), "w") as f:
+                f.write("fake pt")
+            with self.assertRaises(RuntimeError) as ctx:
+                run_vieneu_tts("Text", "vi", "Trúc Ly", 1.0, model_path=tmpdir)
+            self.assertIn("TTS_VOICE_ASSET_MISSING", str(ctx.exception))
+            self.assertIn("voices_v3_turbo.json", str(ctx.exception))
+
+    def test_vieneu_valid_v3_turbo_catalog_succeeds(self):
+        """VieNeu snapshot with authentic voices_v3_turbo.json resolves requested preset voice."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cat_dir = os.path.join(tmpdir, "src", "vieneu", "assets")
+            os.makedirs(cat_dir, exist_ok=True)
+            cat_file = os.path.join(cat_dir, "voices_v3_turbo.json")
+            with open(cat_file, "w", encoding="utf-8") as f:
+                json.dump({"presets": {"Trúc Ly": {"id": "Trúc Ly", "name": "Trúc Ly"}}}, f)
+            os.makedirs(os.path.join(tmpdir, "moss_tokenizer"), exist_ok=True)
+
+            mock_engine = MagicMock()
+            mock_engine.infer.return_value = [0.0] * 24000
+            tts_engine._VIENEU_MODEL_FACTORY = lambda **kwargs: mock_engine
+
+            res = run_vieneu_tts("Xin chào", "vi", "Trúc Ly", 1.0, model_path=tmpdir)
+            self.assertEqual(res["model_name"], "vieneu-tts")
+            self.assertGreater(res["measured_duration_ms"], 0)
+
+    def test_vieneu_voice_not_in_catalog_fails_closed(self):
+        """VieNeu snapshot with voices_v3_turbo.json missing requested voice fails closed."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cat_dir = os.path.join(tmpdir, "src", "vieneu", "assets")
+            os.makedirs(cat_dir, exist_ok=True)
+            cat_file = os.path.join(cat_dir, "voices_v3_turbo.json")
+            with open(cat_file, "w", encoding="utf-8") as f:
+                json.dump({"presets": {"Phạm Tuyên": {"id": "Phạm Tuyên"}}}, f)
+            os.makedirs(os.path.join(tmpdir, "moss_tokenizer"), exist_ok=True)
+
+            with self.assertRaises(RuntimeError) as ctx:
+                run_vieneu_tts("Xin chào", "vi", "Trúc Ly", 1.0, model_path=tmpdir)
+            self.assertIn("TTS_VOICE_ASSET_MISSING", str(ctx.exception))
+            self.assertIn("not found in VieNeu catalog", str(ctx.exception))
+    def test_vieneu_backbone_repo_wiring_and_offline_env(self):
+        """VieNeu wires snapshot to backbone_repo and moss_tokenizer, and sets offline environment variables."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cat_dir = os.path.join(tmpdir, "src", "vieneu", "assets")
+            os.makedirs(cat_dir, exist_ok=True)
+            cat_file = os.path.join(cat_dir, "voices_v3_turbo.json")
+            with open(cat_file, "w", encoding="utf-8") as f:
+                json.dump({"presets": {"Trúc Ly": {"id": "Trúc Ly", "codes": [1, 2, 3], "speaker_emb": [0.1, 0.2]}}}, f)
+            # Create a mock moss_tokenizer dir
+            moss_dir = os.path.join(tmpdir, "moss_tokenizer")
+            os.makedirs(moss_dir, exist_ok=True)
+
+            captured_kwargs = {}
+            mock_engine = MagicMock()
+            mock_engine.infer.return_value = [0.0] * 24000
+            def mock_factory(**kwargs):
+                captured_kwargs.update(kwargs)
+                return mock_engine
+
+            tts_engine._VIENEU_MODEL_FACTORY = mock_factory
+            run_vieneu_tts("Xin chào", "vi", "Trúc Ly", 1.0, model_path=tmpdir)
+
+            self.assertEqual(captured_kwargs.get("backbone_repo"), tmpdir)
+            self.assertEqual(captured_kwargs.get("moss_tokenizer"), moss_dir)
+            self.assertEqual(os.environ.get("HF_HUB_OFFLINE"), "1")
+            self.assertEqual(os.environ.get("TRANSFORMERS_OFFLINE"), "1")
+
+    def test_vieneu_synthesis_voice_data_from_snapshot_catalog(self):
+        """VieNeu preserves both speaker_emb and codes from snapshot catalog and does not call get_preset_voice."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cat_dir = os.path.join(tmpdir, "src", "vieneu", "assets")
+            os.makedirs(cat_dir, exist_ok=True)
+            cat_file = os.path.join(cat_dir, "voices_v3_turbo.json")
+            custom_preset = {
+                "id": "Trúc Ly",
+                "name": "Trúc Ly",
+                "speaker_emb": [0.11, 0.22, 0.33],
+                "codes": [42, 43, 44],
+            }
+            with open(cat_file, "w", encoding="utf-8") as f:
+                json.dump({"presets": {"Trúc Ly": custom_preset}}, f)
+            os.makedirs(os.path.join(tmpdir, "moss_tokenizer"), exist_ok=True)
+
+            mock_engine = MagicMock()
+            mock_engine.infer.return_value = [0.0] * 24000
+            mock_engine.get_preset_voice = MagicMock(side_effect=AssertionError("get_preset_voice must NOT be called"))
+            tts_engine._VIENEU_MODEL_FACTORY = lambda **kwargs: mock_engine
+
+            run_vieneu_tts("Xin chào", "vi", "Trúc Ly", 1.0, model_path=tmpdir)
+            mock_engine.infer.assert_called_once()
+            _, call_kwargs = mock_engine.infer.call_args
+            voice_arg = call_kwargs.get("voice")
+            self.assertIsInstance(voice_arg, dict)
+            self.assertEqual(voice_arg.get("speaker_emb"), [0.11, 0.22, 0.33])
+            self.assertEqual(voice_arg.get("codes"), [42, 43, 44])
+            mock_engine.get_preset_voice.assert_not_called()
+
+    def test_vieneu_missing_moss_tokenizer_fails_closed(self):
+        """VieNeu without mock factory fails closed if local MOSS tokenizer is missing from snapshot."""
+        tts_engine._VIENEU_MODEL_FACTORY = None
+        mock_vieneu_mod = MagicMock()
+        orig_vieneu = sys.modules.get("vieneu")
+        sys.modules["vieneu"] = mock_vieneu_mod
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cat_dir = os.path.join(tmpdir, "src", "vieneu", "assets")
+                os.makedirs(cat_dir, exist_ok=True)
+                with open(os.path.join(cat_dir, "voices_v3_turbo.json"), "w", encoding="utf-8") as f:
+                    json.dump({"presets": {"Trúc Ly": {"id": "Trúc Ly"}}}, f)
+
+                with self.assertRaises(RuntimeError) as ctx:
+                    run_vieneu_tts("Xin chào", "vi", "Trúc Ly", 1.0, model_path=tmpdir)
+                self.assertIn("TTS_MODEL_ASSET_MISSING", str(ctx.exception))
+                self.assertIn("verified local MOSS tokenizer missing in snapshot", str(ctx.exception))
+        finally:
+            if orig_vieneu is not None:
+                sys.modules["vieneu"] = orig_vieneu
+            else:
+                sys.modules.pop("vieneu", None)
+    def test_vieneu_real_factory_refuses_missing_model_path_before_import(self):
+        """VieNeu with real upstream factory (_VIENEU_MODEL_FACTORY is None) refuses missing model_path before import."""
+        tts_engine._VIENEU_MODEL_FACTORY = None
+        with self.assertRaises(RuntimeError) as ctx:
+            run_vieneu_tts("Xin chào", "vi", "Trúc Ly", 1.0, model_path=None)
+        self.assertIn("WORKER_SNAPSHOT_PATH_REQUIRED", str(ctx.exception))
+        self.assertIn("requires a verified local snapshot model_path", str(ctx.exception))
+    def test_kokoro_local_only_model_path_required_without_factory(self):
+        """Kokoro without model_path and without factory fails closed prohibiting Hub download."""
+        tts_engine._KOKORO_MODEL_FACTORY = None
+        mock_kokoro = MagicMock()
+        orig_kokoro = sys.modules.get("kokoro")
+        sys.modules["kokoro"] = mock_kokoro
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                run_kokoro_tts("Hello", "en", "af_heart", 1.0, model_path=None)
+            self.assertIn("WORKER_SNAPSHOT_PATH_REQUIRED", str(ctx.exception))
+            self.assertIn("Hub fallback is strictly prohibited", str(ctx.exception))
+        finally:
+            if orig_kokoro is not None:
+                sys.modules["kokoro"] = orig_kokoro
+            else:
+                sys.modules.pop("kokoro", None)
+
+    def test_kokoro_missing_config_fails_closed(self):
+        """Kokoro with model_path missing config.json fails closed."""
+        tts_engine._KOKORO_MODEL_FACTORY = None
+        mock_kokoro = MagicMock()
+        orig_kokoro = sys.modules.get("kokoro")
+        sys.modules["kokoro"] = mock_kokoro
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt = os.path.join(tmpdir, "kokoro-v1_0.pth")
+            with open(ckpt, "wb") as f:
+                f.write(b"")
+            v_dir = os.path.join(tmpdir, "voices")
+            os.makedirs(v_dir, exist_ok=True)
+            with open(os.path.join(v_dir, "af_heart.pt"), "wb") as f:
+                f.write(b"")
+
+            orig_sha = tts_engine.KOKORO_CHECKPOINT_SHA256
+            tts_engine.KOKORO_CHECKPOINT_SHA256 = hashlib.sha256(b"").hexdigest()
+            try:
+                with self.assertRaises(RuntimeError) as ctx:
+                    run_kokoro_tts("Hello", "en", "af_heart", 1.0, model_path=tmpdir)
+                self.assertIn("TTS_MODEL_ASSET_MISSING", str(ctx.exception))
+                self.assertIn("config.json missing", str(ctx.exception))
+            finally:
+                tts_engine.KOKORO_CHECKPOINT_SHA256 = orig_sha
+                if orig_kokoro is not None:
+                    sys.modules["kokoro"] = orig_kokoro
+                else:
+                    sys.modules.pop("kokoro", None)
+
+    def test_kokoro_missing_weights_fails_closed(self):
+        """Kokoro with model_path missing .pth weights fails closed."""
+        tts_engine._KOKORO_MODEL_FACTORY = None
+        mock_kokoro = MagicMock()
+        orig_kokoro = sys.modules.get("kokoro")
+        sys.modules["kokoro"] = mock_kokoro
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "config.json"), "w") as f:
+                f.write("{}")
+            v_dir = os.path.join(tmpdir, "voices")
+            os.makedirs(v_dir, exist_ok=True)
+            with open(os.path.join(v_dir, "af_heart.pt"), "wb") as f:
+                f.write(b"")
+
+            try:
+                with self.assertRaises(RuntimeError) as ctx:
+                    run_kokoro_tts("Hello", "en", "af_heart", 1.0, model_path=tmpdir)
+                self.assertIn("TTS_MODEL_ASSET_MISSING", str(ctx.exception))
+                self.assertIn("model weights (.pth) missing", str(ctx.exception))
+            finally:
+                if orig_kokoro is not None:
+                    sys.modules["kokoro"] = orig_kokoro
+                else:
+                    sys.modules.pop("kokoro", None)
+    def test_kokoro_local_pt_voice_forwarded(self):
+        """Kokoro forwards verified local .pt voice path to KPipeline."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "config.json"), "w") as f:
+                f.write("{}")
+            ckpt = os.path.join(tmpdir, "kokoro-v1_0.pth")
+            # Write dummy data and calculate sha256 to match KOKORO_CHECKPOINT_SHA256
+            # For testing with factory, we can mock factory:
+            v_dir = os.path.join(tmpdir, "voices")
+            os.makedirs(v_dir, exist_ok=True)
+            v_path = os.path.join(v_dir, "af_heart.pt")
+            with open(v_path, "wb") as f:
+                f.write(b"mock_voice_pt")
+
+            # Mock weights with proper sha256
+            with open(ckpt, "wb") as f:
+                f.write(b"")
+            # Monkey patch KOKORO_CHECKPOINT_SHA256 for test
+            orig_sha = tts_engine.KOKORO_CHECKPOINT_SHA256
+            tts_engine.KOKORO_CHECKPOINT_SHA256 = hashlib.sha256(b"").hexdigest()
+            try:
+                captured_call = {}
+                class MockPipeline:
+                    def __init__(self, lang_code="a"):
+                        pass
+                    def __call__(self, text, voice="af_heart", speed=1.0):
+                        captured_call["voice"] = voice
+                        yield MagicMock(audio=[0.0] * 24000)
+
+                tts_engine._KOKORO_MODEL_FACTORY = MockPipeline
+                run_kokoro_tts("Hello", "en", "af_heart", 1.0, model_path=tmpdir)
+                self.assertEqual(captured_call.get("voice"), v_path)
+            finally:
+                tts_engine.KOKORO_CHECKPOINT_SHA256 = orig_sha
+    def test_kokoro_parent_config_fallback_removed_fails_closed(self):
+        """Kokoro with config.json only in parent directory must fail closed (boundary isolation)."""
+        with tempfile.TemporaryDirectory() as parent_dir:
+            child_dir = os.path.join(parent_dir, "child_snapshot")
+            os.makedirs(child_dir, exist_ok=True)
+            # Put config.json in parent only
+            with open(os.path.join(parent_dir, "config.json"), "w") as f:
+                f.write('{"model_type": "kokoro"}')
+            valid_bytes = b"valid kokoro checkpoint bytes for testing boundary"
+            orig_sha = tts_engine.KOKORO_CHECKPOINT_SHA256
+            tts_engine.KOKORO_CHECKPOINT_SHA256 = hashlib.sha256(valid_bytes).hexdigest()
+            try:
+                ckpt = os.path.join(child_dir, "kokoro-v1_0.pth")
+                with open(ckpt, "wb") as f:
+                    f.write(valid_bytes)
+                voices_dir = os.path.join(child_dir, "voices")
+                os.makedirs(voices_dir, exist_ok=True)
+                with open(os.path.join(voices_dir, "af_heart.pt"), "wb") as f:
+                    f.write(b"voice data")
+
+                with self.assertRaises(RuntimeError) as ctx:
+                    run_kokoro_tts("Hello", "en", "af_heart", 1.0, model_path=child_dir)
+                self.assertIn("config.json missing in snapshot", str(ctx.exception))
+            finally:
+                tts_engine.KOKORO_CHECKPOINT_SHA256 = orig_sha
+
+    def test_vieneu_parent_moss_tokenizer_fallback_removed_fails_closed(self):
+        """VieNeu with moss_tokenizer only in parent directory must fail closed (boundary isolation)."""
+        with tempfile.TemporaryDirectory() as parent_dir:
+            child_dir = os.path.join(parent_dir, "child_snapshot")
+            os.makedirs(child_dir, exist_ok=True)
+            # Put moss_tokenizer in parent only
+            os.makedirs(os.path.join(parent_dir, "moss_tokenizer"), exist_ok=True)
+            # Put valid catalog in child
+            cat_dir = os.path.join(child_dir, "src", "vieneu", "assets")
+            os.makedirs(cat_dir, exist_ok=True)
+            with open(os.path.join(cat_dir, "voices_v3_turbo.json"), "w", encoding="utf-8") as f:
+                json.dump({"presets": {"Trúc Ly": {"id": "Trúc Ly"}}}, f)
+
+            tts_engine._VIENEU_MODEL_FACTORY = lambda **kwargs: MagicMock()
+            with self.assertRaises(RuntimeError) as ctx:
+                run_vieneu_tts("Xin chào", "vi", "Trúc Ly", 1.0, model_path=child_dir)
+            self.assertIn("verified local MOSS tokenizer missing in snapshot", str(ctx.exception))
+    def test_tts_outside_root_entrypoint_fails_closed(self):
+        """TTS entrypoint file located outside model_path snapshot root must fail closed."""
+        with tempfile.TemporaryDirectory() as parent_dir:
+            root_dir = os.path.join(parent_dir, "root")
+            outside_dir = os.path.join(parent_dir, "outside")
+            os.makedirs(root_dir, exist_ok=True)
+            os.makedirs(outside_dir, exist_ok=True)
+
+            outside_file = os.path.join(outside_dir, "escaped_entrypoint.json")
+            with open(outside_file, "w") as f:
+                f.write("{}")
+
+            with self.assertRaises(RuntimeError) as ctx:
+                run_vieneu_tts("Xin chào", "vi", "Trúc Ly", 1.0, model_path=root_dir, entrypoint_file=outside_file)
+            self.assertIn("escapes snapshot root", str(ctx.exception))
+
+            outside_pt = os.path.join(outside_dir, "escaped_voice.pt")
+            with open(outside_pt, "w") as f:
+                f.write("pt")
+            with self.assertRaises(RuntimeError) as ctx:
+                run_kokoro_tts("Hello", "en", "af_heart", 1.0, model_path=root_dir, entrypoint_file=outside_pt)
+            self.assertIn("escapes snapshot root", str(ctx.exception))
 if __name__ == "__main__":
     unittest.main()

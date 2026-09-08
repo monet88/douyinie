@@ -3,6 +3,7 @@ package service_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -202,5 +203,119 @@ func TestAudioMixService_ZeroSpokenSpeechPassthrough(t *testing.T) {
 	}
 	if mixArtifact.AudioStemsCAS != "" {
 		t.Errorf("expected empty AudioStemsCAS on clean passthrough, got %s", mixArtifact.AudioStemsCAS)
+	}
+}
+
+func TestAudioMixService_ZeroDurationSlotOverrun_Refused(t *testing.T) {
+	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+
+	assetID := "asset_zero_slot_" + uuid.NewString()[:8]
+	runID := "run_test_" + uuid.NewString()[:8]
+
+	dummyMedia := media.GeneratePCM16WAV(16000, 1, 35000)
+	mediaObj, err := casStore.Put(bytes.NewReader(dummyMedia))
+	if err != nil {
+		t.Fatalf("put media in cas: %v", err)
+	}
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              attID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		RightsAttestationID: attID,
+		SHA256:              mediaObj.SHA256,
+		CASPath:             mediaObj.Path,
+		ByteSize:            int64(len(dummyMedia)),
+		CreatedAt:           time.Now().UTC(),
+	})
+	preflight := domain.PreflightReport{
+		ID:                     "preflight_" + assetID,
+		AssetID:                assetID,
+		DurationSec:            35.0,
+		DurationMs:             35000,
+		AudioChannels:          1,
+		AudioSampleRate:        16000,
+		ContainerValid:         true,
+		FingerprintMatch:       true,
+		NormalizedAudioSHA256:  mediaObj.SHA256,
+		NormalizedAudioCASPath: mediaObj.Path,
+		CreatedAt:              time.Now().UTC(),
+	}
+	_ = db.SavePreflightReport(ctx, preflight)
+
+	rolePlan := domain.AudioRolePlan{
+		AssetID: assetID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 35000, Role: domain.AudioRoleNarrationDialogue},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	_ = db.SaveAudioRolePlan(ctx, rolePlan)
+
+	// Stems artifact
+	stems := domain.AudioStemArtifacts{
+		ID:      uuid.NewString(),
+		AssetID: assetID,
+		Stems: []domain.AudioStem{
+			{Type: domain.StemTypeBackground, AudioCASHash: mediaObj.SHA256},
+			{Type: domain.StemTypeVocals, AudioCASHash: mediaObj.SHA256},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	stemsBytes, _ := json.Marshal(stems)
+	stemsObj, _ := casStore.Put(bytes.NewReader(stemsBytes))
+	_ = db.SaveAudioStemsArtifactIndex(ctx, storage.AudioStemsArtifactIndex{
+		ID:        stems.ID,
+		AssetID:   assetID,
+		CASHash:   stemsObj.SHA256,
+		CreatedAt: stems.CreatedAt,
+	})
+	// DubSegments containing a segment where start_ms == end_ms (0ms slot) but measured_duration_ms > 0
+	dubSegments := domain.DubSegmentsVariant{
+		ID:             uuid.NewString(),
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		Segments: []domain.DubSegment{
+			{
+				Index:              12,
+				SpeechBlockIndices: []int{12},
+				StartMs:            29680,
+				EndMs:              29680,
+				SlotDurationMs:     0,
+				MeasuredDurationMs: 640,
+				FitDecision:        domain.FitActionAccept,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubBytes, _ := json.Marshal(dubSegments)
+	dubObj, _ := casStore.Put(bytes.NewReader(dubBytes))
+	_ = db.SaveDubSegmentsVariantIndex(ctx, storage.DubSegmentsVariantIndex{
+		ID:             dubSegments.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        dubObj.SHA256,
+		CreatedAt:      dubSegments.CreatedAt,
+	})
+
+	_, err = mixSvc.MixAudio(ctx, service.AudioMixInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		DubSegmentsCAS: dubObj.SHA256,
+		AudioStemsCAS:  stemsObj.SHA256,
+	})
+	if err == nil {
+		t.Fatalf("expected ErrMixerOverrunRefused on 0ms slot with positive measured duration, got nil error")
+	}
+	if !errors.Is(err, domain.ErrMixerOverrunRefused) {
+		t.Fatalf("expected ErrMixerOverrunRefused, got %v", err)
 	}
 }

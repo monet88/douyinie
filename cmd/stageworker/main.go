@@ -351,6 +351,23 @@ func executeStage(ctx context.Context, cmd worker.Command, enc *worker.Encoder) 
 // silently faking model output. This is the smallest architecture-compliant
 // production StageWorker/provider-adapter path.
 func dispatchStage(ctx context.Context, cmd worker.Command, enc *worker.Encoder) (worker.ArtifactRef, error) {
+	// Validate model_snapshot envelope if present or if model snapshot is required (Issue #64)
+	if snapEnv, parseErr := worker.GetModelSnapshotEnvelope(cmd.Config); parseErr != nil {
+		return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+			fmt.Sprintf("invalid model_snapshot envelope: %v", parseErr), nil)
+	} else if snapEnv != nil {
+		if err := worker.ValidateSnapshotPaths(snapEnv); err != nil {
+			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				fmt.Sprintf("snapshot path validation failed: %v", err), nil)
+		}
+	} else {
+		isSeparatorProbe := cmd.Stage == "separator_probe" || (cmd.Stage == "separator" && cmd.Config["mode"] == "probe")
+		if reqSnap, _ := cmd.Config["require_model_snapshot"].(bool); reqSnap && !isSeparatorProbe {
+			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				"required model snapshot envelope missing from command config", nil)
+		}
+	}
+
 	switch cmd.Stage {
 	case "asr":
 		return runASRAdapter(ctx, cmd, enc)
@@ -363,13 +380,56 @@ func dispatchStage(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 	case "tts":
 		return runTTSAdapter(ctx, cmd, enc)
 	case "separator":
+		if mode, _ := cmd.Config["mode"].(string); mode == "probe" {
+			return runSeparatorProbeAdapter(ctx, cmd, enc)
+		}
 		return runSeparatorAdapter(ctx, cmd, enc)
+	case "separator_probe":
+		return runSeparatorProbeAdapter(ctx, cmd, enc)
 	case "ocr":
 		return runOCRAdapter(ctx, cmd, enc)
+	case "translation":
+		return runTranslationAdapter(ctx, cmd, enc)
 	default:
 		// For unrecognized stages, fall back to the marker artifact placeholder.
 		return writeMarkerArtifact(cmd)
 	}
+}
+
+// resolvePrimarySnapshotPath parses the typed model_snapshot envelope for
+// single-model stages (asr, aligner) and returns the verified primary
+// LocalPath. A top-level unverified model_path can never override the typed
+// envelope. When require_model_snapshot=true, a missing envelope or path
+// fails closed with WORKER_SNAPSHOT_PATH_REQUIRED.
+func resolvePrimarySnapshotPath(cmd worker.Command, stage string) (string, bool, error) {
+	reqSnap, _ := cmd.Config["require_model_snapshot"].(bool)
+	snapEnv, parseErr := worker.GetModelSnapshotEnvelope(cmd.Config)
+	if parseErr != nil {
+		return "", reqSnap, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+			fmt.Sprintf("invalid model_snapshot envelope: %v", parseErr),
+			map[string]any{"stage": stage, "command_id": cmd.ID})
+	}
+	var modelPath string
+	if snapEnv != nil {
+		modelPath = snapEnv.Primary.LocalPath
+		if topMP, ok := cmd.Config["model_path"].(string); ok && topMP != "" {
+			if modelPath == "" || filepath.Clean(topMP) != filepath.Clean(modelPath) {
+				return "", reqSnap, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+					fmt.Sprintf("top-level model_path (%s) attempts unverified override of model_snapshot envelope (%s)", topMP, modelPath),
+					map[string]any{"stage": stage, "command_id": cmd.ID})
+			}
+		}
+	} else if reqSnap {
+		return "", reqSnap, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+			fmt.Sprintf("required model snapshot envelope missing from %s command config", stage),
+			map[string]any{"stage": stage, "command_id": cmd.ID})
+	}
+	if reqSnap && modelPath == "" {
+		return "", reqSnap, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+			fmt.Sprintf("%s requires verified primary snapshot local_path (got model_path=%q)", stage, modelPath),
+			map[string]any{"stage": stage, "command_id": cmd.ID})
+	}
+	return modelPath, reqSnap, nil
 }
 
 // runASRAdapter runs the Qwen3-ASR adapter. A real invocation carries an
@@ -395,6 +455,12 @@ func runASRAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 	}
 	modelVersion, _ := cmd.Config[cfgModelVersion].(string)
 
+	// Verified local snapshot is the source of truth for the model weights;
+	// the Python adapter must prefer model_path over any Hub/model ID.
+	modelPath, reqSnap, err := resolvePrimarySnapshotPath(cmd, "asr")
+	if err != nil {
+		return worker.ArtifactRef{}, err
+	}
 	runner, err := resolveASRRunner()
 	if err != nil {
 		return worker.ArtifactRef{}, err
@@ -403,11 +469,13 @@ func runASRAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 	// stdin JSON request: audio_path is the machine-local input artifact path,
 	// plus the declared model identity for observability end-to-end.
 	req := map[string]any{
-		"audio_path":    cmd.Inputs[0].Path,
-		"run_id":        cmd.RunID,
-		"attempt_id":    cmd.AttemptID,
-		cfgModelName:    modelName,
-		cfgModelVersion: modelVersion,
+		"audio_path":             cmd.Inputs[0].Path,
+		"run_id":                 cmd.RunID,
+		"attempt_id":             cmd.AttemptID,
+		cfgModelName:             modelName,
+		cfgModelVersion:          modelVersion,
+		"model_path":             modelPath,
+		"require_model_snapshot": reqSnap,
 	}
 	var out struct {
 		Segments     []domain.ASRRawSegment `json:"segments"`
@@ -451,6 +519,12 @@ func runAlignerAdapter(ctx context.Context, cmd worker.Command, enc *worker.Enco
 			"aligner command has no accepted text in config",
 			map[string]any{"stage": "aligner", "command_id": cmd.ID})
 	}
+	// Verified local snapshot is the source of truth for the model weights;
+	// the Python adapter must prefer model_path over any Hub/model ID.
+	modelPath, reqSnap, err := resolvePrimarySnapshotPath(cmd, "aligner")
+	if err != nil {
+		return worker.ArtifactRef{}, err
+	}
 
 	runner, err := resolveAlignerRunner()
 	if err != nil {
@@ -459,12 +533,14 @@ func runAlignerAdapter(ctx context.Context, cmd worker.Command, enc *worker.Enco
 
 	// stdin JSON request: audio_path + the accepted text to align + identity.
 	req := map[string]any{
-		"audio_path":    cmd.Inputs[0].Path,
-		"text":          text,
-		"run_id":        cmd.RunID,
-		"attempt_id":    cmd.AttemptID,
-		cfgModelName:    modelName,
-		cfgModelVersion: modelVersion,
+		"audio_path":             cmd.Inputs[0].Path,
+		"text":                   text,
+		"run_id":                 cmd.RunID,
+		"attempt_id":             cmd.AttemptID,
+		cfgModelName:             modelName,
+		cfgModelVersion:          modelVersion,
+		"model_path":             modelPath,
+		"require_model_snapshot": reqSnap,
 	}
 	var out struct {
 		WordTimings  []domain.WordTiming `json:"word_timings"`
@@ -504,6 +580,125 @@ func runTTSAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 	voiceID, _ := cmd.Config["voice_id"].(string)
 	speed, _ := cmd.Config["speed"].(string)
 	slotDur, _ := cmd.Config["slot_duration_ms"].(string)
+	snapEnv, parseErr := worker.GetModelSnapshotEnvelope(cmd.Config)
+	if parseErr != nil {
+		return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+			fmt.Sprintf("invalid model_snapshot envelope: %v", parseErr), nil)
+	}
+	var modelPath string
+	var entrypointFile string
+	if snapEnv != nil {
+		modelPath = snapEnv.Primary.LocalPath
+		entrypointFile = snapEnv.Primary.EntrypointFile
+	} else if reqSnap, _ := cmd.Config["require_model_snapshot"].(bool); reqSnap {
+		return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+			"required model snapshot envelope missing from tts command config", nil)
+	}
+	if modelPath == "" {
+		if mp, ok := cmd.Config["model_path"].(string); ok && mp != "" {
+			modelPath = mp
+		}
+	}
+	// Top-level entrypoint_file cannot override the typed verified model_snapshot envelope.
+	// If a top-level override is supplied that differs from the envelope, fail closed.
+	if topEP, ok := cmd.Config["entrypoint_file"].(string); ok && topEP != "" {
+		if entrypointFile == "" || filepath.Clean(topEP) != filepath.Clean(entrypointFile) {
+			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				fmt.Sprintf("top-level entrypoint_file (%s) attempts unverified override of model_snapshot envelope entrypoint (%s)", topEP, entrypointFile),
+				map[string]any{"stage": "tts", "command_id": cmd.ID})
+		}
+	}
+	if modelPath != "" && entrypointFile != "" {
+		rel, err := filepath.Rel(modelPath, entrypointFile)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				fmt.Sprintf("TTS entrypoint file (%s) escapes snapshot root (%s)", entrypointFile, modelPath), nil)
+		}
+	}
+	lowerModel := strings.ToLower(modelName)
+	if strings.Contains(lowerModel, "kokoro") {
+		validKokoro := false
+		for _, v := range domain.FrozenKokoroVoiceOrder {
+			if v == voiceID {
+				validKokoro = true
+				break
+			}
+		}
+		if !validKokoro {
+			return worker.ArtifactRef{}, worker.NewError("TTS_VOICE_ASSET_MISSING",
+				fmt.Sprintf("unverified or unknown Kokoro voice preset %q (must be one of %s)", voiceID, strings.Join(domain.FrozenKokoroVoiceOrder, ", ")),
+				map[string]any{"stage": "tts", "command_id": cmd.ID})
+		}
+		if modelPath != "" || snapEnv != nil {
+			// Exact RC Kokoro hard route requires envelope-derived entrypoint
+			if entrypointFile == "" {
+				return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+					"verified model_snapshot envelope missing required entrypoint_file for Kokoro TTS",
+					map[string]any{"stage": "tts", "command_id": cmd.ID})
+			}
+			// Require manifest-declared, host-verified canonical in-root paths:
+			// 1. config.json in root
+			configPath := filepath.Join(modelPath, "config.json")
+			if fi, err := os.Stat(configPath); err != nil || fi.IsDir() {
+				return worker.ArtifactRef{}, worker.NewError("TTS_MODEL_ASSET_MISSING",
+					fmt.Sprintf("Kokoro config.json missing in snapshot root: %s", configPath),
+					map[string]any{"stage": "tts", "command_id": cmd.ID})
+			}
+			// 2. Canonical voice asset: voices/<voiceID>.pt
+			voicePath := filepath.Join(modelPath, "voices", voiceID+".pt")
+			if fi, err := os.Stat(voicePath); err != nil || fi.IsDir() {
+				return worker.ArtifactRef{}, worker.NewError("TTS_VOICE_ASSET_MISSING",
+					fmt.Sprintf("Kokoro voice asset missing from canonical snapshot path: %s", voicePath),
+					map[string]any{"stage": "tts", "command_id": cmd.ID})
+			}
+			if filepath.Clean(entrypointFile) != filepath.Clean(voicePath) {
+				return worker.ArtifactRef{}, worker.NewError("TTS_VOICE_ASSET_MISSING",
+					fmt.Sprintf("Kokoro envelope entrypoint file (%s) does not match canonical voice path (%s)", entrypointFile, voicePath),
+					map[string]any{"stage": "tts", "command_id": cmd.ID})
+			}
+		}
+	} else if strings.Contains(lowerModel, "vieneu") || strings.Contains(lowerModel, "pnnbao") {
+		validVieNeu := false
+		for _, v := range domain.FrozenVieNeuVoiceOrder {
+			if v == voiceID {
+				validVieNeu = true
+				break
+			}
+		}
+		if !validVieNeu {
+			return worker.ArtifactRef{}, worker.NewError("TTS_VOICE_ASSET_MISSING",
+				fmt.Sprintf("unverified or unknown VieNeu voice preset %q (must be one of %s)", voiceID, strings.Join(domain.FrozenVieNeuVoiceOrder, ", ")),
+				map[string]any{"stage": "tts", "command_id": cmd.ID})
+		}
+		if modelPath != "" || snapEnv != nil {
+			// Exact RC VieNeu hard route requires envelope-derived entrypoint
+			if entrypointFile == "" {
+				return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+					"verified model_snapshot envelope missing required entrypoint_file for VieNeu TTS",
+					map[string]any{"stage": "tts", "command_id": cmd.ID})
+			}
+			// Require manifest-declared, host-verified canonical in-root paths:
+			// 1. Canonical voice catalog: src/vieneu/assets/voices_v3_turbo.json
+			catalogPath := filepath.Join(modelPath, "src", "vieneu", "assets", "voices_v3_turbo.json")
+			if fi, err := os.Stat(catalogPath); err != nil || fi.IsDir() {
+				return worker.ArtifactRef{}, worker.NewError("TTS_VOICE_ASSET_MISSING",
+					fmt.Sprintf("VieNeu v3 Turbo voice catalog (src/vieneu/assets/voices_v3_turbo.json) missing from snapshot: %s", modelPath),
+					map[string]any{"stage": "tts", "command_id": cmd.ID})
+			}
+			if filepath.Clean(entrypointFile) != filepath.Clean(catalogPath) {
+				return worker.ArtifactRef{}, worker.NewError("TTS_VOICE_ASSET_MISSING",
+					fmt.Sprintf("VieNeu envelope entrypoint file (%s) does not match canonical catalog path (%s)", entrypointFile, catalogPath),
+					map[string]any{"stage": "tts", "command_id": cmd.ID})
+			}
+			// 2. Fixed in-root verified MOSS tokenizer layout: moss_tokenizer/
+			mossPath := filepath.Join(modelPath, "moss_tokenizer")
+			if _, err := os.Stat(mossPath); err != nil {
+				return worker.ArtifactRef{}, worker.NewError("TTS_MODEL_ASSET_MISSING",
+					fmt.Sprintf("VieNeu fixed in-root verified MOSS tokenizer layout missing from snapshot: %s", mossPath),
+					map[string]any{"stage": "tts", "command_id": cmd.ID})
+			}
+		}
+	}
 
 	runner, err := resolveTTSRunner()
 	if err != nil {
@@ -520,8 +715,9 @@ func runTTSAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 		"attempt_id":       cmd.AttemptID,
 		cfgModelName:       modelName,
 		cfgModelVersion:    modelVersion,
+		"model_path":       modelPath,
+		"entrypoint_file":  entrypointFile,
 	}
-
 	var out struct {
 		AudioData           []byte `json:"audio_data"`
 		AudioPath           string `json:"audio_path"`
@@ -561,6 +757,8 @@ func invokeCommand(ctx context.Context, binary string, args []string, req any, o
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	// Strict offline execution for model-backed requests (Issue #64)
+	cmd.Env = append(os.Environ(), "HF_HUB_OFFLINE=1", "TRANSFORMERS_OFFLINE=1", "MODELSCOPE_OFFLINE=1")
 	stageTarget := strings.ToLower(filepath.Base(binary))
 	if len(args) > 0 {
 		stageTarget = strings.ToLower(filepath.Base(args[0]))
@@ -568,7 +766,26 @@ func invokeCommand(ctx context.Context, binary string, args []string, req any, o
 
 	if err := cmd.Run(); err != nil {
 		code := "EXEC_FAILED"
-		if strings.Contains(stageTarget, "tts") || strings.Contains(stageTarget, "vieneu") || strings.Contains(stageTarget, "cosyvoice") || strings.Contains(stageTarget, "kokoro") || strings.Contains(stageTarget, "chatterbox") {
+		stderrStr := strings.TrimSpace(stderr.String())
+		if strings.Contains(stderrStr, "TTS_VOICE_ASSET_MISSING") {
+			code = "TTS_VOICE_ASSET_MISSING"
+		} else if strings.Contains(stderrStr, "WORKER_SNAPSHOT_PATH_REQUIRED") {
+			code = "WORKER_SNAPSHOT_PATH_REQUIRED"
+		} else if strings.Contains(stderrStr, "SEPARATOR_METADATA_ASSET_MISSING") {
+			code = "SEPARATOR_METADATA_ASSET_MISSING"
+		} else if strings.Contains(stderrStr, "SEPARATOR_METADATA_INVALID") {
+			code = "SEPARATOR_METADATA_INVALID"
+		} else if strings.Contains(stderrStr, "SEPARATOR_MODEL_ASSET_MISSING") {
+			code = "SEPARATOR_MODEL_ASSET_MISSING"
+		} else if strings.Contains(stderrStr, "SEPARATOR_PACKAGE_VERSION_MISMATCH") {
+			code = "SEPARATOR_PACKAGE_VERSION_MISMATCH"
+		} else if strings.Contains(stderrStr, "DEMUCS_PACKAGE_VERSION_MISMATCH") {
+			code = "DEMUCS_PACKAGE_VERSION_MISMATCH"
+		} else if strings.Contains(stderrStr, "DEMUCS_FT_SUBSTITUTION_REJECTED") {
+			code = "DEMUCS_FT_SUBSTITUTION_REJECTED"
+		} else if strings.Contains(stageTarget, "trans") {
+			code = "TRANSLATION_EXEC_FAILED"
+		} else if strings.Contains(stageTarget, "tts") || strings.Contains(stageTarget, "vieneu") || strings.Contains(stageTarget, "cosyvoice") || strings.Contains(stageTarget, "kokoro") || strings.Contains(stageTarget, "chatterbox") {
 			code = "TTS_EXEC_FAILED"
 		} else if strings.Contains(stageTarget, "align") {
 			code = "ALIGNER_EXEC_FAILED"
@@ -579,11 +796,13 @@ func invokeCommand(ctx context.Context, binary string, args []string, req any, o
 		} else if strings.Contains(stageTarget, "separator") || strings.Contains(stageTarget, "demucs") || strings.Contains(stageTarget, "uvr") {
 			code = "SEPARATOR_EXEC_FAILED"
 		}
-		return worker.NewError(code, fmt.Sprintf("%s exited with error: %v; stderr: %s", binary, err, strings.TrimSpace(stderr.String())), nil)
+		return worker.NewError(code, fmt.Sprintf("%s exited with error: %v; stderr: %s", binary, err, stderrStr), nil)
 	}
 	if err := json.Unmarshal(stdout.Bytes(), out); err != nil {
 		code := "OUTPUT_INVALID"
-		if strings.Contains(stageTarget, "tts") || strings.Contains(stageTarget, "vieneu") || strings.Contains(stageTarget, "cosyvoice") || strings.Contains(stageTarget, "kokoro") || strings.Contains(stageTarget, "chatterbox") {
+		if strings.Contains(stageTarget, "trans") {
+			code = "TRANSLATION_OUTPUT_INVALID"
+		} else if strings.Contains(stageTarget, "tts") || strings.Contains(stageTarget, "vieneu") || strings.Contains(stageTarget, "cosyvoice") || strings.Contains(stageTarget, "kokoro") || strings.Contains(stageTarget, "chatterbox") {
 			code = "TTS_OUTPUT_INVALID"
 		} else if strings.Contains(stageTarget, "align") {
 			code = "ALIGNER_OUTPUT_INVALID"
@@ -841,26 +1060,8 @@ func resolveTTSRunner() (commandRunner, error) {
 		nil)
 }
 
-func resolveSeparatorRunner() (commandRunner, error) {
-	if bin := os.Getenv("DOUYINIE_SEPARATOR_BIN"); bin != "" {
-		if path, err := exec.LookPath(bin); err == nil {
-			return commandRunner{binary: path}, nil
-		}
-		return commandRunner{}, worker.NewError("SEPARATOR_BINARY_NOT_FOUND",
-			fmt.Sprintf("DOUYINIE_SEPARATOR_BIN %q not found", bin), nil)
-	}
-
-	if script := os.Getenv("DOUYINIE_SEPARATOR_ADAPTER"); script != "" {
-		if _, err := os.Stat(script); err == nil {
-			pyBin := resolveSeparatorPythonBinary()
-			if pyBin != "" {
-				return commandRunner{binary: pyBin, args: []string{script}}, nil
-			}
-			return commandRunner{}, worker.NewError("SEPARATOR_BINARY_NOT_FOUND",
-				"python runtime not found to execute DOUYINIE_SEPARATOR_ADAPTER", nil)
-		}
-	}
-	// Repo-owned Python adapter cmd/stageworker/adapters/separator.py
+func resolveSeparatorRunner(requireSnap bool) (commandRunner, error) {
+	// Find repo-owned Python adapter cmd/stageworker/adapters/separator.py
 	adapterPaths := []string{
 		filepath.Join("cmd", "stageworker", "adapters", "separator.py"),
 		filepath.Join("adapters", "separator.py"),
@@ -876,16 +1077,65 @@ func resolveSeparatorRunner() (commandRunner, error) {
 		)
 	}
 
+	var repoAdapterPath string
 	for _, p := range adapterPaths {
 		if absP, err := filepath.Abs(p); err == nil {
-			if _, err := os.Stat(absP); err == nil {
-				pyBin := resolveSeparatorPythonBinary()
-				if pyBin != "" {
-					return commandRunner{binary: pyBin, args: []string{absP}}, nil
-				}
+			if fi, err := os.Stat(absP); err == nil && !fi.IsDir() {
+				repoAdapterPath = absP
+				break
 			}
 		}
 	}
+
+	if bin := os.Getenv("DOUYINIE_SEPARATOR_BIN"); bin != "" {
+		if requireSnap {
+			return commandRunner{}, worker.NewError("SEPARATOR_RUNNER_OVERRIDE_REJECTED",
+				fmt.Sprintf("arbitrary runner binary DOUYINIE_SEPARATOR_BIN=%q cannot self-attest RC provenance on snapshot-required route", bin),
+				nil)
+		}
+		if path, err := exec.LookPath(bin); err == nil {
+			return commandRunner{binary: path}, nil
+		}
+		return commandRunner{}, worker.NewError("SEPARATOR_BINARY_NOT_FOUND",
+			fmt.Sprintf("DOUYINIE_SEPARATOR_BIN %q not found", bin), nil)
+	}
+
+	if script := os.Getenv("DOUYINIE_SEPARATOR_ADAPTER"); script != "" {
+		if fi, err := os.Stat(script); err == nil && !fi.IsDir() {
+			absScript, _ := filepath.Abs(script)
+			isRepo := false
+			if repoAdapterPath != "" {
+				if strings.EqualFold(filepath.Clean(absScript), filepath.Clean(repoAdapterPath)) {
+					isRepo = true
+				} else if rfi, rerr := os.Stat(repoAdapterPath); rerr == nil && os.SameFile(fi, rfi) {
+					isRepo = true
+				}
+			}
+
+			if requireSnap && !isRepo {
+				return commandRunner{}, worker.NewError("SEPARATOR_RUNNER_OVERRIDE_REJECTED",
+					fmt.Sprintf("arbitrary runner adapter DOUYINIE_SEPARATOR_ADAPTER=%q cannot self-attest RC provenance on snapshot-required route (repo-owned adapter required)", script),
+					nil)
+			}
+
+			pyBin := resolveSeparatorPythonBinary()
+			if pyBin != "" {
+				return commandRunner{binary: pyBin, args: []string{absScript}}, nil
+			}
+			return commandRunner{}, worker.NewError("SEPARATOR_BINARY_NOT_FOUND",
+				"python runtime not found to execute DOUYINIE_SEPARATOR_ADAPTER", nil)
+		}
+		return commandRunner{}, worker.NewError("SEPARATOR_BINARY_NOT_FOUND",
+			fmt.Sprintf("DOUYINIE_SEPARATOR_ADAPTER script %q not found", script), nil)
+	}
+
+	if repoAdapterPath != "" {
+		pyBin := resolveSeparatorPythonBinary()
+		if pyBin != "" {
+			return commandRunner{binary: pyBin, args: []string{repoAdapterPath}}, nil
+		}
+	}
+
 	return commandRunner{}, worker.NewError("SEPARATOR_BINARY_NOT_FOUND",
 		"audio separator adapter or binary not available: configure DOUYINIE_SEPARATOR_ADAPTER/DOUYINIE_SEPARATOR_BIN or install python-audio-separator/demucs",
 		nil)
@@ -907,17 +1157,145 @@ func runSeparatorAdapter(ctx context.Context, cmd worker.Command, enc *worker.En
 		modelVersion = "v3"
 	}
 
-	runner, err := resolveSeparatorRunner()
+	snapEnv, parseErr := worker.GetModelSnapshotEnvelope(cmd.Config)
+	if parseErr != nil {
+		return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+			fmt.Sprintf("invalid model_snapshot envelope: %v", parseErr), nil)
+	}
+	var modelPath string
+	var entrypointFile string
+	if snapEnv != nil {
+		modelPath = snapEnv.Primary.LocalPath
+		entrypointFile = snapEnv.Primary.EntrypointFile
+	} else if reqSnap, _ := cmd.Config["require_model_snapshot"].(bool); reqSnap {
+		return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+			"required model snapshot envelope missing from separator command config", nil)
+	}
+	if modelPath == "" {
+		if mp, ok := cmd.Config["model_path"].(string); ok && mp != "" {
+			modelPath = mp
+		}
+	}
+	// Top-level entrypoint_file cannot override the typed verified model_snapshot envelope.
+	// If a top-level override is supplied that differs from the envelope, fail closed.
+	if topEP, ok := cmd.Config["entrypoint_file"].(string); ok && topEP != "" {
+		if entrypointFile == "" || filepath.Clean(topEP) != filepath.Clean(entrypointFile) {
+			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				fmt.Sprintf("top-level entrypoint_file (%s) attempts unverified override of model_snapshot envelope entrypoint (%s)", topEP, entrypointFile),
+				map[string]any{"stage": "separator", "command_id": cmd.ID})
+		}
+	}
+	if modelPath != "" && entrypointFile != "" {
+		rel, err := filepath.Rel(modelPath, entrypointFile)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				fmt.Sprintf("separator entrypoint file (%s) escapes snapshot root (%s)", entrypointFile, modelPath), nil)
+		}
+	}
+
+	lowerModel := strings.ToLower(modelName)
+	var metadataFile string
+	if snapEnv != nil {
+		for _, dep := range snapEnv.Dependencies {
+			if strings.EqualFold(dep.Role, "model_metadata") || strings.EqualFold(dep.DependencyName, "mdx_model_data.json") {
+				metadataFile = dep.EntrypointFile
+				break
+			}
+		}
+	}
+	if metadataFile == "" {
+		if mFile, ok := cmd.Config["metadata_file"].(string); ok && mFile != "" {
+			metadataFile = mFile
+		}
+	}
+
+	if strings.Contains(lowerModel, "uvr") || strings.Contains(lowerModel, "mdx") {
+		if snapEnv != nil || cmd.Config["require_model_snapshot"] == true {
+			if entrypointFile == "" {
+				return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+					"UVR separator requires verified UVR-MDX-NET-Inst_HQ_4.onnx entrypoint in model snapshot",
+					map[string]any{"stage": "separator", "command_id": cmd.ID})
+			}
+			if !strings.EqualFold(filepath.Base(entrypointFile), "UVR-MDX-NET-Inst_HQ_4.onnx") {
+				return worker.ArtifactRef{}, worker.NewError("SEPARATOR_MODEL_ASSET_MISSING",
+					fmt.Sprintf("unverified UVR entrypoint %s (expected UVR-MDX-NET-Inst_HQ_4.onnx)", filepath.Base(entrypointFile)),
+					map[string]any{"stage": "separator", "command_id": cmd.ID})
+			}
+			if _, err := os.Stat(entrypointFile); err != nil {
+				return worker.ArtifactRef{}, worker.NewError("SEPARATOR_MODEL_ASSET_MISSING",
+					fmt.Sprintf("UVR artifact file missing from snapshot: %s", entrypointFile),
+					map[string]any{"stage": "separator", "command_id": cmd.ID})
+			}
+			if metadataFile == "" {
+				return worker.ArtifactRef{}, worker.NewError("SEPARATOR_METADATA_ASSET_MISSING",
+					"UVR separator requires verified model metadata asset (mdx_model_data.json) in model snapshot",
+					map[string]any{"stage": "separator", "command_id": cmd.ID})
+			}
+			if _, err := os.Stat(metadataFile); err != nil {
+				return worker.ArtifactRef{}, worker.NewError("SEPARATOR_METADATA_ASSET_MISSING",
+					fmt.Sprintf("UVR model metadata file missing from snapshot: %s", metadataFile),
+					map[string]any{"stage": "separator", "command_id": cmd.ID})
+			}
+		}
+	} else if strings.Contains(lowerModel, "demucs") {
+		if strings.Contains(lowerModel, "htdemucs_ft") {
+			return worker.ArtifactRef{}, worker.NewError("DEMUCS_FT_SUBSTITUTION_REJECTED",
+				"htdemucs_ft bag is rejected as htdemucs fallback; exact htdemucs required",
+				map[string]any{"stage": "separator", "command_id": cmd.ID})
+		}
+		if snapEnv != nil || cmd.Config["require_model_snapshot"] == true {
+			if entrypointFile == "" {
+				return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+					"Demucs separator requires verified 955717e8-8726e21a.th entrypoint in model snapshot",
+					map[string]any{"stage": "separator", "command_id": cmd.ID})
+			}
+			if !strings.Contains(strings.ToLower(filepath.Base(entrypointFile)), "955717e8") {
+				return worker.ArtifactRef{}, worker.NewError("SEPARATOR_MODEL_ASSET_MISSING",
+					fmt.Sprintf("unverified Demucs entrypoint %s (expected 955717e8-8726e21a.th)", filepath.Base(entrypointFile)),
+					map[string]any{"stage": "separator", "command_id": cmd.ID})
+			}
+			if _, err := os.Stat(entrypointFile); err != nil {
+				return worker.ArtifactRef{}, worker.NewError("SEPARATOR_MODEL_ASSET_MISSING",
+					fmt.Sprintf("Demucs checkpoint file missing from snapshot: %s", entrypointFile),
+					map[string]any{"stage": "separator", "command_id": cmd.ID})
+			}
+		}
+	}
+
+	requireSnap, _ := cmd.Config[worker.ConfigKeyRequireModelSnapshot].(bool)
+	if !requireSnap {
+		requireSnap, _ = cmd.Config["require_model_snapshot"].(bool)
+	}
+	runner, err := resolveSeparatorRunner(requireSnap)
 	if err != nil {
 		return worker.ArtifactRef{}, err
 	}
 
+	hasVerifiedBagYAML := false
+	if snapEnv != nil {
+		for _, dep := range snapEnv.Dependencies {
+			if strings.EqualFold(dep.DependencyName, "htdemucs.yaml") || strings.EqualFold(dep.Role, "bag_yaml") {
+				hasVerifiedBagYAML = true
+				break
+			}
+		}
+	}
+	if b, ok := cmd.Config["has_verified_bag_yaml"].(bool); ok && b {
+		hasVerifiedBagYAML = true
+	}
+
 	req := map[string]any{
-		"audio_path":    cmd.Inputs[0].Path,
-		"run_id":        cmd.RunID,
-		"attempt_id":    cmd.AttemptID,
-		cfgModelName:    modelName,
-		cfgModelVersion: modelVersion,
+		"audio_path":             cmd.Inputs[0].Path,
+		"run_id":                 cmd.RunID,
+		"attempt_id":             cmd.AttemptID,
+		"model_path":             modelPath,
+		"entrypoint_file":        entrypointFile,
+		"metadata_file":          metadataFile,
+		"require_model_snapshot": cmd.Config["require_model_snapshot"],
+		"has_verified_bag_yaml":  hasVerifiedBagYAML,
+		"model_snapshot":         snapEnv,
+		cfgModelName:             modelName,
+		cfgModelVersion:          modelVersion,
 	}
 
 	var out struct {
@@ -930,19 +1308,84 @@ func runSeparatorAdapter(ctx context.Context, cmd worker.Command, enc *worker.En
 		Channels         int    `json:"channels"`
 		ModelName        string `json:"model_name"`
 		ModelVersion     string `json:"model_version"`
+		RuntimeIdentity  string `json:"runtime_identity"`
 	}
-
 	if err := invokeCommand(ctx, runner.binary, runner.args, req, &out); err != nil {
 		return worker.ArtifactRef{}, err
 	}
 
 	if out.ModelName == "" {
-		out.ModelName = modelName
+		if snapEnv != nil && snapEnv.Primary.DependencyName != "" {
+			out.ModelName = snapEnv.Primary.DependencyName
+		} else {
+			out.ModelName = modelName
+		}
 	}
 	if out.ModelVersion == "" {
-		out.ModelVersion = modelVersion
+		if snapEnv != nil && snapEnv.Primary.Version != "" {
+			out.ModelVersion = snapEnv.Primary.Version
+		} else {
+			out.ModelVersion = modelVersion
+		}
+	}
+	return writeOutputArtifact(cmd, out)
+}
+
+// runSeparatorProbeAdapter probes the configured separator Python runtime environment
+// for installed distribution versions, exact PEP 610 VCS source revision, and backend versions.
+// It fails closed if the runner is missing, execution fails, or the probe cannot prove
+// the pinned source revision from trustworthy metadata.
+func runSeparatorProbeAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder) (worker.ArtifactRef, error) {
+	modelName, _ := cmd.Config[cfgModelName].(string)
+	if modelName == "" {
+		modelName = "UVR-MDX-NET-Inst_HQ_4.onnx"
+	}
+	modelVersion, _ := cmd.Config[cfgModelVersion].(string)
+	if modelVersion == "" {
+		modelVersion = "v3"
 	}
 
+	requireSnap, _ := cmd.Config[worker.ConfigKeyRequireModelSnapshot].(bool)
+	if !requireSnap {
+		requireSnap, _ = cmd.Config["require_model_snapshot"].(bool)
+	}
+	runner, err := resolveSeparatorRunner(requireSnap)
+	if err != nil {
+		return worker.ArtifactRef{}, err
+	}
+
+	req := map[string]any{
+		"mode":          "probe",
+		"run_id":        cmd.RunID,
+		"attempt_id":    cmd.AttemptID,
+		cfgModelName:    modelName,
+		cfgModelVersion: modelVersion,
+	}
+
+	var out struct {
+		Status          string            `json:"status"`
+		PackageName     string            `json:"package_name"`
+		PackageVersion  string            `json:"package_version"`
+		SourceRevision  string            `json:"source_revision"`
+		RuntimeVersions map[string]string `json:"runtime_versions"`
+		AdapterRevision string            `json:"adapter_revision"`
+		Error           string            `json:"error,omitempty"`
+	}
+	if err := invokeCommand(ctx, runner.binary, runner.args, req, &out); err != nil {
+		return worker.ArtifactRef{}, worker.NewError("SEPARATOR_RUNTIME_PROBE_FAILED",
+			fmt.Sprintf("separator runtime probe failed: %v", err),
+			map[string]any{"stage": "separator_probe", "command_id": cmd.ID})
+	}
+	if out.Error != "" {
+		return worker.ArtifactRef{}, worker.NewError("SEPARATOR_RUNTIME_PROBE_FAILED",
+			out.Error,
+			map[string]any{"stage": "separator_probe", "command_id": cmd.ID})
+	}
+	if out.SourceRevision == "" {
+		return worker.ArtifactRef{}, worker.NewError("SEPARATOR_RUNTIME_PROBE_FAILED",
+			"separator runtime probe returned empty source revision",
+			map[string]any{"stage": "separator_probe", "command_id": cmd.ID})
+	}
 	return writeOutputArtifact(cmd, out)
 }
 
@@ -1011,6 +1454,33 @@ func runOCRAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 	if modelVersion == "" {
 		modelVersion = "v6"
 	}
+	snapEnv, _ := worker.GetModelSnapshotEnvelope(cmd.Config)
+	var detDir, recDir, clsDir string
+	if snapEnv != nil {
+		if snapEnv.Primary.Role == "det" || strings.Contains(strings.ToLower(snapEnv.Primary.DependencyName), "det") {
+			detDir = snapEnv.Primary.LocalPath
+		}
+		for _, dep := range snapEnv.Dependencies {
+			role := strings.ToLower(dep.Role)
+			name := strings.ToLower(dep.DependencyName)
+			if role == "det" || strings.Contains(name, "det") {
+				detDir = dep.LocalPath
+			} else if role == "rec" || strings.Contains(name, "rec") {
+				recDir = dep.LocalPath
+			} else if role == "ori" || role == "cls" || strings.Contains(name, "ori") || strings.Contains(name, "cls") {
+				clsDir = dep.LocalPath
+			}
+		}
+	}
+
+	reqSnap, _ := cmd.Config["require_model_snapshot"].(bool)
+	if reqSnap {
+		if detDir == "" || recDir == "" || clsDir == "" {
+			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				fmt.Sprintf("ocr requires verified det, rec, and ori snapshots (got det=%q, rec=%q, cls=%q)", detDir, recDir, clsDir),
+				map[string]any{"stage": "ocr", "command_id": cmd.ID})
+		}
+	}
 
 	runner, err := resolveOCRRunner()
 	if err != nil {
@@ -1023,10 +1493,13 @@ func runOCRAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 		"attempt_id":           cmd.AttemptID,
 		"frame_sample_step_ms": cmd.Config["frame_sample_step_ms"],
 		"max_frames":           cmd.Config["max_frames"],
+		"det_model_dir":        detDir,
+		"rec_model_dir":        recDir,
+		"cls_model_dir":        clsDir,
+		"ori_model_dir":        clsDir,
 		cfgModelName:           modelName,
 		cfgModelVersion:        modelVersion,
 	}
-
 	var out struct {
 		FrameWidth        int                         `json:"frame_width"`
 		FrameHeight       int                         `json:"frame_height"`
@@ -1045,6 +1518,161 @@ func runOCRAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 	}
 	if out.ModelVersion == "" {
 		out.ModelVersion = modelVersion
+	}
+
+	return writeOutputArtifact(cmd, out)
+}
+
+func resolveTranslationRunner() (commandRunner, error) {
+	if bin := os.Getenv("DOUYINIE_TRANSLATION_BIN"); bin != "" {
+		if path, err := exec.LookPath(bin); err == nil {
+			return commandRunner{binary: path}, nil
+		}
+		return commandRunner{}, worker.NewError("TRANSLATION_BINARY_NOT_FOUND",
+			fmt.Sprintf("DOUYINIE_TRANSLATION_BIN %q not found", bin), nil)
+	}
+
+	if script := os.Getenv("DOUYINIE_TRANSLATION_ADAPTER"); script != "" {
+		if _, err := os.Stat(script); err == nil {
+			pyBin := resolveTranslationPythonBinary()
+			if pyBin != "" {
+				return commandRunner{binary: pyBin, args: []string{script}}, nil
+			}
+			return commandRunner{}, worker.NewError("TRANSLATION_BINARY_NOT_FOUND",
+				"python runtime not found to execute DOUYINIE_TRANSLATION_ADAPTER", nil)
+		}
+	}
+
+	adapterPaths := []string{
+		filepath.Join("cmd", "stageworker", "adapters", "translation_qwen3.py"),
+		filepath.Join("adapters", "translation_qwen3.py"),
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		adapterPaths = append(adapterPaths,
+			filepath.Join(exeDir, "adapters", "translation_qwen3.py"),
+			filepath.Join(exeDir, "..", "cmd", "stageworker", "adapters", "translation_qwen3.py"),
+			filepath.Join(exeDir, "..", "..", "cmd", "stageworker", "adapters", "translation_qwen3.py"),
+		)
+	}
+
+	for _, p := range adapterPaths {
+		if absP, err := filepath.Abs(p); err == nil {
+			if _, err := os.Stat(absP); err == nil {
+				pyBin := resolveTranslationPythonBinary()
+				if pyBin != "" {
+					return commandRunner{binary: pyBin, args: []string{absP}}, nil
+				}
+			}
+		}
+	}
+
+	for _, name := range []string{"qwen3-translator", "qwen-translator"} {
+		if path, err := exec.LookPath(name); err == nil {
+			return commandRunner{binary: path}, nil
+		}
+	}
+
+	return commandRunner{}, worker.NewError("TRANSLATION_BINARY_NOT_FOUND",
+		"Qwen3 translation adapter or binary not available: configure DOUYINIE_TRANSLATION_ADAPTER/DOUYINIE_TRANSLATION_BIN",
+		nil)
+}
+
+func runTranslationAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder) (worker.ArtifactRef, error) {
+	rawSegments, ok := cmd.Config["segments"]
+	if !ok || rawSegments == nil {
+		return worker.ArtifactRef{}, worker.NewError("TRANSLATION_MISSING_INPUT",
+			"translation command has no input segments in config",
+			map[string]any{"stage": "translation", "command_id": cmd.ID})
+	}
+
+	targetLang, _ := cmd.Config["target_language"].(string)
+	if strings.TrimSpace(targetLang) == "" {
+		return worker.ArtifactRef{}, worker.NewError("TRANSLATION_MISSING_TARGET_LANGUAGE",
+			"translation command has no target_language in config",
+			map[string]any{"stage": "translation", "command_id": cmd.ID})
+	}
+
+	sourceLang, _ := cmd.Config["source_language"].(string)
+	if strings.TrimSpace(sourceLang) == "" {
+		sourceLang = "zh"
+	}
+
+	modelName, _ := cmd.Config[cfgModelName].(string)
+	if modelName == "" {
+		modelName = "qwen3_4b_translator"
+	}
+	modelVersion, _ := cmd.Config[cfgModelVersion].(string)
+	if modelVersion == "" {
+		modelVersion = "Qwen3-4B-Q4_K_M"
+	}
+
+	snapEnv, parseErr := worker.GetModelSnapshotEnvelope(cmd.Config)
+	if parseErr != nil {
+		return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+			fmt.Sprintf("invalid model_snapshot envelope: %v", parseErr), nil)
+	}
+
+	var modelPath string
+	if snapEnv != nil {
+		modelPath = strings.TrimSpace(snapEnv.Primary.EntrypointFile)
+		if modelPath == "" {
+			modelPath = strings.TrimSpace(snapEnv.EntrypointFile)
+		}
+		if modelPath == "" {
+			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				"verified model_snapshot envelope missing entrypoint_file for translation", nil)
+		}
+		info, err := os.Stat(modelPath)
+		if err != nil {
+			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				fmt.Sprintf("verified model_snapshot entrypoint file inaccessible (%s): %v", modelPath, err), nil)
+		}
+		if info.IsDir() {
+			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				fmt.Sprintf("verified model_snapshot entrypoint path (%s) is a directory; exact GGUF file required", modelPath), nil)
+		}
+	} else if reqSnap, _ := cmd.Config["require_model_snapshot"].(bool); reqSnap {
+		return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+			"required model snapshot envelope missing from translation command config", nil)
+	}
+
+	runner, err := resolveTranslationRunner()
+	if err != nil {
+		return worker.ArtifactRef{}, err
+	}
+
+	req := map[string]any{
+		"segments":        rawSegments,
+		"source_language": sourceLang,
+		"target_language": targetLang,
+		"run_id":          cmd.RunID,
+		"attempt_id":      cmd.AttemptID,
+		cfgModelName:      modelName,
+		cfgModelVersion:   modelVersion,
+		"model_path":      modelPath,
+	}
+	var out struct {
+		Segments     []domain.TranslationSegment `json:"segments"`
+		ModelName    string                      `json:"model_name"`
+		ModelVersion string                      `json:"model_version"`
+	}
+
+	if err := invokeCommand(ctx, runner.binary, runner.args, req, &out); err != nil {
+		return worker.ArtifactRef{}, err
+	}
+
+	if out.ModelName == "" {
+		out.ModelName = modelName
+	}
+	if out.ModelVersion == "" {
+		out.ModelVersion = modelVersion
+	}
+
+	if len(out.Segments) == 0 {
+		return worker.ArtifactRef{}, worker.NewError("TRANSLATION_NO_SEGMENTS",
+			"translation produced no segments",
+			map[string]any{"stage": "translation", "command_id": cmd.ID})
 	}
 
 	return writeOutputArtifact(cmd, out)
@@ -1077,6 +1705,19 @@ func resolveTTSPythonBinary() string {
 		if path, err := exec.LookPath(py); err == nil {
 			return path
 		}
+		if _, err := os.Stat(py); err == nil {
+			return py
+		}
+		// If configured as python.cmd or directory, try sibling python.exe
+		if strings.HasSuffix(strings.ToLower(py), ".cmd") || strings.HasSuffix(strings.ToLower(py), ".bat") {
+			exe := strings.TrimSuffix(py, filepath.Ext(py)) + ".exe"
+			if path, err := exec.LookPath(exe); err == nil {
+				return path
+			}
+			if _, err := os.Stat(exe); err == nil {
+				return exe
+			}
+		}
 	}
 	return resolvePythonBinary()
 }
@@ -1085,8 +1726,100 @@ func resolveSeparatorPythonBinary() string {
 		if path, err := exec.LookPath(py); err == nil {
 			return path
 		}
+		if _, err := os.Stat(py); err == nil {
+			return py
+		}
+		if strings.HasSuffix(strings.ToLower(py), ".cmd") || strings.HasSuffix(strings.ToLower(py), ".bat") {
+			exe := strings.TrimSuffix(py, filepath.Ext(py)) + ".exe"
+			if path, err := exec.LookPath(exe); err == nil {
+				return path
+			}
+			if _, err := os.Stat(exe); err == nil {
+				return exe
+			}
+		}
 	}
 	return resolvePythonBinary()
+}
+func resolveTranslationPythonBinary() string {
+	if py := os.Getenv("DOUYINIE_TRANSLATION_PYTHON_BIN"); py != "" {
+		if path, err := exec.LookPath(py); err == nil {
+			return path
+		}
+	}
+	return resolvePythonBinary()
+}
+
+// resolveDiarizerSnapshotPaths parses and validates the typed model_snapshot envelope
+// for the diarizer stages. When require_model_snapshot=true, both primary CAMPPlus
+// and dependency VAD local paths must exist and be valid directories.
+func resolveDiarizerSnapshotPaths(cmd worker.Command, stage string) (modelPath string, vadModelPath string, reqSnap bool, err error) {
+	reqSnap, _ = cmd.Config["require_model_snapshot"].(bool)
+	snapEnv, parseErr := worker.GetModelSnapshotEnvelope(cmd.Config)
+	if parseErr != nil {
+		return "", "", reqSnap, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+			fmt.Sprintf("invalid model_snapshot envelope: %v", parseErr),
+			map[string]any{"stage": stage, "command_id": cmd.ID})
+	}
+
+	if snapEnv != nil {
+		modelPath = snapEnv.Primary.LocalPath
+		for _, dep := range snapEnv.Dependencies {
+			role := strings.ToLower(dep.Role)
+			name := strings.ToLower(dep.DependencyName)
+			if role == "vad" || strings.Contains(name, "vad") {
+				vadModelPath = dep.LocalPath
+				break
+			}
+		}
+
+		// Top-level unverified overrides cannot supersede envelope paths.
+		if topMP, ok := cmd.Config["model_path"].(string); ok && topMP != "" {
+			if modelPath == "" || filepath.Clean(topMP) != filepath.Clean(modelPath) {
+				return "", "", reqSnap, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+					fmt.Sprintf("top-level model_path (%s) attempts unverified override of model_snapshot envelope (%s)", topMP, modelPath),
+					map[string]any{"stage": stage, "command_id": cmd.ID})
+			}
+		}
+		if topVAD, ok := cmd.Config["vad_model_path"].(string); ok && topVAD != "" {
+			if vadModelPath == "" || filepath.Clean(topVAD) != filepath.Clean(vadModelPath) {
+				return "", "", reqSnap, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+					fmt.Sprintf("top-level vad_model_path (%s) attempts unverified override of model_snapshot envelope (%s)", topVAD, vadModelPath),
+					map[string]any{"stage": stage, "command_id": cmd.ID})
+			}
+		}
+	} else if reqSnap {
+		return "", "", reqSnap, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+			fmt.Sprintf("required model snapshot envelope missing from %s command config", stage),
+			map[string]any{"stage": stage, "command_id": cmd.ID})
+	} else {
+		if mp, ok := cmd.Config["model_path"].(string); ok && mp != "" {
+			modelPath = mp
+		}
+		if vp, ok := cmd.Config["vad_model_path"].(string); ok && vp != "" {
+			vadModelPath = vp
+		}
+	}
+
+	if reqSnap {
+		if modelPath == "" || vadModelPath == "" {
+			return "", "", reqSnap, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				fmt.Sprintf("%s requires verified primary campplus and vad snapshots (got model_path=%q, vad_model_path=%q)", stage, modelPath, vadModelPath),
+				map[string]any{"stage": stage, "command_id": cmd.ID})
+		}
+		if info, statErr := os.Stat(modelPath); statErr != nil || !info.IsDir() {
+			return "", "", reqSnap, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				fmt.Sprintf("primary model snapshot path inaccessible or not a directory (%s)", modelPath),
+				map[string]any{"stage": stage, "command_id": cmd.ID})
+		}
+		if info, statErr := os.Stat(vadModelPath); statErr != nil || !info.IsDir() {
+			return "", "", reqSnap, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				fmt.Sprintf("vad model snapshot path inaccessible or not a directory (%s)", vadModelPath),
+				map[string]any{"stage": stage, "command_id": cmd.ID})
+		}
+	}
+
+	return modelPath, vadModelPath, reqSnap, nil
 }
 
 // runDiarizerAdapter runs the speaker-diarization adapter (Issue #44 Finding
@@ -1118,20 +1851,28 @@ func runDiarizerAdapter(ctx context.Context, cmd worker.Command, enc *worker.Enc
 		vadModelVersion = defaultVADModelVersion
 	}
 
+	modelPath, vadModelPath, reqSnap, err := resolveDiarizerSnapshotPaths(cmd, "diarize")
+	if err != nil {
+		return worker.ArtifactRef{}, err
+	}
+
 	runner, err := resolveDiarizerRunner()
 	if err != nil {
 		return worker.ArtifactRef{}, err
 	}
 
 	req := map[string]any{
-		"mode":             "diarize",
-		"audio_path":       cmd.Inputs[0].Path,
-		"run_id":           cmd.RunID,
-		"attempt_id":       cmd.AttemptID,
-		cfgModelName:       modelName,
-		cfgModelVersion:    modelVersion,
-		cfgVADModelName:    vadModelName,
-		cfgVADModelVersion: vadModelVersion,
+		"mode":                   "diarize",
+		"audio_path":             cmd.Inputs[0].Path,
+		"run_id":                 cmd.RunID,
+		"attempt_id":             cmd.AttemptID,
+		cfgModelName:             modelName,
+		cfgModelVersion:          modelVersion,
+		cfgVADModelName:          vadModelName,
+		cfgVADModelVersion:       vadModelVersion,
+		"model_path":             modelPath,
+		"vad_model_path":         vadModelPath,
+		"require_model_snapshot": reqSnap,
 	}
 	var out struct {
 		SpeakerAssignments []domain.SpeakerAssignment `json:"speaker_assignments"`
@@ -1185,6 +1926,10 @@ func runDiarizerEvidenceAdapter(ctx context.Context, cmd worker.Command, enc *wo
 	if vadModelVersion == "" {
 		vadModelVersion = defaultVADModelVersion
 	}
+	modelPath, vadModelPath, reqSnap, err := resolveDiarizerSnapshotPaths(cmd, "diarize_evidence")
+	if err != nil {
+		return worker.ArtifactRef{}, err
+	}
 
 	runner, err := resolveDiarizerRunner()
 	if err != nil {
@@ -1201,6 +1946,9 @@ func runDiarizerEvidenceAdapter(ctx context.Context, cmd worker.Command, enc *wo
 		cfgVADModelName:              vadModelName,
 		cfgVADModelVersion:           vadModelVersion,
 		"embedding_cosine_threshold": threshold,
+		"model_path":                 modelPath,
+		"vad_model_path":             vadModelPath,
+		"require_model_snapshot":     reqSnap,
 	}
 	var out struct {
 		SpeakerEvidence domain.SpeakerEvidence `json:"speaker_evidence"`

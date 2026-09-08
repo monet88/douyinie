@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -86,7 +87,114 @@ type SpeechBlock struct {
 const (
 	SpeechBlockTypeSpeech  = "speech"
 	SpeechBlockTypeSilence = "silence"
+	SpeechBlockTypeNoise   = "noise"
 )
+
+// IsPathologicalRepetitionNoise detects non-semantic repetitive ASR noise loops
+// (such as Whisper looping on BGM/ambient sound with 4+ identical n-grams or
+// single-character runaway loops). It protects production translation/dubbing
+// pipelines from unrecoverable whole-run aborts while preserving genuine speech.
+func IsPathologicalRepetitionNoise(text string) bool {
+	s := strings.TrimSpace(text)
+	runes := []rune(s)
+	n := len(runes)
+	if n < 4 {
+		return false
+	}
+
+	// 1. Single rune repeated 5+ times consecutively (e.g. 啊啊啊啊啊, 啦啦啦啦啦)
+	runCount := 1
+	for i := 1; i < n; i++ {
+		if runes[i] == runes[i-1] {
+			runCount++
+			if runCount >= 5 {
+				return true
+			}
+		} else {
+			runCount = 1
+		}
+	}
+
+	// 2. Substrings of length L (1 to 8 runes) repeating consecutively 3+ times
+	// Note: for l == 1 (single character), require reps >= 5 so intentional 3x/4x
+	// emphasis or laughter (e.g. 哈哈哈, 哈哈哈哈) is not marked as noise.
+	for l := 1; l <= 8 && l*3 <= n; l++ {
+		for i := 0; i+l*3 <= n; i++ {
+			gram := string(runes[i : i+l])
+			reps := 1
+			for j := i + l; j+l <= n; j += l {
+				if string(runes[j:j+l]) == gram {
+					reps++
+				} else {
+					break
+				}
+			}
+			if l == 1 {
+				if reps >= 5 {
+					return true
+				}
+			} else if reps >= 3 {
+				matchedLen := reps * l
+				if matchedLen >= 10 || float64(matchedLen)/float64(n) >= 0.4 {
+					return true
+				}
+			}
+		}
+	}
+
+	// 3. Frequency of most common 2-gram, 3-gram, or 4-gram
+	for l := 2; l <= 4 && l <= n; l++ {
+		counts := make(map[string]int)
+		for i := 0; i+l <= n; i++ {
+			gram := string(runes[i : i+l])
+			counts[gram]++
+		}
+		for _, count := range counts {
+			if count >= 4 && float64(count*l)/float64(n) >= 0.45 {
+				return true
+			}
+		}
+	}
+
+	// 4. Heavy Japanese Kana Hallucination on non-Japanese speech:
+	// When Whisper loops on background music in non-Japanese speech, it typically produces
+	// runaway Katakana onomatopoeia (15+ consecutive Katakana runes without spaces/kanji)
+	// OR overwhelming Kana (>= 30 runes, >= 50% of text) with 3+ repeated 3-grams.
+	maxKatakana := 0
+	curKatakana := 0
+	kanaCount := 0
+	for _, r := range runes {
+		if r >= 0x30A0 && r <= 0x30FF {
+			curKatakana++
+			if curKatakana > maxKatakana {
+				maxKatakana = curKatakana
+			}
+			kanaCount++
+		} else if r >= 0x3040 && r <= 0x309F {
+			curKatakana = 0
+			kanaCount++
+		} else if r != ' ' {
+			curKatakana = 0
+		}
+	}
+	if maxKatakana >= 15 {
+		return true
+	}
+	if kanaCount >= 30 && float64(kanaCount)/float64(n) >= 0.5 {
+		for l := 3; l <= 8 && l <= n; l++ {
+			counts := make(map[string]int)
+			for i := 0; i+l <= n; i++ {
+				counts[string(runes[i:i+l])]++
+			}
+			for _, count := range counts {
+				if count >= 3 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
 
 // TranscriptArtifact is the persisted output of the speech understanding pipeline:
 // ASR → accepted transcript → forced alignment → conditional diarization → canonical SpeechBlock segmentation.

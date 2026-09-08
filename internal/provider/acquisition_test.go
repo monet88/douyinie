@@ -19,7 +19,10 @@ func TestClassifyAcquisitionFailure(t *testing.T) {
 		{"auth required", "aweme detail requires login cookie", domain.AcquisitionAuthRequired},
 		{"anti-bot empty", "empty response from server, likely anti-bot", domain.AcquisitionAntiBotOrEmpty},
 		{"anti-bot status", `status_code": -1 retrying`, domain.AcquisitionAntiBotOrEmpty},
+		{"anti-bot 403 forbidden", "HTTP Error 403: Forbidden - WAF challenge", domain.AcquisitionAntiBotOrEmpty},
+		{"anti-bot 429 rate limit", "HTTP 429: Too Many Requests / rate limit reached", domain.AcquisitionAntiBotOrEmpty},
 		{"removed", "aweme not found or removed", domain.AcquisitionContentUnavailable},
+		{"410 gone", "HTTP status 410: resource gone", domain.AcquisitionContentUnavailable},
 		{"private", "this account is private", domain.AcquisitionContentUnavailable},
 		{"generic", "connection reset by peer", domain.AcquisitionDownloadFailed},
 	}

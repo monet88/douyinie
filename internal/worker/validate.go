@@ -46,6 +46,19 @@ func ValidateEnvelope(env Envelope) error {
 		if err == nil {
 			err = requireNonEmpty("attempt_id", p.AttemptID)
 		}
+		if err == nil && p.Config != nil {
+			if raw, ok := p.Config[ConfigKeyModelSnapshot]; ok && raw != nil {
+				if snapEnv, parseErr := GetModelSnapshotEnvelope(p.Config); parseErr != nil {
+					err = fmt.Errorf("invalid %s config: %w", ConfigKeyModelSnapshot, parseErr)
+				} else if snapEnv != nil {
+					if strings.TrimSpace(snapEnv.Primary.DependencyName) == "" {
+						err = fmt.Errorf("model_snapshot primary missing dependency_name")
+					} else if strings.TrimSpace(snapEnv.Primary.SnapshotManifestSHA256) == "" {
+						err = fmt.Errorf("model_snapshot primary missing snapshot_manifest_sha256")
+					}
+				}
+			}
+		}
 	case MessageTypeHello:
 		var p HelloPayload
 		err = decodePayload(env.Payload, &p)

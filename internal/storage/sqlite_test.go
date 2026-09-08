@@ -240,18 +240,20 @@ func TestStorage_SQLiteFlow(t *testing.T) {
 
 	// 9. Provider Attempts & Selection Decisions
 	pa := domain.ProviderAttempt{
-		ID:            uuid.NewString(),
-		RunID:         runID,
-		Stage:         "tts",
-		ProviderID:    "fake_vieneu_tts_vi",
-		ModelName:     "vieneu-v1",
-		ModelVersion:  "1.0.0",
-		InputHash:     "hash123",
-		AttemptNumber: 1,
-		Status:        "succeeded",
-		LatencyMs:     120,
-		CostUnits:     0.0,
-		CreatedAt:     time.Now().UTC(),
+		ID:                uuid.NewString(),
+		RunID:             runID,
+		Stage:             "tts",
+		ProviderID:        "fake_vieneu_tts_vi",
+		ModelName:         "vieneu-v1",
+		ModelVersion:      "1.0.0",
+		InputHash:         "hash123",
+		AttemptNumber:     1,
+		Status:            "succeeded",
+		LatencyMs:         120,
+		CostUnits:         0.0,
+		ObservedModel:     "observed-model-1",
+		ServiceBaselineID: "baseline-1",
+		CreatedAt:         time.Now().UTC(),
 	}
 	if err := db.RecordProviderAttempt(ctx, pa); err != nil {
 		t.Fatalf("RecordProviderAttempt failed: %v", err)
@@ -259,6 +261,9 @@ func TestStorage_SQLiteFlow(t *testing.T) {
 	attempts, err := db.ListProviderAttempts(ctx, runID, "tts")
 	if err != nil || len(attempts) != 1 {
 		t.Fatalf("ListProviderAttempts failed: %v, got %d", err, len(attempts))
+	}
+	if attempts[0].ObservedModel != "observed-model-1" || attempts[0].ServiceBaselineID != "baseline-1" {
+		t.Fatalf("ListProviderAttempts provenance mismatch: got observed=%q baseline=%q", attempts[0].ObservedModel, attempts[0].ServiceBaselineID)
 	}
 
 	sd := domain.SelectionDecision{
@@ -1084,5 +1089,95 @@ func TestStorage_MigrationV15ToV16_UpgradeAddsTableAndPreservesMetadata(t *testi
 	got, err := db2.GetSourceAcquisitionBySourceID(ctx, "douyin:aweme:123")
 	if err != nil || got.AssetID != assetID {
 		t.Fatalf("provenance round-trip after upgrade failed: %+v err=%v", got, err)
+	}
+}
+
+func TestStorage_MigrationV17_SnapshotVerificationEvents(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "v17_test.db")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	// 1. Migration v17 recorded and table exists.
+	var countV17 int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 17`).Scan(&countV17); err != nil || countV17 != 1 {
+		t.Fatalf("expected migration version 17 recorded, got count=%d err=%v", countV17, err)
+	}
+	var tableCount int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='snapshot_verification_events'`).Scan(&tableCount); err != nil || tableCount != 1 {
+		t.Fatalf("expected snapshot_verification_events table, got count=%d err=%v", tableCount, err)
+	}
+
+	// 2. Record and list verification events
+	evID := uuid.NewString()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	ev := domain.SnapshotVerificationEvent{
+		ID:                     evID,
+		DependencyName:         "qwen3-asr",
+		Version:                "1.7b",
+		SnapshotManifestSHA256: "aabbccdd11223344",
+		Outcome:                "VERIFIED",
+		FileCount:              4,
+		TotalBytes:             1024000,
+		VerifierVersion:        "1.0",
+		VerifiedAt:             now,
+	}
+	if err := db.RecordSnapshotVerificationEvent(ctx, ev); err != nil {
+		t.Fatalf("RecordSnapshotVerificationEvent failed: %v", err)
+	}
+
+	events, err := db.ListSnapshotVerificationEvents(ctx, "qwen3-asr")
+	if err != nil {
+		t.Fatalf("ListSnapshotVerificationEvents failed: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].ID != evID || events[0].Outcome != "VERIFIED" || events[0].FileCount != 4 {
+		t.Fatalf("mismatched event data: %+v", events[0])
+	}
+
+	// Empty filter returns all events
+	allEvents, err := db.ListSnapshotVerificationEvents(ctx, "")
+	if err != nil {
+		t.Fatalf("ListSnapshotVerificationEvents with empty filter failed: %v", err)
+	}
+	if len(allEvents) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(allEvents))
+	}
+}
+
+func TestStorage_MigrationV16ToV17_UpgradeAddsTable(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "v16_to_v17_upgrade.db")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open initial db: %v", err)
+	}
+
+	// Downgrade to v16 baseline: drop table and remove version 17
+	if _, err := db.db.ExecContext(ctx, `DROP TABLE IF EXISTS snapshot_verification_events`); err != nil {
+		t.Fatalf("drop snapshot_verification_events: %v", err)
+	}
+	if _, err := db.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = 17`); err != nil {
+		t.Fatalf("delete v17 row: %v", err)
+	}
+	_ = db.Close()
+
+	// Re-open: migrate() should apply v17
+	db2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("re-open upgraded db: %v", err)
+	}
+	defer db2.Close()
+
+	var countV17 int
+	if err := db2.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 17`).Scan(&countV17); err != nil || countV17 != 1 {
+		t.Fatalf("expected migration v17 applied, got count=%d err=%v", countV17, err)
 	}
 }

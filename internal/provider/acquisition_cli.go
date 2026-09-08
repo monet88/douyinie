@@ -116,8 +116,13 @@ func (a *cliAcquisitionProvider) Probe(ctx context.Context, locator domain.Sourc
 	if err != nil {
 		return nil, &domain.AcquisitionError{State: domain.AcquisitionDownloadFailed, ProviderID: a.id, Detail: "short link resolution failed"}
 	}
-	if status == http.StatusNotFound || status == http.StatusGone || status == http.StatusForbidden {
+	if status == http.StatusNotFound || status == http.StatusGone {
 		return nil, &domain.AcquisitionError{State: domain.AcquisitionContentUnavailable, ProviderID: a.id, Detail: fmt.Sprintf("canonical url returned http %d", status)}
+	}
+	if status == http.StatusForbidden || status == http.StatusTooManyRequests {
+		// Invariant (Issue #70 / #63): HTTP 403 alone or 429 is a WAF/rate-limit/security challenge,
+		// never genuine source disappearance (CONTENT_UNAVAILABLE). It scores as acquisition failure.
+		return nil, &domain.AcquisitionError{State: domain.AcquisitionAntiBotOrEmpty, ProviderID: a.id, Detail: fmt.Sprintf("canonical url returned http %d (security/waf/rate-limit challenge, not content disappearance)", status)}
 	}
 
 	mediaType := "video"
@@ -242,15 +247,17 @@ func mediaMimeType(path string) string {
 func ClassifyAcquisitionFailure(output string) domain.AcquisitionState {
 	lower := strings.ToLower(output)
 	switch {
-	case containsAny(lower, "captcha", "verify safety", "safety check"):
+	case containsAny(lower, "captcha", "verify safety", "safety check", "verify_check", "need_verify"):
 		return domain.AcquisitionCaptchaRequired
 	case containsAny(lower, "session expired", "cookie expired", "login expired", "re-login"):
 		return domain.AcquisitionSessionExpired
 	case containsAny(lower, "login", "cookie", "auth"):
 		return domain.AcquisitionAuthRequired
-	case containsAny(lower, "empty response", "anti-bot", "status_code=-1", `status_code": -1`):
+	case containsAny(lower, "403", "forbidden", "waf", "429", "too many requests", "rate limit", "empty response", "anti-bot", "status_code=-1", `status_code": -1`, "status_code=5", `status_code": 5`, "风控", "服务异常"):
+		// Invariant (Issue #70 / #63): 403/429/WAF/security challenge/empty-response drift is
+		// classified as AntiBotOrEmpty (fallback-eligible failure), not CONTENT_UNAVAILABLE.
 		return domain.AcquisitionAntiBotOrEmpty
-	case containsAny(lower, "removed", "not found", "private", "404"):
+	case containsAny(lower, "removed", "not found", "private", "404", "410"):
 		return domain.AcquisitionContentUnavailable
 	default:
 		return domain.AcquisitionDownloadFailed

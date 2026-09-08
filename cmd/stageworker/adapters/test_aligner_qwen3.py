@@ -14,6 +14,7 @@ from aligner_qwen3 import (
     DEFAULT_ALIGNER_MODEL,
     parse_word_timings,
     resolve_aligner_identifier,
+    run_aligner,
 )
 
 
@@ -108,6 +109,80 @@ class Qwen3ForcedAligner:
             self.assertEqual(out["word_timings"][0]["word"], "今天")
             self.assertEqual(out["word_timings"][0]["start_ms"], 0)
             self.assertEqual(out["word_timings"][0]["end_ms"], 300)
+
+    def _install_fake_qwen_aligner(self, tmpdir):
+        pkg_dir = os.path.join(tmpdir, "qwen_asr")
+        os.makedirs(pkg_dir, exist_ok=True)
+        with open(os.path.join(pkg_dir, "__init__.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "class Qwen3ForcedAligner:\n"
+                "    last_checkpoint = None\n"
+                "\n"
+                "    def __init__(self, *args, **kwargs):\n"
+                "        pass\n"
+                "\n"
+                "    @classmethod\n"
+                "    def from_pretrained(cls, checkpoint, **kwargs):\n"
+                "        cls.last_checkpoint = checkpoint\n"
+                "        return cls()\n"
+                "\n"
+                "    def align(self, audio=None, text=None, **kwargs):\n"
+                '        return [{"word": "snap", "start_ms": 0, "end_ms": 300, "confidence": 0.9}]\n'
+            )
+        sys.path.insert(0, tmpdir)
+        self.addCleanup(sys.path.remove, tmpdir)
+        for mod in [m for m in list(sys.modules) if m == "qwen_asr" or m.startswith("qwen_asr.")]:
+            del sys.modules[mod]
+
+    def test_run_aligner_prefers_verified_snapshot_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._install_fake_qwen_aligner(tmpdir)
+            snap = os.path.join(tmpdir, "snap")
+            os.makedirs(snap)
+            import qwen_asr
+            out = run_aligner("whatever.wav", "快照语音", "Qwen3-ForcedAligner-0.6B", "0.6b", snap, True)
+            self.assertEqual(qwen_asr.Qwen3ForcedAligner.last_checkpoint, snap)
+            self.assertEqual(out["word_timings"][0]["word"], "snap")
+
+    def test_run_aligner_strict_missing_snapshot_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._install_fake_qwen_aligner(tmpdir)
+            with self.assertRaises(RuntimeError) as ctx:
+                run_aligner("whatever.wav", "快照语音", "Qwen3-ForcedAligner-0.6B", "0.6b", os.path.join(tmpdir, "nope"), True)
+            self.assertIn("WORKER_SNAPSHOT_PATH_REQUIRED", str(ctx.exception))
+
+    def test_run_aligner_nonstrict_legacy_hub_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._install_fake_qwen_aligner(tmpdir)
+            import qwen_asr
+            out = run_aligner("whatever.wav", "快照语音", "Qwen3-ForcedAligner-0.6B", "0.6b")
+            self.assertEqual(qwen_asr.Qwen3ForcedAligner.last_checkpoint, DEFAULT_ALIGNER_MODEL)
+            self.assertEqual(out["word_timings"][0]["word"], "snap")
+
+    def test_cli_strict_missing_snapshot_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_file = os.path.join(tmpdir, "test.wav")
+            with open(audio_file, "wb") as f:
+                f.write(b"fake wav header and pcm data")
+            script_path = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "aligner_qwen3.py")
+            )
+            req = {
+                "audio_path": audio_file,
+                "text": "快照语音",
+                "model_name": "Qwen3-ForcedAligner-0.6B",
+                "model_version": "0.6b",
+                "model_path": os.path.join(tmpdir, "nope"),
+                "require_model_snapshot": True,
+            }
+            proc = subprocess.run(
+                [sys.executable, script_path],
+                input=json.dumps(req),
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("WORKER_SNAPSHOT_PATH_REQUIRED", proc.stderr)
 
 
 if __name__ == "__main__":

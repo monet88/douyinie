@@ -3,14 +3,17 @@ package service_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/governance"
 	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/service"
+	"github.com/monet88/douyinie/internal/storage"
 )
 
 func TestMeaningFirstQAGate_RejectsSemanticFactCorruption(t *testing.T) {
@@ -201,5 +204,300 @@ func TestTranslationService_CacheIdentityChangesWithProviderModelVersion(t *test
 	}
 	if first.ID == second.ID {
 		t.Fatalf("expected a new immutable TranslationVariant after provider model-version change; both=%s", first.ID)
+	}
+}
+
+func TestTranslationService_QAInvalidPrimary_ValidFallback_AdvancesAndRecordsProvenance(t *testing.T) {
+	db, casStore, router, reg := setupTranslationTestEnv(t)
+	svc := service.NewTranslationService(db, casStore)
+	svc.ConfigureRouter(router)
+
+	ctx := context.Background()
+	runID := uuid.NewString()
+	assetID := uuid.NewString()
+	attID := uuid.NewString()
+
+	if err := db.CreateRightsAttestation(ctx, domain.RightsAttestation{ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION", TermsAccepted: true, ConfirmedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{ID: assetID, RightsAttestationID: attID, SHA256: "qa-fallback-source", ByteSize: 100, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("create source asset: %v", err)
+	}
+	if err := db.CreateJob(ctx, domain.LocalizationJob{ID: "qa-fallback-job", SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: "qa-fallback-job", Status: "running", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	// Primary provider produces corrupted numbers -> triggers Meaning-First QA rejection
+	primaryProv, ok := reg.Get("fake_llm_translator")
+	if !ok {
+		t.Fatal("fake_llm_translator not found")
+	}
+	primaryProv.(*provider.FakeTranslationProvider).CorruptNumbers = true
+
+	// Fallback provider produces valid numbers
+	fbProv, ok := reg.Get("fake_local_translator_fallback")
+	if !ok {
+		t.Fatal("fake_local_translator_fallback not found")
+	}
+	fbProv.(*provider.FakeTranslationProvider).CorruptNumbers = false
+
+	input := domain.TranslationJobInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		JobID:          "qa-fallback-job",
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "剪刀以45度角剪掉枝条。", StartMs: 0, EndMs: 1500},
+		},
+	}
+
+	variant, err := svc.Translate(ctx, input)
+	if err != nil {
+		t.Fatalf("expected successful translation via fallback, got: %v", err)
+	}
+	if variant.ProviderID != "fake_local_translator_fallback" {
+		t.Fatalf("expected fallback provider fake_local_translator_fallback, got %s", variant.ProviderID)
+	}
+	if !variant.Segments[0].PassedQAGate {
+		t.Fatalf("expected segment to pass QA gate on fallback")
+	}
+
+	// Invariant: Router recorded quality_failed for primary, succeeded for fallback
+	attempts, err := db.ListProviderAttempts(ctx, runID, "translation")
+	if err != nil {
+		t.Fatalf("list provider attempts: %v", err)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("expected exactly 2 attempts recorded, got %d", len(attempts))
+	}
+	if attempts[0].ProviderID != "fake_llm_translator" || attempts[0].Status != "quality_failed" {
+		t.Fatalf("expected attempt 0 to be quality_failed for fake_llm_translator, got %+v", attempts[0])
+	}
+	if !strings.Contains(attempts[0].ErrorMessage, domain.ErrQualityRejected.Error()) || !strings.Contains(attempts[0].ErrorMessage, domain.ErrNumberCorrupted.Error()) {
+		t.Fatalf("expected quality_failed error message to contain ErrQualityRejected and ErrNumberCorrupted, got: %s", attempts[0].ErrorMessage)
+	}
+	if attempts[1].ProviderID != "fake_local_translator_fallback" || attempts[1].Status != "succeeded" {
+		t.Fatalf("expected attempt 1 to be succeeded for fake_local_translator_fallback, got %+v", attempts[1])
+	}
+
+	// Invariant: Router recorded fallback SelectionDecision for alternate candidate
+	decisions, err := db.ListSelectionDecisions(ctx, runID, "translation")
+	if err != nil {
+		t.Fatalf("list selection decisions: %v", err)
+	}
+	if len(decisions) < 2 {
+		t.Fatalf("expected at least 2 selection decisions, got %d", len(decisions))
+	}
+	lastDecision := decisions[len(decisions)-1]
+	if lastDecision.SelectedProviderID != "fake_local_translator_fallback" {
+		t.Fatalf("expected last selection decision for fake_local_translator_fallback, got %s", lastDecision.SelectedProviderID)
+	}
+	if !strings.Contains(lastDecision.DecisionReason, "selected alternate candidate fake_local_translator_fallback after prior candidate failure") {
+		t.Fatalf("unexpected decision reason: %s", lastDecision.DecisionReason)
+	}
+}
+
+func TestTranslationService_AllCandidatesQAInvalid_FailsClosed(t *testing.T) {
+	db, casStore, router, reg := setupTranslationTestEnv(t)
+	svc := service.NewTranslationService(db, casStore)
+	svc.ConfigureRouter(router)
+
+	ctx := context.Background()
+	runID := uuid.NewString()
+	assetID := uuid.NewString()
+	attID := uuid.NewString()
+
+	if err := db.CreateRightsAttestation(ctx, domain.RightsAttestation{ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION", TermsAccepted: true, ConfirmedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{ID: assetID, RightsAttestationID: attID, SHA256: "all-invalid-source", ByteSize: 100, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("create source asset: %v", err)
+	}
+	if err := db.CreateJob(ctx, domain.LocalizationJob{ID: "all-invalid-job", SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: "all-invalid-job", Status: "running", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	// Both primary and fallback invert negation
+	primaryProv, _ := reg.Get("fake_llm_translator")
+	primaryFake := primaryProv.(*provider.FakeTranslationProvider)
+	primaryFake.CustomTranslations = map[string]string{"请不要打开窗户。": "Hãy mở cửa sổ ra nhé."}
+	fbProv, _ := reg.Get("fake_local_translator_fallback")
+	fbFake := fbProv.(*provider.FakeTranslationProvider)
+	fbFake.CustomTranslations = map[string]string{"请不要打开窗户。": "Hãy mở cửa sổ ra nhé."}
+	input := domain.TranslationJobInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		JobID:          "all-invalid-job",
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "请不要打开窗户。", StartMs: 0, EndMs: 1500},
+		},
+	}
+
+	_, err := svc.Translate(ctx, input)
+	if err == nil {
+		t.Fatalf("expected translation to fail closed when all candidates fail QA")
+	}
+	if !errors.Is(err, domain.ErrQualityRejected) {
+		t.Fatalf("expected error to wrap domain.ErrQualityRejected, got: %v", err)
+	}
+	if !errors.Is(err, domain.ErrNegationInverted) {
+		t.Fatalf("expected error to wrap negation polarity error, got: %v", err)
+	}
+
+	// Invariant: Both attempts recorded as quality_failed in SQLite provenance
+	attempts, err := db.ListProviderAttempts(ctx, runID, "translation")
+	if err != nil {
+		t.Fatalf("list provider attempts: %v", err)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("expected 2 attempts recorded, got %d", len(attempts))
+	}
+	for i, att := range attempts {
+		if att.Status != "quality_failed" {
+			t.Errorf("attempt %d status must be quality_failed, got %s", i, att.Status)
+		}
+		if !strings.Contains(att.ErrorMessage, domain.ErrQualityRejected.Error()) {
+			t.Errorf("attempt %d error message must contain ErrQualityRejected, got %s", i, att.ErrorMessage)
+		}
+	}
+
+	// Invariant: Fallback selection decision was recorded
+	decisions, err := db.ListSelectionDecisions(ctx, runID, "translation")
+	if err != nil {
+		t.Fatalf("list selection decisions: %v", err)
+	}
+	if len(decisions) < 2 {
+		t.Fatalf("expected at least 2 selection decisions, got %d", len(decisions))
+	}
+}
+
+func TestTranslationService_HybridLadder_Gemini_DeepSeek_Qwen_QualityFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	casStore, err := cas.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("setup CAS: %v", err)
+	}
+	db, err := storage.Open(tmpDir + "/ladder.db")
+	if err != nil {
+		t.Fatalf("setup DB: %v", err)
+	}
+	defer db.Close()
+
+	reg := provider.NewRegistry()
+	polSvc := governance.NewPolicyService(db)
+	licSvc := governance.NewLicenseService(db)
+	credSvc := governance.NewCredentialService(db)
+
+	// Ladder: Gemini -> DeepSeek -> local Qwen
+	geminiFake := provider.NewFakeTranslationProvider(provider.GatewayGeminiTranslationProviderID)
+	geminiFake.ModelName = "gemini-3.8-flash"
+	geminiFake.ModelVersion = "2026-08"
+	geminiFake.CorruptNumbers = true // Primary fails QA on numbers
+	_ = reg.Register(geminiFake)
+
+	deepseekFake := provider.NewFakeTranslationProvider(provider.GatewayDeepSeekTranslationProviderID)
+	deepseekFake.ModelName = "deepseek-v4-flash"
+	deepseekFake.ModelVersion = "v4"
+	// First fallback fails QA on negation inversion
+	deepseekFake.CustomTranslations = map[string]string{
+		"请将温度调至25度，张伟说不要打开窗户。": "Vui lòng điều chỉnh nhiệt độ đến 25 độ, Trương Vĩ nói hãy mở cửa sổ.",
+	}
+	_ = reg.Register(deepseekFake)
+	qwenFake := provider.NewFakeTranslationProvider(provider.WorkerQwenTranslationProviderID)
+	qwenFake.ModelName = "qwen3-4b"
+	qwenFake.ModelVersion = "q4_k_m"
+	// Second fallback succeeds!
+	_ = reg.Register(qwenFake)
+
+	initCtx := context.Background()
+	for _, p := range reg.ListAll() {
+		mName, mVer := p.ModelInfo()
+		_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+			DependencyName: mName,
+			Version:        mVer,
+			SHA256:         "sha256_mock_" + mName,
+			SourceRepo:     "github.com/monet88/douyinie/models/" + mName,
+			CodeLicense:    "Apache-2.0",
+			ModelLicense:   "Apache-2.0",
+			DataLicense:    "OpenData",
+			ServiceTerms:   "Standard",
+			Verified:       true,
+			CreatedAt:      time.Now().UTC(),
+		})
+	}
+
+	router := provider.NewRouter(reg, polSvc, licSvc, credSvc, nil, db)
+	svc := service.NewTranslationService(db, casStore)
+	svc.ConfigureRouter(router)
+
+	runID := uuid.NewString()
+	assetID := uuid.NewString()
+	attID := uuid.NewString()
+
+	_ = db.CreateRightsAttestation(initCtx, domain.RightsAttestation{ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION", TermsAccepted: true, ConfirmedAt: time.Now().UTC()})
+	_ = db.CreateSourceAsset(initCtx, domain.SourceAsset{ID: assetID, RightsAttestationID: attID, SHA256: "ladder-source", ByteSize: 100, CreatedAt: time.Now().UTC()})
+	_ = db.CreateJob(initCtx, domain.LocalizationJob{ID: "ladder-job", SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: time.Now().UTC()})
+	_ = db.CreateRun(initCtx, domain.LocalizationRun{ID: runID, JobID: "ladder-job", Status: "running", CreatedAt: time.Now().UTC()})
+
+	input := domain.TranslationJobInput{
+		RunID:            runID,
+		AssetID:          assetID,
+		JobID:            "ladder-job",
+		SourceLanguage:   "zh",
+		TargetLanguage:   "vi",
+		ExecutionProfile: domain.ExecutionProfileHybrid,
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "请将温度调至25度，张伟说不要打开窗户。", StartMs: 0, EndMs: 2000},
+		},
+	}
+
+	variant, err := svc.Translate(initCtx, input)
+	if err != nil {
+		t.Fatalf("expected hybrid ladder to fall back to Qwen and succeed, got: %v", err)
+	}
+	if variant.ProviderID != provider.WorkerQwenTranslationProviderID {
+		t.Fatalf("expected final variant provider %s, got %s", provider.WorkerQwenTranslationProviderID, variant.ProviderID)
+	}
+
+	// Invariant: Gemini (quality_failed) -> DeepSeek (quality_failed) -> Qwen (succeeded)
+	attempts, err := db.ListProviderAttempts(initCtx, runID, "translation")
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	if len(attempts) != 3 {
+		t.Fatalf("expected exactly 3 attempts, got %d", len(attempts))
+	}
+	if attempts[0].ProviderID != provider.GatewayGeminiTranslationProviderID || attempts[0].Status != "quality_failed" {
+		t.Errorf("attempt 0 must be Gemini quality_failed, got %+v", attempts[0])
+	}
+	if attempts[1].ProviderID != provider.GatewayDeepSeekTranslationProviderID || attempts[1].Status != "quality_failed" {
+		t.Errorf("attempt 1 must be DeepSeek quality_failed, got %+v", attempts[1])
+	}
+	if attempts[2].ProviderID != provider.WorkerQwenTranslationProviderID || attempts[2].Status != "succeeded" {
+		t.Errorf("attempt 2 must be Qwen succeeded, got %+v", attempts[2])
+	}
+
+	// Invariant: Fallback selection decisions recorded for DeepSeek and Qwen
+	decisions, err := db.ListSelectionDecisions(initCtx, runID, "translation")
+	if err != nil {
+		t.Fatalf("list decisions: %v", err)
+	}
+	if len(decisions) < 3 {
+		t.Fatalf("expected at least 3 selection decisions across ladder, got %d", len(decisions))
+	}
+	if decisions[1].SelectedProviderID != provider.GatewayDeepSeekTranslationProviderID {
+		t.Errorf("expected decision 1 for DeepSeek, got %s", decisions[1].SelectedProviderID)
+	}
+	if decisions[2].SelectedProviderID != provider.WorkerQwenTranslationProviderID {
+		t.Errorf("expected decision 2 for Qwen, got %s", decisions[2].SelectedProviderID)
 	}
 }

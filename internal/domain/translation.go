@@ -39,21 +39,24 @@ type TranslationSegment struct {
 // TranslationVariant is the immutable target-language meaning-preserving artifact.
 // Consumed explicitly by downstream stages: T10 (visual text localization) and T13 (dubbing translation).
 type TranslationVariant struct {
-	ID             string               `json:"id"`
-	SchemaVersion  int                  `json:"schema_version"`
-	AssetID        string               `json:"asset_id"`
-	RunID          string               `json:"run_id"`
-	JobID          string               `json:"job_id,omitempty"`
-	SourceLanguage string               `json:"source_language"` // e.g. "zh"
-	TargetLanguage string               `json:"target_language"` // "vi" or "en"
-	Segments       []TranslationSegment `json:"segments"`
-	ProviderID     string               `json:"provider_id"`
-	ModelName      string               `json:"model_name"`
-	ModelVersion   string               `json:"model_version"`
-	CASHash        string               `json:"cas_hash,omitempty"`
-	ProvenanceHash string               `json:"provenance_hash,omitempty"`
-	OverallQAScore float64              `json:"overall_qa_score"`
-	CreatedAt      time.Time            `json:"created_at"`
+	ID                string               `json:"id"`
+	SchemaVersion     int                  `json:"schema_version"`
+	AssetID           string               `json:"asset_id"`
+	RunID             string               `json:"run_id"`
+	JobID             string               `json:"job_id,omitempty"`
+	SourceLanguage    string               `json:"source_language"` // e.g. "zh"
+	TargetLanguage    string               `json:"target_language"` // "vi" or "en"
+	Segments          []TranslationSegment `json:"segments"`
+	ProviderID        string               `json:"provider_id"`
+	ModelName         string               `json:"model_name"`
+	ModelVersion      string               `json:"model_version"`
+	ServiceBaselineID string               `json:"service_baseline_id,omitempty"`
+	ObservedModel     string               `json:"observed_model,omitempty"`
+	SystemFingerprint string               `json:"system_fingerprint,omitempty"`
+	CASHash           string               `json:"cas_hash,omitempty"`
+	ProvenanceHash    string               `json:"provenance_hash,omitempty"`
+	OverallQAScore    float64              `json:"overall_qa_score"`
+	CreatedAt         time.Time            `json:"created_at"`
 }
 
 // TranslationInputSegment is a text input segment for translation.
@@ -76,6 +79,7 @@ type TranslationJobInput struct {
 	TranscriptArtifactCAS string                    `json:"transcript_artifact_cas,omitempty"`
 	ExecutionProfile      ExecutionProfile          `json:"execution_profile,omitempty"`
 	AuthorizedCredentials []string                  `json:"authorized_credentials,omitempty"`
+	ConsentGranted        bool                      `json:"consent_granted,omitempty"`
 }
 
 type DubScriptSegment struct {

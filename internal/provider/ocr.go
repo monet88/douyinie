@@ -33,6 +33,15 @@ type OCRResult struct {
 	FrameHeight       int
 	FrameSampleStepMs int64
 	Detections        []RawTextDetection
+	DetSnapshotDigest string
+	RecSnapshotDigest string
+	OriSnapshotDigest string
+	RuntimeIdentity   string
+}
+
+// OCRSnapshotProvider is optionally implemented by OCR providers that expose their verified snapshot and runtime identities.
+type OCRSnapshotProvider interface {
+	OCRSnapshotDigests() (detSHA, recSHA, oriSHA, runtimeIdentity string)
 }
 
 // OCRRegionProvider defines the capability interface for visual text detection and OCR.

@@ -248,5 +248,221 @@ class Diarization3Dspeaker:
             self.assertEqual(out_evidence["speaker_evidence"]["speaker_change_count"], 1)
             self.assertEqual(out_evidence["speaker_evidence"]["confidence"], 0.0)
 
+    def test_snapshot_model_cache_dir_resolution(self):
+        """
+        Verify that snapshot paths resolving to ROOT/<model_id>/configuration.json pass model_cache_dir.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pkg_dir = os.path.join(tmpdir, "speakerlab", "bin")
+            os.makedirs(pkg_dir, exist_ok=True)
+            with open(os.path.join(tmpdir, "speakerlab", "__init__.py"), "w", encoding="utf-8") as f:
+                f.write("")
+            with open(os.path.join(tmpdir, "speakerlab", "bin", "__init__.py"), "w", encoding="utf-8") as f:
+                f.write("")
+
+            mock_code = """
+class Diarization3Dspeaker:
+    def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
+        # Assert model_cache_dir was provided
+        if "model_cache_dir" not in kwargs or not kwargs["model_cache_dir"]:
+            raise ValueError("model_cache_dir missing in constructor")
+
+    def __call__(self, audio_path):
+        return [[0.0, 1.5, "SPEAKER_00"], [1.5, 3.2, "SPEAKER_01"]]
+"""
+            with open(os.path.join(pkg_dir, "infer_diarization.py"), "w", encoding="utf-8") as f:
+                f.write(mock_code)
+
+            cache_root = os.path.join(tmpdir, "cache_root")
+            campplus_dir = os.path.join(cache_root, "iic", "speech_campplus_sv_zh_en_16k-common_advanced")
+            vad_dir = os.path.join(cache_root, "iic", "speech_fsmn_vad_zh-cn-16k-common-pytorch")
+            os.makedirs(campplus_dir, exist_ok=True)
+            os.makedirs(vad_dir, exist_ok=True)
+
+            with open(os.path.join(campplus_dir, "configuration.json"), "w", encoding="utf-8") as f:
+                f.write("{}")
+            with open(os.path.join(vad_dir, "configuration.json"), "w", encoding="utf-8") as f:
+                f.write("{}")
+
+            audio_path = os.path.join(tmpdir, "test.wav")
+            with open(audio_path, "wb") as f:
+                f.write(b"RIFFdummyWAVEfmt ")
+
+            adapter_path = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "diarizer_3dspeaker.py")
+            )
+            env = dict(os.environ)
+            env["PYTHONPATH"] = tmpdir + os.pathsep + env.get("PYTHONPATH", "")
+
+            req = {
+                "mode": "diarize",
+                "audio_path": audio_path,
+                "model_name": DEFAULT_MODEL_NAME,
+                "model_version": DEFAULT_MODEL_VERSION,
+                "vad_model_name": DEFAULT_VAD_MODEL,
+                "vad_model_version": DEFAULT_VAD_VERSION,
+                "model_path": campplus_dir,
+                "vad_model_path": vad_dir,
+                "require_model_snapshot": True,
+            }
+            proc = subprocess.run(
+                [sys.executable, adapter_path],
+                input=json.dumps(req).encode("utf-8"),
+                capture_output=True,
+                env=env,
+                check=True,
+            )
+            out = json.loads(proc.stdout.decode("utf-8"))
+            self.assertIn("speaker_assignments", out)
+            self.assertEqual(len(out["speaker_assignments"]), 2)
+
+            # Test invalid cache root fails closed
+            bad_req = dict(req)
+            bad_req["vad_model_path"] = os.path.join(tmpdir, "other_dir")
+            proc_bad = subprocess.run(
+                [sys.executable, adapter_path],
+                input=json.dumps(bad_req).encode("utf-8"),
+                capture_output=True,
+                env=env,
+            )
+            self.assertNotEqual(proc_bad.returncode, 0)
+            self.assertIn(b"WORKER_SNAPSHOT_PATH_REQUIRED", proc_bad.stderr)
+    def test_strict_mode_rejects_constructor_type_error_without_fallback(self):
+        """
+        Verify that when Diarization3Dspeaker rejects model_cache_dir with TypeError:
+        - require_model_snapshot=True fails closed with WORKER_SNAPSHOT_PATH_REQUIRED (no fallback to unbound cache).
+        - require_model_snapshot=False allows fallback to DiarizationClass() for non-strict mock testing.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pkg_dir = os.path.join(tmpdir, "speakerlab", "bin")
+            os.makedirs(pkg_dir, exist_ok=True)
+            with open(os.path.join(tmpdir, "speakerlab", "__init__.py"), "w", encoding="utf-8") as f:
+                f.write("")
+            with open(os.path.join(tmpdir, "speakerlab", "bin", "__init__.py"), "w", encoding="utf-8") as f:
+                f.write("")
+
+            # Class that accepts NO kwargs (raises TypeError if model_cache_dir is passed)
+            mock_code = """
+class Diarization3Dspeaker:
+    def __init__(self):
+        pass
+
+    def __call__(self, audio_path):
+        return [[0.0, 1.5, "SPEAKER_00"], [1.5, 3.2, "SPEAKER_01"]]
+
+    def probe_evidence(self, audio_path):
+        return {"has_multi_speaker_cues": True, "speaker_change_count": 2, "confidence": 0.0}
+"""
+            with open(os.path.join(pkg_dir, "infer_diarization.py"), "w", encoding="utf-8") as f:
+                f.write(mock_code)
+
+            cache_root = os.path.join(tmpdir, "cache_root")
+            campplus_dir = os.path.join(cache_root, "iic", "speech_campplus_sv_zh_en_16k-common_advanced")
+            vad_dir = os.path.join(cache_root, "iic", "speech_fsmn_vad_zh-cn-16k-common-pytorch")
+            os.makedirs(campplus_dir, exist_ok=True)
+            os.makedirs(vad_dir, exist_ok=True)
+
+            with open(os.path.join(campplus_dir, "configuration.json"), "w", encoding="utf-8") as f:
+                f.write("{}")
+            with open(os.path.join(vad_dir, "configuration.json"), "w", encoding="utf-8") as f:
+                f.write("{}")
+
+            audio_path = os.path.join(tmpdir, "test.wav")
+            with open(audio_path, "wb") as f:
+                f.write(b"RIFFdummyWAVEfmt ")
+
+            adapter_path = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "diarizer_3dspeaker.py")
+            )
+            env = dict(os.environ)
+            env["PYTHONPATH"] = tmpdir + os.pathsep + env.get("PYTHONPATH", "")
+
+            # 1. Strict mode (diarize): MUST fail closed, no silent fallback to unbound DiarizationClass()
+            req_strict_diarize = {
+                "mode": "diarize",
+                "audio_path": audio_path,
+                "model_name": DEFAULT_MODEL_NAME,
+                "model_version": DEFAULT_MODEL_VERSION,
+                "vad_model_name": DEFAULT_VAD_MODEL,
+                "vad_model_version": DEFAULT_VAD_VERSION,
+                "model_path": campplus_dir,
+                "vad_model_path": vad_dir,
+                "require_model_snapshot": True,
+            }
+            proc_sd = subprocess.run(
+                [sys.executable, adapter_path],
+                input=json.dumps(req_strict_diarize).encode("utf-8"),
+                capture_output=True,
+                env=env,
+            )
+            self.assertNotEqual(proc_sd.returncode, 0)
+            self.assertIn(b"WORKER_SNAPSHOT_PATH_REQUIRED", proc_sd.stderr)
+            self.assertIn(b"does not accept verified model_cache_dir", proc_sd.stderr)
+
+            # 2. Strict mode (evidence): MUST fail closed, no silent fallback
+            req_strict_evidence = {
+                "mode": "evidence",
+                "audio_path": audio_path,
+                "model_name": DEFAULT_MODEL_NAME,
+                "model_version": DEFAULT_MODEL_VERSION,
+                "vad_model_name": DEFAULT_VAD_MODEL,
+                "vad_model_version": DEFAULT_VAD_VERSION,
+                "model_path": campplus_dir,
+                "vad_model_path": vad_dir,
+                "embedding_cosine_threshold": 0.65,
+                "require_model_snapshot": True,
+            }
+            proc_se = subprocess.run(
+                [sys.executable, adapter_path],
+                input=json.dumps(req_strict_evidence).encode("utf-8"),
+                capture_output=True,
+                env=env,
+            )
+            self.assertNotEqual(proc_se.returncode, 0)
+            self.assertIn(b"WORKER_SNAPSHOT_PATH_REQUIRED", proc_se.stderr)
+            self.assertIn(b"does not accept verified model_cache_dir", proc_se.stderr)
+
+            # 3. Non-strict mode (diarize): allows fallback to DiarizationClass()
+            req_nonstrict_diarize = {
+                "mode": "diarize",
+                "audio_path": audio_path,
+                "model_name": DEFAULT_MODEL_NAME,
+                "model_version": DEFAULT_MODEL_VERSION,
+                "vad_model_name": DEFAULT_VAD_MODEL,
+                "vad_model_version": DEFAULT_VAD_VERSION,
+                "require_model_snapshot": False,
+            }
+            proc_nd = subprocess.run(
+                [sys.executable, adapter_path],
+                input=json.dumps(req_nonstrict_diarize).encode("utf-8"),
+                capture_output=True,
+                env=env,
+                check=True,
+            )
+            out_nd = json.loads(proc_nd.stdout.decode("utf-8"))
+            self.assertIn("speaker_assignments", out_nd)
+
+            # 4. Non-strict mode (evidence): allows fallback to DiarizationClass()
+            req_nonstrict_evidence = {
+                "mode": "evidence",
+                "audio_path": audio_path,
+                "model_name": DEFAULT_MODEL_NAME,
+                "model_version": DEFAULT_MODEL_VERSION,
+                "vad_model_name": DEFAULT_VAD_MODEL,
+                "vad_model_version": DEFAULT_VAD_VERSION,
+                "embedding_cosine_threshold": 0.65,
+                "require_model_snapshot": False,
+            }
+            proc_ne = subprocess.run(
+                [sys.executable, adapter_path],
+                input=json.dumps(req_nonstrict_evidence).encode("utf-8"),
+                capture_output=True,
+                env=env,
+                check=True,
+            )
+            out_ne = json.loads(proc_ne.stdout.decode("utf-8"))
+            self.assertIn("speaker_evidence", out_ne)
+
 if __name__ == "__main__":
     unittest.main()

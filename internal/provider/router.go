@@ -36,12 +36,13 @@ type RouteResult struct {
 
 // Router orchestrates policy-before-health provider selection, credential-backed authorization, and execution provenance.
 type Router struct {
-	registry   *Registry
-	policySvc  *governance.PolicyService
-	licenseSvc *governance.LicenseService
-	credSvc    *governance.CredentialService
-	circuit    *CircuitBreaker
-	db         *storage.DB
+	registry    *Registry
+	policySvc   *governance.PolicyService
+	licenseSvc  *governance.LicenseService
+	credSvc     *governance.CredentialService
+	snapshotSvc *governance.SnapshotService
+	circuit     *CircuitBreaker
+	db          *storage.DB
 }
 
 // NewRouter creates a new ProviderRouter.
@@ -69,6 +70,26 @@ func NewRouter(
 // Circuit returns the underlying circuit breaker.
 func (r *Router) Circuit() *CircuitBreaker {
 	return r.circuit
+}
+
+// SetSnapshotService sets the model snapshot verification service and propagates
+// it to registered providers that accept snapshot injection.
+func (r *Router) SetSnapshotService(snapSvc *governance.SnapshotService) {
+	r.snapshotSvc = snapSvc
+	if r.registry != nil {
+		for _, p := range r.registry.ListAll() {
+			if sp, ok := p.(interface {
+				SetSnapshotService(*governance.SnapshotService)
+			}); ok {
+				sp.SetSnapshotService(snapSvc)
+			}
+		}
+	}
+}
+
+// SnapshotService returns the configured snapshot service.
+func (r *Router) SnapshotService() *governance.SnapshotService {
+	return r.snapshotSvc
 }
 
 // Helper to check if slice contains string (case-insensitive)
@@ -269,7 +290,8 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 
 		// License checkpoint validation (versioned & fail-closed)
 		modelName, modelVer := p.ModelInfo()
-		if modelName != "" && r.licenseSvc != nil {
+		primaryRequired := primaryCheckpointRequired(p)
+		if primaryRequired && modelName != "" && r.licenseSvc != nil {
 			if err := r.licenseSvc.VerifyCheckpoint(ctx, modelName, modelVer, ""); err != nil {
 				// If manifest is missing or unverified, fail closed
 				eval.Eligible = false
@@ -280,8 +302,44 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 			}
 		}
 
+		// Snapshot verification binding validation (versioned & fail-closed, Issue #64)
+		requiresSnapshot := false
+		if rsp, ok := p.(interface{ RequiresSnapshot() bool }); ok {
+			requiresSnapshot = rsp.RequiresSnapshot()
+		}
+		if !requiresSnapshot && r.snapshotSvc != nil && r.snapshotSvc.HasBinding(modelName, modelVer) {
+			requiresSnapshot = true
+		}
+
+		if primaryRequired && requiresSnapshot && modelName != "" {
+			if r.snapshotSvc == nil {
+				eval.Eligible = false
+				eval.RejectionCode = "SNAPSHOT_UNVERIFIED"
+				eval.Reason = "snapshot verification service unavailable: unverified snapshot"
+				evaluations = append(evaluations, eval)
+				continue
+			}
+			if err := r.snapshotSvc.CheckBindingFingerprints(modelName, modelVer); err != nil {
+				eval.Eligible = false
+				if errors.Is(err, domain.ErrSnapshotUnverified) {
+					eval.RejectionCode = "SNAPSHOT_UNVERIFIED"
+				} else if errors.Is(err, domain.ErrSnapshotMutatedRehashRequired) {
+					eval.RejectionCode = "SNAPSHOT_MUTATED_REHASH_REQUIRED"
+				} else if errors.Is(err, domain.ErrSnapshotDigestMismatch) {
+					eval.RejectionCode = "SNAPSHOT_DIGEST_MISMATCH"
+				} else if errors.Is(err, domain.ErrSnapshotFileCorrupted) {
+					eval.RejectionCode = "SNAPSHOT_FILE_CORRUPTED"
+				} else {
+					eval.RejectionCode = "SNAPSHOT_UNVERIFIED"
+				}
+				eval.Reason = "snapshot verification check failed: " + err.Error()
+				evaluations = append(evaluations, eval)
+				continue
+			}
+		}
+
 		// Verify any dependent checkpoints (e.g. FSMN-VAD for diarizer) fail-closed
-		if r.licenseSvc != nil {
+		if r.licenseSvc != nil || r.snapshotSvc != nil {
 			var deps []ModelDependency
 			if dmp, ok := p.(DependentModelProvider); ok {
 				deps = dmp.ModelDependencies()
@@ -294,13 +352,37 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 			depMissing := false
 			for _, dep := range deps {
 				if dep.Name != "" {
-					if err := r.licenseSvc.VerifyCheckpoint(ctx, dep.Name, dep.Version, ""); err != nil {
-						eval.Eligible = false
-						eval.RejectionCode = "LICENSE_MANIFEST_MISSING"
-						eval.Reason = fmt.Sprintf("unmanifested or unverified dependency checkpoint %s (%s): %v", dep.Name, dep.Role, err)
-						evaluations = append(evaluations, eval)
-						depMissing = true
-						break
+					if r.licenseSvc != nil {
+						if err := r.licenseSvc.VerifyCheckpoint(ctx, dep.Name, dep.Version, ""); err != nil {
+							eval.Eligible = false
+							eval.RejectionCode = "LICENSE_MANIFEST_MISSING"
+							eval.Reason = fmt.Sprintf("unmanifested or unverified dependency checkpoint %s (%s): %v", dep.Name, dep.Role, err)
+							evaluations = append(evaluations, eval)
+							depMissing = true
+							break
+						}
+					}
+					depRequiresSnapshot := requiresSnapshot
+					if !depRequiresSnapshot && r.snapshotSvc != nil && r.snapshotSvc.HasBinding(dep.Name, dep.Version) {
+						depRequiresSnapshot = true
+					}
+					if depRequiresSnapshot {
+						if r.snapshotSvc == nil {
+							eval.Eligible = false
+							eval.RejectionCode = "DEPENDENCY_SNAPSHOT_INVALID"
+							eval.Reason = fmt.Sprintf("snapshot service unavailable for dependency %s (%s)", dep.Name, dep.Role)
+							evaluations = append(evaluations, eval)
+							depMissing = true
+							break
+						}
+						if err := r.snapshotSvc.CheckBindingFingerprints(dep.Name, dep.Version); err != nil {
+							eval.Eligible = false
+							eval.RejectionCode = "DEPENDENCY_SNAPSHOT_INVALID"
+							eval.Reason = fmt.Sprintf("invalid or unverified dependency snapshot %s (%s): %v", dep.Name, dep.Role, err)
+							evaluations = append(evaluations, eval)
+							depMissing = true
+							break
+						}
 					}
 				}
 			}
@@ -319,7 +401,8 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 			continue
 		}
 
-		if req.Language != "" && len(cap.Languages) > 0 && !containsFold(cap.Languages, req.Language) {
+		reqLang := strings.TrimSpace(req.Language)
+		if reqLang != "" && reqLang != "*" && len(cap.Languages) > 0 && !containsFold(cap.Languages, reqLang) {
 			eval.Eligible = false
 			eval.RejectionCode = "LANGUAGE_NOT_SUPPORTED"
 			eval.Reason = fmt.Sprintf("language %s not supported", req.Language)
@@ -342,6 +425,15 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 				evaluations = append(evaluations, eval)
 				continue
 			}
+		}
+
+		// Profile tier gating: Local profile hard-excludes every remote/cloud provider candidate
+		if req.ExecutionProfile == domain.ExecutionProfileLocal && !strings.EqualFold(cap.ExecutionTier, "local") {
+			eval.Eligible = false
+			eval.RejectionCode = "PROFILE_TIER_EXCLUDED"
+			eval.Reason = fmt.Sprintf("execution profile local hard-excludes non-local tier %s", cap.ExecutionTier)
+			evaluations = append(evaluations, eval)
+			continue
 		}
 
 		// 3. Runtime Health & Circuit Breaker Check
@@ -367,7 +459,7 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 		}
 
 		// 4. Profile / Quality / Cost Scoring
-		score := calculateScore(cap, req.ExecutionProfile)
+		score := calculateScore(p.ID(), cap, req.ExecutionProfile)
 		if req.PreferredProviderID != "" {
 			pref := strings.ToLower(req.PreferredProviderID)
 			pid := strings.ToLower(p.ID())
@@ -450,8 +542,7 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 		Decision:         decision,
 	}, nil
 }
-
-func calculateScore(cap domain.ProviderCapability, profile domain.ExecutionProfile) float64 {
+func calculateScore(providerID string, cap domain.ProviderCapability, profile domain.ExecutionProfile) float64 {
 	var baseScore float64
 
 	switch profile {
@@ -474,16 +565,37 @@ func calculateScore(cap domain.ProviderCapability, profile domain.ExecutionProfi
 	case domain.ExecutionProfileHybrid:
 		fallthrough
 	default:
-		// Cost-First Hybrid Default:
-		if strings.EqualFold(cap.ExecutionTier, "local") {
-			baseScore += 6.0
-		} else if strings.EqualFold(cap.ExecutionTier, "hybrid") {
-			baseScore += 5.0
+		// Translation stage has approved frozen hybrid ordering (Issue #66):
+		// gateway gemini-3.8-flash -> gateway deepseek/deepseek-v4-flash-vision-exp -> local Qwen fallback.
+		// Uses exact provider IDs with deterministic score separation so lane ordering
+		// is explicitly guaranteed regardless of minor quality score deltas.
+		if strings.EqualFold(cap.Stage, string(TypeTranslation)) || strings.EqualFold(cap.Stage, "translation") {
+			switch providerID {
+			case GatewayGeminiTranslationProviderID:
+				baseScore += 1000.0
+			case GatewayDeepSeekTranslationProviderID:
+				baseScore += 500.0
+			case WorkerQwenTranslationProviderID, "translation_fake_qwen":
+				baseScore += 100.0
+			default:
+				if strings.EqualFold(cap.ExecutionTier, "cloud") || strings.EqualFold(cap.ExecutionTier, "hybrid") {
+					baseScore += 50.0
+				} else {
+					baseScore += 10.0
+				}
+			}
 		} else {
-			baseScore += 3.0
+			// Cost-First Hybrid Default:
+			if strings.EqualFold(cap.ExecutionTier, "local") {
+				baseScore += 6.0
+			} else if strings.EqualFold(cap.ExecutionTier, "hybrid") {
+				baseScore += 5.0
+			} else {
+				baseScore += 3.0
+			}
+			// Cost penalty
+			baseScore -= cap.CostPerUnit * 10.0
 		}
-		// Cost penalty
-		baseScore -= cap.CostPerUnit * 10.0
 	}
 
 	// Quality boost
@@ -550,6 +662,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 
 	for idx, p := range candidates {
 		modelName, modelVer := p.ModelInfo()
+		primaryRequired := primaryCheckpointRequired(p)
 		var effectivePolicy domain.PolicyState
 
 		// When moving to an alternate candidate (idx > 0), re-evaluate policy eligibility and append selection decision provenance
@@ -581,14 +694,49 @@ func (r *Router) ExecuteRoutedWithRetry(
 				continue
 			}
 
-			if modelName != "" && r.licenseSvc != nil {
+			if primaryRequired && modelName != "" && r.licenseSvc != nil {
 				if err := r.licenseSvc.VerifyCheckpoint(ctx, modelName, modelVer, ""); err != nil {
+					lastErr = err
+					continue
+				}
+			}
+			requiresSnapshot := false
+			if rsp, ok := p.(interface{ RequiresSnapshot() bool }); ok {
+				requiresSnapshot = rsp.RequiresSnapshot()
+			}
+			if !requiresSnapshot && r.snapshotSvc != nil && r.snapshotSvc.HasBinding(modelName, modelVer) {
+				requiresSnapshot = true
+			}
+			if primaryRequired && requiresSnapshot && modelName != "" {
+				if r.snapshotSvc == nil {
+					lastErr = domain.ErrSnapshotUnverified
+					continue
+				}
+				if err := r.snapshotSvc.CheckBindingFingerprints(modelName, modelVer); err != nil {
 					lastErr = err
 					continue
 				}
 			}
 		}
 
+		// Verify snapshot integrity right before execution attempt (Issue #64)
+		requiresSnapshot := false
+		if rsp, ok := p.(interface{ RequiresSnapshot() bool }); ok {
+			requiresSnapshot = rsp.RequiresSnapshot()
+		}
+		if !requiresSnapshot && r.snapshotSvc != nil && r.snapshotSvc.HasBinding(modelName, modelVer) {
+			requiresSnapshot = true
+		}
+		if primaryRequired && requiresSnapshot && modelName != "" {
+			if r.snapshotSvc == nil {
+				lastErr = domain.ErrSnapshotUnverified
+				continue
+			}
+			if err := r.snapshotSvc.CheckBindingFingerprints(modelName, modelVer); err != nil {
+				lastErr = err
+				continue
+			}
+		}
 		if r.circuit != nil && !r.circuit.CanAttempt(p.ID()) {
 			attemptGlobal++
 			pa := domain.ProviderAttempt{
@@ -606,6 +754,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 				CostUnits:     0.0,
 				CreatedAt:     time.Now().UTC(),
 			}
+			enrichAttemptMetadata(&pa, p)
 			if r.db != nil {
 				if err := r.db.RecordProviderAttempt(ctx, pa); err != nil {
 					return fmt.Errorf("fail-closed: record circuit_broken attempt provenance: %w", err)
@@ -629,7 +778,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 						PolicyState:   string(effectivePolicy),
 						HealthOK:      p.IsHealthy(),
 						CircuitClosed: true,
-						Score:         calculateScore(p.Capability(), req.ExecutionProfile),
+						Score:         calculateScore(p.ID(), p.Capability(), req.ExecutionProfile),
 						Reason:        "selected alternate fallback candidate after prior failure",
 					},
 				},
@@ -674,6 +823,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 					CostUnits:     p.Capability().CostPerUnit,
 					CreatedAt:     time.Now().UTC(),
 				}
+				enrichAttemptMetadata(&pa, p)
 				if r.db != nil {
 					if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
 						return fmt.Errorf("fail-closed: record succeeded attempt provenance: %w", errDB)
@@ -712,6 +862,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 					CostUnits:     0.0,
 					CreatedAt:     time.Now().UTC(),
 				}
+				enrichAttemptMetadata(&pa, p)
 				if r.db != nil {
 					if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
 						return fmt.Errorf("fail-closed: record policy_rejected attempt provenance: %w (original: %v)", errDB, err)
@@ -737,6 +888,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 					CostUnits:     p.Capability().CostPerUnit,
 					CreatedAt:     time.Now().UTC(),
 				}
+				enrichAttemptMetadata(&pa, p)
 				if r.db != nil {
 					if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
 						return fmt.Errorf("fail-closed: record quality_failed attempt provenance: %w", errDB)
@@ -761,6 +913,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 				CostUnits:     0.0,
 				CreatedAt:     time.Now().UTC(),
 			}
+			enrichAttemptMetadata(&pa, p)
 			if r.db != nil {
 				if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
 					return fmt.Errorf("fail-closed: record failed attempt provenance: %w", errDB)
@@ -773,4 +926,10 @@ func (r *Router) ExecuteRoutedWithRetry(
 	}
 
 	return fmt.Errorf("all provider candidates failed for stage %s: %w", req.Stage, lastErr)
+}
+
+func enrichAttemptMetadata(pa *domain.ProviderAttempt, p Provider) {
+	prov := ExtractRemoteProvenance(p)
+	pa.ObservedModel = prov.ObservedModel
+	pa.ServiceBaselineID = prov.ServiceBaselineID
 }
