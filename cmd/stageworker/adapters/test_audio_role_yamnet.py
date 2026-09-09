@@ -217,6 +217,87 @@ class TestAudioRoleYAMNetAdapter(unittest.TestCase):
             audio_role_yamnet.resolve_model_path("nonexistent_dir_123")
         self.assertIn("does not exist", str(ctx.exception))
 
+    def test_low_confidence_quiet_background_maps_to_uncertain(self):
+        v_path = self._create_wav(duration_sec=1.5, amplitude=100)
+        b_path = self._create_wav(duration_sec=1.5, amplitude=100)
+        try:
+            # Both instrumental (132) and SFX (100) below safe threshold (e.g. 0.05)
+            scores = [0.0] * 521
+            scores[132] = 0.05
+            scores[100] = 0.04
+            audio_role_yamnet._YAMNET_MODEL_FACTORY = lambda p: MockYAMNetImpl(scores)
+
+            res = audio_role_yamnet.run_audio_role_analysis({
+                "vocals_audio": v_path,
+                "background_audio": b_path,
+                "model_path": "fake_root",
+            })
+            self.assertEqual(len(res["segments"]), 1)
+            self.assertEqual(res["segments"][0]["role"], "uncertain",
+                             "low-confidence background must not default to instrumental/background")
+        finally:
+            os.remove(v_path)
+            os.remove(b_path)
+
+    def test_empty_wav_fails_closed_with_error(self):
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            # 0 frames
+        audio_role_yamnet._YAMNET_MODEL_FACTORY = lambda p: MockYAMNetImpl([0.0] * 521)
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                audio_role_yamnet.run_audio_role_analysis({
+                    "source_audio": path,
+                    "model_path": "fake_root",
+                })
+            self.assertIn("empty", str(ctx.exception).lower())
+        finally:
+            os.close(fd)
+            os.remove(path)
+
+    def test_conflicting_background_maps_to_uncertain(self):
+        v_path = self._create_wav(duration_sec=1.5, amplitude=100)
+        b_path = self._create_wav(duration_sec=1.5, amplitude=15000)
+        try:
+            # Both instrumental and SFX are strong and near-identical (conflicting evidence)
+            scores = [0.0] * 521
+            scores[132] = 0.40  # instrumental
+            scores[100] = 0.39  # SFX (diff 0.01 < margin 0.08)
+            audio_role_yamnet._YAMNET_MODEL_FACTORY = lambda p: MockYAMNetImpl(scores)
+
+            res = audio_role_yamnet.run_audio_role_analysis({
+                "vocals_audio": v_path,
+                "background_audio": b_path,
+                "model_path": "fake_root",
+            })
+            self.assertEqual(len(res["segments"]), 1)
+            self.assertEqual(res["segments"][0]["role"], "uncertain")
+        finally:
+            os.remove(v_path)
+            os.remove(b_path)
+
+    def test_source_only_low_confidence_maps_to_uncertain(self):
+        s_path = self._create_wav(duration_sec=1.5, amplitude=1000)
+        try:
+            # Unseparated source has low confidence across all roles
+            scores = [0.0] * 521
+            scores[0] = 0.10  # low speech
+            scores[132] = 0.12  # low music
+            audio_role_yamnet._YAMNET_MODEL_FACTORY = lambda p: MockYAMNetImpl(scores)
+
+            res = audio_role_yamnet.run_audio_role_analysis({
+                "source_audio": s_path,
+                "model_path": "fake_root",
+            })
+            self.assertEqual(len(res["segments"]), 1)
+            self.assertEqual(res["segments"][0]["role"], "uncertain",
+                             "source-only fallback must be conservative and not infer confident no-dub")
+        finally:
+            os.remove(s_path)
+
 
 if __name__ == "__main__":
     unittest.main()

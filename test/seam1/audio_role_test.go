@@ -14,6 +14,7 @@ import (
 
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/provider"
+	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
 )
 
@@ -973,5 +974,33 @@ func TestSeam1_SpeechUnderstand_AutomaticPrerequisiteGeneration(t *testing.T) {
 	defer speechResp2.Body.Close()
 	if speechResp2.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("expected fail-closed 422 Unprocessable Entity when audio role service is nil, got %d", speechResp2.StatusCode)
+	}
+}
+
+func TestSeam1_SpeechUnderstand_AudioRoleErrorClassification(t *testing.T) {
+	h := setupHarness(t)
+
+	// Case 1: AudioRoleService configured with NO analyzer and an empty router (no eligible provider)
+	// -> Automatic prerequisite generation fails with 503 Service Unavailable
+	audioMixSvc := service.NewAudioMixService(h.db, h.casStore)
+	emptyReg := provider.NewRegistry()
+	emptyRouter := provider.NewRouter(emptyReg, nil, nil, nil, nil, h.db)
+	emptyAudioRole := service.NewAudioRoleService(h.db, h.casStore, audioMixSvc)
+	emptyAudioRole.ConfigureRouter(emptyRouter)
+	h.srv.SetAudioRoleService(emptyAudioRole)
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	speechBody, _ := json.Marshal(map[string]any{"run_id": runID})
+	speechResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/speech-understand", h.server.URL, assetID), "application/json", bytes.NewReader(speechBody))
+	if err != nil {
+		t.Fatalf("speech-understand request failed: %v", err)
+	}
+	defer speechResp.Body.Close()
+
+	if speechResp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable when audio role analyzer/provider is unavailable, got %d", speechResp.StatusCode)
 	}
 }

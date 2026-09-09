@@ -166,6 +166,9 @@ func New(cfg Config) *Server {
 			cfg.ReviewSvc.SetRenderService(cfg.RenderSvc)
 		}
 	}
+	if cfg.AudioRoleSvc != nil && cfg.Router != nil {
+		cfg.AudioRoleSvc.ConfigureRouter(cfg.Router)
+	}
 	s := &Server{
 		db:             cfg.DB,
 		casStore:       cfg.CASStore,
@@ -255,6 +258,9 @@ func (s *Server) SetAudioMixService(svc *service.AudioMixService) {
 // SetAudioRoleService sets or replaces the injected audio role service (Issue #80).
 func (s *Server) SetAudioRoleService(svc *service.AudioRoleService) {
 	s.audioRoleSvc = svc
+	if svc != nil && s.router != nil {
+		svc.ConfigureRouter(s.router)
+	}
 }
 
 // SetVisualTextService sets or replaces the injected visual text pipeline (T09).
@@ -835,7 +841,24 @@ func (s *Server) handleRunSpeechUnderstand(w http.ResponseWriter, r *http.Reques
 			RunID:   body.RunID,
 		})
 		if err != nil {
-			writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("automatic audio role plan prerequisite generation failed: %v", err))
+			if errors.Is(err, domain.ErrAudioRoleAnalyzerUnavailable) ||
+				errors.Is(err, domain.ErrNoEligibleProvider) ||
+				errors.Is(err, domain.ErrPolicyBlocked) ||
+				errors.Is(err, domain.ErrLicenseManifestMissing) ||
+				errors.Is(err, domain.ErrSnapshotUnverified) ||
+				errors.Is(err, domain.ErrAudioRoleModelAssetMissing) ||
+				strings.Contains(err.Error(), "no eligible provider") ||
+				strings.Contains(err.Error(), "no available provider") ||
+				strings.Contains(err.Error(), "all provider candidates failed") {
+				writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("automatic audio role plan analyzer unavailable: %v", err))
+				return
+			}
+			if strings.Contains(err.Error(), "preflight report required") ||
+				strings.Contains(err.Error(), "normalized audio artifact missing") {
+				writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("automatic audio role plan prerequisite missing: %v", err))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("automatic audio role plan generation failed: %v", err))
 			return
 		}
 		rolePlan = genPlan

@@ -35,8 +35,13 @@ INSTRUMENTAL_INDICES = set(range(132, 277))
 # All other AudioSet classes fall into ambience / sound effects / foley
 SFX_INDICES = (set(range(0, 521)) - DIALOGUE_INDICES - SINGING_INDICES - INSTRUMENTAL_INDICES)
 
-DEFAULT_CONFIG = {
-    "version": "1.0",
+# Versioned conservative bootstrap mapping configuration.
+# NOTE: YAMNet raw output scores are uncalibrated activations across 521 AudioSet classes,
+# not calibrated posterior probabilities. These thresholds represent conservative operational
+# decision bounds for bootstrap classification, preferring "uncertain" over false-positive
+# auto-classification or premature no-dub.
+BOOTSTRAP_CONSERVATIVE_CONFIG = {
+    "version": "1.0-bootstrap-conservative",
     "window_samples": 15600,
     "sample_rate": 16000,
     "dialogue_threshold": 0.30,
@@ -47,6 +52,7 @@ DEFAULT_CONFIG = {
     "uncertain_margin": 0.08,
     "min_confidence": 0.20,
 }
+DEFAULT_CONFIG = BOOTSTRAP_CONSERVATIVE_CONFIG
 
 
 def read_wav_mono_16k(path: str) -> Tuple[List[float], int, int]:
@@ -185,10 +191,11 @@ def classify_window(
     bg_window: List[float],
     classifier: YAMNetClassifier,
     cfg: Dict[str, Any],
+    is_source_only: bool = False,
 ) -> str:
     v_rms = compute_rms(vocals_window)
     v_scores = classifier.infer(vocals_window)
-    bg_scores = classifier.infer(bg_window)
+    bg_scores = classifier.infer(bg_window) if bg_window != vocals_window else v_scores
 
     s_dial = max(v_scores[i] for i in DIALOGUE_INDICES)
     s_sing = max(v_scores[i] for i in SINGING_INDICES)
@@ -203,6 +210,28 @@ def classify_window(
     inst_thresh = cfg.get("instrumental_threshold", 0.25)
     amb_thresh = cfg.get("ambience_threshold", 0.25)
 
+    if is_source_only:
+        # Source-only fallback without isolated vocal stem must be conservative:
+        # do not infer confident no-dub from absence of vocal evidence alone.
+        if s_dial >= dial_thresh and s_dial > s_sing:
+            if abs(s_dial - s_sing) < uncertain_margin:
+                return "uncertain"
+            return "narration/dialogue"
+        if s_sing >= sing_thresh and s_sing > s_dial:
+            if abs(s_sing - s_dial) < uncertain_margin:
+                return "uncertain"
+            return "singing/music-vocal"
+        # Only strong positive non-dialogue evidence can classify as background or SFX
+        if s_inst >= inst_thresh and s_inst > s_sfx:
+            if abs(s_inst - s_sfx) < uncertain_margin:
+                return "uncertain"
+            return "instrumental/background"
+        if s_sfx >= amb_thresh and s_sfx > s_inst:
+            if abs(s_sfx - s_inst) < uncertain_margin:
+                return "uncertain"
+            return "ambience/SFX"
+        return "uncertain"
+
     if v_rms >= vocal_rms_thresh:
         # Vocals stem has measurable sound
         if abs(s_dial - s_sing) < uncertain_margin and max(s_dial, s_sing) >= min_confidence:
@@ -211,20 +240,19 @@ def classify_window(
             return "narration/dialogue"
         if s_sing >= sing_thresh and s_sing > s_dial:
             return "singing/music-vocal"
-        if max(s_dial, s_sing) < min_confidence:
-            return "uncertain"
         return "uncertain"
     else:
-        # Vocals stem is silent / background dominates
+        # Vocals stem is silent / below RMS threshold
+        # Positive non-dialogue evidence is strictly required for background/SFX
         if abs(s_inst - s_sfx) < uncertain_margin and max(s_inst, s_sfx) >= min_confidence:
             return "uncertain"
         if s_inst >= inst_thresh and s_inst > s_sfx:
             return "instrumental/background"
         if s_sfx >= amb_thresh and s_sfx > s_inst:
             return "ambience/SFX"
-        # If both are below threshold and quiet, default to background
-        return "instrumental/background"
-
+        # Low-confidence background (both instrumental and SFX below safe evidence threshold) => uncertain!
+        # NEVER default to instrumental/background when evidence is weak or quiet!
+        return "uncertain"
 
 def merge_adjacent_segments(raw_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not raw_segments:
@@ -278,23 +306,16 @@ def run_audio_role_analysis(req: Dict[str, Any]) -> Dict[str, Any]:
     window_samples = cfg.get("window_samples", 15600)
     raw_segments = []
 
-    if max_len == 0:
-        # Zero duration valid empty/background plan
-        return {
-            "segments": [{"start_ms": 0, "end_ms": 0, "role": "instrumental/background"}],
-            "model_name": PINNED_MODEL_NAME,
-            "model_version": PINNED_MODEL_VERSION,
-            "runtime_identity": f"{PINNED_YAMNET_PACKAGE} {PINNED_YAMNET_VERSION}",
-            "provider_id": "yamnet_worker",
-        }
+    if max_len == 0 or duration_ms == 0:
+        raise ValueError("audio input is empty or contains zero readable samples; fail-closed")
 
+    is_source_only = not bool(vocals_path)
     for idx in range(0, max_len, window_samples):
         start_ms = int(idx * 1000 / sr)
         end_ms = min(duration_ms, int((idx + window_samples) * 1000 / sr))
         v_win = vocals_samples[idx : idx + window_samples]
         b_win = bg_samples[idx : idx + window_samples]
-
-        role = classify_window(v_win, b_win, classifier, cfg)
+        role = classify_window(v_win, b_win, classifier, cfg, is_source_only=is_source_only)
         raw_segments.append({
             "start_ms": start_ms,
             "end_ms": end_ms,

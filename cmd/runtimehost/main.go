@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/governance"
@@ -89,19 +88,9 @@ func main() {
 	licSvc := governance.NewLicenseService(db)
 	credSvc := governance.NewCredentialService(db)
 	snapSvc := governance.NewSnapshotService(db, licSvc)
-	_ = licSvc.RegisterManifest(context.Background(), domain.LicenseManifestEntry{
-		ID:             uuid.NewString(),
-		DependencyName: provider.YAMNetModelID,
-		Version:        provider.YAMNetModelVersion,
-		SHA256:         domain.PinnedYAMNetManifestSHA256,
-		SourceRepo:     "https://tfhub.dev/google/lite-model/yamnet/classification/tflite/1?lite-format=tflite",
-		CodeLicense:    "Apache-2.0",
-		ModelLicense:   "Apache-2.0",
-		DataLicense:    "CC-BY-4.0",
-		ServiceTerms:   "https://tfhub.dev/terms",
-		Verified:       true,
-		CreatedAt:      time.Now().UTC(),
-	})
+	if err := provider.BootstrapYAMNetLicenseManifest(context.Background(), licSvc); err != nil {
+		log.Fatalf("[RuntimeHost] failed to bootstrap YAMNet license manifest: %v", err)
+	}
 	reg, err := provider.NewProductionSpeechRegistry(gpuLeaseMgr, snapSvc, credSvc.MaterializeSecret)
 	if err != nil {
 		log.Fatalf("[RuntimeHost] failed to initialize production speech registry: %v", err)

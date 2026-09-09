@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/governance"
 	"github.com/monet88/douyinie/internal/worker"
 )
 
@@ -21,7 +22,11 @@ const (
 	YAMNetModelVersion = domain.PinnedYAMNetModelVersion
 )
 
-// AudioRoleConfig defines versioned threshold and calibration settings for YAMNet audio role analysis.
+// AudioRoleConfig defines versioned threshold and mapping settings for YAMNet audio role analysis.
+// NOTE: YAMNet raw scores are uncalibrated sigmoid activations across 521 AudioSet classes,
+// not calibrated posterior probabilities. These thresholds represent conservative operational
+// decision bounds for bootstrap classification, preferring "uncertain" over false-positive
+// auto-classification or premature no-dub.
 type AudioRoleConfig struct {
 	Version               string  `json:"version"`
 	WindowSamples         int     `json:"window_samples"`
@@ -35,10 +40,10 @@ type AudioRoleConfig struct {
 	MinConfidence         float64 `json:"min_confidence"`
 }
 
-// DefaultAudioRoleConfig returns the calibrated default configuration for Google YAMNet classification TFLite v1.
-func DefaultAudioRoleConfig() AudioRoleConfig {
+// BootstrapConservativeAudioRoleConfig returns the versioned conservative bootstrap mapping configuration.
+func BootstrapConservativeAudioRoleConfig() AudioRoleConfig {
 	return AudioRoleConfig{
-		Version:               "1.0",
+		Version:               "1.0-bootstrap-conservative",
 		WindowSamples:         15600,
 		SampleRate:            16000,
 		DialogueThreshold:     0.30,
@@ -51,6 +56,11 @@ func DefaultAudioRoleConfig() AudioRoleConfig {
 	}
 }
 
+// DefaultAudioRoleConfig returns BootstrapConservativeAudioRoleConfig.
+func DefaultAudioRoleConfig() AudioRoleConfig {
+	return BootstrapConservativeAudioRoleConfig()
+}
+
 // Hash returns the deterministic SHA-256 digest of the canonical JSON configuration.
 func (c AudioRoleConfig) Hash() string {
 	b, err := json.Marshal(c)
@@ -59,6 +69,57 @@ func (c AudioRoleConfig) Hash() string {
 	}
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
+}
+
+// BootstrapYAMNetLicenseManifest idempotently registers and verifies the official Google YAMNet license manifest.
+// Fails closed if registration fails for any reason other than exact existing entry, or if an existing entry mismatches.
+func BootstrapYAMNetLicenseManifest(ctx context.Context, licSvc *governance.LicenseService) error {
+	if licSvc == nil {
+		return fmt.Errorf("license service is required to bootstrap YAMNet license manifest")
+	}
+
+	expected := domain.LicenseManifestEntry{
+		DependencyName: YAMNetModelID,
+		Version:        YAMNetModelVersion,
+		SHA256:         domain.PinnedYAMNetManifestSHA256,
+		SourceRepo:     "https://tfhub.dev/google/lite-model/yamnet/classification/tflite/1?lite-format=tflite",
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "AudioSet dataset: CC-BY-4.0; AudioSet ontology/class map: CC-BY-SA-4.0",
+		ServiceTerms:   "https://tfhub.dev/terms (local snapshot runtime inference; no external network calls at inference time)",
+		Verified:       true,
+	}
+
+	err := licSvc.RegisterManifest(ctx, expected)
+	if err == nil {
+		return nil
+	}
+
+	// If registration fails because immutable entry already exists, verify exact match
+	if strings.Contains(err.Error(), "already exists") {
+		existing, getErr := licSvc.GetManifest(ctx, expected.DependencyName, expected.Version)
+		if getErr != nil {
+			return fmt.Errorf("load existing license manifest for %s %s: %w", expected.DependencyName, expected.Version, getErr)
+		}
+		if existing == nil {
+			return fmt.Errorf("license manifest for %s %s missing after collision", expected.DependencyName, expected.Version)
+		}
+		if !existing.Verified {
+			return fmt.Errorf("existing license manifest for %s %s is not verified", expected.DependencyName, expected.Version)
+		}
+		if existing.SHA256 != expected.SHA256 {
+			return fmt.Errorf("existing license manifest SHA mismatch for %s %s: got %s, want %s",
+				expected.DependencyName, expected.Version, existing.SHA256, expected.SHA256)
+		}
+		if existing.CodeLicense != expected.CodeLicense ||
+			existing.ModelLicense != expected.ModelLicense ||
+			existing.DataLicense != expected.DataLicense {
+			return fmt.Errorf("existing license manifest obligation mismatch for %s %s", expected.DependencyName, expected.Version)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("register YAMNet license manifest: %w", err)
 }
 
 // WorkerAudioRoleProvider implements the concrete StageWorker adapter provider for YAMNet AudioRolePlan analysis.

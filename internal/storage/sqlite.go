@@ -2351,8 +2351,13 @@ func (s *DB) ListProviderAttempts(ctx context.Context, runID string, stage strin
 	var query string
 	var args []any
 	if stage != "" {
-		query = `SELECT id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at, COALESCE(observed_model, ''), COALESCE(service_baseline_id, '') FROM provider_attempts WHERE run_id = ? AND stage = ? ORDER BY attempt_number ASC, created_at ASC, id ASC`
-		args = []any{runID, stage}
+		if stage == "audio_role" || stage == "audio_role_plan" {
+			query = `SELECT id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at, COALESCE(observed_model, ''), COALESCE(service_baseline_id, '') FROM provider_attempts WHERE run_id = ? AND (stage = 'audio_role' OR stage = 'audio_role_plan') ORDER BY attempt_number ASC, created_at ASC, id ASC`
+			args = []any{runID}
+		} else {
+			query = `SELECT id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at, COALESCE(observed_model, ''), COALESCE(service_baseline_id, '') FROM provider_attempts WHERE run_id = ? AND stage = ? ORDER BY attempt_number ASC, created_at ASC, id ASC`
+			args = []any{runID, stage}
+		}
 	} else if runID != "" {
 		query = `SELECT id, run_id, stage, provider_id, model_name, model_version, input_hash, attempt_number, status, error_message, latency_ms, cost_units, created_at, COALESCE(observed_model, ''), COALESCE(service_baseline_id, '') FROM provider_attempts WHERE run_id = ? ORDER BY attempt_number ASC, created_at ASC, id ASC`
 		args = []any{runID}
@@ -2421,8 +2426,13 @@ func (s *DB) ListSelectionDecisions(ctx context.Context, runID string, stage str
 	var query string
 	var args []any
 	if stage != "" && runID != "" {
-		query = `SELECT id, run_id, stage, selected_provider_id, candidates_evaluated_json, policy_check_result, decision_reason, created_at FROM selection_decisions WHERE run_id = ? AND stage = ? ORDER BY created_at ASC, id ASC`
-		args = []any{runID, stage}
+		if stage == "audio_role" || stage == "audio_role_plan" {
+			query = `SELECT id, run_id, stage, selected_provider_id, candidates_evaluated_json, policy_check_result, decision_reason, created_at FROM selection_decisions WHERE run_id = ? AND (stage = 'audio_role' OR stage = 'audio_role_plan') ORDER BY created_at ASC, id ASC`
+			args = []any{runID}
+		} else {
+			query = `SELECT id, run_id, stage, selected_provider_id, candidates_evaluated_json, policy_check_result, decision_reason, created_at FROM selection_decisions WHERE run_id = ? AND stage = ? ORDER BY created_at ASC, id ASC`
+			args = []any{runID, stage}
+		}
 	} else if runID != "" {
 		query = `SELECT id, run_id, stage, selected_provider_id, candidates_evaluated_json, policy_check_result, decision_reason, created_at FROM selection_decisions WHERE run_id = ? ORDER BY created_at ASC, id ASC`
 		args = []any{runID}

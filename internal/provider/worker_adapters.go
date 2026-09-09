@@ -269,6 +269,16 @@ func (b *workerBridge) run(ctx context.Context, cmd worker.Command) ([]byte, err
 									return nil, fmt.Errorf("resolve separator model entrypoint: %w", epErr)
 								}
 								entrypointFile = ep
+							} else if cmd.Family == "audio_role" || cmd.Stage == "audio_role" {
+								if primaryBinding.DependencyName != YAMNetModelID || primaryBinding.Version != YAMNetModelVersion {
+									return nil, fmt.Errorf("invalid YAMNet snapshot binding %s:%s (must be exact RC %s:%s): %w",
+										primaryBinding.DependencyName, primaryBinding.Version, YAMNetModelID, YAMNetModelVersion, domain.ErrSnapshotUnverified)
+								}
+								ep, epErr := domain.ResolveAudioRoleEntrypoint(primaryBinding.Manifest, primaryBinding.LocalPath, mName)
+								if epErr != nil {
+									return nil, fmt.Errorf("resolve audio_role model entrypoint: %w", epErr)
+								}
+								entrypointFile = ep
 							}
 							envelope := worker.ModelSnapshotEnvelope{
 								Primary: worker.ModelSnapshotRef{
@@ -315,6 +325,19 @@ func (b *workerBridge) run(ctx context.Context, cmd worker.Command) ([]byte, err
 											break
 										}
 									}
+								}
+							}
+							if cmd.Family == "audio_role" || cmd.Stage == "audio_role" {
+								classMapPath, cmErr := domain.ResolveAudioRoleClassMapPath(primaryBinding.Manifest, primaryBinding.LocalPath)
+								if cmErr == nil && classMapPath != "" {
+									envelope.Dependencies = append(envelope.Dependencies, worker.ModelSnapshotRef{
+										Role:                   "class_map",
+										DependencyName:         primaryBinding.DependencyName,
+										Version:                primaryBinding.Version,
+										SnapshotManifestSHA256: primaryBinding.SnapshotManifestSHA256,
+										LocalPath:              primaryBinding.LocalPath,
+										EntrypointFile:         classMapPath,
+									})
 								}
 							}
 							if vadName, ok := cmd.Config["vad_model_name"].(string); ok && vadName != "" {

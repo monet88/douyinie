@@ -781,3 +781,27 @@ func ResolveAudioRoleEntrypoint(manifest SnapshotManifest, snapshotRoot, modelNa
 	}
 	return verifySnapshotRegularFile(cleanRoot, tfliteEntry, "yamnet.tflite")
 }
+
+// ResolveAudioRoleClassMapPath validates and returns the class map CSV file declared in the snapshot manifest.
+func ResolveAudioRoleClassMapPath(manifest SnapshotManifest, snapshotRoot string) (string, error) {
+	cleanRoot := strings.TrimSpace(snapshotRoot)
+	if cleanRoot == "" {
+		return "", fmt.Errorf("%w: empty snapshotRoot", ErrSnapshotFileCorrupted)
+	}
+	var classMapEntry *SnapshotFileEntry
+	for i, f := range manifest.Files {
+		norm := strings.ToLower(NormalizeRelativePath(f.RelativePath))
+		if strings.HasSuffix(norm, "yamnet_class_map.csv") || norm == "yamnet_class_map.csv" {
+			classMapEntry = &manifest.Files[i]
+			break
+		}
+	}
+	if classMapEntry == nil {
+		return "", fmt.Errorf("%w: yamnet_class_map.csv not declared in snapshot manifest", ErrAudioRoleModelAssetMissing)
+	}
+	if !strings.EqualFold(classMapEntry.SHA256, PinnedYAMNetClassMapSHA256) {
+		return "", fmt.Errorf("%w: YAMNet class map %s SHA-256 mismatch: expected %s, got %s",
+			ErrSnapshotDigestMismatch, classMapEntry.RelativePath, PinnedYAMNetClassMapSHA256, classMapEntry.SHA256)
+	}
+	return verifySnapshotRegularFile(cleanRoot, classMapEntry, "yamnet_class_map.csv")
+}

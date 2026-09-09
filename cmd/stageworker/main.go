@@ -1415,9 +1415,13 @@ func runAudioRoleAdapter(ctx context.Context, cmd worker.Command, enc *worker.En
 		return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
 			fmt.Sprintf("invalid model_snapshot envelope: %v", parseErr), nil)
 	}
-	var modelPath string
+	var modelPath, entrypointFile string
 	if snapEnv != nil {
 		modelPath = snapEnv.Primary.LocalPath
+		entrypointFile = snapEnv.Primary.EntrypointFile
+		if entrypointFile == "" {
+			entrypointFile = snapEnv.EntrypointFile
+		}
 	} else if reqSnap, _ := cmd.Config["require_model_snapshot"].(bool); reqSnap {
 		return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
 			"required model snapshot envelope missing from audio_role command config", nil)
@@ -1434,13 +1438,22 @@ func runAudioRoleAdapter(ctx context.Context, cmd worker.Command, enc *worker.En
 				"audio_role requires verified primary yamnet snapshot local_path",
 				map[string]any{"stage": "audio_role", "command_id": cmd.ID})
 		}
-		tflitePath := modelPath
-		if fi, err := os.Stat(modelPath); err == nil && fi.IsDir() {
-			tflitePath = filepath.Join(modelPath, "yamnet.tflite")
+		if entrypointFile == "" {
+			if fi, err := os.Stat(modelPath); err == nil && !fi.IsDir() {
+				entrypointFile = modelPath
+			} else {
+				return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+					"verified model_snapshot envelope missing required entrypoint_file for YAMNet audio_role",
+					map[string]any{"stage": "audio_role", "command_id": cmd.ID})
+			}
 		}
-		if _, err := os.Stat(tflitePath); err != nil {
+		if rel, err := filepath.Rel(modelPath, entrypointFile); err != nil || strings.HasPrefix(rel, "..") {
 			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
-				fmt.Sprintf("yamnet.tflite asset missing from snapshot path: %s", tflitePath),
+				fmt.Sprintf("YAMNet entrypoint file (%s) escapes snapshot root (%s)", entrypointFile, modelPath), nil)
+		}
+		if _, err := os.Stat(entrypointFile); err != nil {
+			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				fmt.Sprintf("yamnet.tflite entrypoint missing from snapshot path: %s", entrypointFile),
 				map[string]any{"stage": "audio_role", "command_id": cmd.ID})
 		}
 	} else if modelPath != "" {
@@ -1486,8 +1499,13 @@ func runAudioRoleAdapter(ctx context.Context, cmd worker.Command, enc *worker.En
 		"vocals_audio":     vocalsAudio,
 		"background_audio": bgAudio,
 		"source_audio":     srcAudio,
-		"model_path":       modelPath,
-		"config":           cmd.Config["config"],
+		"model_path": func() string {
+			if entrypointFile != "" {
+				return entrypointFile
+			}
+			return modelPath
+		}(),
+		"config": cmd.Config["config"],
 	}
 
 	var out struct {

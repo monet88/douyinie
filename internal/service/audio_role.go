@@ -17,6 +17,7 @@ import (
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/media"
+	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/storage"
 )
 
@@ -47,6 +48,7 @@ type AudioRoleService struct {
 	db          *storage.DB
 	cas         *cas.Store
 	audioMixSvc *AudioMixService
+	router      *provider.Router
 	analyzer    AudioRoleAnalyzer
 }
 
@@ -81,6 +83,11 @@ func (s *AudioRoleService) Analyzer() AudioRoleAnalyzer {
 	return s.analyzer
 }
 
+// ConfigureRouter injects the provider router for production audio role provider routing.
+func (s *AudioRoleService) ConfigureRouter(router *provider.Router) {
+	s.router = router
+}
+
 // GenerateAudioRolePlan automatically generates a canonical AudioRolePlan using source preflight and stem evidence.
 func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRolePlanInput) (*domain.AudioRolePlan, error) {
 	if strings.TrimSpace(in.AssetID) == "" {
@@ -105,14 +112,7 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		return nil, fmt.Errorf("normalized audio artifact missing from preflight report for asset %s", in.AssetID)
 	}
 
-	// 2. Resolve analyzer seam
-	analyzer := s.analyzer
-	if analyzer == nil {
-		return nil, domain.ErrAudioRoleAnalyzerUnavailable
-	}
-	providerID, modelName, modelVersion, configHash := analyzer.AnalyzerInfo()
-
-	// 3. Separate audio stems or reuse existing stem artifacts
+	// 2. Separate audio stems or reuse existing stem artifacts
 	var stems *domain.AudioStemArtifacts
 	stemsIdx, err := s.db.GetAudioStemsArtifactIndex(ctx, in.AssetID)
 	if err == nil && stemsIdx != nil && stemsIdx.CASHash != "" && s.cas != nil {
@@ -142,7 +142,7 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		stems = separated
 	}
 
-	// 4. Resolve stem paths
+	// 3. Resolve stem paths
 	var vocalsPath, bgPath string
 	stemsCASHash := ""
 	if stems != nil {
@@ -156,31 +156,7 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		}
 	}
 
-	// 5. Provenance calculation and idempotent reuse check
-	provHash := domain.ComputeAudioRolePlanProvenanceHash(
-		preflight.NormalizedAudioSHA256,
-		stemsCASHash,
-		providerID,
-		modelName,
-		modelVersion,
-		configHash,
-	)
-
-	if existingIdx, err := s.db.GetAudioRolePlanByProvenance(ctx, provHash); err == nil && existingIdx != nil {
-		// Idempotent hit: return existing plan
-		if existingPlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID); err == nil && existingPlan != nil {
-			// Governance records must not be bypassable by idempotent cache reuse.
-			if in.RunID != "" {
-				if err := s.ensureGovernanceRecords(ctx, in.RunID, providerID, modelName, modelVersion, provHash, 0); err != nil {
-					return nil, fmt.Errorf("ensure audio role governance records on cache hit: %w", err)
-				}
-			}
-			return existingPlan, nil
-		}
-	}
-
-	// 6. Invoke source analysis
-	req := AudioRoleAnalysisRequest{
+	analysisReq := AudioRoleAnalysisRequest{
 		AssetID:          in.AssetID,
 		RunID:            in.RunID,
 		DurationMs:       preflight.DurationMs,
@@ -190,23 +166,172 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		ExecutionProfile: in.ExecutionProfile,
 	}
 
-	analysisRes, err := analyzer.AnalyzeAudioRoles(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("audio role analysis: %w", err)
-	}
-	if analysisRes == nil || len(analysisRes.Segments) == 0 {
-		return nil, errors.New("audio role analysis produced empty segments")
+	// 4. Deterministic Test Analyzer Path (unit and Seam 1 testing harnesses)
+	if s.analyzer != nil {
+		analyzer := s.analyzer
+		providerID, modelName, modelVersion, configHash := analyzer.AnalyzerInfo()
+		provHash := domain.ComputeAudioRolePlanProvenanceHash(
+			preflight.NormalizedAudioSHA256,
+			stemsCASHash,
+			providerID,
+			modelName,
+			modelVersion,
+			configHash,
+		)
+
+		if existingIdx, err := s.db.GetAudioRolePlanByProvenance(ctx, provHash); err == nil && existingIdx != nil {
+			if existingPlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID); err == nil && existingPlan != nil {
+				if in.RunID != "" {
+					if err := s.ensureGovernanceRecords(ctx, in.RunID, providerID, modelName, modelVersion, provHash, 0); err != nil {
+						return nil, fmt.Errorf("ensure audio role governance records on cache hit: %w", err)
+					}
+				}
+				return existingPlan, nil
+			}
+		}
+
+		analysisRes, err := analyzer.AnalyzeAudioRoles(ctx, analysisReq)
+		if err != nil {
+			return nil, fmt.Errorf("audio role analysis: %w", err)
+		}
+		if analysisRes == nil || len(analysisRes.Segments) == 0 {
+			return nil, errors.New("audio role analysis produced empty segments")
+		}
+
+		plan := domain.AudioRolePlan{
+			ID:             uuid.NewString(),
+			AssetID:        in.AssetID,
+			Segments:       analysisRes.Segments,
+			ProviderID:     providerID,
+			ModelName:      modelName,
+			ModelVersion:   modelVersion,
+			ProvenanceHash: provHash,
+			CreatedAt:      time.Now().UTC(),
+		}
+
+		if s.cas != nil {
+			blob, err := json.Marshal(plan)
+			if err != nil {
+				return nil, fmt.Errorf("marshal audio role plan: %w", err)
+			}
+			obj, err := s.cas.Put(bytes.NewReader(blob))
+			if err != nil {
+				return nil, fmt.Errorf("commit audio role plan to CAS: %w", err)
+			}
+			plan.CASHash = obj.SHA256
+		}
+
+		if err := s.db.SaveAudioRolePlan(ctx, plan); err != nil {
+			return nil, fmt.Errorf("persist audio role plan: %w", err)
+		}
+
+		if in.RunID != "" {
+			latencyMs := time.Since(startTime).Milliseconds()
+			if err := s.ensureGovernanceRecords(ctx, in.RunID, providerID, modelName, modelVersion, provHash, latencyMs); err != nil {
+				return nil, err
+			}
+		}
+
+		return &plan, nil
 	}
 
-	// 7. Build and commit AudioRolePlan to CAS
+	// 5. Production Router Path (Fail closed if router is not configured)
+	if s.router == nil {
+		return nil, domain.ErrAudioRoleAnalyzerUnavailable
+	}
+
+	routeReq := provider.RouteRequest{
+		RunID:            in.RunID,
+		Stage:            provider.TypeAudioRole,
+		Language:         "*",
+		ExecutionProfile: in.ExecutionProfile,
+	}
+
+	routeRes, err := s.router.Route(ctx, routeReq)
+	if err != nil {
+		return nil, fmt.Errorf("route audio_role provider: %w", err)
+	}
+	if routeRes == nil || routeRes.SelectedProvider == nil {
+		return nil, domain.ErrNoEligibleProvider
+	}
+
+	// Check candidates in policy-eligible order for an existing cached plan
+	candidates := append([]provider.Provider{routeRes.SelectedProvider}, routeRes.FallbackOrdered...)
+	for _, p := range candidates {
+		if p == nil || p.PolicyState() != provider.PolicyAllowed || !p.IsHealthy() {
+			continue
+		}
+		analyzer, ok := p.(domain.AudioRoleAnalyzer)
+		if !ok {
+			continue
+		}
+		pID, mName, mVer, cfgHash := analyzer.AnalyzerInfo()
+		candProvHash := domain.ComputeAudioRolePlanProvenanceHash(
+			preflight.NormalizedAudioSHA256,
+			stemsCASHash,
+			pID,
+			mName,
+			mVer,
+			cfgHash,
+		)
+		if existingIdx, err := s.db.GetAudioRolePlanByProvenance(ctx, candProvHash); err == nil && existingIdx != nil {
+			if existingPlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID); err == nil && existingPlan != nil {
+				// Cache hit for a new run: ensure provider attempt is recorded for in.RunID so governance evidence is complete.
+				if in.RunID != "" {
+					if err := s.ensureAttemptRecord(ctx, in.RunID, pID, mName, mVer, candProvHash, 0); err != nil {
+						return nil, fmt.Errorf("ensure audio role attempt on cache hit: %w", err)
+					}
+				}
+				return existingPlan, nil
+			}
+		}
+	}
+
+	// Fresh execution: Execute via Router.ExecuteRoutedWithRetry (records SelectionDecision & ProviderAttempt canonically)
+	var analysisRes *domain.AudioRoleAnalysisResult
+	var executedProviderID, executedModelName, executedModelVersion, executedProvHash string
+
+	inputHash := preflight.NormalizedAudioSHA256
+	err = s.router.ExecuteRoutedWithRetry(ctx, routeReq, routeRes, inputHash, 1, func(p provider.Provider, attemptNum int) error {
+		analyzer, ok := p.(domain.AudioRoleAnalyzer)
+		if !ok {
+			return fmt.Errorf("provider %s does not implement AudioRoleAnalyzer", p.ID())
+		}
+		pID, mName, mVer, cfgHash := analyzer.AnalyzerInfo()
+		executedProviderID = pID
+		executedModelName = mName
+		executedModelVersion = mVer
+		executedProvHash = domain.ComputeAudioRolePlanProvenanceHash(
+			preflight.NormalizedAudioSHA256,
+			stemsCASHash,
+			pID,
+			mName,
+			mVer,
+			cfgHash,
+		)
+
+		res, err := analyzer.AnalyzeAudioRoles(ctx, analysisReq)
+		if err != nil {
+			return err
+		}
+		if res == nil || len(res.Segments) == 0 {
+			return errors.New("audio role analysis produced empty segments")
+		}
+		analysisRes = res
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("execute audio_role provider: %w", err)
+	}
+
 	plan := domain.AudioRolePlan{
 		ID:             uuid.NewString(),
 		AssetID:        in.AssetID,
 		Segments:       analysisRes.Segments,
-		ProviderID:     providerID,
-		ModelName:      modelName,
-		ModelVersion:   modelVersion,
-		ProvenanceHash: provHash,
+		ProviderID:     executedProviderID,
+		ModelName:      executedModelName,
+		ModelVersion:   executedModelVersion,
+		ProvenanceHash: executedProvHash,
 		CreatedAt:      time.Now().UTC(),
 	}
 
@@ -222,21 +347,35 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		plan.CASHash = obj.SHA256
 	}
 
-	// 8. Transactionally persist AudioRolePlan and index to SQLite
 	if err := s.db.SaveAudioRolePlan(ctx, plan); err != nil {
 		return nil, fmt.Errorf("persist audio role plan: %w", err)
 	}
 
-	// 9. Record Governance Records (SelectionDecision & ProviderAttempt)
-	if in.RunID != "" {
-		latencyMs := time.Since(startTime).Milliseconds()
-		if err := s.ensureGovernanceRecords(ctx, in.RunID, providerID, modelName, modelVersion, provHash, latencyMs); err != nil {
-			return nil, err
-		}
-	}
-
 	_ = asset
 	return &plan, nil
+}
+
+func (s *AudioRoleService) ensureAttemptRecord(ctx context.Context, runID, providerID, modelName, modelVersion, provHash string, latencyMs int64) error {
+	attempts, err := s.db.ListProviderAttempts(ctx, runID, "audio_role_plan")
+	if err != nil || len(attempts) == 0 {
+		attempt := domain.ProviderAttempt{
+			ID:            uuid.NewString(),
+			RunID:         runID,
+			Stage:         "audio_role_plan",
+			ProviderID:    providerID,
+			ModelName:     modelName,
+			ModelVersion:  modelVersion,
+			InputHash:     provHash,
+			AttemptNumber: 1,
+			Status:        "succeeded",
+			LatencyMs:     latencyMs,
+			CreatedAt:     time.Now().UTC(),
+		}
+		if err := s.db.RecordProviderAttempt(ctx, attempt); err != nil {
+			return fmt.Errorf("record audio role provider attempt: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *AudioRoleService) ensureGovernanceRecords(ctx context.Context, runID, providerID, modelName, modelVersion, provHash string, latencyMs int64) error {
