@@ -10,10 +10,10 @@ import (
 // Frozen RC identities and digests for audio stem separation (Issue #69)
 const (
 	// UVR Primary frozen RC identities
-	UVRModelID          = domain.PinnedUVRModelID
-	UVRModelVersion     = domain.PinnedUVRModelVersion
-	UVRArtifactSHA      = domain.PinnedUVRArtifactSHA256
-	UVRProviderID       = "uvr_separator"
+	UVRModelID      = domain.PinnedUVRModelID
+	UVRModelVersion = domain.PinnedUVRModelVersion
+	UVRArtifactSHA  = domain.PinnedUVRArtifactSHA256
+	UVRProviderID   = "uvr_separator"
 
 	// Demucs Fallback frozen RC identities
 	DemucsModelID       = domain.PinnedDemucsModelID

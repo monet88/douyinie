@@ -106,10 +106,10 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 
 	preflight, err := s.db.GetPreflightReport(ctx, in.AssetID)
 	if err != nil {
-		return nil, fmt.Errorf("preflight report required for asset %s: %w", in.AssetID, err)
+		return nil, fmt.Errorf("%w for asset %s: %v", domain.ErrAudioRolePreflightRequired, in.AssetID, err)
 	}
 	if preflight.NormalizedAudioCASPath == "" || preflight.NormalizedAudioSHA256 == "" {
-		return nil, fmt.Errorf("normalized audio artifact missing from preflight report for asset %s", in.AssetID)
+		return nil, fmt.Errorf("%w: normalized audio artifact missing from preflight report for asset %s", domain.ErrAudioRoleEvidenceMissing, in.AssetID)
 	}
 
 	// 2. Separate audio stems or reuse existing stem artifacts
@@ -137,7 +137,7 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		}
 		separated, err := s.audioMixSvc.SeparateAudio(ctx, sepInput)
 		if err != nil {
-			return nil, fmt.Errorf("audio stem separation failed: %w", err)
+			return nil, fmt.Errorf("%w: audio stem separation failed: %v", domain.ErrAudioRoleEvidenceMissing, err)
 		}
 		stems = separated
 	}
@@ -249,7 +249,7 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 
 	routeRes, err := s.router.Route(ctx, routeReq)
 	if err != nil {
-		return nil, fmt.Errorf("route audio_role provider: %w", err)
+		return nil, fmt.Errorf("%w: route audio_role provider: %v", domain.ErrAudioRoleAnalyzerUnavailable, err)
 	}
 	if routeRes == nil || routeRes.SelectedProvider == nil {
 		return nil, domain.ErrNoEligibleProvider
@@ -290,8 +290,20 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 	// Fresh execution: Execute via Router.ExecuteRoutedWithRetry (records SelectionDecision & ProviderAttempt canonically)
 	var analysisRes *domain.AudioRoleAnalysisResult
 	var executedProviderID, executedModelName, executedModelVersion, executedProvHash string
+	selectedAnalyzer, ok := routeRes.SelectedProvider.(domain.AudioRoleAnalyzer)
+	if !ok {
+		return nil, fmt.Errorf("%w: selected provider %s does not implement AudioRoleAnalyzer", domain.ErrAudioRoleAnalyzerUnavailable, routeRes.SelectedProvider.ID())
+	}
+	selPID, selMName, selMVer, selCfgHash := selectedAnalyzer.AnalyzerInfo()
+	inputHash := domain.ComputeAudioRolePlanProvenanceHash(
+		preflight.NormalizedAudioSHA256,
+		stemsCASHash,
+		selPID,
+		selMName,
+		selMVer,
+		selCfgHash,
+	)
 
-	inputHash := preflight.NormalizedAudioSHA256
 	err = s.router.ExecuteRoutedWithRetry(ctx, routeReq, routeRes, inputHash, 1, func(p provider.Provider, attemptNum int) error {
 		analyzer, ok := p.(domain.AudioRoleAnalyzer)
 		if !ok {
@@ -321,7 +333,7 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("execute audio_role provider: %w", err)
+		return nil, fmt.Errorf("%w: execute audio_role provider: %v", domain.ErrAudioRoleAnalyzerUnavailable, err)
 	}
 
 	plan := domain.AudioRolePlan{

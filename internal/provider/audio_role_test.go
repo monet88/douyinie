@@ -64,36 +64,85 @@ func TestBootstrapYAMNetLicenseManifest_Idempotent(t *testing.T) {
 }
 
 func TestBootstrapYAMNetLicenseManifest_MismatchedExisting_FailsClosed(t *testing.T) {
-	db, err := storage.Open(filepath.Join(t.TempDir(), "test_lic_mismatch.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	defer db.Close()
-
-	licSvc := governance.NewLicenseService(db)
-	ctx := context.Background()
-
-	// Seed corrupted / mismatched manifest entry
-	badEntry := domain.LicenseManifestEntry{
-		ID:             uuid.NewString(),
+	validEntry := domain.LicenseManifestEntry{
 		DependencyName: provider.YAMNetModelID,
 		Version:        provider.YAMNetModelVersion,
-		SHA256:         "deadbeefdeadbeef000000000000000000000000000000000000000000000000",
-		SourceRepo:     "https://example.com/bad",
-		CodeLicense:    "GPL-3.0",
-		ModelLicense:   "Proprietary",
-		DataLicense:    "Unknown",
-		ServiceTerms:   "None",
+		SHA256:         domain.PinnedYAMNetManifestSHA256,
+		SourceRepo:     "https://tfhub.dev/google/lite-model/yamnet/classification/tflite/1?lite-format=tflite",
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "AudioSet dataset: CC-BY-4.0; AudioSet ontology/class map: CC-BY-SA-4.0",
+		ServiceTerms:   "https://tfhub.dev/terms (local snapshot runtime inference; no external network calls at inference time)",
 		Verified:       true,
-		CreatedAt:      time.Now().UTC(),
-	}
-	if err := licSvc.RegisterManifest(ctx, badEntry); err != nil {
-		t.Fatalf("seed bad manifest: %v", err)
 	}
 
-	// Bootstrap should detect mismatch and fail closed!
-	err = provider.BootstrapYAMNetLicenseManifest(ctx, licSvc)
-	if err == nil {
-		t.Fatal("expected bootstrap to fail closed on mismatched manifest, got nil")
+	cases := []struct {
+		name      string
+		transform func(e *domain.LicenseManifestEntry)
+	}{
+		{
+			name: "sha256_mismatch",
+			transform: func(e *domain.LicenseManifestEntry) {
+				e.SHA256 = "deadbeefdeadbeef000000000000000000000000000000000000000000000000"
+			},
+		},
+		{
+			name: "source_repo_mismatch",
+			transform: func(e *domain.LicenseManifestEntry) {
+				e.SourceRepo = "https://unauthorized-mirror.com/yamnet"
+			},
+		},
+		{
+			name: "service_terms_mismatch",
+			transform: func(e *domain.LicenseManifestEntry) {
+				e.ServiceTerms = "https://other-terms.com"
+			},
+		},
+		{
+			name: "code_license_mismatch",
+			transform: func(e *domain.LicenseManifestEntry) {
+				e.CodeLicense = "GPL-3.0"
+			},
+		},
+		{
+			name: "data_license_mismatch",
+			transform: func(e *domain.LicenseManifestEntry) {
+				e.DataLicense = "Proprietary"
+			},
+		},
+		{
+			name: "unverified_entry",
+			transform: func(e *domain.LicenseManifestEntry) {
+				e.Verified = false
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := storage.Open(filepath.Join(t.TempDir(), "test_"+tc.name+".db"))
+			if err != nil {
+				t.Fatalf("open db: %v", err)
+			}
+			defer db.Close()
+
+			licSvc := governance.NewLicenseService(db)
+			ctx := context.Background()
+
+			mutated := validEntry
+			mutated.ID = uuid.NewString()
+			mutated.CreatedAt = time.Now().UTC()
+			tc.transform(&mutated)
+
+			if err := licSvc.RegisterManifest(ctx, mutated); err != nil {
+				t.Fatalf("seed manifest: %v", err)
+			}
+
+			// Bootstrap must fail closed on any field mismatch!
+			err = provider.BootstrapYAMNetLicenseManifest(ctx, licSvc)
+			if err == nil {
+				t.Fatalf("expected bootstrap to fail closed on %s, got nil error", tc.name)
+			}
+		})
 	}
 }

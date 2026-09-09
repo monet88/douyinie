@@ -1982,6 +1982,14 @@ func resolveAudioRolePythonBinary() string {
 			}
 		}
 	}
+	for _, candidate := range []string{
+		`D:\douyinie-ref\phase1.1-runtime\venvs\audio_role\Scripts\python.exe`,
+		`D:/douyinie-ref/phase1.1-runtime/venvs/audio_role/Scripts/python.exe`,
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
 	return resolvePythonBinary()
 }
 func resolveTranslationPythonBinary() string {

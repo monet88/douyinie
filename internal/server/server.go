@@ -846,15 +846,16 @@ func (s *Server) handleRunSpeechUnderstand(w http.ResponseWriter, r *http.Reques
 				errors.Is(err, domain.ErrPolicyBlocked) ||
 				errors.Is(err, domain.ErrLicenseManifestMissing) ||
 				errors.Is(err, domain.ErrSnapshotUnverified) ||
+				errors.Is(err, domain.ErrSnapshotDigestMismatch) ||
+				errors.Is(err, domain.ErrSnapshotMutatedRehashRequired) ||
+				errors.Is(err, domain.ErrSnapshotFileCorrupted) ||
 				errors.Is(err, domain.ErrAudioRoleModelAssetMissing) ||
-				strings.Contains(err.Error(), "no eligible provider") ||
-				strings.Contains(err.Error(), "no available provider") ||
-				strings.Contains(err.Error(), "all provider candidates failed") {
+				errors.Is(err, domain.ErrCircuitOpen) {
 				writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("automatic audio role plan analyzer unavailable: %v", err))
 				return
 			}
-			if strings.Contains(err.Error(), "preflight report required") ||
-				strings.Contains(err.Error(), "normalized audio artifact missing") {
+			if errors.Is(err, domain.ErrAudioRolePreflightRequired) ||
+				errors.Is(err, domain.ErrAudioRoleEvidenceMissing) {
 				writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("automatic audio role plan prerequisite missing: %v", err))
 				return
 			}

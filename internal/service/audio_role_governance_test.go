@@ -409,6 +409,9 @@ func TestAudioRoleService_Governance_AllowedVerified_RecordsCanonicalProvenance(
 	if decisions[0].SelectedProviderID != "yamnet_verified" {
 		t.Fatalf("expected selected provider yamnet_verified, got %s", decisions[0].SelectedProviderID)
 	}
+	if decisions[0].Stage != "audio_role_plan" {
+		t.Fatalf("expected SelectionDecision stage audio_role_plan, got %s", decisions[0].Stage)
+	}
 
 	attempts, err := h.db.ListProviderAttempts(ctx, runID, "audio_role_plan")
 	if err != nil {
@@ -419,6 +422,13 @@ func TestAudioRoleService_Governance_AllowedVerified_RecordsCanonicalProvenance(
 	}
 	if attempts[0].Status != "succeeded" {
 		t.Fatalf("expected attempt status succeeded, got %s", attempts[0].Status)
+	}
+	if attempts[0].Stage != "audio_role_plan" {
+		t.Fatalf("expected ProviderAttempt stage audio_role_plan, got %s", attempts[0].Stage)
+	}
+	if attempts[0].InputHash != plan.ProvenanceHash {
+		t.Fatalf("expected attempt InputHash to bind canonical audio role plan provenance, got %s, want %s",
+			attempts[0].InputHash, plan.ProvenanceHash)
 	}
 }
 

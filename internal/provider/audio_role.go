@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -90,36 +91,43 @@ func BootstrapYAMNetLicenseManifest(ctx context.Context, licSvc *governance.Lice
 		Verified:       true,
 	}
 
-	err := licSvc.RegisterManifest(ctx, expected)
-	if err == nil {
-		return nil
-	}
-
-	// If registration fails because immutable entry already exists, verify exact match
-	if strings.Contains(err.Error(), "already exists") {
-		existing, getErr := licSvc.GetManifest(ctx, expected.DependencyName, expected.Version)
-		if getErr != nil {
-			return fmt.Errorf("load existing license manifest for %s %s: %w", expected.DependencyName, expected.Version, getErr)
-		}
-		if existing == nil {
-			return fmt.Errorf("license manifest for %s %s missing after collision", expected.DependencyName, expected.Version)
-		}
-		if !existing.Verified {
-			return fmt.Errorf("existing license manifest for %s %s is not verified", expected.DependencyName, expected.Version)
+	existing, err := licSvc.GetManifest(ctx, expected.DependencyName, expected.Version)
+	if err == nil && existing != nil {
+		// Entry already exists: validate ALL curated immutable/trust fields
+		if existing.DependencyName != expected.DependencyName || existing.Version != expected.Version {
+			return fmt.Errorf("existing license manifest identity mismatch for %s %s", expected.DependencyName, expected.Version)
 		}
 		if existing.SHA256 != expected.SHA256 {
 			return fmt.Errorf("existing license manifest SHA mismatch for %s %s: got %s, want %s",
 				expected.DependencyName, expected.Version, existing.SHA256, expected.SHA256)
+		}
+		if existing.SourceRepo != expected.SourceRepo {
+			return fmt.Errorf("existing license manifest source_repo mismatch for %s %s: got %s, want %s",
+				expected.DependencyName, expected.Version, existing.SourceRepo, expected.SourceRepo)
 		}
 		if existing.CodeLicense != expected.CodeLicense ||
 			existing.ModelLicense != expected.ModelLicense ||
 			existing.DataLicense != expected.DataLicense {
 			return fmt.Errorf("existing license manifest obligation mismatch for %s %s", expected.DependencyName, expected.Version)
 		}
+		if existing.ServiceTerms != expected.ServiceTerms {
+			return fmt.Errorf("existing license manifest service_terms mismatch for %s %s: got %s, want %s",
+				expected.DependencyName, expected.Version, existing.ServiceTerms, expected.ServiceTerms)
+		}
+		if !existing.Verified {
+			return fmt.Errorf("existing license manifest for %s %s is not verified", expected.DependencyName, expected.Version)
+		}
 		return nil
 	}
 
-	return fmt.Errorf("register YAMNet license manifest: %w", err)
+	if errors.Is(err, domain.ErrLicenseManifestMissing) {
+		if regErr := licSvc.RegisterManifest(ctx, expected); regErr != nil {
+			return fmt.Errorf("register YAMNet license manifest: %w", regErr)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("query license manifest for %s %s: %w", expected.DependencyName, expected.Version, err)
 }
 
 // WorkerAudioRoleProvider implements the concrete StageWorker adapter provider for YAMNet AudioRolePlan analysis.

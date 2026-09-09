@@ -22,6 +22,10 @@ var (
 	ErrDubMixNotFound = errors.New("dub mix artifact not found")
 	// ErrSeparatorFailed is returned when vocal separator fails to isolate stems.
 	ErrSeparatorFailed = errors.New("audio separation failed to produce stems")
+	// ErrAudioRolePreflightRequired is returned when preflight metadata is required to generate an AudioRolePlan.
+	ErrAudioRolePreflightRequired = errors.New("audio role plan requires source preflight report")
+	// ErrAudioRoleEvidenceMissing is returned when normalized audio or stems evidence required for audio role analysis is missing.
+	ErrAudioRoleEvidenceMissing = errors.New("audio role plan requires valid normalized audio and stem evidence")
 )
 
 const (

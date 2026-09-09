@@ -999,8 +999,33 @@ func TestSeam1_SpeechUnderstand_AudioRoleErrorClassification(t *testing.T) {
 		t.Fatalf("speech-understand request failed: %v", err)
 	}
 	defer speechResp.Body.Close()
-
 	if speechResp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 Service Unavailable when audio role analyzer/provider is unavailable, got %d", speechResp.StatusCode)
+	}
+
+	// Case 2: Source asset has NO preflight report in DB
+	// -> Automatic prerequisite generation fails with 422 Unprocessable Entity
+	jobID2, runID2 := createJobAndRun(t, h)
+	job2 := getJobViaAPI(t, h, jobID2)
+	assetID2 := job2.SourceAssetID
+
+	// Overwrite preflight report with empty normalized audio to test prerequisite missing classification
+	err = h.db.SavePreflightReport(context.Background(), domain.PreflightReport{
+		AssetID:                assetID2,
+		NormalizedAudioCASPath: "",
+		NormalizedAudioSHA256:  "",
+	})
+	if err != nil {
+		t.Fatalf("save empty preflight report: %v", err)
+	}
+
+	speechBody2, _ := json.Marshal(map[string]any{"run_id": runID2})
+	resp2, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/speech-understand", h.server.URL, assetID2), "application/json", bytes.NewReader(speechBody2))
+	if err != nil {
+		t.Fatalf("speech-understand request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity when preflight is missing, got %d", resp2.StatusCode)
 	}
 }
