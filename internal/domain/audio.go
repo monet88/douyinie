@@ -36,6 +36,7 @@ type AudioRolePlanProvenance struct {
 	ProviderID    string `json:"provider_id"`
 	ModelName     string `json:"model_name"`
 	ModelVersion  string `json:"model_version"`
+	ConfigHash    string `json:"config_hash,omitempty"`
 	SchemaVersion int    `json:"schema_version"`
 }
 
@@ -49,13 +50,14 @@ func (p AudioRolePlanProvenance) Hash() string {
 }
 
 // ComputeAudioRolePlanProvenanceHash computes the deterministic hash for AudioRolePlan.
-func ComputeAudioRolePlanProvenanceHash(assetSHA256, stemsCASHash, providerID, modelName, modelVersion string) string {
+func ComputeAudioRolePlanProvenanceHash(assetSHA256, stemsCASHash, providerID, modelName, modelVersion, configHash string) string {
 	return AudioRolePlanProvenance{
 		AssetSHA256:   assetSHA256,
 		StemsCASHash:  stemsCASHash,
 		ProviderID:    providerID,
 		ModelName:     modelName,
 		ModelVersion:  modelVersion,
+		ConfigHash:    configHash,
 		SchemaVersion: AudioRolePlanSchemaVersion,
 	}.Hash()
 }

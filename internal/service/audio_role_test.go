@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -257,10 +258,12 @@ func TestAudioRoleService_AutomaticGeneration_FromStems(t *testing.T) {
 		}
 	}
 
-	// 8500 - 10000 ms: Uncertain (marginal weak energy in vocals with sub-pitch frequency)
+	// 8500 - 10000 ms: Uncertain (irregular noisy vocal energy with low autocorrelation)
+	var lcg int32 = 12345
 	for i := 8500 * sampleRate / 1000; i < 10000*sampleRate/1000; i++ {
 		bgSamples[i] = 500
-		vocalsSamples[i] = int16(380 * math.Sin(2*math.Pi*73*float64(i)/float64(sampleRate)))
+		lcg = (lcg*1103515245 + 12345) & 0x7fffffff
+		vocalsSamples[i] = int16((lcg % 900) - 450)
 	}
 
 	assetID, _ := createControlledAsset(t, h, durationMs, vocalsSamples, bgSamples)
@@ -310,11 +313,17 @@ func TestAudioRoleService_AutomaticGeneration_FromStems(t *testing.T) {
 
 	t.Logf("Generated plan segments: %+v", plan.Segments)
 
-	if !foundRoles[domain.AudioRoleNarrationDialogue] {
-		t.Errorf("expected narration/dialogue segment to be generated")
+	requiredRoles := []domain.AudioRole{
+		domain.AudioRoleNarrationDialogue,
+		domain.AudioRoleSingingMusicVocal,
+		domain.AudioRoleInstrumentalBgm,
+		domain.AudioRoleAmbienceSFX,
+		domain.AudioRoleUncertain,
 	}
-	if !foundRoles[domain.AudioRoleInstrumentalBgm] {
-		t.Errorf("expected instrumental/background segment to be generated")
+	for _, r := range requiredRoles {
+		if !foundRoles[r] {
+			t.Errorf("missing required canonical role %q in generated plan: %+v", r, plan.Segments)
+		}
 	}
 
 	// Verify plan is persisted in DB and retrievable
@@ -418,15 +427,23 @@ func TestAudioRoleService_UncertainIntervals_ProjectReviewItem(t *testing.T) {
 	vocalsSamples := make([]int16, totalSamples)
 	bgSamples := make([]int16, totalSamples)
 
-	// 0 - 3000 ms: Dialogue
+	// 0 - 3000 ms: Dialogue (speech consonants and modulation)
 	for i := 0; i < 3000*sampleRate/1000; i++ {
-		vocalsSamples[i] = int16(4000 * math.Sin(2*math.Pi*200*float64(i)/float64(sampleRate)))
+		if (i % 4) == 0 {
+			vocalsSamples[i] = -2500
+		} else if (i % 4) == 2 {
+			vocalsSamples[i] = 2500
+		} else {
+			vocalsSamples[i] = int16(3000 * math.Sin(2*math.Pi*180*float64(i)/float64(sampleRate)))
+		}
 		bgSamples[i] = 500
 	}
-	// 3000 - 6000 ms: Uncertain role
+	// 3000 - 6000 ms: Uncertain role (marginal noisy vocal energy with low autocorrelation)
+	var lcg int32 = 67890
 	for i := 3000 * sampleRate / 1000; i < 6000*sampleRate/1000; i++ {
-		vocalsSamples[i] = int16(380 * math.Sin(2*math.Pi*70*float64(i)/float64(sampleRate)))
 		bgSamples[i] = 500
+		lcg = (lcg*1103515245 + 12345) & 0x7fffffff
+		vocalsSamples[i] = int16((lcg % 900) - 450)
 	}
 
 	assetID, _ := createControlledAsset(t, h, durationMs, vocalsSamples, bgSamples)
@@ -447,7 +464,7 @@ func TestAudioRoleService_UncertainIntervals_ProjectReviewItem(t *testing.T) {
 		}
 	}
 	if !hasUncertain {
-		t.Logf("Segments produced: %+v", plan.Segments)
+		t.Fatalf("expected plan to contain uncertain segments, but found none: %+v", plan.Segments)
 	}
 
 	// Project review items via ReviewService
@@ -456,17 +473,15 @@ func TestAudioRoleService_UncertainIntervals_ProjectReviewItem(t *testing.T) {
 		t.Fatalf("ProjectReviewItems failed: %v", err)
 	}
 
-	if hasUncertain {
-		var foundAudioRoleReviewItem bool
-		for _, it := range items {
-			if it.Type == domain.ReviewItemTypeAudioRole && it.Status == domain.ReviewItemStatusPending {
-				foundAudioRoleReviewItem = true
-				break
-			}
+	var foundAudioRoleReviewItem bool
+	for _, it := range items {
+		if it.Type == domain.ReviewItemTypeAudioRole && it.Reason == "uncertain_audio_role" && it.Status == domain.ReviewItemStatusPending {
+			foundAudioRoleReviewItem = true
+			break
 		}
-		if !foundAudioRoleReviewItem {
-			t.Errorf("expected pending audio_role_uncertain ReviewItem for uncertain segment")
-		}
+	}
+	if !foundAudioRoleReviewItem {
+		t.Fatalf("expected pending audio_role_uncertain ReviewItem for uncertain segment, got: %+v", items)
 	}
 }
 
@@ -536,5 +551,168 @@ func TestAudioRoleService_MissingPreflight_FailsClosed(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error on missing preflight, got nil")
+	}
+}
+
+type mockCustomAnalyzer struct {
+	pID     string
+	mName   string
+	mVer    string
+	cfgHash string
+}
+
+func (m *mockCustomAnalyzer) AnalyzerInfo() (string, string, string, string) {
+	return m.pID, m.mName, m.mVer, m.cfgHash
+}
+
+func (m *mockCustomAnalyzer) AnalyzeAudioRoles(ctx context.Context, req service.AudioRoleAnalysisRequest) (*service.AudioRoleAnalysisResult, error) {
+	return &service.AudioRoleAnalysisResult{
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
+		},
+		ProviderID:   m.pID,
+		ModelName:    m.mName,
+		ModelVersion: m.mVer,
+	}, nil
+}
+
+func TestAudioRoleService_InjectedAnalyzerProvenance(t *testing.T) {
+	h := setupAudioRoleTestHarness(t)
+	ctx := context.Background()
+
+	customAnalyzer := &mockCustomAnalyzer{
+		pID:     "vendor_audio_lab",
+		mName:   "deep_acoustic_role_classifier",
+		mVer:    "v3.2",
+		cfgHash: "cfg-deterministic-1234",
+	}
+	h.audioRole.SetAnalyzer(customAnalyzer)
+
+	durationMs := int64(3000)
+	sampleRate := 16000
+	totalSamples := (sampleRate * int(durationMs)) / 1000
+	vocalSamples := make([]int16, totalSamples)
+	bgSamples := make([]int16, totalSamples)
+	for i := range vocalSamples {
+		vocalSamples[i] = 1000
+		bgSamples[i] = 500
+	}
+
+	assetID, normSHA := createControlledAsset(t, h, durationMs, vocalSamples, bgSamples)
+
+	// Fetch stems CAS hash
+	stemsIdx, err := h.db.GetAudioStemsArtifactIndex(ctx, assetID)
+	if err != nil {
+		t.Fatalf("get stems idx: %v", err)
+	}
+
+	plan, err := h.audioRole.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{
+		AssetID: assetID,
+		RunID:   uuid.NewString(),
+	})
+	if err != nil {
+		t.Fatalf("GenerateAudioRolePlan failed: %v", err)
+	}
+
+	// 1. Assert plan metadata matches injected analyzer exactly
+	if plan.ProviderID != "vendor_audio_lab" {
+		t.Errorf("expected ProviderID vendor_audio_lab, got %s", plan.ProviderID)
+	}
+	if plan.ModelName != "deep_acoustic_role_classifier" {
+		t.Errorf("expected ModelName deep_acoustic_role_classifier, got %s", plan.ModelName)
+	}
+	if plan.ModelVersion != "v3.2" {
+		t.Errorf("expected ModelVersion v3.2, got %s", plan.ModelVersion)
+	}
+
+	// 2. Assert provenance hash was calculated using the injected analyzer's identity and config hash
+	expectedProvHash := domain.ComputeAudioRolePlanProvenanceHash(
+		normSHA,
+		stemsIdx.CASHash,
+		"vendor_audio_lab",
+		"deep_acoustic_role_classifier",
+		"v3.2",
+		"cfg-deterministic-1234",
+	)
+	if plan.ProvenanceHash != expectedProvHash {
+		t.Errorf("provenance hash mismatch:\nexpected: %s\ngot:      %s", expectedProvHash, plan.ProvenanceHash)
+	}
+
+	// 3. Assert SQLite index is queryable by this exact provenance hash
+	idx, err := h.db.GetAudioRolePlanByProvenance(ctx, expectedProvHash)
+	if err != nil {
+		t.Fatalf("GetAudioRolePlanByProvenance failed: %v", err)
+	}
+	if idx.ProviderID != "vendor_audio_lab" || idx.ModelName != "deep_acoustic_role_classifier" {
+		t.Errorf("indexed metadata mismatch: %+v", idx)
+	}
+}
+
+func TestAudioRoleService_MissingOrCorruptEvidence_FailsClosed(t *testing.T) {
+	h := setupAudioRoleTestHarness(t)
+	ctx := context.Background()
+
+	// 1. Corrupt vocals stem: file with invalid non-WAV bytes
+	corruptVocalsPath := filepath.Join(h.dir, "corrupt_vocals.wav")
+	_ = os.WriteFile(corruptVocalsPath, []byte("INVALID_TRUNCATED_WAV_HEADER"), 0644)
+
+	corruptReq := service.AudioRoleAnalysisRequest{
+		AssetID:         uuid.NewString(),
+		DurationMs:      5000,
+		VocalsPath:      corruptVocalsPath,
+		BackgroundPath:  filepath.Join(h.dir, "valid_bg.wav"),
+		SourceAudioPath: filepath.Join(h.dir, "source.wav"),
+	}
+	analyzer := service.NewDeterministicTestAudioRoleAnalyzer()
+	_, err := analyzer.AnalyzeAudioRoles(ctx, corruptReq)
+	if err == nil {
+		t.Fatal("expected decode failure on corrupt vocals stem, got nil")
+	}
+
+	// 2. Nonexistent stem file
+	missingReq := service.AudioRoleAnalysisRequest{
+		AssetID:         uuid.NewString(),
+		DurationMs:      5000,
+		VocalsPath:      filepath.Join(h.dir, "nonexistent_vocals.wav"),
+		BackgroundPath:  filepath.Join(h.dir, "valid_bg.wav"),
+		SourceAudioPath: filepath.Join(h.dir, "source.wav"),
+	}
+	_, err = analyzer.AnalyzeAudioRoles(ctx, missingReq)
+	if err == nil {
+		t.Fatal("expected failure on nonexistent vocals stem, got nil")
+	}
+
+	// 3. Empty request with no readable samples
+	emptyReq := service.AudioRoleAnalysisRequest{
+		AssetID:    uuid.NewString(),
+		DurationMs: 5000,
+	}
+	_, err = analyzer.AnalyzeAudioRoles(ctx, emptyReq)
+	if err == nil {
+		t.Fatal("expected failure when no samples provided, got nil")
+	}
+}
+
+func TestAudioRoleService_GovernancePersistenceError_Propagated(t *testing.T) {
+	h := setupAudioRoleTestHarness(t)
+	ctx := context.Background()
+
+	durationMs := int64(3000)
+	sampleRate := 16000
+	totalSamples := (sampleRate * int(durationMs)) / 1000
+	vocalSamples := make([]int16, totalSamples)
+	bgSamples := make([]int16, totalSamples)
+
+	assetID, _ := createControlledAsset(t, h, durationMs, vocalSamples, bgSamples)
+
+	// Close database to force persistence/governance failure
+	_ = h.db.Close()
+
+	_, err := h.audioRole.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{
+		AssetID: assetID,
+		RunID:   uuid.NewString(),
+	})
+	if err == nil {
+		t.Fatal("expected error when DB write fails, got nil")
 	}
 }

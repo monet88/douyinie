@@ -3,6 +3,8 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,9 +21,12 @@ import (
 )
 
 const (
-	DefaultAcousticProviderID   = "builtin_acoustic_analyzer"
-	DefaultAcousticModelName    = "acoustic_signal_classifier"
-	DefaultAcousticModelVersion = "v1.0"
+	// TestAcousticProviderID is the provider identity for the deterministic test/harness analyzer.
+	// NOTE: This analyzer is for deterministic Seam 1 and integration test suites. Production audio
+	// role classification requires an approved ML classifier model (e.g. PyAnnote / Silero / SVD).
+	TestAcousticProviderID   = "test_acoustic_analyzer"
+	TestAcousticModelName    = "deterministic_signal_classifier"
+	TestAcousticModelVersion = "v0.1-test"
 )
 
 // AudioRolePlanInput defines the input parameters for automatic AudioRolePlan generation.
@@ -54,6 +59,7 @@ type AudioRoleAnalysisResult struct {
 
 // AudioRoleAnalyzer is the provider-neutral interface for classifying timeline audio roles.
 type AudioRoleAnalyzer interface {
+	AnalyzerInfo() (providerID, modelName, modelVersion, configHash string)
 	AnalyzeAudioRoles(ctx context.Context, req AudioRoleAnalysisRequest) (*AudioRoleAnalysisResult, error)
 }
 
@@ -71,15 +77,13 @@ func NewAudioRoleService(db *storage.DB, casStore *cas.Store, audioMixSvc *Audio
 		db:          db,
 		cas:         casStore,
 		audioMixSvc: audioMixSvc,
-		analyzer:    NewAcousticAudioRoleAnalyzer(),
+		analyzer:    NewDeterministicTestAudioRoleAnalyzer(),
 	}
 }
 
 // SetAnalyzer replaces the active AudioRoleAnalyzer implementation.
 func (s *AudioRoleService) SetAnalyzer(analyzer AudioRoleAnalyzer) {
-	if analyzer != nil {
-		s.analyzer = analyzer
-	}
+	s.analyzer = analyzer
 }
 
 // GenerateAudioRolePlan automatically generates a canonical AudioRolePlan using source preflight and stem evidence.
@@ -89,7 +93,7 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 	}
 	startTime := time.Now().UTC()
 
-	// 1. Verify source asset and preflight report
+	// 1. Verify database, source asset, and preflight report
 	if s.db == nil {
 		return nil, errors.New("database is not configured")
 	}
@@ -106,7 +110,14 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		return nil, fmt.Errorf("normalized audio artifact missing from preflight report for asset %s", in.AssetID)
 	}
 
-	// 2. Separate audio stems or reuse existing stem artifacts
+	// 2. Resolve analyzer seam
+	analyzer := s.analyzer
+	if analyzer == nil {
+		return nil, errors.New("no audio role analyzer configured")
+	}
+	providerID, modelName, modelVersion, configHash := analyzer.AnalyzerInfo()
+
+	// 3. Separate audio stems or reuse existing stem artifacts
 	var stems *domain.AudioStemArtifacts
 	stemsIdx, err := s.db.GetAudioStemsArtifactIndex(ctx, in.AssetID)
 	if err == nil && stemsIdx != nil && stemsIdx.CASHash != "" && s.cas != nil {
@@ -136,7 +147,7 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		stems = separated
 	}
 
-	// 3. Resolve stems paths and metadata
+	// 4. Resolve stem paths
 	var vocalsPath, bgPath string
 	stemsCASHash := ""
 	if stems != nil {
@@ -150,17 +161,14 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		}
 	}
 
-	providerID := DefaultAcousticProviderID
-	modelName := DefaultAcousticModelName
-	modelVersion := DefaultAcousticModelVersion
-
-	// 4. Provenance calculation and idempotent reuse check
+	// 5. Provenance calculation and idempotent reuse check
 	provHash := domain.ComputeAudioRolePlanProvenanceHash(
 		preflight.NormalizedAudioSHA256,
 		stemsCASHash,
 		providerID,
 		modelName,
 		modelVersion,
+		configHash,
 	)
 
 	if existingIdx, err := s.db.GetAudioRolePlanByProvenance(ctx, provHash); err == nil && existingIdx != nil {
@@ -170,7 +178,7 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		}
 	}
 
-	// 5. Invoke source analysis
+	// 6. Invoke source analysis
 	req := AudioRoleAnalysisRequest{
 		AssetID:          in.AssetID,
 		RunID:            in.RunID,
@@ -181,11 +189,6 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		ExecutionProfile: in.ExecutionProfile,
 	}
 
-	analyzer := s.analyzer
-	if analyzer == nil {
-		analyzer = NewAcousticAudioRoleAnalyzer()
-	}
-
 	analysisRes, err := analyzer.AnalyzeAudioRoles(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("audio role analysis: %w", err)
@@ -194,17 +197,7 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		return nil, errors.New("audio role analysis produced empty segments")
 	}
 
-	if analysisRes.ProviderID != "" {
-		providerID = analysisRes.ProviderID
-	}
-	if analysisRes.ModelName != "" {
-		modelName = analysisRes.ModelName
-	}
-	if analysisRes.ModelVersion != "" {
-		modelVersion = analysisRes.ModelVersion
-	}
-
-	// 6. Build and commit AudioRolePlan
+	// 7. Build and commit AudioRolePlan to CAS
 	plan := domain.AudioRolePlan{
 		ID:             uuid.NewString(),
 		AssetID:        in.AssetID,
@@ -228,12 +221,12 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		plan.CASHash = obj.SHA256
 	}
 
-	// 7. Save to SQLite
+	// 8. Transactionally persist AudioRolePlan and index to SQLite
 	if err := s.db.SaveAudioRolePlan(ctx, plan); err != nil {
 		return nil, fmt.Errorf("persist audio role plan: %w", err)
 	}
 
-	// 8. Record Governance Records (SelectionDecision & ProviderAttempt)
+	// 9. Record Governance Records (SelectionDecision & ProviderAttempt)
 	if in.RunID != "" {
 		latencyMs := time.Since(startTime).Milliseconds()
 		decision := domain.SelectionDecision{
@@ -245,7 +238,9 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 			DecisionReason:     "source-analysis audio role classification",
 			CreatedAt:          time.Now().UTC(),
 		}
-		_ = s.db.RecordSelectionDecision(ctx, decision)
+		if err := s.db.RecordSelectionDecision(ctx, decision); err != nil {
+			return nil, fmt.Errorf("record audio role selection decision: %w", err)
+		}
 
 		attempt := domain.ProviderAttempt{
 			ID:            uuid.NewString(),
@@ -260,7 +255,9 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 			LatencyMs:     latencyMs,
 			CreatedAt:     time.Now().UTC(),
 		}
-		_ = s.db.RecordProviderAttempt(ctx, attempt)
+		if err := s.db.RecordProviderAttempt(ctx, attempt); err != nil {
+			return nil, fmt.Errorf("record audio role provider attempt: %w", err)
+		}
 	}
 
 	_ = asset
@@ -268,11 +265,12 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 }
 
 // ---------------------------------------------------------------------------
-// Production AcousticAudioRoleAnalyzer Implementation
+// DeterministicTestAudioRoleAnalyzer Implementation
+// NOTE: For deterministic integration and unit test suites only.
 // ---------------------------------------------------------------------------
 
-// AcousticAudioRoleAnalyzer analyzes physical acoustic signals from source audio and separated stems.
-type AcousticAudioRoleAnalyzer struct {
+// DeterministicTestAudioRoleAnalyzer classifies audio signals for test suites.
+type DeterministicTestAudioRoleAnalyzer struct {
 	VocalSilenceRMS     float64
 	VocalUncertainFloor float64
 	SingingMinAutocorr  float64
@@ -282,54 +280,87 @@ type AcousticAudioRoleAnalyzer struct {
 	HopDurationMs       int64
 }
 
-// NewAcousticAudioRoleAnalyzer creates a new AcousticAudioRoleAnalyzer with calibrated production defaults.
-func NewAcousticAudioRoleAnalyzer() *AcousticAudioRoleAnalyzer {
-	return &AcousticAudioRoleAnalyzer{
-		VocalSilenceRMS:     200.0, // samples below 200 (~ -44 dBFS) are silent
-		VocalUncertainFloor: 350.0, // weak/marginal vocal amplitude band
-		SingingMinAutocorr:  0.65,  // high pitch stability and sustained harmonicity
-		SingingMaxZCR:       0.12,  // singing vowels have lower zero-crossing rate than speech consonants
-		SFXMinCrestFactor:   4.5,   // impulsive transients (Foley, taps, clinks) have high peak-to-RMS ratio
-		WindowDurationMs:    500,   // 500 ms acoustic analysis window
-		HopDurationMs:       500,   // 500 ms hop (contiguous non-overlapping windows)
+// NewDeterministicTestAudioRoleAnalyzer creates an analyzer with standard test parameters.
+func NewDeterministicTestAudioRoleAnalyzer() *DeterministicTestAudioRoleAnalyzer {
+	return &DeterministicTestAudioRoleAnalyzer{
+		VocalSilenceRMS:     200.0,
+		VocalUncertainFloor: 350.0,
+		SingingMinAutocorr:  0.65,
+		SingingMaxZCR:       0.12,
+		SFXMinCrestFactor:   4.5,
+		WindowDurationMs:    500,
+		HopDurationMs:       500,
 	}
 }
 
-func (a *AcousticAudioRoleAnalyzer) AnalyzeAudioRoles(ctx context.Context, req AudioRoleAnalysisRequest) (*AudioRoleAnalysisResult, error) {
+func (a *DeterministicTestAudioRoleAnalyzer) AnalyzerInfo() (string, string, string, string) {
+	return TestAcousticProviderID, TestAcousticModelName, TestAcousticModelVersion, a.configHash()
+}
+
+func (a *DeterministicTestAudioRoleAnalyzer) configHash() string {
+	raw := fmt.Sprintf("%.1f_%.1f_%.2f_%.2f_%.1f_%d_%d",
+		a.VocalSilenceRMS, a.VocalUncertainFloor, a.SingingMinAutocorr, a.SingingMaxZCR,
+		a.SFXMinCrestFactor, a.WindowDurationMs, a.HopDurationMs)
+	h := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(h[:8])
+}
+
+func (a *DeterministicTestAudioRoleAnalyzer) AnalyzeAudioRoles(ctx context.Context, req AudioRoleAnalysisRequest) (*AudioRoleAnalysisResult, error) {
 	sampleRate := 16000
 
 	var vocalSamples []int16
 	if req.VocalsPath != "" {
-		if data, err := os.ReadFile(req.VocalsPath); err == nil {
-			if s, info, err := media.ExtractPCM16Samples(data); err == nil {
-				vocalSamples = s
-				if info != nil && info.SampleRate > 0 {
-					sampleRate = int(info.SampleRate)
-				}
-			}
+		data, err := os.ReadFile(req.VocalsPath)
+		if err != nil {
+			return nil, fmt.Errorf("read vocals stem file %s: %w", req.VocalsPath, err)
+		}
+		s, info, err := media.ExtractPCM16Samples(data)
+		if err != nil {
+			return nil, fmt.Errorf("decode vocals stem PCM %s: %w", req.VocalsPath, err)
+		}
+		vocalSamples = s
+		if info != nil && info.SampleRate > 0 {
+			sampleRate = int(info.SampleRate)
 		}
 	}
 
 	var bgSamples []int16
 	if req.BackgroundPath != "" {
-		if data, err := os.ReadFile(req.BackgroundPath); err == nil {
-			if s, _, err := media.ExtractPCM16Samples(data); err == nil {
-				bgSamples = s
-			}
+		data, err := os.ReadFile(req.BackgroundPath)
+		if err != nil {
+			return nil, fmt.Errorf("read background stem file %s: %w", req.BackgroundPath, err)
+		}
+		s, info, err := media.ExtractPCM16Samples(data)
+		if err != nil {
+			return nil, fmt.Errorf("decode background stem PCM %s: %w", req.BackgroundPath, err)
+		}
+		bgSamples = s
+		if info != nil && info.SampleRate > 0 {
+			sampleRate = int(info.SampleRate)
 		}
 	}
 
-	// Fallback to source audio if neither stem was read
+	var sourceFallback bool
+	// Fallback to source audio ONLY if neither stem was supplied
 	if len(vocalSamples) == 0 && len(bgSamples) == 0 && req.SourceAudioPath != "" {
-		if data, err := os.ReadFile(req.SourceAudioPath); err == nil {
-			if s, info, err := media.ExtractPCM16Samples(data); err == nil {
-				// With only source audio, treat as background/mixed
-				bgSamples = s
-				if info != nil && info.SampleRate > 0 {
-					sampleRate = int(info.SampleRate)
-				}
-			}
+		data, err := os.ReadFile(req.SourceAudioPath)
+		if err != nil {
+			return nil, fmt.Errorf("read source audio file %s: %w", req.SourceAudioPath, err)
 		}
+		s, info, err := media.ExtractPCM16Samples(data)
+		if err != nil {
+			return nil, fmt.Errorf("decode source audio PCM %s: %w", req.SourceAudioPath, err)
+		}
+		bgSamples = s
+		vocalSamples = s
+		sourceFallback = true
+		if info != nil && info.SampleRate > 0 {
+			sampleRate = int(info.SampleRate)
+		}
+	}
+
+	if len(vocalSamples) == 0 && len(bgSamples) == 0 {
+		return nil, errors.New("no readable audio samples available for audio role analysis")
 	}
 
 	durationMs := req.DurationMs
@@ -340,12 +371,17 @@ func (a *AcousticAudioRoleAnalyzer) AnalyzeAudioRoles(ctx context.Context, req A
 		}
 		if maxLen > 0 {
 			durationMs = int64(maxLen*1000) / int64(sampleRate)
-		} else {
-			durationMs = 1000 // minimum 1s placeholder
 		}
+	}
+	if durationMs <= 0 {
+		return nil, errors.New("invalid zero duration for audio role analysis")
 	}
 
 	totalSamples := int((int64(sampleRate) * durationMs) / 1000)
+	if totalSamples <= 0 {
+		return nil, errors.New("invalid zero sample count for audio role analysis")
+	}
+
 	if len(vocalSamples) < totalSamples {
 		padded := make([]int16, totalSamples)
 		copy(padded, vocalSamples)
@@ -359,7 +395,7 @@ func (a *AcousticAudioRoleAnalyzer) AnalyzeAudioRoles(ctx context.Context, req A
 
 	windowSamples := (sampleRate * int(a.WindowDurationMs)) / 1000
 	if windowSamples <= 0 {
-		windowSamples = 8000 // 500 ms at 16k
+		windowSamples = 8000
 	}
 
 	numWindows := totalSamples / windowSamples
@@ -402,30 +438,39 @@ func (a *AcousticAudioRoleAnalyzer) AnalyzeAudioRoles(ctx context.Context, req A
 		}
 
 		var role domain.AudioRole
-		if vocalRMS < a.VocalSilenceRMS {
-			// Vocal stem silent: pure background/soundtrack
-			if bgCrestFactor >= a.SFXMinCrestFactor && bgPeak > 1000 {
-				role = domain.AudioRoleAmbienceSFX
+		if sourceFallback {
+			// Source audio fallback without stem separation is mixed.
+			// Any vocal energy in mixed source audio cannot be cleanly separated:
+			// mark as uncertain rather than falsely declaring background/no-dub.
+			if vocalRMS < a.VocalSilenceRMS {
+				if bgCrestFactor >= a.SFXMinCrestFactor && bgPeak > 1000 {
+					role = domain.AudioRoleAmbienceSFX
+				} else {
+					role = domain.AudioRoleInstrumentalBgm
+				}
 			} else {
-				role = domain.AudioRoleInstrumentalBgm
+				role = domain.AudioRoleUncertain
 			}
 		} else {
-			// Vocal stem active: evaluate vocal acoustics
-			zcr := computeZCR(vocalChunk)
-			autocorr := computeMaxAutocorr(vocalChunk, sampleRate)
-
-			if vocalRMS < a.VocalUncertainFloor && autocorr < 0.30 {
-				// Weak, ambiguous, or corrupted vocal signal
-				role = domain.AudioRoleUncertain
-			} else if autocorr >= a.SingingMinAutocorr && zcr <= a.SingingMaxZCR {
-				// Steady harmonicity + sustained musical pitch
-				role = domain.AudioRoleSingingMusicVocal
-			} else if autocorr >= 0.20 || zcr >= 0.04 {
-				// Natural speech modulation (formants + consonants)
-				role = domain.AudioRoleNarrationDialogue
+			if vocalRMS < a.VocalSilenceRMS {
+				if bgCrestFactor >= a.SFXMinCrestFactor && bgPeak > 1000 {
+					role = domain.AudioRoleAmbienceSFX
+				} else {
+					role = domain.AudioRoleInstrumentalBgm
+				}
 			} else {
-				// Ambiguous / unclassified
-				role = domain.AudioRoleUncertain
+				zcr := computeZCR(vocalChunk)
+				autocorr := computeMaxAutocorr(vocalChunk, sampleRate)
+
+				if vocalRMS < a.VocalUncertainFloor && autocorr < 0.30 {
+					role = domain.AudioRoleUncertain
+				} else if autocorr >= a.SingingMinAutocorr && zcr <= a.SingingMaxZCR {
+					role = domain.AudioRoleSingingMusicVocal
+				} else if autocorr >= 0.20 || zcr >= 0.04 {
+					role = domain.AudioRoleNarrationDialogue
+				} else {
+					role = domain.AudioRoleUncertain
+				}
 			}
 		}
 
@@ -436,7 +481,10 @@ func (a *AcousticAudioRoleAnalyzer) AnalyzeAudioRoles(ctx context.Context, req A
 		})
 	}
 
-	// Merge contiguous windows of the same role into clean segments
+	if len(windows) == 0 {
+		return nil, errors.New("audio role analysis produced no temporal windows")
+	}
+
 	var merged []domain.AudioSegment
 	for _, w := range windows {
 		if len(merged) == 0 {
@@ -460,21 +508,14 @@ func (a *AcousticAudioRoleAnalyzer) AnalyzeAudioRoles(ctx context.Context, req A
 		}
 	}
 
-	// Ensure boundary invariants: begins at 0 and ends at durationMs
-	if len(merged) == 0 {
-		merged = []domain.AudioSegment{
-			{StartMs: 0, EndMs: durationMs, Role: domain.AudioRoleInstrumentalBgm},
-		}
-	} else {
-		merged[0].StartMs = 0
-		merged[len(merged)-1].EndMs = durationMs
-	}
+	merged[0].StartMs = 0
+	merged[len(merged)-1].EndMs = durationMs
 
 	return &AudioRoleAnalysisResult{
 		Segments:     merged,
-		ProviderID:   DefaultAcousticProviderID,
-		ModelName:    DefaultAcousticModelName,
-		ModelVersion: DefaultAcousticModelVersion,
+		ProviderID:   TestAcousticProviderID,
+		ModelName:    TestAcousticModelName,
+		ModelVersion: TestAcousticModelVersion,
 	}, nil
 }
 
@@ -533,9 +574,8 @@ func computeMaxAutocorr(samples []int16, sampleRate int) float64 {
 		return 0.0
 	}
 
-	// Human vocal pitch range: 80 Hz to 500 Hz
-	minLag := sampleRate / 500 // ~32 samples at 16k
-	maxLag := sampleRate / 80  // ~200 samples at 16k
+	minLag := sampleRate / 500
+	maxLag := sampleRate / 80
 	if maxLag >= n {
 		maxLag = n - 1
 	}

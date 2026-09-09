@@ -334,7 +334,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/assets/{id}", s.handleGetAsset)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/preflight", s.handleGetAssetPreflight)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/audio-role-plan", s.handleSaveAudioRolePlan)
-	s.mux.HandleFunc("POST /api/v1/assets/{id}/audio-role-plan/generate", s.handleSaveAudioRolePlan)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/audio-role-plan/generate", s.handleGenerateAudioRolePlan)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/audio-role-plan", s.handleGetAudioRolePlan)
 
 	// Localization Jobs & Runs
@@ -689,38 +689,10 @@ func (s *Server) handleSaveAudioRolePlan(w http.ResponseWriter, r *http.Request)
 	}
 
 	var body struct {
-		Segments         []domain.AudioSegment   `json:"segments,omitempty"`
-		RunID            string                  `json:"run_id,omitempty"`
-		JobID            string                  `json:"job_id,omitempty"`
-		ExecutionProfile domain.ExecutionProfile `json:"execution_profile,omitempty"`
+		Segments []domain.AudioSegment `json:"segments"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
-		return
-	}
-
-	// If no segments were supplied, automatically generate production AudioRolePlan
-	if len(body.Segments) == 0 {
-		if s.audioRoleSvc == nil {
-			writeError(w, http.StatusInternalServerError, "audio role service is not configured")
-			return
-		}
-		in := service.AudioRolePlanInput{
-			AssetID:          assetID,
-			RunID:            body.RunID,
-			JobID:            body.JobID,
-			ExecutionProfile: body.ExecutionProfile,
-		}
-		plan, err := s.audioRoleSvc.GenerateAudioRolePlan(r.Context(), in)
-		if err != nil {
-			if errors.Is(err, domain.ErrAssetNotFound) || errors.Is(err, storage.ErrNotFound) {
-				writeError(w, http.StatusNotFound, err.Error())
-				return
-			}
-			writeError(w, http.StatusInternalServerError, "generate audio role plan: "+err.Error())
-			return
-		}
-		writeJSON(w, http.StatusCreated, map[string]any{"audio_role_plan": plan})
 		return
 	}
 
@@ -753,6 +725,49 @@ func (s *Server) handleSaveAudioRolePlan(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusCreated, map[string]any{"audio_role_plan": plan})
 }
 
+func (s *Server) handleGenerateAudioRolePlan(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if _, err := s.db.GetSourceAsset(r.Context(), assetID); err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.audioRoleSvc == nil {
+		writeError(w, http.StatusInternalServerError, "audio role service is not configured")
+		return
+	}
+
+	var body struct {
+		RunID            string                  `json:"run_id,omitempty"`
+		JobID            string                  `json:"job_id,omitempty"`
+		ExecutionProfile domain.ExecutionProfile `json:"execution_profile,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in := service.AudioRolePlanInput{
+		AssetID:          assetID,
+		RunID:            body.RunID,
+		JobID:            body.JobID,
+		ExecutionProfile: body.ExecutionProfile,
+	}
+	plan, err := s.audioRoleSvc.GenerateAudioRolePlan(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) || errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "generate audio role plan: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"audio_role_plan": plan})
+}
 func (s *Server) handleGetAudioRolePlan(w http.ResponseWriter, r *http.Request) {
 	assetID := r.PathValue("id")
 	plan, err := s.db.GetAudioRolePlan(r.Context(), assetID)
@@ -808,6 +823,20 @@ func (s *Server) handleRunSpeechUnderstand(w http.ResponseWriter, r *http.Reques
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+
+	// Automatic prerequisite generation on the normal production speech path:
+	// If no AudioRolePlan has been pre-seeded or generated for this asset,
+	// automatically generate and persist the canonical plan using production
+	// source analysis before invoking SpeechService.
+	if rolePlan == nil && s.audioRoleSvc != nil {
+		genPlan, err := s.audioRoleSvc.GenerateAudioRolePlan(r.Context(), service.AudioRolePlanInput{
+			AssetID: assetID,
+			RunID:   body.RunID,
+		})
+		if err == nil && genPlan != nil {
+			rolePlan = genPlan
+		}
 	}
 
 	// Resolve the source media from the asset's CAS metadata on the RuntimeHost

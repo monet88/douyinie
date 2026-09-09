@@ -1621,24 +1621,30 @@ func (s *DB) SaveAudioRolePlan(ctx context.Context, plan domain.AudioRolePlan) e
 
 	createdAtStr := plan.CreatedAt.Format(time.RFC3339Nano)
 
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin save audio role plan tx: %w", err)
+	}
+	defer tx.Rollback()
+
 	// Check if a plan for this asset_id already exists to update it
 	var existingID string
-	err = s.db.QueryRowContext(ctx, `SELECT id FROM audio_role_plans WHERE asset_id = ?`, plan.AssetID).Scan(&existingID)
+	err = tx.QueryRowContext(ctx, `SELECT id FROM audio_role_plans WHERE asset_id = ?`, plan.AssetID).Scan(&existingID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("check existing audio role plan: %w", err)
 	}
 
 	if existingID != "" {
-		// Update existing plan, retaining its ID (or update ID to match plan.ID to be consistent with client request)
+		// Update existing plan
 		query := `UPDATE audio_role_plans SET id = ?, plan_json = ?, created_at = ? WHERE asset_id = ?`
-		_, err = s.db.ExecContext(ctx, query, plan.ID, string(segmentsJSON), createdAtStr, plan.AssetID)
+		_, err = tx.ExecContext(ctx, query, plan.ID, string(segmentsJSON), createdAtStr, plan.AssetID)
 		if err != nil {
 			return fmt.Errorf("update audio role plan: %w", err)
 		}
 	} else {
 		// Insert new plan
 		query := `INSERT INTO audio_role_plans (id, asset_id, plan_json, created_at) VALUES (?, ?, ?, ?)`
-		_, err = s.db.ExecContext(ctx, query, plan.ID, plan.AssetID, string(segmentsJSON), createdAtStr)
+		_, err = tx.ExecContext(ctx, query, plan.ID, plan.AssetID, string(segmentsJSON), createdAtStr)
 		if err != nil {
 			return fmt.Errorf("save audio role plan: %w", err)
 		}
@@ -1652,7 +1658,7 @@ func (s *DB) SaveAudioRolePlan(ctx context.Context, plan domain.AudioRolePlan) e
 			ON CONFLICT(provenance_hash) DO UPDATE SET
 				cas_hash = excluded.cas_hash
 		`
-		_, _ = s.db.ExecContext(ctx, idxQuery,
+		_, err = tx.ExecContext(ctx, idxQuery,
 			plan.ID,
 			plan.AssetID,
 			plan.ProviderID,
@@ -1662,6 +1668,13 @@ func (s *DB) SaveAudioRolePlan(ctx context.Context, plan domain.AudioRolePlan) e
 			plan.ProvenanceHash,
 			createdAtStr,
 		)
+		if err != nil {
+			return fmt.Errorf("insert audio_role_plan_artifacts index: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit save audio role plan tx: %w", err)
 	}
 	return nil
 }
