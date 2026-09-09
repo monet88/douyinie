@@ -53,8 +53,7 @@ func setupAudioRoleTestHarness(t *testing.T) *audioRoleTestHarness {
 	audioMixSvc := service.NewAudioMixService(db, casStore)
 	audioMixSvc.ConfigureRouter(router)
 
-	audioRoleSvc := service.NewAudioRoleService(db, casStore, audioMixSvc)
-
+	audioRoleSvc := service.NewAudioRoleServiceWithAnalyzer(db, casStore, audioMixSvc, service.NewDeterministicTestAudioRoleAnalyzer())
 	reviewSvc := service.NewReviewService(db, casStore)
 	reviewSvc.SetAudioMixService(audioMixSvc)
 
@@ -714,5 +713,85 @@ func TestAudioRoleService_GovernancePersistenceError_Propagated(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error when DB write fails, got nil")
+	}
+}
+
+func TestAudioRoleService_DefaultConstructor_FailsClosedWithoutAnalyzer(t *testing.T) {
+	h := setupAudioRoleTestHarness(t)
+	ctx := context.Background()
+
+	// Default constructor with no analyzer
+	svc := service.NewAudioRoleService(h.db, h.casStore, h.audioMixSvc)
+	if svc.Analyzer() != nil {
+		t.Fatal("expected NewAudioRoleService to have nil analyzer by default in production")
+	}
+
+	durationMs := int64(2000)
+	sampleRate := 16000
+	totalSamples := (sampleRate * int(durationMs)) / 1000
+	vocalSamples := make([]int16, totalSamples)
+	bgSamples := make([]int16, totalSamples)
+	assetID, _ := createControlledAsset(t, h, durationMs, vocalSamples, bgSamples)
+
+	_, err := svc.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{
+		AssetID: assetID,
+		RunID:   uuid.NewString(),
+	})
+	if err == nil || !errors.Is(err, domain.ErrAudioRoleAnalyzerUnavailable) {
+		t.Fatalf("expected ErrAudioRoleAnalyzerUnavailable when analyzer is not configured, got: %v", err)
+	}
+}
+
+func TestAudioRoleService_GovernanceCacheCompleteness(t *testing.T) {
+	h := setupAudioRoleTestHarness(t)
+	ctx := context.Background()
+
+	durationMs := int64(2000)
+	sampleRate := 16000
+	totalSamples := (sampleRate * int(durationMs)) / 1000
+	vocalSamples := make([]int16, totalSamples)
+	bgSamples := make([]int16, totalSamples)
+	assetID, _ := createControlledAsset(t, h, durationMs, vocalSamples, bgSamples)
+
+	// Run 1: Generates plan and records governance records for run1
+	runID1 := uuid.NewString()
+	plan1, err := h.audioRole.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{
+		AssetID: assetID,
+		RunID:   runID1,
+	})
+	if err != nil {
+		t.Fatalf("first run failed: %v", err)
+	}
+
+	decisions1, err := h.db.ListSelectionDecisions(ctx, runID1, "audio_role_plan")
+	if err != nil || len(decisions1) == 0 {
+		t.Fatalf("expected selection decision for run1, got %v (err=%v)", decisions1, err)
+	}
+	attempts1, err := h.db.ListProviderAttempts(ctx, runID1, "audio_role_plan")
+	if err != nil || len(attempts1) == 0 {
+		t.Fatalf("expected provider attempt for run1, got %v (err=%v)", attempts1, err)
+	}
+
+	// Run 2: Cache hit from same asset and provenance, but new runID2!
+	// Governance records MUST be created for runID2 on cache hit!
+	runID2 := uuid.NewString()
+	plan2, err := h.audioRole.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{
+		AssetID: assetID,
+		RunID:   runID2,
+	})
+	if err != nil {
+		t.Fatalf("second run (cache hit) failed: %v", err)
+	}
+	if plan2.ID != plan1.ID {
+		t.Fatalf("expected cached plan ID %s, got %s", plan1.ID, plan2.ID)
+	}
+
+	decisions2, err := h.db.ListSelectionDecisions(ctx, runID2, "audio_role_plan")
+	if err != nil || len(decisions2) == 0 {
+		t.Fatalf("governance bypassed on cache hit: expected selection decision for run2, got %v (err=%v)", decisions2, err)
+	}
+	attempts2, err := h.db.ListProviderAttempts(ctx, runID2, "audio_role_plan")
+	if err != nil || len(attempts2) == 0 {
+		t.Fatalf("governance bypassed on cache hit: expected provider attempt for run2, got %v (err=%v)", attempts2, err)
 	}
 }

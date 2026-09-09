@@ -1234,3 +1234,67 @@ func TestSeam1_Snapshot_Separator_RegistrationAndVerification(t *testing.T) {
 		t.Fatalf("expected entrypoint file 955717e8-8726e21a.th, got %s", depComplete)
 	}
 }
+
+func TestSeam1_Snapshot_AudioRole_YAMNet_RegistrationAndVerification(t *testing.T) {
+	tmpDir := t.TempDir()
+	yamnetDir := filepath.Join(tmpDir, "yamnet")
+	if err := os.MkdirAll(yamnetDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Case A: Missing file fails closed
+	genuineYAMNetManifest := domain.SnapshotManifest{
+		SchemaVersion: "1.0",
+		ModelID:       provider.YAMNetModelID,
+		ModelVersion:  provider.YAMNetModelVersion,
+		Files: []domain.SnapshotFileEntry{
+			{
+				RelativePath: "yamnet.tflite",
+				SHA256:       domain.PinnedYAMNetArtifactSHA256,
+				SizeBytes:    3870000,
+			},
+		},
+		SnapshotManifestSHA256: domain.PinnedYAMNetManifestSHA256,
+	}
+
+	if _, err := domain.ResolveAudioRoleEntrypoint(genuineYAMNetManifest, yamnetDir, provider.YAMNetModelID); !errors.Is(err, domain.ErrSnapshotFileCorrupted) {
+		t.Fatalf("expected ErrSnapshotFileCorrupted when file does not exist on disk, got: %v", err)
+	}
+
+	// Case B1: Unmanifested yamnet.tflite fails closed
+	emptyManifest := genuineYAMNetManifest
+	emptyManifest.Files = nil
+	if _, err := domain.ResolveAudioRoleEntrypoint(emptyManifest, yamnetDir, provider.YAMNetModelID); !errors.Is(err, domain.ErrAudioRoleModelAssetMissing) {
+		t.Fatalf("expected ErrAudioRoleModelAssetMissing when unmanifested, got: %v", err)
+	}
+	// Case B: Corrupted digest in manifest fails closed
+	corruptPath := filepath.Join(yamnetDir, "yamnet.tflite")
+	if err := os.WriteFile(corruptPath, []byte("valid-yamnet-weights"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	corruptManifest := genuineYAMNetManifest
+	corruptManifest.Files = []domain.SnapshotFileEntry{
+		{
+			RelativePath: "yamnet.tflite",
+			SHA256:       "badbeefbadbeef",
+			SizeBytes:    100,
+		},
+	}
+	if _, err := domain.ResolveAudioRoleEntrypoint(corruptManifest, yamnetDir, provider.YAMNetModelID); !errors.Is(err, domain.ErrSnapshotDigestMismatch) {
+		t.Fatalf("expected ErrSnapshotDigestMismatch for corrupt manifest digest, got: %v", err)
+	}
+
+	// Case C: Genuine model file resolves successfully
+	ep, err := domain.ResolveAudioRoleEntrypoint(genuineYAMNetManifest, yamnetDir, provider.YAMNetModelID)
+	if err != nil {
+		t.Fatalf("expected valid entrypoint to resolve, got: %v", err)
+	}
+	if filepath.Base(ep) != "yamnet.tflite" {
+		t.Fatalf("expected yamnet.tflite, got: %s", ep)
+	}
+
+	// Case D: Unknown model ID fails closed
+	if _, err := domain.ResolveAudioRoleEntrypoint(genuineYAMNetManifest, yamnetDir, "unknown_audio_model"); !errors.Is(err, domain.ErrAudioRoleModelAssetMissing) {
+		t.Fatalf("expected ErrAudioRoleModelAssetMissing for unknown model ID, got: %v", err)
+	}
+}

@@ -1678,3 +1678,81 @@ class Diarization3Dspeaker:
 		t.Fatalf("expected strict diarize_evidence to fail closed with WORKER_SNAPSHOT_PATH_REQUIRED when model_cache_dir rejected, got: %v", err)
 	}
 }
+
+func TestSeam2_AudioRoleStage_YAMNet_StrictModeAndExecution(t *testing.T) {
+	cacheRoot := t.TempDir()
+	yamnetDir := filepath.Join(cacheRoot, "yamnet")
+	if err := os.MkdirAll(yamnetDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	yamnetEnv := worker.ModelSnapshotEnvelope{
+		Primary: worker.ModelSnapshotRef{
+			Role:                   "primary",
+			DependencyName:         "yamnet",
+			Version:                "v1",
+			SnapshotManifestSHA256: domain.PinnedYAMNetManifestSHA256,
+			LocalPath:              yamnetDir,
+		},
+	}
+
+	// 1. Envelope validation
+	cmdSnap := worker.Command{
+		ID:        "cmd-audiorole-snap-1",
+		Family:    "audio_role",
+		Stage:     "audio_role",
+		AttemptID: "att-audiorole-1",
+		Config: map[string]any{
+			worker.ConfigKeyModelSnapshot: yamnetEnv,
+		},
+	}
+	bSnap, _ := json.Marshal(cmdSnap)
+	envSnap := worker.Envelope{
+		Type:    worker.MessageTypeCommand,
+		Version: worker.ProtocolVersion,
+		At:      time.Now().UTC(),
+		Payload: bSnap,
+	}
+	if err := worker.ValidateEnvelope(envSnap); err != nil {
+		t.Fatalf("expected valid audio_role snapshot envelope to pass, got %v", err)
+	}
+
+	// 2. Build stageworker if needed
+	exe := buildStageWorker(t)
+	sup := worker.NewSupervisor()
+	if err := sup.Spawn(context.Background(), "audio_role", exe, "-family", "audio_role", "-heartbeat-ms", "1000"); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	defer sup.Terminate()
+
+	client := worker.NewClient(sup)
+	if _, err := client.Handshake(context.Background(), 5*time.Second); err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("handshake: %v", err)
+	}
+	defer client.Shutdown()
+
+	audioPath := filepath.Join(t.TempDir(), "audio.wav")
+	_ = os.WriteFile(audioPath, []byte("fake audio"), 0644)
+
+	// Strict mode: missing model asset in snapshot dir fails closed
+	cmdStrict := worker.Command{
+		ID:         "cmd-audiorole-strict-fail",
+		Family:     "audio_role",
+		Stage:      "audio_role",
+		AttemptID:  "att-strict-1",
+		RunID:      "run-strict-1",
+		Inputs:     []worker.ArtifactRef{{Path: audioPath}},
+		OutputPath: filepath.Join(t.TempDir(), "out-strict.json"),
+		Config: map[string]any{
+			worker.ConfigKeyModelSnapshot: yamnetEnv,
+			"model_name":                  "yamnet",
+			"model_version":               "v1",
+			"require_model_snapshot":      true,
+		},
+	}
+	_, err := client.Run(context.Background(), cmdStrict, 10*time.Second, 10*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "WORKER_SNAPSHOT_PATH_REQUIRED") {
+		t.Fatalf("expected strict mode to fail closed with WORKER_SNAPSHOT_PATH_REQUIRED when model asset missing, got: %v", err)
+	}
+}

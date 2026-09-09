@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -60,6 +61,34 @@ func ComputeAudioRolePlanProvenanceHash(assetSHA256, stemsCASHash, providerID, m
 		ConfigHash:    configHash,
 		SchemaVersion: AudioRolePlanSchemaVersion,
 	}.Hash()
+}
+
+// AudioRoleAnalysisRequest represents the input to an AudioRoleAnalyzer.
+type AudioRoleAnalysisRequest struct {
+	AssetID          string
+	RunID            string
+	SourceAudioPath  string
+	VocalsPath       string
+	BackgroundPath   string
+	DurationMs       int64
+	SampleRate       int
+	Channels         int
+	ExecutionProfile ExecutionProfile
+}
+
+// AudioRoleAnalysisResult captures the classified segments and provenance metadata.
+type AudioRoleAnalysisResult struct {
+	Segments        []AudioSegment
+	ModelName       string
+	ModelVersion    string
+	RuntimeIdentity string
+	ProviderID      string
+}
+
+// AudioRoleAnalyzer defines the pluggable seam for audio role classification.
+type AudioRoleAnalyzer interface {
+	AnalyzeAudioRoles(ctx context.Context, req AudioRoleAnalysisRequest) (*AudioRoleAnalysisResult, error)
+	AnalyzerInfo() (providerID, modelName, modelVersion, configHash string)
 }
 
 // StemType identifies the acoustic content of an audio stem.

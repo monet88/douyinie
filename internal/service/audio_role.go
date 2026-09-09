@@ -37,31 +37,10 @@ type AudioRolePlanInput struct {
 	ExecutionProfile domain.ExecutionProfile `json:"execution_profile,omitempty"`
 }
 
-// AudioRoleAnalysisRequest represents the evidence bundle provided to an AudioRoleAnalyzer.
-type AudioRoleAnalysisRequest struct {
-	AssetID          string
-	RunID            string
-	DurationMs       int64
-	SourceAudioPath  string
-	VocalsPath       string
-	BackgroundPath   string
-	ExecutionProfile domain.ExecutionProfile
-}
-
-// AudioRoleAnalysisResult represents the output of an AudioRoleAnalyzer.
-type AudioRoleAnalysisResult struct {
-	Segments     []domain.AudioSegment
-	ProviderID   string
-	ModelName    string
-	ModelVersion string
-	Metadata     map[string]any
-}
-
-// AudioRoleAnalyzer is the provider-neutral interface for classifying timeline audio roles.
-type AudioRoleAnalyzer interface {
-	AnalyzerInfo() (providerID, modelName, modelVersion, configHash string)
-	AnalyzeAudioRoles(ctx context.Context, req AudioRoleAnalysisRequest) (*AudioRoleAnalysisResult, error)
-}
+// Type aliases to domain audio role analysis contracts
+type AudioRoleAnalysisRequest = domain.AudioRoleAnalysisRequest
+type AudioRoleAnalysisResult = domain.AudioRoleAnalysisResult
+type AudioRoleAnalyzer = domain.AudioRoleAnalyzer
 
 // AudioRoleService coordinates automatic source analysis to generate and persist canonical AudioRolePlans.
 type AudioRoleService struct {
@@ -71,19 +50,35 @@ type AudioRoleService struct {
 	analyzer    AudioRoleAnalyzer
 }
 
-// NewAudioRoleService constructs a new AudioRoleService instance.
+// NewAudioRoleService constructs a new production AudioRoleService instance with no default analyzer.
+// Production RuntimeHost must explicitly set or inject a verified production analyzer, or calls fail closed.
 func NewAudioRoleService(db *storage.DB, casStore *cas.Store, audioMixSvc *AudioMixService) *AudioRoleService {
 	return &AudioRoleService{
 		db:          db,
 		cas:         casStore,
 		audioMixSvc: audioMixSvc,
-		analyzer:    NewDeterministicTestAudioRoleAnalyzer(),
+		analyzer:    nil,
+	}
+}
+
+// NewAudioRoleServiceWithAnalyzer constructs an AudioRoleService with an explicitly provided analyzer.
+func NewAudioRoleServiceWithAnalyzer(db *storage.DB, casStore *cas.Store, audioMixSvc *AudioMixService, analyzer AudioRoleAnalyzer) *AudioRoleService {
+	return &AudioRoleService{
+		db:          db,
+		cas:         casStore,
+		audioMixSvc: audioMixSvc,
+		analyzer:    analyzer,
 	}
 }
 
 // SetAnalyzer replaces the active AudioRoleAnalyzer implementation.
 func (s *AudioRoleService) SetAnalyzer(analyzer AudioRoleAnalyzer) {
 	s.analyzer = analyzer
+}
+
+// Analyzer returns the currently configured AudioRoleAnalyzer implementation.
+func (s *AudioRoleService) Analyzer() AudioRoleAnalyzer {
+	return s.analyzer
 }
 
 // GenerateAudioRolePlan automatically generates a canonical AudioRolePlan using source preflight and stem evidence.
@@ -113,7 +108,7 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 	// 2. Resolve analyzer seam
 	analyzer := s.analyzer
 	if analyzer == nil {
-		return nil, errors.New("no audio role analyzer configured")
+		return nil, domain.ErrAudioRoleAnalyzerUnavailable
 	}
 	providerID, modelName, modelVersion, configHash := analyzer.AnalyzerInfo()
 
@@ -174,6 +169,12 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 	if existingIdx, err := s.db.GetAudioRolePlanByProvenance(ctx, provHash); err == nil && existingIdx != nil {
 		// Idempotent hit: return existing plan
 		if existingPlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID); err == nil && existingPlan != nil {
+			// Governance records must not be bypassable by idempotent cache reuse.
+			if in.RunID != "" {
+				if err := s.ensureGovernanceRecords(ctx, in.RunID, providerID, modelName, modelVersion, provHash, 0); err != nil {
+					return nil, fmt.Errorf("ensure audio role governance records on cache hit: %w", err)
+				}
+			}
 			return existingPlan, nil
 		}
 	}
@@ -229,9 +230,21 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 	// 9. Record Governance Records (SelectionDecision & ProviderAttempt)
 	if in.RunID != "" {
 		latencyMs := time.Since(startTime).Milliseconds()
+		if err := s.ensureGovernanceRecords(ctx, in.RunID, providerID, modelName, modelVersion, provHash, latencyMs); err != nil {
+			return nil, err
+		}
+	}
+
+	_ = asset
+	return &plan, nil
+}
+
+func (s *AudioRoleService) ensureGovernanceRecords(ctx context.Context, runID, providerID, modelName, modelVersion, provHash string, latencyMs int64) error {
+	decisions, err := s.db.ListSelectionDecisions(ctx, runID, "audio_role_plan")
+	if err != nil || len(decisions) == 0 {
 		decision := domain.SelectionDecision{
 			ID:                 uuid.NewString(),
-			RunID:              in.RunID,
+			RunID:              runID,
 			Stage:              "audio_role_plan",
 			SelectedProviderID: providerID,
 			PolicyCheckResult:  "allowed",
@@ -239,12 +252,15 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 			CreatedAt:          time.Now().UTC(),
 		}
 		if err := s.db.RecordSelectionDecision(ctx, decision); err != nil {
-			return nil, fmt.Errorf("record audio role selection decision: %w", err)
+			return fmt.Errorf("record audio role selection decision: %w", err)
 		}
+	}
 
+	attempts, err := s.db.ListProviderAttempts(ctx, runID, "audio_role_plan")
+	if err != nil || len(attempts) == 0 {
 		attempt := domain.ProviderAttempt{
 			ID:            uuid.NewString(),
-			RunID:         in.RunID,
+			RunID:         runID,
 			Stage:         "audio_role_plan",
 			ProviderID:    providerID,
 			ModelName:     modelName,
@@ -256,12 +272,10 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 			CreatedAt:     time.Now().UTC(),
 		}
 		if err := s.db.RecordProviderAttempt(ctx, attempt); err != nil {
-			return nil, fmt.Errorf("record audio role provider attempt: %w", err)
+			return fmt.Errorf("record audio role provider attempt: %w", err)
 		}
 	}
-
-	_ = asset
-	return &plan, nil
+	return nil
 }
 
 // ---------------------------------------------------------------------------

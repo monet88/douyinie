@@ -146,6 +146,8 @@ func newRuntimeHost(t *testing.T, db *storage.DB, casStore *cas.Store, queueSvc 
 	}
 	router := provider.NewRouter(fakeRegistry, polSvc, licSvc, credSvc, nil, db)
 
+	audioMixSvc := service.NewAudioMixService(db, casStore)
+	audioRoleSvc := service.NewAudioRoleServiceWithAnalyzer(db, casStore, audioMixSvc, service.NewDeterministicTestAudioRoleAnalyzer())
 	return server.New(server.Config{
 		Addr:           "127.0.0.1:0",
 		DB:             db,
@@ -161,7 +163,8 @@ func newRuntimeHost(t *testing.T, db *storage.DB, casStore *cas.Store, queueSvc 
 		SpeechSvc:      service.NewSpeechService(db, casStore),
 		TranslationSvc: service.NewTranslationService(db, casStore),
 		DubbingSvc:     service.NewDubbingService(db, casStore),
-		AudioMixSvc:    service.NewAudioMixService(db, casStore),
+		AudioMixSvc:    audioMixSvc,
+		AudioRoleSvc:   audioRoleSvc,
 		VisualTextSvc:  service.NewVisualTextService(db, casStore),
 		RenderSvc:      service.NewRenderService(db, casStore),
 		ReviewSvc:      service.NewReviewService(db, casStore),

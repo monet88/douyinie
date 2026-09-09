@@ -18,6 +18,7 @@ const (
 	TypeSeparator   ProviderType = "separator"
 	TypeOCR         ProviderType = "ocr"
 	TypeTranslation ProviderType = "translation"
+	TypeAudioRole   ProviderType = "audio_role"
 )
 
 // Alias for domain.PolicyState

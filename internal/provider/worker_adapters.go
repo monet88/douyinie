@@ -44,6 +44,7 @@ const (
 	stageWorkerFamilyTTS       = "tts"
 	stageWorkerFamilySeparator = "separator"
 	stageWorkerFamilyOCR       = "ocr"
+	stageWorkerFamilyAudioRole = "audio_role"
 )
 
 // resolveStageWorkerBinary locates the StageWorker executable: explicit
@@ -644,6 +645,17 @@ func NewProductionSpeechRegistry(opts ...any) (*Registry, error) {
 		return nil, err
 	}
 
+	// 7b. AudioRole YAMNet baseline (Issue #80)
+	yamnet, err := NewWorkerAudioRoleProvider(YAMNetProviderID, YAMNetModelID, YAMNetModelVersion, 0.95)
+	if err != nil {
+		return nil, err
+	}
+	yamnet.SetRequiresSnapshot(requireSnapshots)
+	yamnet.SetSnapshotService(snapshotSvc)
+	yamnet.SetLeaseManager(mgr)
+	if err := reg.Register(yamnet); err != nil {
+		return nil, err
+	}
 	// 8. Production Translation Providers
 	// Gateway translation providers are registered ONLY when an explicit
 	// OpenAI-compatible gateway endpoint and baseline IDs are provided.

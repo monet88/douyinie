@@ -18,6 +18,7 @@ type SnapshotFileEntry struct {
 	SHA256       string `json:"sha256"`
 	SizeBytes    int64  `json:"size_bytes"`
 }
+
 // SnapshotManifest defines the canonical manifest contract for an executable model snapshot.
 // It enumerates every primary/dependency model, config, tokenizer, voice, or asset file.
 type SnapshotManifest struct {
@@ -228,6 +229,7 @@ func (r *RuntimeIdentity) ComputeRuntimeManifestSHA256() string {
 	hash := sha256.Sum256(b)
 	return hex.EncodeToString(hash[:])
 }
+
 // Frozen preset voice rotations for TTS (Issue #68).
 var (
 	FrozenKokoroVoiceOrder = []string{"af_heart", "am_michael", "af_bella", "am_fenrir"}
@@ -485,7 +487,6 @@ func ResolveTTSVoiceEntrypoint(manifest SnapshotManifest, snapshotRoot, modelNam
 			return "", err
 		}
 
-
 		catalogBytes, err := os.ReadFile(fullCatalogPath)
 		if err != nil {
 			return "", fmt.Errorf("%w: failed to read VieNeu voice catalog (%s): %v",
@@ -578,7 +579,7 @@ const (
 	PinnedUVRArtifactSHA256    = "3c4b5b9b05090fdf238f38ba5046813982d50e2a652e9cb3324ea79720c3c9c8"
 	PinnedUVRSourceRevision    = "bf1164aa0f1ee1d1d0ef0f09b315f7659fc06bab"
 	PinnedUVRPackageVersion    = "0.47.0"
-	PinnedUVRMetadataFilename   = "mdx_model_data.json"
+	PinnedUVRMetadataFilename  = "mdx_model_data.json"
 	PinnedDemucsModelID        = "htdemucs"
 	PinnedDemucsModelVersion   = "v4"
 	PinnedDemucsCheckpointSHA  = "8726e21a993978c7ba086d3872e7608d7d5bfca646ca4aca459ffda844faa8b4"
@@ -618,6 +619,7 @@ func NewDemucsRuntimeIdentity(primarySnapSHA string, depSHAs []string) RuntimeId
 	rt.RuntimeManifestSHA256 = rt.ComputeRuntimeManifestSHA256()
 	return rt
 }
+
 // ResolveSeparatorEntrypoint validates that the requested separator model asset is part
 // of the verified model snapshot manifest and accessible on disk, failing closed if missing,
 // mismatched, or unverified.
@@ -720,4 +722,62 @@ func ResolveSeparatorMetadataPath(manifest SnapshotManifest, snapshotRoot string
 			ErrSeparatorModelAssetMissing, PinnedUVRMetadataFilename, manifest.ModelID)
 	}
 	return verifySnapshotRegularFile(cleanRoot, metaEntry, "UVR model metadata")
+}
+
+// Frozen RC identities and digests for audio role analysis (Issue #80)
+const (
+	PinnedYAMNetModelID         = "yamnet"
+	PinnedYAMNetModelVersion    = "v1"
+	PinnedYAMNetArtifactSHA256  = "10c95ea3eb9a7bb4cb8bddf6feb023250381008177ac162ce169694d05c317de"
+	PinnedYAMNetClassMapSHA256  = "cdf24d193e196d9e95912a2667051ae203e92a2ba09449218ccb40ef787c6df2"
+	PinnedYAMNetManifestSHA256  = "305743f2153ec1250ed1149fcb5acbfe1944d548630f9b23c6c53655dea79943"
+	PinnedYAMNetPackageVersion  = "2.2.0"
+	PinnedYAMNetAdapterRevision = "cmd/stageworker/adapters/audio_role_yamnet.py@v2.2.0"
+)
+
+// NewYAMNetRuntimeIdentity constructs the authoritative RuntimeIdentity evidence for YAMNet.
+func NewYAMNetRuntimeIdentity(primarySnapSHA string, depSHAs []string) RuntimeIdentity {
+	rt := RuntimeIdentity{
+		AdapterRevision: PinnedYAMNetAdapterRevision,
+		SourceRevision:  "google/yamnet@v1",
+		RuntimeVersions: map[string]string{
+			"ai-edge-litert": PinnedYAMNetPackageVersion,
+		},
+		PrimarySnapshotSHA256:  primarySnapSHA,
+		DependencySnapshotSHAs: depSHAs,
+	}
+	rt.RuntimeManifestSHA256 = rt.ComputeRuntimeManifestSHA256()
+	return rt
+}
+
+// ResolveAudioRoleEntrypoint validates that the requested audio role model asset (yamnet.tflite)
+// is part of the verified model snapshot manifest and accessible on disk, failing closed if missing or unverified.
+func ResolveAudioRoleEntrypoint(manifest SnapshotManifest, snapshotRoot, modelName string) (string, error) {
+	cleanRoot := strings.TrimSpace(snapshotRoot)
+	if cleanRoot == "" {
+		return "", fmt.Errorf("%w: empty snapshotRoot", ErrSnapshotFileCorrupted)
+	}
+
+	lowerModel := strings.ToLower(strings.TrimSpace(modelName))
+	if !strings.Contains(lowerModel, "yamnet") && !strings.Contains(lowerModel, "audio_role") {
+		return "", fmt.Errorf("%w: unrecognized audio role model %s", ErrAudioRoleModelAssetMissing, modelName)
+	}
+
+	var tfliteEntry *SnapshotFileEntry
+	for i, f := range manifest.Files {
+		norm := strings.ToLower(NormalizeRelativePath(f.RelativePath))
+		if strings.HasSuffix(norm, "yamnet.tflite") || norm == "yamnet.tflite" {
+			tfliteEntry = &manifest.Files[i]
+			break
+		}
+	}
+	if tfliteEntry == nil {
+		return "", fmt.Errorf("%w: yamnet.tflite not declared in snapshot manifest for %s",
+			ErrAudioRoleModelAssetMissing, modelName)
+	}
+	if !strings.EqualFold(tfliteEntry.SHA256, PinnedYAMNetArtifactSHA256) {
+		return "", fmt.Errorf("%w: YAMNet artifact %s SHA-256 mismatch: expected %s, got %s",
+			ErrSnapshotDigestMismatch, tfliteEntry.RelativePath, PinnedYAMNetArtifactSHA256, tfliteEntry.SHA256)
+	}
+	return verifySnapshotRegularFile(cleanRoot, tfliteEntry, "yamnet.tflite")
 }

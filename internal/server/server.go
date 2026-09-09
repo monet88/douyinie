@@ -834,9 +834,11 @@ func (s *Server) handleRunSpeechUnderstand(w http.ResponseWriter, r *http.Reques
 			AssetID: assetID,
 			RunID:   body.RunID,
 		})
-		if err == nil && genPlan != nil {
-			rolePlan = genPlan
+		if err != nil {
+			writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("automatic audio role plan prerequisite generation failed: %v", err))
+			return
 		}
+		rolePlan = genPlan
 	}
 
 	// Resolve the source media from the asset's CAS metadata on the RuntimeHost
