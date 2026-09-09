@@ -892,6 +892,134 @@ func TestVisualTextService_LocalizeVisualTrack_CanonicalTranslationGrounding_Suc
 	}
 }
 
+func TestVisualTextService_LocalizeVisualTrack_ExplicitTranslationCASSurvivesResumeWithNewerOverlayIndex(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	setupTestTranslationService(db, casStore, svc)
+
+	ctx := context.Background()
+	_, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:   "run-resume-pin",
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+
+	speechMeaning := "Bước 1: Chuẩn bị đầy đủ các nguyên liệu tươi ngon."
+	speechVariant := domain.TranslationVariant{
+		ID:             "trans-speech-resume-pin",
+		AssetID:        assetID,
+		RunID:          "run-resume-pin",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{{
+			Index:      0,
+			SourceText: "第一步：准备好所有新鲜食材。",
+			TargetText: speechMeaning,
+			StartMs:    0,
+			EndMs:      3000,
+		}},
+		CreatedAt: time.Now().UTC(),
+	}
+	speechBytes, _ := json.Marshal(speechVariant)
+	speechObj, err := casStore.Put(bytes.NewReader(speechBytes))
+	if err != nil {
+		t.Fatalf("put speech translation in CAS: %v", err)
+	}
+	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             speechVariant.ID,
+		AssetID:        assetID,
+		RunID:          speechVariant.RunID,
+		TargetLanguage: "vi",
+		CASHash:        speechObj.SHA256,
+		ProvenanceHash: "prov-speech-resume-pin",
+		CreatedAt:      speechVariant.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save speech translation index: %v", err)
+	}
+
+	dubVariant := domain.DubScriptVariant{
+		ID:                    "dub-resume-pin",
+		AssetID:               assetID,
+		RunID:                 "run-resume-pin",
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: speechObj.SHA256,
+		Segments: []domain.DubScriptSegment{{
+			Index:       0,
+			SourceText:  "第一步：准备好所有新鲜食材。",
+			MeaningText: speechMeaning,
+			SpokenText:  "Bước 1: Chuẩn bị nguyên liệu.",
+			StartMs:     0,
+			EndMs:       3000,
+		}},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubBytes, _ := json.Marshal(dubVariant)
+	dubObj, err := casStore.Put(bytes.NewReader(dubBytes))
+	if err != nil {
+		t.Fatalf("put dub script in CAS: %v", err)
+	}
+	if err := db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID:             dubVariant.ID,
+		AssetID:        assetID,
+		RunID:          dubVariant.RunID,
+		TargetLanguage: "vi",
+		CASHash:        dubObj.SHA256,
+		ProvenanceHash: "prov-dub-resume-pin",
+		CreatedAt:      dubVariant.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save dub script index: %v", err)
+	}
+
+	// Simulate a previous visual-track attempt: an overlay translation becomes the
+	// latest asset/language index, while the dub script still correctly references
+	// the speech translation artifact that the caller passes explicitly on resume.
+	overlayVariant := domain.TranslationVariant{
+		ID:             "trans-overlay-newer",
+		AssetID:        assetID,
+		RunID:          "run-resume-pin",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{{
+			Index:      0,
+			SourceText: "屏幕文字",
+			TargetText: "Văn bản trên màn hình",
+		}},
+		CreatedAt: speechVariant.CreatedAt.Add(time.Second),
+	}
+	overlayBytes, _ := json.Marshal(overlayVariant)
+	overlayObj, err := casStore.Put(bytes.NewReader(overlayBytes))
+	if err != nil {
+		t.Fatalf("put overlay translation in CAS: %v", err)
+	}
+	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             overlayVariant.ID,
+		AssetID:        assetID,
+		RunID:          overlayVariant.RunID,
+		TargetLanguage: "vi",
+		CASHash:        overlayObj.SHA256,
+		ProvenanceHash: "prov-overlay-newer",
+		CreatedAt:      overlayVariant.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save overlay translation index: %v", err)
+	}
+
+	visTrack, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:                 "run-resume-pin",
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: speechObj.SHA256,
+	})
+	if err != nil {
+		t.Fatalf("explicit speech translation CAS must survive newer overlay index on resume: %v", err)
+	}
+	if len(visTrack.SubtitleCues) != 1 {
+		t.Fatalf("expected 1 subtitle cue, got %d", len(visTrack.SubtitleCues))
+	}
+	if visTrack.SubtitleCues[0].Text != speechMeaning {
+		t.Fatalf("subtitle text %q != explicitly pinned speech translation %q", visTrack.SubtitleCues[0].Text, speechMeaning)
+	}
+}
+
 func setupTestTranslationService(db *storage.DB, casStore *cas.Store, svc *service.VisualTextService) {
 	transSvc := service.NewTranslationService(db, casStore)
 	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {

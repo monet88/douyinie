@@ -38,12 +38,18 @@ The system is designed for unattended execution by default, surfacing only genui
    - One stable voice assigned per speaker per run (no sentence-by-sentence engine hopping).
    - Videos with no spoken dialogue display `No dubbing required` and bypass voice audition.
 
-5. **Exception-Only Human Review**:
+5. **API-First Production Translation; Local Media Processing**:
+   - Production VI/EN translation uses the authorized remote gateway: `gemini-3.8-flash` first, then `deepseek/deepseek-v4-flash-vision-exp`.
+   - Local LLM translation is not a production requirement and is not a fallback. If the remote translation lanes cannot produce an acceptable result, fail closed or request review instead of silently lowering model quality.
+   - The target desktop's limited compute budget is reserved for specialized local media work: ASR/alignment/diarization, voice/TTS, separation, OCR/tracking, mixing, and render.
+   - Local OCR/tracking remains valid; detected visual text is translated through the same remote translation policy.
+
+6. **Exception-Only Human Review**:
    - The pipeline runs unattended; passing and auto-resolved segments bypass human intervention.
    - The review queue surfaces only actionable exceptions (tight timing, uncertain text roles, occlusion risks, or pronunciation anomalies).
    - Direct-manipulation operator override (drag/resize/reclassify text regions, tweak translations, adjust voice).
 
-6. **Out of Scope for V1**:
+7. **Out of Scope for V1**:
    - Facial lip synchronization (LatentSync, MuseTalk) is explicitly out of V1 scope.
    - Arbitrary free-form video editing and timeline restructuring are out of scope.
 

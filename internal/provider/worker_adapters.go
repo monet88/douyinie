@@ -487,7 +487,8 @@ func NewWorkerASRProvider(id, modelName, modelVersion string, qualityScore float
 
 // GatewayTranslationConfig configures optional OpenAI-compatible gateway translation lanes.
 // Remote translation lanes are gateway-only and require an explicit gateway endpoint
-// and runtime service baseline IDs. Local translation operates without remote configuration.
+// and runtime service baseline IDs. Without gateway configuration, the production
+// registry exposes no translation lane and translation fails closed.
 type GatewayTranslationConfig struct {
 	Endpoint           string
 	GeminiBaselineID   string
@@ -643,20 +644,10 @@ func NewProductionSpeechRegistry(opts ...any) (*Registry, error) {
 		return nil, err
 	}
 
-	// 8. Production Translation Providers (Issue #66)
-	// Local: Qwen3-4B-GGUF Q4_K_M lane
-	qwenTrans, err := NewWorkerTranslationProvider("qwen3_4b_translator", "qwen3_4b_translator", "Qwen3-4B-Q4_K_M", 0.85)
-	if err != nil {
-		return nil, err
-	}
-	qwenTrans.SetLeaseManager(mgr)
-	if err := reg.Register(qwenTrans); err != nil {
-		return nil, err
-	}
-
-	// Hybrid: Gateway translation providers are registered ONLY when an explicit
+	// 8. Production Translation Providers
+	// Gateway translation providers are registered ONLY when an explicit
 	// OpenAI-compatible gateway endpoint and baseline IDs are provided.
-	// Local translation operates cleanly without remote configuration.
+	// No local general-purpose translation model is registered in production.
 	if gatewayCfg.Endpoint != "" && !isForbiddenDirectPublicEndpoint(gatewayCfg.Endpoint) {
 		var gwOpts []any
 		if secretResolver != nil {

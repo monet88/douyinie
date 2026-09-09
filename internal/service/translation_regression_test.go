@@ -75,6 +75,62 @@ func TestMeaningFirstQAGate_AcceptsEquivalentVietnameseNumberWords(t *testing.T)
 	}
 }
 
+func TestMeaningFirstQAGate_AcceptsEquivalentCompactClockRangeFormatting(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+
+	res := qa.ValidateSegment(
+		"工作日900-17:00",
+		"Weekdays 9:00-17:00",
+		"zh",
+		"en",
+	)
+	if !res.Passed {
+		t.Fatalf("expected compact 900 and 9:00 to be equivalent clock times, got violations=%v err=%v", res.Violations, res.Err)
+	}
+}
+
+func TestMeaningFirstQAGate_DoesNotEquateArbitraryCompactNumberWithClockHour(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+
+	res := qa.ValidateSegment(
+		"库存900件",
+		"Stock: 9 units",
+		"zh",
+		"en",
+	)
+	if res.Passed || !errors.Is(res.Err, domain.ErrNumberCorrupted) {
+		t.Fatalf("expected arbitrary 900 -> 9 change to remain rejected, got passed=%v violations=%v err=%v", res.Passed, res.Violations, res.Err)
+	}
+}
+
+func TestMeaningFirstQAGate_AffirmativeToNegativeStillFailsClosed(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+
+	res := qa.ValidateSegment(
+		"打开窗户",
+		"Do not open the window",
+		"zh",
+		"en",
+	)
+	if res.Passed || !errors.Is(res.Err, domain.ErrNegationInverted) {
+		t.Fatalf("expected affirmative source -> negative target to remain rejected, got passed=%v violations=%v err=%v", res.Passed, res.Violations, res.Err)
+	}
+}
+
+func TestMeaningFirstQAGate_DoesNotTreatAttachedCupQuantityAsBrand(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+
+	res := qa.ValidateSegment(
+		"1CUP",
+		"1 cup",
+		"zh",
+		"en",
+	)
+	if !res.Passed {
+		t.Fatalf("expected 1CUP to be treated as a quantity token rather than a protected brand, got violations=%v err=%v", res.Violations, res.Err)
+	}
+}
+
 func TestTranslationService_FallbackAppendsSelectionDecision(t *testing.T) {
 	db, casStore, router, reg := setupTranslationTestEnv(t)
 	svc := service.NewTranslationService(db, casStore)
@@ -380,7 +436,7 @@ func TestTranslationService_AllCandidatesQAInvalid_FailsClosed(t *testing.T) {
 	}
 }
 
-func TestTranslationService_HybridLadder_Gemini_DeepSeek_Qwen_QualityFallback(t *testing.T) {
+func TestTranslationService_HybridLadder_Gemini_DeepSeek_FailsClosedWithoutLocalFallback(t *testing.T) {
 	tmpDir := t.TempDir()
 	casStore, err := cas.NewStore(tmpDir)
 	if err != nil {
@@ -397,14 +453,16 @@ func TestTranslationService_HybridLadder_Gemini_DeepSeek_Qwen_QualityFallback(t 
 	licSvc := governance.NewLicenseService(db)
 	credSvc := governance.NewCredentialService(db)
 
-	// Ladder: Gemini -> DeepSeek -> local Qwen
+	// Production ladder: Gemini -> DeepSeek. Local Qwen may be registered but is not translation-eligible.
 	geminiFake := provider.NewFakeTranslationProvider(provider.GatewayGeminiTranslationProviderID)
+	geminiFake.Cap.ExecutionTier = "cloud"
 	geminiFake.ModelName = "gemini-3.8-flash"
 	geminiFake.ModelVersion = "2026-08"
 	geminiFake.CorruptNumbers = true // Primary fails QA on numbers
 	_ = reg.Register(geminiFake)
 
 	deepseekFake := provider.NewFakeTranslationProvider(provider.GatewayDeepSeekTranslationProviderID)
+	deepseekFake.Cap.ExecutionTier = "cloud"
 	deepseekFake.ModelName = "deepseek-v4-flash"
 	deepseekFake.ModelVersion = "v4"
 	// First fallback fails QA on negation inversion
@@ -415,7 +473,7 @@ func TestTranslationService_HybridLadder_Gemini_DeepSeek_Qwen_QualityFallback(t 
 	qwenFake := provider.NewFakeTranslationProvider(provider.WorkerQwenTranslationProviderID)
 	qwenFake.ModelName = "qwen3-4b"
 	qwenFake.ModelVersion = "q4_k_m"
-	// Second fallback succeeds!
+	// Local Qwen would succeed if invoked, which makes this a regression guard against accidental local fallback.
 	_ = reg.Register(qwenFake)
 
 	initCtx := context.Background()
@@ -460,21 +518,18 @@ func TestTranslationService_HybridLadder_Gemini_DeepSeek_Qwen_QualityFallback(t 
 		},
 	}
 
-	variant, err := svc.Translate(initCtx, input)
-	if err != nil {
-		t.Fatalf("expected hybrid ladder to fall back to Qwen and succeed, got: %v", err)
-	}
-	if variant.ProviderID != provider.WorkerQwenTranslationProviderID {
-		t.Fatalf("expected final variant provider %s, got %s", provider.WorkerQwenTranslationProviderID, variant.ProviderID)
+	_, err = svc.Translate(initCtx, input)
+	if err == nil {
+		t.Fatal("expected hybrid translation to fail closed after both remote providers fail quality QA")
 	}
 
-	// Invariant: Gemini (quality_failed) -> DeepSeek (quality_failed) -> Qwen (succeeded)
+	// Invariant: Gemini (quality_failed) -> DeepSeek (quality_failed), then stop. Qwen is never attempted.
 	attempts, err := db.ListProviderAttempts(initCtx, runID, "translation")
 	if err != nil {
 		t.Fatalf("list attempts: %v", err)
 	}
-	if len(attempts) != 3 {
-		t.Fatalf("expected exactly 3 attempts, got %d", len(attempts))
+	if len(attempts) != 2 {
+		t.Fatalf("expected exactly 2 remote attempts, got %d", len(attempts))
 	}
 	if attempts[0].ProviderID != provider.GatewayGeminiTranslationProviderID || attempts[0].Status != "quality_failed" {
 		t.Errorf("attempt 0 must be Gemini quality_failed, got %+v", attempts[0])
@@ -482,22 +537,21 @@ func TestTranslationService_HybridLadder_Gemini_DeepSeek_Qwen_QualityFallback(t 
 	if attempts[1].ProviderID != provider.GatewayDeepSeekTranslationProviderID || attempts[1].Status != "quality_failed" {
 		t.Errorf("attempt 1 must be DeepSeek quality_failed, got %+v", attempts[1])
 	}
-	if attempts[2].ProviderID != provider.WorkerQwenTranslationProviderID || attempts[2].Status != "succeeded" {
-		t.Errorf("attempt 2 must be Qwen succeeded, got %+v", attempts[2])
-	}
 
-	// Invariant: Fallback selection decisions recorded for DeepSeek and Qwen
+	// Invariant: fallback selection decision is recorded for DeepSeek only.
 	decisions, err := db.ListSelectionDecisions(initCtx, runID, "translation")
 	if err != nil {
 		t.Fatalf("list decisions: %v", err)
 	}
-	if len(decisions) < 3 {
-		t.Fatalf("expected at least 3 selection decisions across ladder, got %d", len(decisions))
+	if len(decisions) < 2 {
+		t.Fatalf("expected at least 2 selection decisions across remote ladder, got %d", len(decisions))
 	}
 	if decisions[1].SelectedProviderID != provider.GatewayDeepSeekTranslationProviderID {
 		t.Errorf("expected decision 1 for DeepSeek, got %s", decisions[1].SelectedProviderID)
 	}
-	if decisions[2].SelectedProviderID != provider.WorkerQwenTranslationProviderID {
-		t.Errorf("expected decision 2 for Qwen, got %s", decisions[2].SelectedProviderID)
+	for _, decision := range decisions {
+		if decision.SelectedProviderID == provider.WorkerQwenTranslationProviderID {
+			t.Fatal("local Qwen must never be selected as a production translation fallback")
+		}
 	}
 }

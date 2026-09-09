@@ -13,7 +13,7 @@ import (
 	"github.com/monet88/douyinie/internal/storage"
 )
 
-func TestRouter_TranslationLocalProfile_HardExcludesRemoteCandidates(t *testing.T) {
+func TestRouter_TranslationLocalProfile_DisablesTranslationProviders(t *testing.T) {
 	ctx := context.Background()
 	reg := provider.NewRegistry()
 
@@ -45,31 +45,14 @@ func TestRouter_TranslationLocalProfile_HardExcludesRemoteCandidates(t *testing.
 
 	router := provider.NewRouter(reg, nil, nil, nil, nil, nil)
 
-	// Request with ExecutionProfileLocal
-	res, err := router.Route(ctx, provider.RouteRequest{
+	_, err := router.Route(ctx, provider.RouteRequest{
 		RunID:            uuid.NewString(),
 		Stage:            provider.TypeTranslation,
 		Language:         "vi",
 		ExecutionProfile: domain.ExecutionProfileLocal,
 	})
-	if err != nil {
-		t.Fatalf("Route failed: %v", err)
-	}
-
-	if res.SelectedProvider.ID() != "qwen3_4b_translator" {
-		t.Fatalf("expected local qwen3_4b_translator to be selected, got: %s", res.SelectedProvider.ID())
-	}
-
-	// Verify that remote candidates were hard-excluded with PROFILE_TIER_EXCLUDED, not merely scored lower
-	for _, cand := range res.Decision.CandidatesEvaluated {
-		if cand.ProviderID == "gateway_gemini_3_8_flash" || cand.ProviderID == "gateway_deepseek_v4_flash_vision_exp" {
-			if cand.Eligible {
-				t.Fatalf("remote candidate %s must be marked ineligible under Local profile", cand.ProviderID)
-			}
-			if cand.RejectionCode != "PROFILE_TIER_EXCLUDED" {
-				t.Fatalf("expected rejection code PROFILE_TIER_EXCLUDED for %s, got: %s", cand.ProviderID, cand.RejectionCode)
-			}
-		}
+	if !errors.Is(err, domain.ErrNoEligibleProvider) {
+		t.Fatalf("expected local translation routing to fail closed with ErrNoEligibleProvider, got: %v", err)
 	}
 }
 
@@ -118,15 +101,22 @@ func TestRouter_TranslationHybridProfile_DeterministicOrdering(t *testing.T) {
 		t.Fatalf("expected primary provider gateway_gemini_3_8_flash, got: %s", res.SelectedProvider.ID())
 	}
 
-	// 2. Fallbacks must be [DeepSeek, Qwen] in exact order
-	if len(res.FallbackOrdered) != 2 {
-		t.Fatalf("expected 2 fallback providers, got %d", len(res.FallbackOrdered))
+	// 2. Fallbacks must contain DeepSeek only; local Qwen is not production-eligible for translation.
+	if len(res.FallbackOrdered) != 1 {
+		t.Fatalf("expected 1 fallback provider, got %d", len(res.FallbackOrdered))
 	}
 	if res.FallbackOrdered[0].ID() != "gateway_deepseek_v4_flash_vision_exp" {
 		t.Fatalf("expected first fallback gateway_deepseek_v4_flash_vision_exp, got: %s", res.FallbackOrdered[0].ID())
 	}
-	if res.FallbackOrdered[1].ID() != "qwen3_4b_translator" {
-		t.Fatalf("expected second fallback qwen3_4b_translator, got: %s", res.FallbackOrdered[1].ID())
+	for _, cand := range res.Decision.CandidatesEvaluated {
+		if cand.ProviderID == "qwen3_4b_translator" {
+			if cand.Eligible {
+				t.Fatal("local Qwen must be ineligible for Hybrid translation")
+			}
+			if cand.RejectionCode != "TRANSLATION_LOCAL_PROVIDER_EXCLUDED" {
+				t.Fatalf("expected TRANSLATION_LOCAL_PROVIDER_EXCLUDED, got %s", cand.RejectionCode)
+			}
+		}
 	}
 }
 
@@ -171,18 +161,78 @@ func TestRouter_TranslationHybridProfile_FrozenOrderingRegardlessOfQuality(t *te
 		t.Fatalf("Route failed: %v", err)
 	}
 
-	// Frozen ordering MUST still hold: Gemini > DeepSeek > Qwen
+	// Frozen production ordering MUST still hold: Gemini > DeepSeek, with no local LLM fallback.
 	if res.SelectedProvider.ID() != "gateway_gemini_3_8_flash" {
 		t.Fatalf("expected primary provider gateway_gemini_3_8_flash, got: %s", res.SelectedProvider.ID())
 	}
-	if len(res.FallbackOrdered) != 2 {
-		t.Fatalf("expected 2 fallback providers, got %d", len(res.FallbackOrdered))
+	if len(res.FallbackOrdered) != 1 {
+		t.Fatalf("expected 1 fallback provider, got %d", len(res.FallbackOrdered))
 	}
 	if res.FallbackOrdered[0].ID() != "gateway_deepseek_v4_flash_vision_exp" {
 		t.Fatalf("expected first fallback gateway_deepseek_v4_flash_vision_exp, got: %s", res.FallbackOrdered[0].ID())
 	}
-	if res.FallbackOrdered[1].ID() != "qwen3_4b_translator" {
-		t.Fatalf("expected second fallback qwen3_4b_translator, got: %s", res.FallbackOrdered[1].ID())
+}
+
+func TestRouter_TranslationHybridProfile_FrozenOrderingIgnoresPreferredProviderOverride(t *testing.T) {
+	ctx := context.Background()
+	reg := provider.NewRegistry()
+
+	gemini, _ := provider.NewGatewayTranslationProvider(
+		provider.GatewayGeminiTranslationProviderID,
+		"gemini-3.8-flash",
+		"baseline-gemini-3.8-flash-2026-08",
+		0.90,
+		"http://127.0.0.1:8080",
+	)
+	gemini.SetPolicyState(domain.PolicyAllowed)
+	_ = reg.Register(gemini)
+
+	deepseek, _ := provider.NewGatewayTranslationProvider(
+		provider.GatewayDeepSeekTranslationProviderID,
+		"deepseek/deepseek-v4-flash-vision-exp",
+		"baseline-deepseek-v4-2026-08",
+		0.99,
+		"http://127.0.0.1:8080",
+	)
+	deepseek.SetPolicyState(domain.PolicyAllowed)
+	_ = reg.Register(deepseek)
+
+	router := provider.NewRouter(reg, nil, nil, nil, nil, nil)
+	res, err := router.Route(ctx, provider.RouteRequest{
+		RunID:               uuid.NewString(),
+		Stage:               provider.TypeTranslation,
+		Language:            "vi",
+		ExecutionProfile:    domain.ExecutionProfileHybrid,
+		PreferredProviderID: provider.GatewayDeepSeekTranslationProviderID,
+	})
+	if err != nil {
+		t.Fatalf("Route failed: %v", err)
+	}
+	if res.SelectedProvider.ID() != provider.GatewayGeminiTranslationProviderID {
+		t.Fatalf("translation ladder must ignore preferred-provider override; got primary %s", res.SelectedProvider.ID())
+	}
+	if len(res.FallbackOrdered) != 1 || res.FallbackOrdered[0].ID() != provider.GatewayDeepSeekTranslationProviderID {
+		t.Fatalf("expected frozen fallback %s, got %+v", provider.GatewayDeepSeekTranslationProviderID, res.FallbackOrdered)
+	}
+}
+
+func TestRouter_TranslationCloudProfile_RejectsLocalProvider(t *testing.T) {
+	ctx := context.Background()
+	reg := provider.NewRegistry()
+
+	qwen, _ := provider.NewWorkerTranslationProvider("qwen3_4b_translator", "qwen3_4b_translator", "Qwen3-4B-Q4_K_M", 0.99)
+	qwen.SetRequiresSnapshot(false)
+	_ = reg.Register(qwen)
+
+	router := provider.NewRouter(reg, nil, nil, nil, nil, nil)
+	_, err := router.Route(ctx, provider.RouteRequest{
+		RunID:            uuid.NewString(),
+		Stage:            provider.TypeTranslation,
+		Language:         "en",
+		ExecutionProfile: domain.ExecutionProfileCloud,
+	})
+	if !errors.Is(err, domain.ErrNoEligibleProvider) {
+		t.Fatalf("expected cloud translation to reject local provider and fail closed, got: %v", err)
 	}
 }
 

@@ -362,8 +362,10 @@ Strict Invariants:
 1. One target language per request (%s).
 2. Faithfully translate each segment into natural, idiomatic %s while strictly preserving meaning.
 3. Protect and preserve all numbers, digits, quantities, proper names, entities, and negation polarity.
-4. Do NOT compress or shorten duration (e.g. no vi_short duration adaptations). Shorten-first adaptation is performed downstream.
-5. Respond ONLY with valid JSON conforming to:
+4. When the source contains grammatical negation or prohibition, the target MUST express it with explicit grammatical negation or prohibition appropriate to the target language (for example English "don't", "do not", "no", "never"; Vietnamese "không", "đừng", "chẳng", "chưa", "cấm"). Do not replace it with an affirmative-form idiom; choose an explicitly negative equivalent instead.
+5. In colloquial Chinese/ASR, clause-final 不 can be an interrogative particle rather than semantic negation (for example 喜欢你不 / 去不), including when punctuation is missing and the next clause follows immediately. When 不 is functioning this way, preserve it as a yes/no or tag question; do NOT emit standalone "no/không" or turn the question into a negative assertion. For Vietnamese, prefer an explicit tag-question form such as "phải không?" or "đúng không?" so the interrogative meaning remains unambiguous. This interrogative use of 不 is NOT grammatical negation for rule 4.
+6. Do NOT compress or shorten duration (e.g. no vi_short duration adaptations). Shorten-first adaptation is performed downstream.
+7. Respond ONLY with valid JSON conforming to:
 {
   "segments": [
     {

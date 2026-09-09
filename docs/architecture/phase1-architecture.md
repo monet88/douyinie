@@ -20,6 +20,17 @@ The system is architected around seven non-negotiable principles:
 6. **Provider-Neutral & Policy-Governed**: Local, hybrid, and cloud providers share identical domain contracts. Provider selection enforces policy and licensing constraints strictly before considering runtime health or cost.
 7. **Automation-First with Exception-Only Review**: The pipeline executes unattended by default. Passing and auto-resolved segments bypass human intervention; the review queue surfaces only genuine confidence, timing, cover, or policy exceptions.
 
+### 1.1 Production Translation Routing Amendment
+
+Provider neutrality remains an interface property, but production eligibility is intentionally narrower than the set of adapters present in the repository:
+
+- VI/EN meaning translation for both speech and translatable visual text uses the authorized gateway in order `gemini-3.8-flash` -> `deepseek/deepseek-v4-flash-vision-exp`.
+- Local general-purpose LLM translation is not production-eligible and is not a fallback after remote failure. If both remote lanes fail policy, authorization, availability, or meaning-first QA, the translation stage fails closed and may surface review.
+- `ExecutionProfileLocal` is not an end-to-end localization release path. It verifies specialized local media stages without requiring a local translation LLM.
+- Constrained local GPU/CPU resources are reserved for ASR/alignment/diarization, TTS, separation, OCR/tracking, mixing, and rendering. Local OCR remains the source text detector; its translatable text is passed through the remote translation provider contract.
+
+Historical research and benchmark records that evaluated local Qwen translation remain evidence of prior decisions/runs, not the current production route.
+
 ---
 
 ## 2. System Boundaries & Execution Topology
@@ -559,7 +570,7 @@ The five live-tested video fixtures from `.ref/_live-tests/e2e-acceptance-202608
 - V3 compact fit-content subtitle presentation with scene-aware non-occlusion.
 - Background soundtrack preservation (BGM, Foley, ambient SFX, singing vocals) with dialogue-only suppression.
 - Localhost API-first `RuntimeHost` daemon, single active run, SQLite persistence, and filesystem CAS.
-- Local / Hybrid / Cloud execution profiles over unified provider seams.
+- Hybrid as the production end-to-end localization profile over unified provider seams, with stage-level local media verification and conditional cloud capability checks.
 - Variant A (Queue + Inspector) exception-only operator review workflow.
 - Native deterministic composition and rendering via FFmpeg.
 

@@ -19,6 +19,8 @@ import (
 	"github.com/monet88/douyinie/internal/storage"
 )
 
+const translationMeaningContractVersion = "facts_names_numbers_negation_v3"
+
 // TranslationInvokeFunc executes one translation provider attempt.
 type TranslationInvokeFunc func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error)
 
@@ -355,7 +357,7 @@ func (s *TranslationService) computeProvenanceHash(in domain.TranslationJobInput
 		SemanticConfig: func() map[string]any {
 			cfg := map[string]any{
 				"source_language":  in.SourceLanguage,
-				"meaning_contract": "facts_names_numbers_negation_v1",
+				"meaning_contract": translationMeaningContractVersion,
 			}
 			if bp, ok := p.(interface{ ServiceBaselineID() string }); ok {
 				if baseline := strings.TrimSpace(bp.ServiceBaselineID()); baseline != "" {

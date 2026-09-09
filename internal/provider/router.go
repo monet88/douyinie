@@ -427,6 +427,17 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 			}
 		}
 
+		// Production translation is remote-LLM only. Local model-backed translators remain
+		// available as non-production adapters/tests, but Router must never select them for
+		// VI/EN translation. This keeps constrained local hardware focused on voice/audio/CV.
+		if p.Type() == TypeTranslation && strings.EqualFold(cap.ExecutionTier, "local") {
+			eval.Eligible = false
+			eval.RejectionCode = "TRANSLATION_LOCAL_PROVIDER_EXCLUDED"
+			eval.Reason = "production translation requires an authorized remote gateway provider"
+			evaluations = append(evaluations, eval)
+			continue
+		}
+
 		// Profile tier gating: Local profile hard-excludes every remote/cloud provider candidate
 		if req.ExecutionProfile == domain.ExecutionProfileLocal && !strings.EqualFold(cap.ExecutionTier, "local") {
 			eval.Eligible = false
@@ -460,7 +471,10 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 
 		// 4. Profile / Quality / Cost Scoring
 		score := calculateScore(p.ID(), cap, req.ExecutionProfile)
-		if req.PreferredProviderID != "" {
+		// Translation has a frozen production ladder (Gemini -> DeepSeek), so caller
+		// preference must not reorder it. PreferredProviderID remains available to
+		// stages such as acquisition and TTS where operator/provider preference is valid.
+		if p.Type() != TypeTranslation && req.PreferredProviderID != "" {
 			pref := strings.ToLower(req.PreferredProviderID)
 			pid := strings.ToLower(p.ID())
 			if pid == pref || pid == "fake_"+pref || strings.TrimPrefix(pid, "fake_") == strings.TrimPrefix(pref, "fake_") {
@@ -565,8 +579,9 @@ func calculateScore(providerID string, cap domain.ProviderCapability, profile do
 	case domain.ExecutionProfileHybrid:
 		fallthrough
 	default:
-		// Translation stage has approved frozen hybrid ordering (Issue #66):
-		// gateway gemini-3.8-flash -> gateway deepseek/deepseek-v4-flash-vision-exp -> local Qwen fallback.
+		// Translation stage has approved production ordering:
+		// gateway gemini-3.8-flash -> gateway deepseek/deepseek-v4-flash-vision-exp.
+		// Local LLM translators are filtered before scoring.
 		// Uses exact provider IDs with deterministic score separation so lane ordering
 		// is explicitly guaranteed regardless of minor quality score deltas.
 		if strings.EqualFold(cap.Stage, string(TypeTranslation)) || strings.EqualFold(cap.Stage, "translation") {
@@ -575,8 +590,6 @@ func calculateScore(providerID string, cap domain.ProviderCapability, profile do
 				baseScore += 1000.0
 			case GatewayDeepSeekTranslationProviderID:
 				baseScore += 500.0
-			case WorkerQwenTranslationProviderID, "translation_fake_qwen":
-				baseScore += 100.0
 			default:
 				if strings.EqualFold(cap.ExecutionTier, "cloud") || strings.EqualFold(cap.ExecutionTier, "hybrid") {
 					baseScore += 50.0

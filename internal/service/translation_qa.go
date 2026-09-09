@@ -36,13 +36,18 @@ var (
 	// Regex for long Arabic digit sequences formatted as 3-digit groups (e.g. 909 999 520).
 	threeDigitGroupRegex = regexp.MustCompile(`\b\d{3}(?:[ ]+\d{3})+\b`)
 
+	// Regex for explicit clock ranges. Compact HMM/HHMM endpoints are accepted only
+	// inside a range, so an arbitrary value such as "900" is never reinterpreted as
+	// a time by itself.
+	clockRangeRegex = regexp.MustCompile(`\b(\d{1,2}:\d{2}|\d{3,4})\s*[-–—~至到]\s*(\d{1,2}:\d{2}|\d{3,4})\b`)
+
 	// Regex for ASCII proper names/brands (e.g. SUPOR, Matcha, iPhone, etc.)
 	asciiNameRegex = regexp.MustCompile(`\b[A-Za-z0-9_-]{2,}\b`)
 
 	// Regex for quantity/measurement unit suffixes attached to numbers (e.g. 3MINUTE, 20KG, 500ML).
 	// These are quantities/units that should be naturally translated or preserved as numbers,
 	// not proper names/brands that must remain verbatim.
-	asciiQuantityTokenRegex = regexp.MustCompile(`^(?i)\d+(?:MINUTE|MINUTES|MIN|SEC|SECOND|SECONDS|HR|HOUR|HOURS|DAY|DAYS|WEEK|WEEKS|MONTH|MONTHS|YEAR|YEARS|KM|M|CM|MM|KG|G|ML|L)$`)
+	asciiQuantityTokenRegex = regexp.MustCompile(`^(?i)\d+(?:MINUTE|MINUTES|MIN|SEC|SECOND|SECONDS|HR|HOUR|HOURS|DAY|DAYS|WEEK|WEEKS|MONTH|MONTHS|YEAR|YEARS|KM|M|CM|MM|KG|G|ML|L|CUP|CUPS|TSP|TBSP|TEASPOON|TEASPOONS|TABLESPOON|TABLESPOONS)$`)
 )
 
 var zhDigitMap = map[rune]int64{
@@ -211,6 +216,7 @@ var viNegationExceptions = []string{
 	"chẳng lẽ", "không lẽ", "không những", "không chỉ", "vô cùng", "vô số", "bất ngờ", "bất kể", "vô tư", "không ngừng",
 	"có phải không", "được không", "phải không", "đúng không",
 }
+
 // English phrases that do not invert polarity.
 var enNegationExceptions = []string{
 	"not only", "no matter", "no wonder",
@@ -415,6 +421,12 @@ func (g *MeaningFirstQAGate) ValidateSegment(source, target, srcLang, tgtLang st
 				}
 			}
 		}
+
+		// A provider may normalize compact clock notation while preserving the
+		// exact time range, e.g. 900-17:00 -> 9:00-17:00. Reconcile only when a
+		// valid canonical clock range exists on both sides; arbitrary numbers are
+		// intentionally unaffected.
+		reconcileEquivalentClockRanges(src, tgt, srcMissing, tgtUnexpected)
 	}
 
 	for _, numStr := range sortedBoolKeys(srcMissing) {
@@ -567,6 +579,81 @@ func extractNumbers(text, lang string) map[string]bool {
 	}
 
 	return res
+}
+
+func reconcileEquivalentClockRanges(source, target string, srcMissing, tgtUnexpected map[string]bool) {
+	srcRanges := extractClockRangeNumberTokens(source)
+	tgtRanges := extractClockRangeNumberTokens(target)
+	for canonical, srcTokens := range srcRanges {
+		tgtTokens, ok := tgtRanges[canonical]
+		if !ok {
+			continue
+		}
+		for token := range srcTokens {
+			delete(srcMissing, token)
+		}
+		for token := range tgtTokens {
+			delete(tgtUnexpected, token)
+		}
+	}
+}
+
+func extractClockRangeNumberTokens(text string) map[string]map[string]bool {
+	ranges := make(map[string]map[string]bool)
+	for _, match := range clockRangeRegex.FindAllStringSubmatch(text, -1) {
+		if len(match) != 3 {
+			continue
+		}
+		start, ok := canonicalClockEndpoint(match[1])
+		if !ok {
+			continue
+		}
+		end, ok := canonicalClockEndpoint(match[2])
+		if !ok {
+			continue
+		}
+		key := start + "-" + end
+		tokens := ranges[key]
+		if tokens == nil {
+			tokens = make(map[string]bool)
+			ranges[key] = tokens
+		}
+		for _, token := range digitRegex.FindAllString(match[0], -1) {
+			tokens[token] = true
+		}
+	}
+	return ranges
+}
+
+func canonicalClockEndpoint(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	var hourText, minuteText string
+	if strings.Contains(raw, ":") {
+		parts := strings.Split(raw, ":")
+		if len(parts) != 2 || len(parts[0]) < 1 || len(parts[0]) > 2 || len(parts[1]) != 2 {
+			return "", false
+		}
+		hourText, minuteText = parts[0], parts[1]
+	} else {
+		switch len(raw) {
+		case 3:
+			hourText, minuteText = raw[:1], raw[1:]
+		case 4:
+			hourText, minuteText = raw[:2], raw[2:]
+		default:
+			return "", false
+		}
+	}
+
+	hour, err := strconv.Atoi(hourText)
+	if err != nil || hour < 0 || hour > 23 {
+		return "", false
+	}
+	minute, err := strconv.Atoi(minuteText)
+	if err != nil || minute < 0 || minute > 59 {
+		return "", false
+	}
+	return fmt.Sprintf("%02d:%02d", hour, minute), true
 }
 
 func extractSemanticFacts(text, lang string) map[string]string {
@@ -1133,6 +1220,7 @@ func stripCJKSpaces(s string) string {
 	}
 	return b.String()
 }
+
 // ExtractNumbers finds all numeric values in a string (both digits and language words) as canonical decimal string representations.
 func ExtractNumbers(text, lang string) map[string]bool {
 	return extractNumbers(text, lang)
