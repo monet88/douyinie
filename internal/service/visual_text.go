@@ -669,11 +669,22 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 		return nil, fmt.Errorf("%w: %s", domain.ErrInvalidTargetLanguage, in.TargetLanguage)
 	}
 
-	// Query canonical TranslationVariantIndex for this asset & target language upfront
-	// before any on-the-fly overlay translation runs can update the latest index row.
-	transIdx, err := s.db.GetTranslationVariantIndex(ctx, in.AssetID, in.TargetLanguage)
-	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return nil, fmt.Errorf("query translation variant index: %w", err)
+	// Prefer the caller-pinned speech TranslationVariant artifact when provided.
+	// This keeps retries/resumes stable even when a previous visual-track attempt
+	// wrote newer overlay translations into the asset/language index. Legacy
+	// callers without an explicit CAS continue to resolve the latest index row.
+	explicitTransCAS := strings.TrimSpace(in.TranslationVariantCAS)
+	canonicalTransCAS := explicitTransCAS
+	var transIdx *storage.TranslationVariantIndex
+	if canonicalTransCAS == "" {
+		var err error
+		transIdx, err = s.db.GetTranslationVariantIndex(ctx, in.AssetID, in.TargetLanguage)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("query translation variant index: %w", err)
+		}
+		if transIdx != nil {
+			canonicalTransCAS = transIdx.CASHash
+		}
 	}
 
 	// 1. Load latest TextRegionPlan
@@ -900,7 +911,7 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 		return nil, fmt.Errorf("query dub script variant index: %w", err)
 	}
 
-	if dubScriptIdx != nil || transIdx != nil {
+	if dubScriptIdx != nil || transIdx != nil || canonicalTransCAS != "" {
 		// A localized track is requested/present. Must fail closed on any missing/mismatch/empty artifact.
 		if dubScriptIdx != nil {
 			if dubScriptIdx.CASHash == "" {
@@ -921,14 +932,14 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 
 			// Load canonical TranslationVariant to cross-check and ground captions
 			var tVariant domain.TranslationVariant
-			if transIdx == nil || transIdx.CASHash == "" {
+			if canonicalTransCAS == "" {
 				return nil, fmt.Errorf("%w: missing canonical translation index for dub script", domain.ErrTranslationVariantNotFound)
 			}
-			if dVariant.TranslationVariantCAS == "" || dVariant.TranslationVariantCAS != transIdx.CASHash {
-				return nil, fmt.Errorf("%w: dub script translation CAS %q does not match canonical index CAS %q",
-					domain.ErrMeaningPreservationFailed, dVariant.TranslationVariantCAS, transIdx.CASHash)
+			if dVariant.TranslationVariantCAS == "" || dVariant.TranslationVariantCAS != canonicalTransCAS {
+				return nil, fmt.Errorf("%w: dub script translation CAS %q does not match canonical translation CAS %q",
+					domain.ErrMeaningPreservationFailed, dVariant.TranslationVariantCAS, canonicalTransCAS)
 			}
-			transCAS := transIdx.CASHash
+			transCAS := canonicalTransCAS
 			trc, err := s.cas.Get(transCAS)
 			if err != nil {
 				return nil, fmt.Errorf("load translation variant from CAS (%s): %w", transCAS, err)
@@ -936,6 +947,12 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			defer trc.Close()
 			if err := json.NewDecoder(trc).Decode(&tVariant); err != nil {
 				return nil, fmt.Errorf("decode translation variant artifact (%s): %w", transCAS, err)
+			}
+			if explicitTransCAS != "" {
+				if tVariant.AssetID != in.AssetID || !strings.EqualFold(tVariant.TargetLanguage, in.TargetLanguage) {
+					return nil, fmt.Errorf("%w: explicit translation variant ownership mismatch for asset %q target %q",
+						domain.ErrMeaningPreservationFailed, in.AssetID, in.TargetLanguage)
+				}
 			}
 			if len(tVariant.Segments) == 0 {
 				return nil, fmt.Errorf("canonical translation variant has zero segments")
@@ -993,18 +1010,25 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 				subtitleCues = append(subtitleCues, cue)
 			}
 		} else {
-			// transIdx != nil && dubScriptIdx == nil
-			if transIdx.CASHash == "" {
+			// A translation exists without a dub script. Use the caller-pinned CAS
+			// when present; otherwise this is the legacy latest-index path.
+			if canonicalTransCAS == "" {
 				return nil, fmt.Errorf("translation variant index has empty CAS hash")
 			}
-			trc, err := s.cas.Get(transIdx.CASHash)
+			trc, err := s.cas.Get(canonicalTransCAS)
 			if err != nil {
-				return nil, fmt.Errorf("load translation variant from CAS (%s): %w", transIdx.CASHash, err)
+				return nil, fmt.Errorf("load translation variant from CAS (%s): %w", canonicalTransCAS, err)
 			}
 			defer trc.Close()
 			var tVariant domain.TranslationVariant
 			if err := json.NewDecoder(trc).Decode(&tVariant); err != nil {
-				return nil, fmt.Errorf("decode translation variant artifact (%s): %w", transIdx.CASHash, err)
+				return nil, fmt.Errorf("decode translation variant artifact (%s): %w", canonicalTransCAS, err)
+			}
+			if explicitTransCAS != "" {
+				if tVariant.AssetID != in.AssetID || !strings.EqualFold(tVariant.TargetLanguage, in.TargetLanguage) {
+					return nil, fmt.Errorf("%w: explicit translation variant ownership mismatch for asset %q target %q",
+						domain.ErrMeaningPreservationFailed, in.AssetID, in.TargetLanguage)
+				}
 			}
 			if len(tVariant.Segments) == 0 {
 				return nil, fmt.Errorf("canonical translation variant has zero segments")

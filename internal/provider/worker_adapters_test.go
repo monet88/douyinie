@@ -26,6 +26,11 @@ import (
 // the production speech registry is populated with concrete worker-backed ASR 1.7B,
 // ASR 0.6B fallback, forced aligner, and diarization capability. No fake providers exist.
 func TestProductionSpeechRegistry_ContainsAllRequiredCapabilities(t *testing.T) {
+	t.Setenv("DOUYINIE_GATEWAY_URL", "")
+	t.Setenv("DOUYINIE_GATEWAY_ENDPOINT", "")
+	t.Setenv("DOUYINIE_SERVICE_BASELINE_GEMINI", "")
+	t.Setenv("DOUYINIE_SERVICE_BASELINE_DEEPSEEK", "")
+
 	reg, err := provider.NewProductionSpeechRegistry()
 	if err != nil {
 		t.Fatalf("NewProductionSpeechRegistry failed: %v", err)
@@ -96,6 +101,12 @@ func TestProductionSpeechRegistry_ContainsAllRequiredCapabilities(t *testing.T) 
 		t.Fatal("diarizer does not implement VADModelInfo")
 	}
 
+	// Production translation is API-first. Without gateway configuration there
+	// must be no translation provider, especially no local Qwen fallback.
+	if translators := reg.ListByType(provider.TypeTranslation); len(translators) != 0 {
+		t.Fatalf("expected no production translation providers without gateway config, got %d", len(translators))
+	}
+
 	// Verify Finding 1 & Issue #66: Every production local model-backed provider requires
 	// a snapshot by default; remote gateway providers are never represented as pinned checkpoints.
 	for _, p := range reg.ListAll() {
@@ -111,6 +122,61 @@ func TestProductionSpeechRegistry_ContainsAllRequiredCapabilities(t *testing.T) 
 			if rsp.RequiresSnapshot() {
 				t.Fatalf("expected remote gateway provider %s to NOT require snapshot", p.ID())
 			}
+		}
+	}
+}
+
+func TestProductionSpeechRegistry_TranslationProvidersAreGatewayOnly(t *testing.T) {
+	reg, err := provider.NewProductionSpeechRegistry(provider.GatewayTranslationConfig{
+		Endpoint:           "https://gateway.example.test/v1",
+		GeminiBaselineID:   "test-gemini-baseline",
+		DeepSeekBaselineID: "test-deepseek-baseline",
+	})
+	if err != nil {
+		t.Fatalf("NewProductionSpeechRegistry failed: %v", err)
+	}
+
+	translators := reg.ListByType(provider.TypeTranslation)
+	if len(translators) != 2 {
+		t.Fatalf("expected exactly 2 gateway translation providers, got %d", len(translators))
+	}
+	want := map[string]bool{
+		provider.GatewayGeminiTranslationProviderID:   false,
+		provider.GatewayDeepSeekTranslationProviderID: false,
+	}
+	for _, p := range translators {
+		if p.Capability().ExecutionTier == "local" {
+			t.Fatalf("production registry must not contain local translation provider %s", p.ID())
+		}
+		if _, ok := want[p.ID()]; !ok {
+			t.Fatalf("unexpected production translation provider %s", p.ID())
+		}
+		want[p.ID()] = true
+	}
+	for id, seen := range want {
+		if !seen {
+			t.Fatalf("missing production gateway translation provider %s", id)
+		}
+	}
+}
+
+func TestProductionSpeechRegistry_LoadsGatewayTranslationFromEnvironment(t *testing.T) {
+	t.Setenv("DOUYINIE_GATEWAY_URL", "https://gateway.example.test/v1")
+	t.Setenv("DOUYINIE_GATEWAY_ENDPOINT", "")
+	t.Setenv("DOUYINIE_SERVICE_BASELINE_GEMINI", "env-gemini-baseline")
+	t.Setenv("DOUYINIE_SERVICE_BASELINE_DEEPSEEK", "env-deepseek-baseline")
+
+	reg, err := provider.NewProductionSpeechRegistry()
+	if err != nil {
+		t.Fatalf("NewProductionSpeechRegistry failed: %v", err)
+	}
+	translators := reg.ListByType(provider.TypeTranslation)
+	if len(translators) != 2 {
+		t.Fatalf("expected runtime environment to register 2 gateway translators, got %d", len(translators))
+	}
+	for _, p := range translators {
+		if p.Capability().ExecutionTier == "local" {
+			t.Fatalf("runtime environment must not register local translator %s", p.ID())
 		}
 	}
 }

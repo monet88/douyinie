@@ -34,6 +34,13 @@ func setupTranslationTestEnv(t *testing.T) (*storage.DB, *cas.Store, *provider.R
 	}
 
 	reg := provider.NewSeam1FakeRegistry()
+	// Translation routing is remote-only in production. These legacy-named fakes
+	// exercise translation service behavior, so model them as remote gateway lanes.
+	for _, id := range []string{"fake_llm_translator", "fake_local_translator_fallback"} {
+		if p, ok := reg.Get(id); ok {
+			p.(*provider.FakeTranslationProvider).Cap.ExecutionTier = "cloud"
+		}
+	}
 	polSvc := governance.NewPolicyService(db)
 	licSvc := governance.NewLicenseService(db)
 	credSvc := governance.NewCredentialService(db)
@@ -178,6 +185,60 @@ func TestTranslationService_Translate_VI_and_EN(t *testing.T) {
 	}
 	if variantEN.OverallQAScore < 0.9 {
 		t.Errorf("expected overall QA score >= 0.9, got %f", variantEN.OverallQAScore)
+	}
+}
+
+func TestTranslationService_ProviderReportedNegativeCannotOverrideLexicalNegationMismatch(t *testing.T) {
+	db, casStore, _, _ := setupTranslationTestEnv(t)
+	svc := service.NewTranslationService(db, casStore)
+
+	ctx := context.Background()
+	runID := uuid.NewString()
+	assetID := uuid.NewString()
+	jobID := uuid.NewString()
+	attID := uuid.NewString()
+
+	if err := db.CreateRightsAttestation(ctx, domain.RightsAttestation{ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION", TermsAccepted: true, ConfirmedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{ID: assetID, RightsAttestationID: attID, SHA256: "semantic-negation-source", ByteSize: 100, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("create source asset: %v", err)
+	}
+	if err := db.CreateJob(ctx, domain.LocalizationJob{ID: jobID, SourceAssetID: assetID, TargetLanguage: "en", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: jobID, Status: "running", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	svc.TranslateInvoke = func(_ context.Context, _ provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		return &provider.TranslationResult{
+			ProviderID:   provider.GatewayGeminiTranslationProviderID,
+			ModelVersion: "gemini-3.8-flash",
+			Segments: []domain.TranslationSegment{{
+				Index:            0,
+				SourceText:       req.Segments[0].SourceText,
+				TargetText:       "Open the window.",
+				NegationPolarity: true,
+			}},
+		}, nil
+	}
+
+	_, err := svc.Translate(ctx, domain.TranslationJobInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		JobID:          jobID,
+		SourceLanguage: "zh",
+		TargetLanguage: "en",
+		Segments: []domain.TranslationInputSegment{{
+			Index:      0,
+			SourceText: "不要打开窗户",
+			StartMs:    0,
+			EndMs:      1000,
+		}},
+	})
+	if err == nil || !errors.Is(err, domain.ErrNegationInverted) {
+		t.Fatalf("expected provider self-report to be unable to override lexical negation mismatch, got: %v", err)
 	}
 }
 

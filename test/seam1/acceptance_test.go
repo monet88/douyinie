@@ -97,6 +97,13 @@ func newRuntimeHost(t *testing.T, db *storage.DB, casStore *cas.Store, queueSvc 
 
 	ingestSvc := service.NewIngestService(db, casStore, prober)
 	fakeRegistry := provider.NewSeam1FakeRegistry()
+	// Seam 1 models production translation as remote gateway execution. Keep all
+	// voice/audio/CV fakes local; only the legacy translation fixtures are remote.
+	for _, id := range []string{"fake_llm_translator", "fake_local_translator_fallback"} {
+		if p, ok := fakeRegistry.Get(id); ok {
+			p.(*provider.FakeTranslationProvider).Cap.ExecutionTier = "cloud"
+		}
+	}
 	polSvc := governance.NewPolicyService(db)
 	licSvc := governance.NewLicenseService(db)
 	credSvc := governance.NewCredentialService(db)

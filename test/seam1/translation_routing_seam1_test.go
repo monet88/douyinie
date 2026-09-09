@@ -147,7 +147,7 @@ func seedSeam1AssetAndJob(t *testing.T, db *storage.DB) (string, string) {
 	return assetID, jobID
 }
 
-func TestSeam1_Translation_LocalProfile_HardExcludesRemoteCandidates(t *testing.T) {
+func TestSeam1_Translation_LocalProfile_DisablesTranslation(t *testing.T) {
 	reg := provider.NewRegistry()
 
 	// 1. Register remote candidates with allowed policy
@@ -197,35 +197,8 @@ func TestSeam1_Translation_LocalProfile_HardExcludesRemoteCandidates(t *testing.
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		t.Fatalf("expected 200/201, got status %d", resp.StatusCode)
-	}
-
-	var res struct {
-		Variant domain.TranslationVariant `json:"translation_variant"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-
-	if res.Variant.ProviderID != "qwen3_4b_translator" {
-		t.Fatalf("expected local qwen provider, got %q", res.Variant.ProviderID)
-	}
-
-	// 4. Verify selection decisions in SQLite: remote candidates must be PROFILE_TIER_EXCLUDED
-	decisions, err := h.db.ListSelectionDecisions(context.Background(), runID, string(provider.TypeTranslation))
-	if err != nil || len(decisions) == 0 {
-		t.Fatalf("expected recorded selection decision: %v", err)
-	}
-	for _, cand := range decisions[0].CandidatesEvaluated {
-		if cand.ProviderID == "gateway_gemini_3_8_flash" || cand.ProviderID == "gateway_deepseek_v4_flash_vision_exp" {
-			if cand.Eligible {
-				t.Fatalf("remote candidate %s must be marked ineligible under Local profile", cand.ProviderID)
-			}
-			if cand.RejectionCode != "PROFILE_TIER_EXCLUDED" {
-				t.Fatalf("expected PROFILE_TIER_EXCLUDED for %s, got %s", cand.ProviderID, cand.RejectionCode)
-			}
-		}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 because Local profile does not provide an E2E translation lane, got status %d", resp.StatusCode)
 	}
 }
 
@@ -407,10 +380,11 @@ func TestSeam1_Translation_LocalProfile_FailsClosedIfSnapshotUnverified(t *testi
 func TestSeam1_Translation_MeaningFirstValidation_RejectsFactOrNegationCorruption(t *testing.T) {
 	reg := provider.NewRegistry()
 
-	// Fake provider that corrupts numbers
-	fakeQwen := provider.NewFakeTranslationProvider("qwen3_4b_translator")
-	fakeQwen.CorruptNumbers = true
-	_ = reg.Register(fakeQwen)
+	// Remote translation fake corrupts numbers; QA must still reject it.
+	fakeGateway := provider.NewFakeTranslationProvider(provider.GatewayGeminiTranslationProviderID)
+	fakeGateway.Cap.ExecutionTier = "cloud"
+	fakeGateway.CorruptNumbers = true
+	_ = reg.Register(fakeGateway)
 
 	h := setupCustomTranslationHarness(t, reg)
 	assetID, jobID := seedSeam1AssetAndJob(t, h.db)
@@ -421,7 +395,7 @@ func TestSeam1_Translation_MeaningFirstValidation_RejectsFactOrNegationCorruptio
 		"job_id":            jobID,
 		"target_language":   "vi",
 		"source_language":   "zh",
-		"execution_profile": "local",
+		"execution_profile": "hybrid",
 		"segments": []map[string]any{
 			{"index": 0, "source_text": "500ml 锅 120 元"},
 		},
@@ -477,7 +451,7 @@ func TestSeam1_Translation_MissingOrCorruptEnvelopePath_FailsClosed(t *testing.T
 	}
 }
 
-func TestSeam1_VisualTrack_LocalProfile_HardExcludesRemoteCandidates(t *testing.T) {
+func TestSeam1_VisualTrack_LocalProfile_DisablesTranslation(t *testing.T) {
 	reg := provider.NewRegistry()
 
 	// 1. Remote translation providers
@@ -537,30 +511,9 @@ func TestSeam1_VisualTrack_LocalProfile_HardExcludesRemoteCandidates(t *testing.
 		t.Fatalf("POST /visual-track failed: %v", err)
 	}
 	defer vResp.Body.Close()
-	if vResp.StatusCode != http.StatusCreated {
+	if vResp.StatusCode != http.StatusInternalServerError {
 		b, _ := io.ReadAll(vResp.Body)
-		t.Fatalf("expected 201 Created from visual-track, got %d body=%s", vResp.StatusCode, string(b))
-	}
-
-	// 6. Verify selection decisions in SQLite: remote candidates must be PROFILE_TIER_EXCLUDED
-	decisions, err := h.db.ListSelectionDecisions(context.Background(), runID, string(provider.TypeTranslation))
-	if err != nil || len(decisions) == 0 {
-		t.Fatalf("expected recorded selection decision for visual track translation: %v", err)
-	}
-	for _, decision := range decisions {
-		if decision.SelectedProviderID != "qwen3_4b_translator" {
-			t.Errorf("expected local qwen selected, got %s", decision.SelectedProviderID)
-		}
-		for _, cand := range decision.CandidatesEvaluated {
-			if cand.ProviderID == "gateway_gemini_3_8_flash" || cand.ProviderID == "gateway_deepseek_v4_flash_vision_exp" {
-				if cand.Eligible {
-					t.Fatalf("remote candidate %s must be marked ineligible under Local profile", cand.ProviderID)
-				}
-				if cand.RejectionCode != "PROFILE_TIER_EXCLUDED" {
-					t.Fatalf("expected PROFILE_TIER_EXCLUDED for %s, got %s", cand.ProviderID, cand.RejectionCode)
-				}
-			}
-		}
+		t.Fatalf("expected visual-track to fail closed because Local profile cannot translate visual text, got %d body=%s", vResp.StatusCode, string(b))
 	}
 }
 
@@ -643,7 +596,8 @@ func TestSeam1_VisualTrack_HybridProfile_ConsentAndCredentials(t *testing.T) {
 	}
 	dResp.Body.Close()
 
-	// 1. Call visual-track with Hybrid profile and valid credential, but consent_granted=false
+	// 1. Call visual-track with Hybrid profile and valid credential, but consent_granted=false.
+	// With no local translation fallback this must fail closed.
 	visPayloadNoConsent := map[string]any{
 		"run_id":                 runIDConsentMissing,
 		"job_id":                 jobID,
@@ -658,26 +612,8 @@ func TestSeam1_VisualTrack_HybridProfile_ConsentAndCredentials(t *testing.T) {
 		t.Fatalf("POST /visual-track failed: %v", err)
 	}
 	defer vResp1.Body.Close()
-	if vResp1.StatusCode != http.StatusCreated {
-		t.Fatalf("expected 201 Created from visual-track fallback, got %d", vResp1.StatusCode)
-	}
-
-	// Verify decisions: gateways rejected with REQUIRES_CONSENT
-	decisions1, err := h.db.ListSelectionDecisions(ctx, runIDConsentMissing, string(provider.TypeTranslation))
-	if err != nil || len(decisions1) == 0 {
-		t.Fatalf("expected recorded selection decisions: %v", err)
-	}
-	for _, decision := range decisions1 {
-		for _, cand := range decision.CandidatesEvaluated {
-			if cand.ProviderID == "gateway_gemini_3_8_flash" || cand.ProviderID == "gateway_deepseek_v4_flash_vision_exp" {
-				if cand.Eligible {
-					t.Fatalf("gateway %s must not be eligible when consent_granted=false", cand.ProviderID)
-				}
-				if cand.RejectionCode != "REQUIRES_CONSENT" {
-					t.Fatalf("expected REQUIRES_CONSENT for %s, got %s", cand.ProviderID, cand.RejectionCode)
-				}
-			}
-		}
+	if vResp1.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected visual-track to fail closed when remote translation lacks consent and no local fallback exists, got %d", vResp1.StatusCode)
 	}
 
 	// 2. Call visual-track with Hybrid profile, valid credential, and consent_granted=true

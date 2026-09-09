@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/monet88/douyinie/internal/domain"
@@ -216,5 +217,129 @@ func TestGatewayTranslationProvider_SuccessfulTranslationAndProvenance(t *testin
 	}
 	if len(res.Segments) != 1 || res.Segments[0].TargetText != "Nồi SUPOR 500ml" {
 		t.Fatalf("unexpected translated segments: %+v", res.Segments)
+	}
+}
+
+func TestGatewayTranslationProvider_PromptRequiresExplicitTargetNegation(t *testing.T) {
+	ctx := context.Background()
+	var capturedSystem string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		for _, msg := range body.Messages {
+			if msg.Role == "system" {
+				capturedSystem = msg.Content
+				break
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"gemini-3.8-flash","choices":[{"message":{"content":"{\"segments\":[{\"index\":0,\"source_text\":\"别管我\",\"target_text\":\"Don't bother me.\",\"key_facts\":[],\"negation_polarity\":true}]}"},"finish_reason":"stop"}]}`))
+	}))
+	defer ts.Close()
+
+	secretResolver := func(context.Context, string, string) (string, error) {
+		return "test-token", nil
+	}
+	p, err := provider.NewGatewayTranslationProvider(
+		provider.GatewayGeminiTranslationProviderID,
+		"gemini-3.8-flash",
+		"prompt-contract-baseline",
+		0.99,
+		secretResolver,
+		ts.Client(),
+		ts.URL,
+	)
+	if err != nil {
+		t.Fatalf("NewGatewayTranslationProvider: %v", err)
+	}
+
+	_, err = p.TranslateText(ctx, provider.TranslationRequest{
+		RunID:                 "prompt-contract-run",
+		SourceLanguage:        "zh",
+		TargetLanguage:        "en",
+		AuthorizedCredentials: []string{"cred_ref"},
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "别管我"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("TranslateText failed: %v", err)
+	}
+
+	if !strings.Contains(capturedSystem, "explicit grammatical negation") {
+		t.Fatalf("system prompt must require explicit grammatical negation for negative/prohibitive source text; got %q", capturedSystem)
+	}
+	if !strings.Contains(capturedSystem, "Do not replace it with an affirmative-form idiom") {
+		t.Fatalf("system prompt must forbid affirmative-form paraphrases that defeat deterministic negation QA; got %q", capturedSystem)
+	}
+}
+
+func TestGatewayTranslationProvider_PromptPreservesChineseClauseFinalBuAsQuestion(t *testing.T) {
+	ctx := context.Background()
+	var capturedSystem string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		for _, msg := range body.Messages {
+			if msg.Role == "system" {
+				capturedSystem = msg.Content
+				break
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"gemini-3.8-flash","choices":[{"message":{"content":"{\"segments\":[{\"index\":0,\"source_text\":\"他应该是喜欢你不你长得真帅\",\"target_text\":\"Chắc là anh ấy thích cậu đúng không? Cậu đẹp trai thật đấy.\",\"key_facts\":[],\"negation_polarity\":false}]}"},"finish_reason":"stop"}]}`))
+	}))
+	defer ts.Close()
+
+	secretResolver := func(context.Context, string, string) (string, error) {
+		return "test-token", nil
+	}
+	p, err := provider.NewGatewayTranslationProvider(
+		provider.GatewayGeminiTranslationProviderID,
+		"gemini-3.8-flash",
+		"prompt-contract-baseline",
+		0.99,
+		secretResolver,
+		ts.Client(),
+		ts.URL,
+	)
+	if err != nil {
+		t.Fatalf("NewGatewayTranslationProvider: %v", err)
+	}
+
+	_, err = p.TranslateText(ctx, provider.TranslationRequest{
+		RunID:                 "prompt-question-tail-run",
+		SourceLanguage:        "zh",
+		TargetLanguage:        "vi",
+		AuthorizedCredentials: []string{"cred_ref"},
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "他应该是喜欢你不你长得真帅"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("TranslateText failed: %v", err)
+	}
+
+	if !strings.Contains(capturedSystem, "clause-final 不") {
+		t.Fatalf("system prompt must identify clause-final 不 as a possible interrogative particle; got %q", capturedSystem)
+	}
+	if !strings.Contains(capturedSystem, "preserve it as a yes/no or tag question") {
+		t.Fatalf("system prompt must preserve interrogative 不 as a question instead of emitting a standalone negation; got %q", capturedSystem)
 	}
 }
