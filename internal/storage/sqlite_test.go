@@ -1181,3 +1181,89 @@ func TestStorage_MigrationV16ToV17_UpgradeAddsTable(t *testing.T) {
 		t.Fatalf("expected migration v17 applied, got count=%d err=%v", countV17, err)
 	}
 }
+func TestStorage_MigrationV19_AudioRolePlanArtifactsIndex(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "v19_audio_role.db")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open db: %v", err)
+	}
+	defer db.Close()
+
+	// Verify v19 migration applied
+	var countV19 int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 19`).Scan(&countV19); err != nil || countV19 != 1 {
+		t.Fatalf("expected migration v19 applied, got count=%d err=%v", countV19, err)
+	}
+
+	// Create attestation and asset
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              attID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	})
+	assetID := uuid.NewString()
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		RightsAttestationID: attID,
+		SHA256:              "sha256-test-v19",
+		CASPath:             "cas-path",
+		CreatedAt:           time.Now().UTC(),
+	})
+
+	// Save AudioRolePlan with CAS and Provenance hashes
+	planID := uuid.NewString()
+	provHash := "prov-hash-v19-12345"
+	casHash := "cas-hash-v19-67890"
+	plan := domain.AudioRolePlan{
+		ID:             planID,
+		AssetID:        assetID,
+		CASHash:        casHash,
+		ProvenanceHash: provHash,
+		ProviderID:     "builtin_acoustic_analyzer",
+		ModelName:      "acoustic_signal_classifier",
+		ModelVersion:   "v1.0",
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 1500, EndMs: 3000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+
+	if err := db.SaveAudioRolePlan(ctx, plan); err != nil {
+		t.Fatalf("SaveAudioRolePlan: %v", err)
+	}
+
+	// Retrieve by asset ID
+	loaded, err := db.GetAudioRolePlan(ctx, assetID)
+	if err != nil {
+		t.Fatalf("GetAudioRolePlan: %v", err)
+	}
+	if loaded.ID != planID || loaded.CASHash != casHash || loaded.ProvenanceHash != provHash {
+		t.Errorf("loaded plan mismatch: %+v", loaded)
+	}
+	if len(loaded.Segments) != 2 {
+		t.Errorf("expected 2 segments, got %d", len(loaded.Segments))
+	}
+
+	// Retrieve by provenance hash
+	idx, err := db.GetAudioRolePlanByProvenance(ctx, provHash)
+	if err != nil {
+		t.Fatalf("GetAudioRolePlanByProvenance: %v", err)
+	}
+	if idx.ID != planID || idx.CASHash != casHash || idx.AssetID != assetID {
+		t.Errorf("idx mismatch: %+v", idx)
+	}
+
+	// Retrieve latest index by asset ID
+	idxAsset, err := db.GetAudioRolePlanIndex(ctx, assetID)
+	if err != nil {
+		t.Fatalf("GetAudioRolePlanIndex: %v", err)
+	}
+	if idxAsset.ID != planID || idxAsset.ProvenanceHash != provHash {
+		t.Errorf("idxAsset mismatch: %+v", idxAsset)
+	}
+}

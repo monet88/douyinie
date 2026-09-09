@@ -51,6 +51,7 @@ type Server struct {
 	translationSvc *service.TranslationService
 	dubbingSvc     *service.DubbingService
 	audioMixSvc    *service.AudioMixService
+	audioRoleSvc   *service.AudioRoleService
 	visualTextSvc  *service.VisualTextService
 	renderSvc      *service.RenderService
 	reviewSvc      *service.ReviewService
@@ -79,6 +80,7 @@ type Config struct {
 	TranslationSvc *service.TranslationService // Translation & Meaning-First Localization pipeline (T06)
 	DubbingSvc     *service.DubbingService     // TTS & Measured-Duration Dubbing pipeline (T14)
 	AudioMixSvc    *service.AudioMixService    // Audio stems + soundtrack preservation + dialogue-suppression mix (T15)
+	AudioRoleSvc   *service.AudioRoleService   // Automatic AudioRolePlan generation (Issue #80)
 	VisualTextSvc  *service.VisualTextService  // OCR detection, tracking, and TextRegionPlan (T09)
 	RenderSvc      *service.RenderService      // NativeRenderBackend + frozen RenderPlan + preview/final parity (T11)
 	ReviewSvc      *service.ReviewService      // Exception-only ReviewItem projection service (T16)
@@ -136,6 +138,9 @@ func New(cfg Config) *Server {
 	if cfg.AudioMixSvc != nil && cfg.Router != nil {
 		cfg.AudioMixSvc.ConfigureRouter(cfg.Router)
 	}
+	if cfg.AudioRoleSvc == nil && cfg.DB != nil && cfg.CASStore != nil {
+		cfg.AudioRoleSvc = service.NewAudioRoleService(cfg.DB, cfg.CASStore, cfg.AudioMixSvc)
+	}
 	if cfg.VisualTextSvc != nil {
 		if cfg.Router != nil {
 			cfg.VisualTextSvc.ConfigureRouter(cfg.Router)
@@ -179,6 +184,7 @@ func New(cfg Config) *Server {
 		translationSvc: cfg.TranslationSvc,
 		dubbingSvc:     cfg.DubbingSvc,
 		audioMixSvc:    cfg.AudioMixSvc,
+		audioRoleSvc:   cfg.AudioRoleSvc,
 		visualTextSvc:  cfg.VisualTextSvc,
 		renderSvc:      cfg.RenderSvc,
 		reviewSvc:      cfg.ReviewSvc,
@@ -244,6 +250,11 @@ func (s *Server) SetAudioMixService(svc *service.AudioMixService) {
 	if s.reviewSvc != nil {
 		s.reviewSvc.SetAudioMixService(svc)
 	}
+}
+
+// SetAudioRoleService sets or replaces the injected audio role service (Issue #80).
+func (s *Server) SetAudioRoleService(svc *service.AudioRoleService) {
+	s.audioRoleSvc = svc
 }
 
 // SetVisualTextService sets or replaces the injected visual text pipeline (T09).
@@ -323,6 +334,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/assets/{id}", s.handleGetAsset)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/preflight", s.handleGetAssetPreflight)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/audio-role-plan", s.handleSaveAudioRolePlan)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/audio-role-plan/generate", s.handleSaveAudioRolePlan)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/audio-role-plan", s.handleGetAudioRolePlan)
 
 	// Localization Jobs & Runs
@@ -677,10 +689,38 @@ func (s *Server) handleSaveAudioRolePlan(w http.ResponseWriter, r *http.Request)
 	}
 
 	var body struct {
-		Segments []domain.AudioSegment `json:"segments"`
+		Segments         []domain.AudioSegment   `json:"segments,omitempty"`
+		RunID            string                  `json:"run_id,omitempty"`
+		JobID            string                  `json:"job_id,omitempty"`
+		ExecutionProfile domain.ExecutionProfile `json:"execution_profile,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	// If no segments were supplied, automatically generate production AudioRolePlan
+	if len(body.Segments) == 0 {
+		if s.audioRoleSvc == nil {
+			writeError(w, http.StatusInternalServerError, "audio role service is not configured")
+			return
+		}
+		in := service.AudioRolePlanInput{
+			AssetID:          assetID,
+			RunID:            body.RunID,
+			JobID:            body.JobID,
+			ExecutionProfile: body.ExecutionProfile,
+		}
+		plan, err := s.audioRoleSvc.GenerateAudioRolePlan(r.Context(), in)
+		if err != nil {
+			if errors.Is(err, domain.ErrAssetNotFound) || errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "generate audio role plan: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"audio_role_plan": plan})
 		return
 	}
 

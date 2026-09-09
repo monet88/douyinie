@@ -24,9 +24,41 @@ var (
 )
 
 const (
-	AudioStemsSchemaVersion = 1
-	DubMixSchemaVersion     = 1
+	AudioRolePlanSchemaVersion = 1
+	AudioStemsSchemaVersion    = 1
+	DubMixSchemaVersion        = 1
 )
+
+// AudioRolePlanProvenance captures deterministic provenance for AudioRolePlan.
+type AudioRolePlanProvenance struct {
+	AssetSHA256   string `json:"asset_sha256"`
+	StemsCASHash  string `json:"stems_cas_hash,omitempty"`
+	ProviderID    string `json:"provider_id"`
+	ModelName     string `json:"model_name"`
+	ModelVersion  string `json:"model_version"`
+	SchemaVersion int    `json:"schema_version"`
+}
+
+func (p AudioRolePlanProvenance) Hash() string {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return ""
+	}
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+// ComputeAudioRolePlanProvenanceHash computes the deterministic hash for AudioRolePlan.
+func ComputeAudioRolePlanProvenanceHash(assetSHA256, stemsCASHash, providerID, modelName, modelVersion string) string {
+	return AudioRolePlanProvenance{
+		AssetSHA256:   assetSHA256,
+		StemsCASHash:  stemsCASHash,
+		ProviderID:    providerID,
+		ModelName:     modelName,
+		ModelVersion:  modelVersion,
+		SchemaVersion: AudioRolePlanSchemaVersion,
+	}.Hash()
+}
 
 // StemType identifies the acoustic content of an audio stem.
 type StemType string

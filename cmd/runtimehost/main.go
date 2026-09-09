@@ -187,6 +187,7 @@ func main() {
 		TranslationSvc: translationSvc,
 		DubbingSvc:     dubbingSvc,
 		AudioMixSvc:    audioMixSvc,
+		AudioRoleSvc:   service.NewAudioRoleService(db, casStore, audioMixSvc),
 		VisualTextSvc:  visualTextSvc,
 		RenderSvc:      renderSvc,
 		BundleSvc:      service.NewBundleService(db, casStore, licSvc),

@@ -5,11 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"strings"
-
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/worker"
+	"os"
+	"strings"
 )
 
 type BaseFakeProvider struct {
@@ -373,34 +373,75 @@ func (p *FakeSeparatorProvider) SeparateStems(ctx context.Context, req Separatio
 	channels := 1
 	totalSamples := (sampleRate * int(durationMs)) / 1000
 
-	bgSamples := make([]int16, totalSamples)
-	for i := range bgSamples {
-		bgSamples[i] = 1000 // Constant BGM baseline
+	var sourceSamples []int16
+	if req.SourceAudio.Path != "" {
+		if data, err := os.ReadFile(req.SourceAudio.Path); err == nil {
+			if s, info, err := media.ExtractPCM16Samples(data); err == nil && len(s) > 0 {
+				sourceSamples = s
+				totalSamples = len(s)
+				if info != nil && info.SampleRate > 0 {
+					sampleRate = int(info.SampleRate)
+				}
+				durationMs = int64(totalSamples*1000) / int64(sampleRate)
+			}
+		}
 	}
+
+	bgSamples := make([]int16, totalSamples)
 	vocalsSamples := make([]int16, totalSamples)
-	if req.AudioRolePlan != nil && len(req.AudioRolePlan.Segments) > 0 {
-		for _, seg := range req.AudioRolePlan.Segments {
-			sStart := (int(seg.StartMs) * sampleRate) / 1000
-			sEnd := (int(seg.EndMs) * sampleRate) / 1000
-			if sStart < 0 {
-				sStart = 0
+
+	if len(sourceSamples) > 0 {
+		if req.AudioRolePlan != nil && len(req.AudioRolePlan.Segments) > 0 {
+			for _, seg := range req.AudioRolePlan.Segments {
+				sStart := (int(seg.StartMs) * sampleRate) / 1000
+				sEnd := (int(seg.EndMs) * sampleRate) / 1000
+				if sStart < 0 {
+					sStart = 0
+				}
+				if sEnd > totalSamples {
+					sEnd = totalSamples
+				}
+				for i := sStart; i < sEnd; i++ {
+					if seg.Role == domain.AudioRoleNarrationDialogue || seg.Role == domain.AudioRoleSingingMusicVocal || seg.Role == domain.AudioRoleUncertain {
+						vocalsSamples[i] = sourceSamples[i]
+					} else {
+						bgSamples[i] = sourceSamples[i]
+					}
+				}
 			}
-			if sEnd > totalSamples {
-				sEnd = totalSamples
-			}
-			amp := int16(4000)
-			if seg.Role == domain.AudioRoleSingingMusicVocal {
-				amp = 3000
-			}
-			for i := sStart; i < sEnd; i++ {
-				vocalsSamples[i] = amp
-			}
+		} else {
+			copy(vocalsSamples, sourceSamples)
+			copy(bgSamples, sourceSamples)
 		}
 	} else {
-		for i := range vocalsSamples {
-			vocalsSamples[i] = 4000
+		for i := range bgSamples {
+			bgSamples[i] = 1000 // Constant BGM baseline
+		}
+		if req.AudioRolePlan != nil && len(req.AudioRolePlan.Segments) > 0 {
+			for _, seg := range req.AudioRolePlan.Segments {
+				sStart := (int(seg.StartMs) * sampleRate) / 1000
+				sEnd := (int(seg.EndMs) * sampleRate) / 1000
+				if sStart < 0 {
+					sStart = 0
+				}
+				if sEnd > totalSamples {
+					sEnd = totalSamples
+				}
+				amp := int16(4000)
+				if seg.Role == domain.AudioRoleSingingMusicVocal {
+					amp = 3000
+				}
+				for i := sStart; i < sEnd; i++ {
+					vocalsSamples[i] = amp
+				}
+			}
+		} else {
+			for i := range vocalsSamples {
+				vocalsSamples[i] = 4000
+			}
 		}
 	}
+
 	bg := media.EncodePCM16Samples(bgSamples, sampleRate, channels)
 	vocals := media.EncodePCM16Samples(vocalsSamples, sampleRate, channels)
 	return &SeparationResult{
@@ -415,7 +456,6 @@ func (p *FakeSeparatorProvider) SeparateStems(ctx context.Context, req Separatio
 	}, nil
 }
 
-// FakeOCRProvider simulates OCR text extraction and TextRegionPlan generation.
 type FakeOCRProvider struct {
 	BaseFakeProvider
 	CustomDetections  []RawTextDetection
