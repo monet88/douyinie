@@ -1213,6 +1213,47 @@ func (s *DB) migrate(ctx context.Context) error {
 			return fmt.Errorf("commit migration v18: %w", err)
 		}
 	}
+
+	// Migration v19: AudioRolePlan Artifacts Index (Issue #80)
+	var countV19 int
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 19`).Scan(&countV19)
+	if err != nil {
+		return fmt.Errorf("check migration version 19: %w", err)
+	}
+
+	if countV19 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v19 tx: %w", err)
+		}
+		defer tx.Rollback()
+
+		schemaV19SQL := `
+		CREATE TABLE IF NOT EXISTS audio_role_plan_artifacts (
+			id TEXT PRIMARY KEY,
+			asset_id TEXT NOT NULL REFERENCES source_assets(id) ON DELETE CASCADE,
+			provider_id TEXT NOT NULL,
+			model_name TEXT NOT NULL,
+			model_version TEXT NOT NULL,
+			cas_hash TEXT NOT NULL,
+			provenance_hash TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_role_plan_provenance ON audio_role_plan_artifacts(provenance_hash);
+		CREATE INDEX IF NOT EXISTS idx_audio_role_plan_asset ON audio_role_plan_artifacts(asset_id);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (19, datetime('now'));
+		`
+
+		if _, err := tx.ExecContext(ctx, schemaV19SQL); err != nil {
+			return fmt.Errorf("execute migration v19: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v19: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -1580,27 +1621,60 @@ func (s *DB) SaveAudioRolePlan(ctx context.Context, plan domain.AudioRolePlan) e
 
 	createdAtStr := plan.CreatedAt.Format(time.RFC3339Nano)
 
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin save audio role plan tx: %w", err)
+	}
+	defer tx.Rollback()
+
 	// Check if a plan for this asset_id already exists to update it
 	var existingID string
-	err = s.db.QueryRowContext(ctx, `SELECT id FROM audio_role_plans WHERE asset_id = ?`, plan.AssetID).Scan(&existingID)
+	err = tx.QueryRowContext(ctx, `SELECT id FROM audio_role_plans WHERE asset_id = ?`, plan.AssetID).Scan(&existingID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("check existing audio role plan: %w", err)
 	}
 
 	if existingID != "" {
-		// Update existing plan, retaining its ID (or update ID to match plan.ID to be consistent with client request)
+		// Update existing plan
 		query := `UPDATE audio_role_plans SET id = ?, plan_json = ?, created_at = ? WHERE asset_id = ?`
-		_, err = s.db.ExecContext(ctx, query, plan.ID, string(segmentsJSON), createdAtStr, plan.AssetID)
+		_, err = tx.ExecContext(ctx, query, plan.ID, string(segmentsJSON), createdAtStr, plan.AssetID)
 		if err != nil {
 			return fmt.Errorf("update audio role plan: %w", err)
 		}
 	} else {
 		// Insert new plan
 		query := `INSERT INTO audio_role_plans (id, asset_id, plan_json, created_at) VALUES (?, ?, ?, ?)`
-		_, err = s.db.ExecContext(ctx, query, plan.ID, plan.AssetID, string(segmentsJSON), createdAtStr)
+		_, err = tx.ExecContext(ctx, query, plan.ID, plan.AssetID, string(segmentsJSON), createdAtStr)
 		if err != nil {
 			return fmt.Errorf("save audio role plan: %w", err)
 		}
+	}
+
+	if plan.CASHash != "" && plan.ProvenanceHash != "" {
+		idxQuery := `
+			INSERT INTO audio_role_plan_artifacts (
+				id, asset_id, provider_id, model_name, model_version, cas_hash, provenance_hash, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(provenance_hash) DO UPDATE SET
+				cas_hash = excluded.cas_hash
+		`
+		_, err = tx.ExecContext(ctx, idxQuery,
+			plan.ID,
+			plan.AssetID,
+			plan.ProviderID,
+			plan.ModelName,
+			plan.ModelVersion,
+			plan.CASHash,
+			plan.ProvenanceHash,
+			createdAtStr,
+		)
+		if err != nil {
+			return fmt.Errorf("insert audio_role_plan_artifacts index: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit save audio role plan tx: %w", err)
 	}
 	return nil
 }
@@ -1624,7 +1698,17 @@ func (s *DB) GetAudioRolePlan(ctx context.Context, assetID string) (*domain.Audi
 	}
 
 	if err := json.Unmarshal([]byte(planJSON), &plan.Segments); err != nil {
-		return nil, fmt.Errorf("unmarshal audio segments: %w", err)
+		var fullPlan domain.AudioRolePlan
+		if err2 := json.Unmarshal([]byte(planJSON), &fullPlan); err2 == nil {
+			plan.Segments = fullPlan.Segments
+			plan.CASHash = fullPlan.CASHash
+			plan.ProvenanceHash = fullPlan.ProvenanceHash
+			plan.ProviderID = fullPlan.ProviderID
+			plan.ModelName = fullPlan.ModelName
+			plan.ModelVersion = fullPlan.ModelVersion
+		} else {
+			return nil, fmt.Errorf("unmarshal audio segments: %w", err)
+		}
 	}
 
 	t, err := time.Parse(time.RFC3339Nano, createdAtStr)
@@ -1633,7 +1717,140 @@ func (s *DB) GetAudioRolePlan(ctx context.Context, assetID string) (*domain.Audi
 	}
 	plan.CreatedAt = t
 
+	if plan.CASHash == "" || plan.ProvenanceHash == "" {
+		var idxRow struct {
+			ProviderID     string
+			ModelName      string
+			ModelVersion   string
+			CASHash        string
+			ProvenanceHash string
+		}
+		idxQuery := `SELECT provider_id, model_name, model_version, cas_hash, provenance_hash
+			FROM audio_role_plan_artifacts WHERE asset_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`
+		if err := s.db.QueryRowContext(ctx, idxQuery, assetID).Scan(
+			&idxRow.ProviderID,
+			&idxRow.ModelName,
+			&idxRow.ModelVersion,
+			&idxRow.CASHash,
+			&idxRow.ProvenanceHash,
+		); err == nil {
+			plan.ProviderID = idxRow.ProviderID
+			plan.ModelName = idxRow.ModelName
+			plan.ModelVersion = idxRow.ModelVersion
+			plan.CASHash = idxRow.CASHash
+			plan.ProvenanceHash = idxRow.ProvenanceHash
+		}
+	}
+
 	return &plan, nil
+}
+
+// AudioRolePlanIndex captures the SQLite indexing metadata for a persisted AudioRolePlan.
+type AudioRolePlanIndex struct {
+	ID             string
+	AssetID        string
+	ProviderID     string
+	ModelName      string
+	ModelVersion   string
+	CASHash        string
+	ProvenanceHash string
+	CreatedAt      time.Time
+}
+
+// SaveAudioRolePlanIndex records the index row for a CAS-stored AudioRolePlan.
+func (s *DB) SaveAudioRolePlanIndex(ctx context.Context, idx AudioRolePlanIndex) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		INSERT INTO audio_role_plan_artifacts (
+			id, asset_id, provider_id, model_name, model_version, cas_hash, provenance_hash, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provenance_hash) DO UPDATE SET
+			cas_hash = excluded.cas_hash
+	`
+	_, err := s.db.ExecContext(ctx, query,
+		idx.ID,
+		idx.AssetID,
+		idx.ProviderID,
+		idx.ModelName,
+		idx.ModelVersion,
+		idx.CASHash,
+		idx.ProvenanceHash,
+		func() string {
+			if idx.CreatedAt.IsZero() {
+				return time.Now().UTC().Format(time.RFC3339Nano)
+			}
+			return idx.CreatedAt.Format(time.RFC3339Nano)
+		}(),
+	)
+	if err != nil {
+		return fmt.Errorf("save audio_role_plan_artifacts index: %w", err)
+	}
+	return nil
+}
+
+// GetAudioRolePlanIndex retrieves the latest index row for an asset.
+func (s *DB) GetAudioRolePlanIndex(ctx context.Context, assetID string) (*AudioRolePlanIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx AudioRolePlanIndex
+	var createdStr string
+	query := `SELECT id, asset_id, provider_id, model_name, model_version, cas_hash, provenance_hash, created_at
+		FROM audio_role_plan_artifacts WHERE asset_id = ?
+		ORDER BY created_at DESC, rowid DESC LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, assetID).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.ProviderID,
+		&idx.ModelName,
+		&idx.ModelVersion,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query audio_role_plan_artifacts index: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
+}
+
+// GetAudioRolePlanByProvenance retrieves the index row by provenance hash.
+func (s *DB) GetAudioRolePlanByProvenance(ctx context.Context, provenanceHash string) (*AudioRolePlanIndex, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var idx AudioRolePlanIndex
+	var createdStr string
+	query := `SELECT id, asset_id, provider_id, model_name, model_version, cas_hash, provenance_hash, created_at
+		FROM audio_role_plan_artifacts WHERE provenance_hash = ? LIMIT 1`
+
+	err := s.db.QueryRowContext(ctx, query, provenanceHash).Scan(
+		&idx.ID,
+		&idx.AssetID,
+		&idx.ProviderID,
+		&idx.ModelName,
+		&idx.ModelVersion,
+		&idx.CASHash,
+		&idx.ProvenanceHash,
+		&createdStr,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query audio_role_plan_artifacts by provenance: %w", err)
+	}
+	t, _ := time.Parse(time.RFC3339Nano, createdStr)
+	idx.CreatedAt = t
+	return &idx, nil
 }
 
 // TranscriptArtifactIndex is the SQLite index row for a content-addressed
@@ -4644,7 +4861,7 @@ func (s *DB) GetRenderArtifactIndicesByRun(ctx context.Context, runID string) ([
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	query := `SELECT id, asset_id, run_id, target_language, kind, cas_hash, provenance_hash, created_at
+	query := `SELECT id, asset_id, run_id, target_language, kind, output_cas_hash, cas_hash, provenance_hash, created_at
 		FROM render_artifacts WHERE run_id = ? ORDER BY created_at ASC`
 	rows, err := s.db.QueryContext(ctx, query, runID)
 	if err != nil {
@@ -4656,7 +4873,7 @@ func (s *DB) GetRenderArtifactIndicesByRun(ctx context.Context, runID string) ([
 	for rows.Next() {
 		var idx RenderArtifactIndex
 		var createdStr string
-		if err := rows.Scan(&idx.ID, &idx.AssetID, &idx.RunID, &idx.TargetLanguage, &idx.Kind, &idx.CASHash, &idx.ProvenanceHash, &createdStr); err != nil {
+		if err := rows.Scan(&idx.ID, &idx.AssetID, &idx.RunID, &idx.TargetLanguage, &idx.Kind, &idx.OutputCASHash, &idx.CASHash, &idx.ProvenanceHash, &createdStr); err != nil {
 			return nil, fmt.Errorf("scan render artifact index: %w", err)
 		}
 		idx.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
@@ -5136,19 +5353,29 @@ func (s *DB) UpsertRenderArtifactIndex(ctx context.Context, idx RenderArtifactIn
 	defer s.mu.Unlock()
 
 	query := `
-		INSERT INTO render_artifacts (id, asset_id, run_id, target_language, kind, cas_hash, provenance_hash, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO render_artifacts (
+			id, asset_id, run_id, job_id, target_language, kind,
+			plan_provenance, plan_cas_hash, output_cas_hash, cas_hash, provenance_hash,
+			overall_status, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			asset_id = excluded.asset_id,
 			run_id = excluded.run_id,
+			job_id = excluded.job_id,
 			target_language = excluded.target_language,
 			kind = excluded.kind,
+			plan_provenance = excluded.plan_provenance,
+			plan_cas_hash = excluded.plan_cas_hash,
+			output_cas_hash = excluded.output_cas_hash,
 			cas_hash = excluded.cas_hash,
 			provenance_hash = excluded.provenance_hash,
+			overall_status = excluded.overall_status,
 			created_at = excluded.created_at
 	`
 	_, err := s.db.ExecContext(ctx, query,
-		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.Kind, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+		idx.ID, idx.AssetID, idx.RunID, idx.JobID, idx.TargetLanguage, idx.Kind,
+		idx.PlanProvenance, idx.PlanCASHash, idx.OutputCASHash, idx.CASHash, idx.ProvenanceHash,
+		idx.OverallStatus, idx.CreatedAt.Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert render artifact index: %w", err)

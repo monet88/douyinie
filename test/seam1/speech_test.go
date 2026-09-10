@@ -504,6 +504,8 @@ func TestSeam1_SpeechUnderstand_NoPublicTranscriptWrite(t *testing.T) {
 // hard precondition from completed #29).
 func TestSeam1_SpeechUnderstand_MissingPlanFailsClosed(t *testing.T) {
 	h := setupHarness(t)
+	// Disable automatic prerequisite generator to test SpeechService fail-closed guard
+	h.srv.SetAudioRoleService(nil)
 	jobID, _ := createJobAndRun(t, h)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID

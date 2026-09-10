@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"path/filepath"
@@ -524,5 +525,163 @@ func TestBundleService_OverwriteHandling(t *testing.T) {
 	_, err = bundleSvcB.ImportBundle(ctx, bytes.NewReader(zipBytes), int64(len(zipBytes)), service.ImportOptions{Overwrite: true})
 	if err != nil {
 		t.Fatalf("import with overwrite: true failed: %v", err)
+	}
+}
+
+func TestBundleService_ImportRenderArtifactIndices(t *testing.T) {
+	ctx := context.Background()
+	dbA, casA, licA, bundleSvcA := setupBundleTestEnv(t)
+	defer dbA.Close()
+
+	jobID, assetID := seedTestJob(t, dbA, casA, licA)
+	runs, err := dbA.ListRunsByJobID(ctx, jobID)
+	if err != nil || len(runs) == 0 {
+		t.Fatalf("list runs failed: %v", err)
+	}
+	runID := runs[0].ID
+
+	// Create sample render output media in CAS A
+	previewMedia := []byte("PREVIEW_MEDIA_DATA_12345")
+	prevObj, err := casA.Put(bytes.NewReader(previewMedia))
+	if err != nil {
+		t.Fatalf("put preview media: %v", err)
+	}
+	finalMedia := []byte("FINAL_MEDIA_DATA_67890")
+	finObj, err := casA.Put(bytes.NewReader(finalMedia))
+	if err != nil {
+		t.Fatalf("put final media: %v", err)
+	}
+
+	// Save preview and final artifacts into CAS A
+	praProv := strings.Repeat("a", 64)
+	pra := domain.PreviewRenderArtifact{
+		ID:             uuid.NewString(),
+		AssetID:        assetID,
+		RunID:          runID,
+		JobID:          jobID,
+		TargetLanguage: "vi",
+		OutputCASHash:  prevObj.SHA256,
+		ProvenanceHash: praProv,
+		OverallStatus:  "PASS",
+		CreatedAt:      time.Now().UTC(),
+	}
+	praBytes, _ := json.Marshal(pra)
+	praObj, err := casA.Put(bytes.NewReader(praBytes))
+	if err != nil {
+		t.Fatalf("put pra: %v", err)
+	}
+
+	fraProv := strings.Repeat("b", 64)
+	fra := domain.FinalRenderArtifact{
+		ID:             uuid.NewString(),
+		AssetID:        assetID,
+		RunID:          runID,
+		JobID:          jobID,
+		TargetLanguage: "vi",
+		OutputCASHash:  finObj.SHA256,
+		ProvenanceHash: fraProv,
+		OverallStatus:  "PASS",
+		CreatedAt:      time.Now().UTC(),
+	}
+	fraBytes, _ := json.Marshal(fra)
+	fraObj, err := casA.Put(bytes.NewReader(fraBytes))
+	if err != nil {
+		t.Fatalf("put fra: %v", err)
+	}
+
+	// Index in DB A
+	now := time.Now().UTC()
+	if err := dbA.SaveRenderArtifactIndex(ctx, storage.RenderArtifactIndex{
+		ID:             pra.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		JobID:          jobID,
+		TargetLanguage: "vi",
+		Kind:           "preview",
+		PlanProvenance: strings.Repeat("1", 64),
+		PlanCASHash:    strings.Repeat("2", 64),
+		OutputCASHash:  prevObj.SHA256,
+		CASHash:        praObj.SHA256,
+		ProvenanceHash: praProv,
+		OverallStatus:  "PASS",
+		CreatedAt:      now,
+	}); err != nil {
+		t.Fatalf("save preview idx: %v", err)
+	}
+	if err := dbA.SaveRenderArtifactIndex(ctx, storage.RenderArtifactIndex{
+		ID:             fra.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		JobID:          jobID,
+		TargetLanguage: "vi",
+		Kind:           "final",
+		PlanProvenance: strings.Repeat("4", 64),
+		PlanCASHash:    strings.Repeat("5", 64),
+		OutputCASHash:  finObj.SHA256,
+		CASHash:        fraObj.SHA256,
+		ProvenanceHash: fraProv,
+		CreatedAt:      now.Add(time.Second),
+	}); err != nil {
+		t.Fatalf("save final idx: %v", err)
+	}
+
+	// Export bundle
+	var zipBuf bytes.Buffer
+	_, err = bundleSvcA.ExportBundle(ctx, jobID, &zipBuf)
+	if err != nil {
+		t.Fatalf("export failed: %v", err)
+	}
+
+	// Import into clean B environment
+	dbB, casB, licB, bundleSvcB := setupBundleTestEnv(t)
+	defer dbB.Close()
+	_ = licB
+
+	zipBytes := zipBuf.Bytes()
+	_, err = bundleSvcB.ImportBundle(ctx, bytes.NewReader(zipBytes), int64(len(zipBytes)), service.ImportOptions{})
+	if err != nil {
+		t.Fatalf("import failed: %v", err)
+	}
+
+	// Verify render artifacts were reconstructed in dbB with OutputCASHash intact
+	indices, err := dbB.GetRenderArtifactIndicesByRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get indices by run on B: %v", err)
+	}
+	if len(indices) != 2 {
+		t.Fatalf("expected 2 render indices on B, got %d", len(indices))
+	}
+
+	var foundPreview, foundFinal bool
+	for _, idx := range indices {
+		if idx.Kind == "preview" {
+			foundPreview = true
+			if idx.OutputCASHash != prevObj.SHA256 {
+				t.Errorf("preview output_cas_hash = %q, want %q", idx.OutputCASHash, prevObj.SHA256)
+			}
+			if !casB.Exists(idx.OutputCASHash) {
+				t.Errorf("preview media missing from destination CAS: %s", idx.OutputCASHash)
+			}
+		} else if idx.Kind == "final" {
+			foundFinal = true
+			if idx.OutputCASHash != finObj.SHA256 {
+				t.Errorf("final output_cas_hash = %q, want %q", idx.OutputCASHash, finObj.SHA256)
+			}
+			if !casB.Exists(idx.OutputCASHash) {
+				t.Errorf("final media missing from destination CAS: %s", idx.OutputCASHash)
+			}
+		}
+	}
+	if !foundPreview || !foundFinal {
+		t.Errorf("expected both preview and final indices, got foundPreview=%v, foundFinal=%v", foundPreview, foundFinal)
+	}
+
+	// Also verify GetLatestRenderArtifactIndex resolves output_cas_hash
+	latestPreview, err := dbB.GetLatestRenderArtifactIndex(ctx, assetID, "vi", "preview")
+	if err != nil {
+		t.Fatalf("get latest preview: %v", err)
+	}
+	if latestPreview.OutputCASHash != prevObj.SHA256 {
+		t.Errorf("latest preview output_cas_hash = %q, want %q", latestPreview.OutputCASHash, prevObj.SHA256)
 	}
 }

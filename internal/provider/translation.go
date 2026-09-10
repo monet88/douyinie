@@ -26,13 +26,13 @@ type TranslationResult struct {
 	Segments          []domain.TranslationSegment
 }
 
-
 // Frozen RC translation provider identities (Issue #66).
 const (
 	GatewayGeminiTranslationProviderID   = "gateway_gemini_3_8_flash"
 	GatewayDeepSeekTranslationProviderID = "gateway_deepseek_v4_flash_vision_exp"
 	WorkerQwenTranslationProviderID      = "qwen3_4b_translation"
 )
+
 // TextTranslationProvider is implemented by translation model/service adapters
 // that translate source text segments into Vietnamese or English while preserving meaning.
 type TextTranslationProvider interface {

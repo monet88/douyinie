@@ -1348,3 +1348,43 @@ sys.exit(0)
 		}
 	})
 }
+
+// Item 12: Worker bridge must fail closed when audio_role class map is missing from snapshot manifest
+func TestWorkerAudioRoleProvider_MissingClassMapFailsClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+	yamnetDir := filepath.Join(tmpDir, "yamnet_incomplete")
+	if err := os.MkdirAll(yamnetDir, 0755); err != nil {
+		t.Fatalf("mkdir yamnet dir: %v", err)
+	}
+	tflitePath := filepath.Join(yamnetDir, "yamnet.tflite")
+	if err := os.WriteFile(tflitePath, []byte("fake_tflite"), 0644); err != nil {
+		t.Fatalf("write fake tflite: %v", err)
+	}
+
+	// Manifest with tflite but MISSING class map!
+	manifest := domain.SnapshotManifest{
+		SchemaVersion: "1",
+		ModelID:       provider.YAMNetModelID,
+		ModelVersion:  provider.YAMNetModelVersion,
+		Files: []domain.SnapshotFileEntry{
+			{
+				RelativePath: "yamnet.tflite",
+				SizeBytes:    int64(len("fake_tflite")),
+				SHA256:       domain.PinnedYAMNetArtifactSHA256,
+			},
+		},
+	}
+	snapSHA, err := domain.ComputeSnapshotManifestSHA256(&manifest)
+	if err != nil {
+		t.Fatalf("compute snapshot manifest sha: %v", err)
+	}
+	manifest.SnapshotManifestSHA256 = snapSHA
+
+	_, err = domain.ResolveAudioRoleClassMapPath(manifest, yamnetDir)
+	if err == nil {
+		t.Fatal("expected ResolveAudioRoleClassMapPath to fail when class map missing from manifest")
+	}
+	if !errors.Is(err, domain.ErrAudioRoleModelAssetMissing) {
+		t.Fatalf("expected ErrAudioRoleModelAssetMissing, got %v", err)
+	}
+}

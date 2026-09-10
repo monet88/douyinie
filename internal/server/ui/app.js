@@ -195,7 +195,7 @@ function renderSelectedRun() {
 
   const allowed = {
     pause: ["queued", "running"],
-    resume: ["paused", "interrupted"],
+    resume: ["paused"],
     cancel: ["queued", "running", "paused"],
   };
   $$("[data-run-action]").forEach((button) => {
@@ -296,7 +296,10 @@ function artifactRows(artifact) {
 
 function renderMediaURL(kind) {
   if (!state.selectedJob) return "";
-  return `/api/v1/assets/${encodeURIComponent(state.selectedJob.source_asset_id)}/render/${kind}/media?target_language=${encodeURIComponent(state.selectedJob.target_language)}`;
+  const asset = encodeURIComponent(state.selectedJob.source_asset_id);
+  const target = encodeURIComponent(state.selectedJob.target_language);
+  const runParam = state.selectedRun ? `&run_id=${encodeURIComponent(state.selectedRun.id)}` : "";
+  return `/api/v1/assets/${asset}/render/${kind}/media?target_language=${target}${runParam}`;
 }
 
 function renderResult() {
@@ -644,9 +647,10 @@ async function refreshResult() {
   }
   const assetID = encodeURIComponent(state.selectedJob.source_asset_id);
   const target = encodeURIComponent(state.selectedJob.target_language);
+  const runID = encodeURIComponent(state.selectedRun.id);
   const [previewData, finalData] = await Promise.all([
-    apiOptional(`/api/v1/assets/${assetID}/render/preview?target_language=${target}`),
-    apiOptional(`/api/v1/assets/${assetID}/render/final?target_language=${target}`),
+    apiOptional(`/api/v1/assets/${assetID}/render/preview?target_language=${target}&run_id=${runID}`),
+    apiOptional(`/api/v1/assets/${assetID}/render/final?target_language=${target}&run_id=${runID}`),
   ]);
   state.preview = previewData?.preview_render || null;
   state.final = finalData?.final_render || null;

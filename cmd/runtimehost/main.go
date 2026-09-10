@@ -88,6 +88,9 @@ func main() {
 	licSvc := governance.NewLicenseService(db)
 	credSvc := governance.NewCredentialService(db)
 	snapSvc := governance.NewSnapshotService(db, licSvc)
+	if err := provider.BootstrapYAMNetLicenseManifest(context.Background(), licSvc); err != nil {
+		log.Fatalf("[RuntimeHost] failed to bootstrap YAMNet license manifest: %v", err)
+	}
 	reg, err := provider.NewProductionSpeechRegistry(gpuLeaseMgr, snapSvc, credSvc.MaterializeSecret)
 	if err != nil {
 		log.Fatalf("[RuntimeHost] failed to initialize production speech registry: %v", err)
@@ -187,6 +190,7 @@ func main() {
 		TranslationSvc: translationSvc,
 		DubbingSvc:     dubbingSvc,
 		AudioMixSvc:    audioMixSvc,
+		AudioRoleSvc:   service.NewAudioRoleService(db, casStore, audioMixSvc),
 		VisualTextSvc:  visualTextSvc,
 		RenderSvc:      renderSvc,
 		BundleSvc:      service.NewBundleService(db, casStore, licSvc),

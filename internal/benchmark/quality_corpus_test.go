@@ -15,7 +15,6 @@ import (
 	"github.com/monet88/douyinie/internal/domain"
 )
 
-
 // makeValidAnnotationPack builds a fully secondary-adjudicated ReferenceAnnotationPack fixture.
 func makeValidAnnotationPack(assetID string, isMultiSpeaker, hasBurnedIn, isNoDub bool) *benchmark.ReferenceAnnotationPack {
 	adjudicatedAt := time.Date(2026, 9, 3, 10, 0, 0, 0, time.UTC)
@@ -1154,14 +1153,14 @@ func TestRealQualityCorpus_DraftValidation(t *testing.T) {
 		t.Fatalf("failed to read real quality corpus from %s: %v", corpusPath, err)
 	}
 	var rawAssets []struct {
-		AssetID         string                          `json:"asset_id"`
-		SourceVideoID   string                          `json:"source_video_id"`
-		SourceAssetID   string                          `json:"source_asset_id"`
-		SHA256          string                          `json:"sha256"`
-		PrimaryCategory string                          `json:"primary_category"`
-		Tags            []string                        `json:"tags"`
-		IsReserve       bool                            `json:"is_reserve"`
-		Preflight       domain.PreflightReport          `json:"preflight"`
+		AssetID         string                             `json:"asset_id"`
+		SourceVideoID   string                             `json:"source_video_id"`
+		SourceAssetID   string                             `json:"source_asset_id"`
+		SHA256          string                             `json:"sha256"`
+		PrimaryCategory string                             `json:"primary_category"`
+		Tags            []string                           `json:"tags"`
+		IsReserve       bool                               `json:"is_reserve"`
+		Preflight       domain.PreflightReport             `json:"preflight"`
 		ReferencePack   *benchmark.ReferenceAnnotationPack `json:"reference_pack"`
 	}
 	if err := json.Unmarshal(data, &rawAssets); err != nil {

@@ -44,6 +44,7 @@ const (
 	stageWorkerFamilyTTS       = "tts"
 	stageWorkerFamilySeparator = "separator"
 	stageWorkerFamilyOCR       = "ocr"
+	stageWorkerFamilyAudioRole = "audio_role"
 )
 
 // resolveStageWorkerBinary locates the StageWorker executable: explicit
@@ -268,6 +269,16 @@ func (b *workerBridge) run(ctx context.Context, cmd worker.Command) ([]byte, err
 									return nil, fmt.Errorf("resolve separator model entrypoint: %w", epErr)
 								}
 								entrypointFile = ep
+							} else if (cmd.Family == "audio_role" || cmd.Stage == "audio_role") && cmd.Stage != "audio_role_probe" {
+								if primaryBinding.DependencyName != YAMNetModelID || primaryBinding.Version != YAMNetModelVersion {
+									return nil, fmt.Errorf("invalid YAMNet snapshot binding %s:%s (must be exact RC %s:%s): %w",
+										primaryBinding.DependencyName, primaryBinding.Version, YAMNetModelID, YAMNetModelVersion, domain.ErrSnapshotUnverified)
+								}
+								ep, epErr := domain.ResolveAudioRoleEntrypoint(primaryBinding.Manifest, primaryBinding.LocalPath, mName)
+								if epErr != nil {
+									return nil, fmt.Errorf("resolve audio_role model entrypoint: %w", epErr)
+								}
+								entrypointFile = ep
 							}
 							envelope := worker.ModelSnapshotEnvelope{
 								Primary: worker.ModelSnapshotRef{
@@ -315,6 +326,20 @@ func (b *workerBridge) run(ctx context.Context, cmd worker.Command) ([]byte, err
 										}
 									}
 								}
+							}
+							if (cmd.Family == "audio_role" || cmd.Stage == "audio_role") && cmd.Stage != "audio_role_probe" {
+								classMapPath, cmErr := domain.ResolveAudioRoleClassMapPath(primaryBinding.Manifest, primaryBinding.LocalPath)
+								if cmErr != nil {
+									return nil, fmt.Errorf("resolve audio_role class map: %w", cmErr)
+								}
+								envelope.Dependencies = append(envelope.Dependencies, worker.ModelSnapshotRef{
+									Role:                   "class_map",
+									DependencyName:         primaryBinding.DependencyName,
+									Version:                primaryBinding.Version,
+									SnapshotManifestSHA256: primaryBinding.SnapshotManifestSHA256,
+									LocalPath:              primaryBinding.LocalPath,
+									EntrypointFile:         classMapPath,
+								})
 							}
 							if vadName, ok := cmd.Config["vad_model_name"].(string); ok && vadName != "" {
 								vadVer, _ := cmd.Config["vad_model_version"].(string)
@@ -644,6 +669,17 @@ func NewProductionSpeechRegistry(opts ...any) (*Registry, error) {
 		return nil, err
 	}
 
+	// 7b. AudioRole YAMNet baseline (Issue #80)
+	yamnet, err := NewWorkerAudioRoleProvider(YAMNetProviderID, YAMNetModelID, YAMNetModelVersion, 0.95)
+	if err != nil {
+		return nil, err
+	}
+	yamnet.SetRequiresSnapshot(requireSnapshots)
+	yamnet.SetSnapshotService(snapshotSvc)
+	yamnet.SetLeaseManager(mgr)
+	if err := reg.Register(yamnet); err != nil {
+		return nil, err
+	}
 	// 8. Production Translation Providers
 	// Gateway translation providers are registered ONLY when an explicit
 	// OpenAI-compatible gateway endpoint and baseline IDs are provided.

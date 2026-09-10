@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -73,7 +74,8 @@ func (s *Server) handleUploadAsset(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	filename := filepath.Base(strings.TrimSpace(header.Filename))
+	rawFilename := strings.ReplaceAll(strings.TrimSpace(header.Filename), `\`, "/")
+	filename := path.Base(rawFilename)
 	if filename == "" || filename == "." {
 		writeError(w, http.StatusBadRequest, "uploaded filename is required")
 		return
@@ -167,7 +169,8 @@ func (s *Server) serveLatestRenderMedia(w http.ResponseWriter, r *http.Request, 
 	if targetLang == "" {
 		targetLang = "vi"
 	}
-	idx, err := s.db.GetLatestRenderArtifactIndex(r.Context(), r.PathValue("id"), targetLang, kind)
+	runID := r.URL.Query().Get("run_id")
+	idx, err := s.resolveRenderArtifactIndex(r.Context(), r.PathValue("id"), runID, targetLang, kind)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			writeError(w, http.StatusNotFound, kind+" render media not found")

@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -261,4 +262,337 @@ func TestRenderMediaRoutesStreamOnlyIndexedOutputCAS(t *testing.T) {
 			t.Fatalf("status = %d, want 404", rec.Code)
 		}
 	})
+}
+
+func TestRenderMetadataAndMediaRunBinding(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+	casDir := filepath.Join(tmpDir, "cas")
+
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	casStore, err := cas.NewStore(casDir)
+	if err != nil {
+		t.Fatalf("new cas store: %v", err)
+	}
+
+	now := time.Now().UTC()
+	ra := domain.RightsAttestation{
+		ID:              "att-binding",
+		AttestationType: "OPERATOR_CONFIRMED",
+		DeclaredBy:      "operator",
+		TermsAccepted:   true,
+		Notes:           "test",
+		ConfirmedAt:     now,
+	}
+	if err := db.CreateRightsAttestation(ctx, ra); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  "asset-binding",
+		SHA256:              strings.Repeat("1", 64),
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		OriginalFilename:    "clip.mp4",
+		RightsAttestationID: ra.ID,
+		CASPath:             "clip.mp4",
+		CreatedAt:           now,
+	}); err != nil {
+		t.Fatalf("create source asset: %v", err)
+	}
+
+	mediaRun1Bytes := []byte("MEDIA_RUN_1_CONTENT")
+	objRun1, err := casStore.Put(bytes.NewReader(mediaRun1Bytes))
+	if err != nil {
+		t.Fatalf("put run 1 media: %v", err)
+	}
+	mediaRun2Bytes := []byte("MEDIA_RUN_2_CONTENT")
+	objRun2, err := casStore.Put(bytes.NewReader(mediaRun2Bytes))
+	if err != nil {
+		t.Fatalf("put run 2 media: %v", err)
+	}
+
+	// Seed artifacts in CAS
+	prev1 := domain.PreviewRenderArtifact{
+		ID:             "preview-art-run1",
+		AssetID:        "asset-binding",
+		RunID:          "run-1",
+		TargetLanguage: "vi",
+		OutputCASHash:  objRun1.SHA256,
+		OverallStatus:  "PASS",
+		CreatedAt:      now.Add(1 * time.Second),
+	}
+	p1Bytes, _ := json.Marshal(prev1)
+	casP1, err := casStore.Put(bytes.NewReader(p1Bytes))
+	if err != nil {
+		t.Fatalf("put p1: %v", err)
+	}
+
+	prev2 := domain.PreviewRenderArtifact{
+		ID:             "preview-art-run2",
+		AssetID:        "asset-binding",
+		RunID:          "run-2",
+		TargetLanguage: "vi",
+		OutputCASHash:  objRun2.SHA256,
+		OverallStatus:  "PASS",
+		CreatedAt:      now.Add(2 * time.Second),
+	}
+	p2Bytes, _ := json.Marshal(prev2)
+	casP2, err := casStore.Put(bytes.NewReader(p2Bytes))
+	if err != nil {
+		t.Fatalf("put p2: %v", err)
+	}
+
+	fin1 := domain.FinalRenderArtifact{
+		ID:             "final-art-run1",
+		AssetID:        "asset-binding",
+		RunID:          "run-1",
+		TargetLanguage: "vi",
+		OutputCASHash:  objRun1.SHA256,
+		OverallStatus:  "PASS",
+		CreatedAt:      now.Add(1 * time.Second),
+	}
+	f1Bytes, _ := json.Marshal(fin1)
+	casF1, err := casStore.Put(bytes.NewReader(f1Bytes))
+	if err != nil {
+		t.Fatalf("put f1: %v", err)
+	}
+
+	fin2 := domain.FinalRenderArtifact{
+		ID:             "final-art-run2",
+		AssetID:        "asset-binding",
+		RunID:          "run-2",
+		TargetLanguage: "vi",
+		OutputCASHash:  objRun2.SHA256,
+		OverallStatus:  "PASS",
+		CreatedAt:      now.Add(2 * time.Second),
+	}
+	f2Bytes, _ := json.Marshal(fin2)
+	casF2, err := casStore.Put(bytes.NewReader(f2Bytes))
+	if err != nil {
+		t.Fatalf("put f2: %v", err)
+	}
+
+	// Save DB indices: Run 1 older, Run 2 newer
+	if err := db.SaveRenderArtifactIndex(ctx, storage.RenderArtifactIndex{
+		ID:             "idx-p-run1",
+		AssetID:        "asset-binding",
+		RunID:          "run-1",
+		JobID:          "job-1",
+		TargetLanguage: "vi",
+		Kind:           domain.RenderKindPreview,
+		OutputCASHash:  objRun1.SHA256,
+		CASHash:        casP1.SHA256,
+		ProvenanceHash: strings.Repeat("a", 64),
+		OverallStatus:  "PASS",
+		CreatedAt:      now.Add(1 * time.Second),
+	}); err != nil {
+		t.Fatalf("save idx p1: %v", err)
+	}
+	if err := db.SaveRenderArtifactIndex(ctx, storage.RenderArtifactIndex{
+		ID:             "idx-f-run1",
+		AssetID:        "asset-binding",
+		RunID:          "run-1",
+		JobID:          "job-1",
+		TargetLanguage: "vi",
+		Kind:           domain.RenderKindFinal,
+		OutputCASHash:  objRun1.SHA256,
+		CASHash:        casF1.SHA256,
+		ProvenanceHash: strings.Repeat("b", 64),
+		OverallStatus:  "PASS",
+		CreatedAt:      now.Add(1 * time.Second),
+	}); err != nil {
+		t.Fatalf("save idx f1: %v", err)
+	}
+	if err := db.SaveRenderArtifactIndex(ctx, storage.RenderArtifactIndex{
+		ID:             "idx-p-run2",
+		AssetID:        "asset-binding",
+		RunID:          "run-2",
+		JobID:          "job-1",
+		TargetLanguage: "vi",
+		Kind:           domain.RenderKindPreview,
+		OutputCASHash:  objRun2.SHA256,
+		CASHash:        casP2.SHA256,
+		ProvenanceHash: strings.Repeat("c", 64),
+		OverallStatus:  "PASS",
+		CreatedAt:      now.Add(2 * time.Second),
+	}); err != nil {
+		t.Fatalf("save idx p2: %v", err)
+	}
+	if err := db.SaveRenderArtifactIndex(ctx, storage.RenderArtifactIndex{
+		ID:             "idx-f-run2",
+		AssetID:        "asset-binding",
+		RunID:          "run-2",
+		JobID:          "job-1",
+		TargetLanguage: "vi",
+		Kind:           domain.RenderKindFinal,
+		OutputCASHash:  objRun2.SHA256,
+		CASHash:        casF2.SHA256,
+		ProvenanceHash: strings.Repeat("d", 64),
+		OverallStatus:  "PASS",
+		CreatedAt:      now.Add(2 * time.Second),
+	}); err != nil {
+		t.Fatalf("save idx f2: %v", err)
+	}
+
+	s := New(Config{Addr: "127.0.0.1:0", DB: db, CASStore: casStore})
+
+	t.Run("omitted run_id falls back to latest (run 2)", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/assets/asset-binding/render/preview?target_language=vi", nil)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("preview status = %d", rec.Code)
+		}
+		var resp map[string]domain.PreviewRenderArtifact
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal preview: %v", err)
+		}
+		if resp["preview_render"].RunID != "run-2" {
+			t.Fatalf("got preview run_id %q, want run-2", resp["preview_render"].RunID)
+		}
+	})
+
+	t.Run("explicit run_id returns run 1 metadata", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/assets/asset-binding/render/preview?target_language=vi&run_id=run-1", nil)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("preview status = %d", rec.Code)
+		}
+		var resp map[string]domain.PreviewRenderArtifact
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal preview: %v", err)
+		}
+		if resp["preview_render"].RunID != "run-1" {
+			t.Fatalf("got preview run_id %q, want run-1", resp["preview_render"].RunID)
+		}
+
+		reqFinal := httptest.NewRequest("GET", "/api/v1/assets/asset-binding/render/final?target_language=vi&run_id=run-1", nil)
+		recFinal := httptest.NewRecorder()
+		s.Handler().ServeHTTP(recFinal, reqFinal)
+		if recFinal.Code != http.StatusOK {
+			t.Fatalf("final status = %d", recFinal.Code)
+		}
+		var respFinal map[string]domain.FinalRenderArtifact
+		if err := json.Unmarshal(recFinal.Body.Bytes(), &respFinal); err != nil {
+			t.Fatalf("unmarshal final: %v", err)
+		}
+		if respFinal["final_render"].RunID != "run-1" {
+			t.Fatalf("got final run_id %q, want run-1", respFinal["final_render"].RunID)
+		}
+	})
+
+	t.Run("explicit run_id streams bound media content", func(t *testing.T) {
+		reqMedia := httptest.NewRequest("GET", "/api/v1/assets/asset-binding/render/preview/media?target_language=vi&run_id=run-1", nil)
+		recMedia := httptest.NewRecorder()
+		s.Handler().ServeHTTP(recMedia, reqMedia)
+		if recMedia.Code != http.StatusOK {
+			t.Fatalf("preview media status = %d", recMedia.Code)
+		}
+		if !bytes.Equal(recMedia.Body.Bytes(), mediaRun1Bytes) {
+			t.Fatalf("preview media got %q, want %q", recMedia.Body.String(), string(mediaRun1Bytes))
+		}
+
+		reqMediaFinal := httptest.NewRequest("GET", "/api/v1/assets/asset-binding/render/final/media?target_language=vi&run_id=run-1", nil)
+		recMediaFinal := httptest.NewRecorder()
+		s.Handler().ServeHTTP(recMediaFinal, reqMediaFinal)
+		if recMediaFinal.Code != http.StatusOK {
+			t.Fatalf("final media status = %d", recMediaFinal.Code)
+		}
+		if !bytes.Equal(recMediaFinal.Body.Bytes(), mediaRun1Bytes) {
+			t.Fatalf("final media got %q, want %q", recMediaFinal.Body.String(), string(mediaRun1Bytes))
+		}
+	})
+
+	t.Run("nonexistent run_id returns 404", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/assets/asset-binding/render/preview?target_language=vi&run_id=run-nonexistent", nil)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", rec.Code)
+		}
+	})
+}
+
+func TestUploadAssetFilenameSanitization(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "upload_test.db")
+	casDir := filepath.Join(tmpDir, "cas")
+
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	casStore, err := cas.NewStore(casDir)
+	if err != nil {
+		t.Fatalf("new cas store: %v", err)
+	}
+
+	ingestSvc := service.NewIngestService(db, casStore, &media.MockProber{CustomReport: &domain.PreflightReport{
+		ContainerValid:         true,
+		FingerprintMatch:       true,
+		ContainerFormat:        "mp4",
+		NormalizedAudioSHA256:  "normalized-audio-sha",
+		NormalizedAudioCASPath: "cas/normalized-audio",
+	}})
+	s := New(Config{Addr: "127.0.0.1:0", DB: db, CASStore: casStore, Ingest: ingestSvc})
+
+	// Create sample MP4 payload
+	var mp4Buf bytes.Buffer
+	mp4Buf.WriteString("\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2mp41\x00\x00\x00\x08free")
+
+	// Test Windows backslash path
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("terms_accepted", "true")
+	_ = writer.WriteField("declared_by", "Alice")
+	part, err := writer.CreateFormFile("file", `C:\Users\Alice\video.mp4`)
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	_, _ = part.Write(mp4Buf.Bytes())
+	_ = writer.Close()
+
+	req := httptest.NewRequest("POST", "/api/v1/assets/upload", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%q", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		Asset struct {
+			ID               string `json:"id"`
+			OriginalFilename string `json:"original_filename"`
+		} `json:"asset"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal resp: %v", err)
+	}
+	if resp.Asset.OriginalFilename != "video.mp4" {
+		t.Fatalf("got original_filename %q, want video.mp4", resp.Asset.OriginalFilename)
+	}
+
+	// Verify in DB as well
+	storedAsset, err := db.GetSourceAsset(ctx, resp.Asset.ID)
+	if err != nil {
+		t.Fatalf("get source asset: %v", err)
+	}
+	if storedAsset.OriginalFilename != "video.mp4" {
+		t.Fatalf("db original_filename %q, want video.mp4", storedAsset.OriginalFilename)
+	}
 }

@@ -191,8 +191,13 @@ type AudioSegment struct {
 
 // AudioRolePlan is the temporal classification plan of source audio.
 type AudioRolePlan struct {
-	ID        string         `json:"id"`
-	AssetID   string         `json:"asset_id"`
-	Segments  []AudioSegment `json:"segments"`
-	CreatedAt time.Time      `json:"created_at"`
+	ID             string         `json:"id"`
+	AssetID        string         `json:"asset_id"`
+	Segments       []AudioSegment `json:"segments"`
+	CASHash        string         `json:"cas_hash,omitempty"`
+	ProvenanceHash string         `json:"provenance_hash,omitempty"`
+	ProviderID     string         `json:"provider_id,omitempty"`
+	ModelName      string         `json:"model_name,omitempty"`
+	ModelVersion   string         `json:"model_version,omitempty"`
+	CreatedAt      time.Time      `json:"created_at"`
 }

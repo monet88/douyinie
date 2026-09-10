@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -317,5 +318,170 @@ func TestAudioMixService_ZeroDurationSlotOverrun_Refused(t *testing.T) {
 	}
 	if !errors.Is(err, domain.ErrMixerOverrunRefused) {
 		t.Fatalf("expected ErrMixerOverrunRefused, got %v", err)
+	}
+}
+
+func TestAudioMixService_SeparateAudio_UsesNormalizedPreflightAudio_NotRawMP4(t *testing.T) {
+	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+
+	assetID := "asset_norm_test_" + uuid.NewString()[:8]
+	runID := "run_norm_test_" + uuid.NewString()[:8]
+
+	// 1. Put raw MP4 file in CAS as SourceAsset
+	rawMP4Bytes := []byte("\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00isommp42")
+	mp4Obj, err := casStore.Put(bytes.NewReader(rawMP4Bytes))
+	if err != nil {
+		t.Fatalf("put mp4 in cas: %v", err)
+	}
+	attID := uuid.NewString()
+	if err := db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              attID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+	err = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		RightsAttestationID: attID,
+		SHA256:              mp4Obj.SHA256,
+		CASPath:             mp4Obj.Path,
+		MimeType:            "video/mp4",
+		ByteSize:            int64(len(rawMP4Bytes)),
+		CreatedAt:           time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("save source asset: %v", err)
+	}
+
+	// 2. Put valid normalized 16 kHz mono WAV in CAS as PreflightReport
+	normWAVBytes := media.GeneratePCM16WAV(16000, 1, 2000)
+	wavObj, err := casStore.Put(bytes.NewReader(normWAVBytes))
+	if err != nil {
+		t.Fatalf("put wav in cas: %v", err)
+	}
+
+	preflight := domain.PreflightReport{
+		ID:                     "preflight_" + assetID,
+		AssetID:                assetID,
+		DurationSec:            2.0,
+		DurationMs:             2000,
+		AudioChannels:          1,
+		AudioSampleRate:        16000,
+		ContainerFormat:        "mp4",
+		ContainerValid:         true,
+		FingerprintMatch:       true,
+		NormalizedAudioSHA256:  wavObj.SHA256,
+		NormalizedAudioCASPath: wavObj.Path,
+		CreatedAt:              time.Now().UTC(),
+	}
+	if err := db.SavePreflightReport(ctx, preflight); err != nil {
+		t.Fatalf("save preflight report: %v", err)
+	}
+
+	// 3. Execute SeparateAudio
+	// If raw MP4 is passed to FakeSeparatorProvider, it fails closed because raw MP4 is not a valid 16-bit PCM WAV.
+	// When fixed to use normalized preflight audio, it succeeds and uses wavObj.SHA256 as execution input hash.
+	stems, err := mixSvc.SeparateAudio(ctx, service.AudioSeparationInput{
+		RunID:   runID,
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("SeparateAudio failed: %v", err)
+	}
+	if stems == nil || len(stems.Stems) < 2 {
+		t.Fatalf("expected valid stems, got %+v", stems)
+	}
+
+	// 4. Verify ProviderAttempt InputHash recorded by Router matches NormalizedAudioSHA256, not raw MP4 SHA256
+	attempts, err := db.ListProviderAttempts(ctx, runID, string(provider.TypeSeparator))
+	if err != nil {
+		t.Fatalf("ListProviderAttempts failed: %v", err)
+	}
+	if len(attempts) == 0 {
+		t.Fatalf("expected at least 1 provider attempt recorded")
+	}
+	lastAttempt := attempts[len(attempts)-1]
+	if lastAttempt.InputHash != wavObj.SHA256 {
+		t.Errorf("expected ProviderAttempt.InputHash to be normalized audio SHA %s, got %s (raw mp4 SHA was %s)",
+			wavObj.SHA256, lastAttempt.InputHash, mp4Obj.SHA256)
+	}
+}
+
+func TestAudioMixService_SeparateAudio_FailClosedWhenNormalizedEvidenceMissingOrUnreadable(t *testing.T) {
+	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+
+	assetID := "asset_failclosed_" + uuid.NewString()[:8]
+	runID := "run_failclosed_" + uuid.NewString()[:8]
+
+	rawMP4Bytes := []byte("\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00isommp42")
+	mp4Obj, err := casStore.Put(bytes.NewReader(rawMP4Bytes))
+	if err != nil {
+		t.Fatalf("put raw mp4 in cas: %v", err)
+	}
+	attID := uuid.NewString()
+	if err := db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              attID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		RightsAttestationID: attID,
+		SHA256:              mp4Obj.SHA256,
+		CASPath:             mp4Obj.Path,
+		MimeType:            "video/mp4",
+		ByteSize:            int64(len(rawMP4Bytes)),
+		CreatedAt:           time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create source asset: %v", err)
+	}
+
+	// Case 1: PreflightReport missing entirely -> fails closed
+	_, err = mixSvc.SeparateAudio(ctx, service.AudioSeparationInput{
+		RunID:   runID,
+		AssetID: assetID,
+	})
+	if err == nil || !strings.Contains(err.Error(), "preflight report required for audio separation") {
+		t.Fatalf("expected preflight report required error, got %v", err)
+	}
+	// Case 2: PreflightReport present but NormalizedAudioCASPath / SHA256 missing -> fails closed
+	preflight := domain.PreflightReport{
+		ID:              "preflight_" + assetID,
+		AssetID:         assetID,
+		DurationSec:     2.0,
+		DurationMs:      2000,
+		ContainerFormat: "mp4",
+		ContainerValid:  true,
+		CreatedAt:       time.Now().UTC(),
+	}
+	if err := db.SavePreflightReport(ctx, preflight); err != nil {
+		t.Fatalf("save preflight report: %v", err)
+	}
+	_, err = mixSvc.SeparateAudio(ctx, service.AudioSeparationInput{
+		RunID:   runID,
+		AssetID: assetID,
+	})
+	if err == nil || !strings.Contains(err.Error(), "normalized audio missing from preflight report") {
+		t.Fatalf("expected normalized audio missing error, got %v", err)
+	}
+	// Case 3: NormalizedAudioCASPath points to nonexistent/unreadable file -> fails closed
+	preflight.NormalizedAudioSHA256 = "dummy_sha256"
+	preflight.NormalizedAudioCASPath = "F:/nonexistent/missing_normalized_audio.wav"
+	if err := db.SavePreflightReport(ctx, preflight); err != nil {
+		t.Fatalf("save preflight report: %v", err)
+	}
+	_, err = mixSvc.SeparateAudio(ctx, service.AudioSeparationInput{
+		RunID:   runID,
+		AssetID: assetID,
+	})
+	if err == nil || !strings.Contains(err.Error(), "normalized audio artifact missing") {
+		t.Fatalf("expected normalized audio artifact missing/unreadable error, got %v", err)
 	}
 }

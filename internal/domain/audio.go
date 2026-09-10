@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -21,12 +22,89 @@ var (
 	ErrDubMixNotFound = errors.New("dub mix artifact not found")
 	// ErrSeparatorFailed is returned when vocal separator fails to isolate stems.
 	ErrSeparatorFailed = errors.New("audio separation failed to produce stems")
+	// ErrAudioRolePreflightRequired is returned when preflight metadata is required to generate an AudioRolePlan.
+	ErrAudioRolePreflightRequired = errors.New("audio role plan requires source preflight report")
+	// ErrAudioRoleEvidenceMissing is returned when normalized audio or stems evidence required for audio role analysis is missing.
+	ErrAudioRoleEvidenceMissing = errors.New("audio role plan requires valid normalized audio and stem evidence")
 )
 
 const (
-	AudioStemsSchemaVersion = 1
-	DubMixSchemaVersion     = 1
+	AudioRolePlanSchemaVersion = 1
+	AudioStemsSchemaVersion    = 1
+	DubMixSchemaVersion        = 1
 )
+
+// AudioRolePlanProvenance captures deterministic provenance for AudioRolePlan.
+type AudioRolePlanProvenance struct {
+	AssetSHA256            string `json:"asset_sha256"`
+	StemsCASHash           string `json:"stems_cas_hash,omitempty"`
+	ProviderID             string `json:"provider_id"`
+	ModelName              string `json:"model_name"`
+	ModelVersion           string `json:"model_version"`
+	ConfigHash             string `json:"config_hash,omitempty"`
+	SnapshotManifestSHA256 string `json:"snapshot_manifest_sha256,omitempty"`
+	RuntimeManifestSHA256  string `json:"runtime_manifest_sha256,omitempty"`
+	SchemaVersion          int    `json:"schema_version"`
+}
+
+func (p AudioRolePlanProvenance) Hash() string {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return ""
+	}
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+// ComputeAudioRolePlanProvenanceHash computes the deterministic hash for AudioRolePlan.
+func ComputeAudioRolePlanProvenanceHash(assetSHA256, stemsCASHash, providerID, modelName, modelVersion, configHash string, snapshotAndRuntimeIdentities ...string) string {
+	var snapSHA, rtSHA string
+	if len(snapshotAndRuntimeIdentities) > 0 {
+		snapSHA = snapshotAndRuntimeIdentities[0]
+	}
+	if len(snapshotAndRuntimeIdentities) > 1 {
+		rtSHA = snapshotAndRuntimeIdentities[1]
+	}
+	return AudioRolePlanProvenance{
+		AssetSHA256:            assetSHA256,
+		StemsCASHash:           stemsCASHash,
+		ProviderID:             providerID,
+		ModelName:              modelName,
+		ModelVersion:           modelVersion,
+		ConfigHash:             configHash,
+		SnapshotManifestSHA256: snapSHA,
+		RuntimeManifestSHA256:  rtSHA,
+		SchemaVersion:          AudioRolePlanSchemaVersion,
+	}.Hash()
+}
+
+// AudioRoleAnalysisRequest represents the input to an AudioRoleAnalyzer.
+type AudioRoleAnalysisRequest struct {
+	AssetID          string
+	RunID            string
+	SourceAudioPath  string
+	VocalsPath       string
+	BackgroundPath   string
+	DurationMs       int64
+	SampleRate       int
+	Channels         int
+	ExecutionProfile ExecutionProfile
+}
+
+// AudioRoleAnalysisResult captures the classified segments and provenance metadata.
+type AudioRoleAnalysisResult struct {
+	Segments        []AudioSegment
+	ModelName       string
+	ModelVersion    string
+	RuntimeIdentity string
+	ProviderID      string
+}
+
+// AudioRoleAnalyzer defines the pluggable seam for audio role classification.
+type AudioRoleAnalyzer interface {
+	AnalyzeAudioRoles(ctx context.Context, req AudioRoleAnalysisRequest) (*AudioRoleAnalysisResult, error)
+	AnalyzerInfo() (providerID, modelName, modelVersion, configHash string)
+}
 
 // StemType identifies the acoustic content of an audio stem.
 type StemType string

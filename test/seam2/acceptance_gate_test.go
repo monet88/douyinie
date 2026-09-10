@@ -127,6 +127,7 @@ func TestSeam2_AcceptanceGate_ArtifactTransportContract(t *testing.T) {
 		t.Fatalf("artifact model identity mismatch: got %s@%s", marker.ModelName, marker.ModelVersion)
 	}
 }
+
 // TestSeam2_QualityCorpus_ProfileIsolationAndResourceTelemetry exercises the StageWorker
 // execution contract under Local and Hybrid profiles, verifying that WDDM GPU resource sampling
 // captures device-wide baseline/peak VRAM bound to stage execution timestamps.
