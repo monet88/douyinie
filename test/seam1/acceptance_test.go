@@ -42,7 +42,12 @@ func (h *testHarness) SetExecutor(exec server.Executor) {
 	h.srv.SetExecutor(exec)
 }
 
-func setupHarness(t *testing.T) *testHarness {
+type harnessOptions struct {
+	autoRunExecutor   bool
+	audioRoleAnalyzer domain.AudioRoleAnalyzer
+}
+
+func setupHarnessWithOptions(t *testing.T, opts harnessOptions) *testHarness {
 	t.Helper()
 	tmpDir := t.TempDir()
 
@@ -59,10 +64,11 @@ func setupHarness(t *testing.T) *testHarness {
 
 	queueSvc := queue.NewService(db)
 	resScheduler := scheduler.New()
-	srv, registry, router := newRuntimeHost(t, db, casStore, queueSvc, resScheduler)
+	srv, registry, router := newRuntimeHostWithOptions(t, db, casStore, queueSvc, resScheduler, opts)
 
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() {
+		_ = srv.Shutdown(context.Background())
 		ts.Close()
 		_ = db.Close()
 	})
@@ -80,12 +86,20 @@ func setupHarness(t *testing.T) *testHarness {
 	}
 }
 
+func setupHarness(t *testing.T) *testHarness {
+	return setupHarnessWithOptions(t, harnessOptions{})
+}
+
+func setupAutoRunHarness(t *testing.T) *testHarness {
+	return setupHarnessWithOptions(t, harnessOptions{autoRunExecutor: true})
+}
+
 // newRuntimeHost constructs a Seam-1 RuntimeHost server over the given open DB and
 // CAS store, returning the server plus its registry and router. It is used both for
 // the initial harness and to reconstruct a fresh RuntimeHost over reopened persisted
 // state (restart simulation), so the surviving queue/recovery result is observed
 // through the same public HTTP API surface.
-func newRuntimeHost(t *testing.T, db *storage.DB, casStore *cas.Store, queueSvc *queue.Service, resScheduler *scheduler.Scheduler) (*server.Server, *provider.Registry, *provider.Router) {
+func newRuntimeHostWithOptions(t *testing.T, db *storage.DB, casStore *cas.Store, queueSvc *queue.Service, resScheduler *scheduler.Scheduler, opts harnessOptions) (*server.Server, *provider.Registry, *provider.Router) {
 	t.Helper()
 
 	var prober media.Prober
@@ -147,28 +161,37 @@ func newRuntimeHost(t *testing.T, db *storage.DB, casStore *cas.Store, queueSvc 
 	router := provider.NewRouter(fakeRegistry, polSvc, licSvc, credSvc, nil, db)
 
 	audioMixSvc := service.NewAudioMixService(db, casStore)
-	audioRoleSvc := service.NewAudioRoleServiceWithAnalyzer(db, casStore, audioMixSvc, service.NewDeterministicTestAudioRoleAnalyzer())
+	analyzer := opts.audioRoleAnalyzer
+	if analyzer == nil {
+		analyzer = service.NewDeterministicTestAudioRoleAnalyzer()
+	}
+	audioRoleSvc := service.NewAudioRoleServiceWithAnalyzer(db, casStore, audioMixSvc, analyzer)
 	return server.New(server.Config{
-		Addr:           "127.0.0.1:0",
-		DB:             db,
-		CASStore:       casStore,
-		Ingest:         ingestSvc,
-		Registry:       fakeRegistry,
-		PolicySvc:      polSvc,
-		LicenseSvc:     licSvc,
-		CredSvc:        credSvc,
-		Router:         router,
-		QueueSvc:       queueSvc,
-		Scheduler:      resScheduler,
-		SpeechSvc:      service.NewSpeechService(db, casStore),
-		TranslationSvc: service.NewTranslationService(db, casStore),
-		DubbingSvc:     service.NewDubbingService(db, casStore),
-		AudioMixSvc:    audioMixSvc,
-		AudioRoleSvc:   audioRoleSvc,
-		VisualTextSvc:  service.NewVisualTextService(db, casStore),
-		RenderSvc:      service.NewRenderService(db, casStore),
-		ReviewSvc:      service.NewReviewService(db, casStore),
+		Addr:            "127.0.0.1:0",
+		DB:              db,
+		CASStore:        casStore,
+		Ingest:          ingestSvc,
+		Registry:        fakeRegistry,
+		PolicySvc:       polSvc,
+		LicenseSvc:      licSvc,
+		CredSvc:         credSvc,
+		Router:          router,
+		QueueSvc:        queueSvc,
+		Scheduler:       resScheduler,
+		AutoRunExecutor: opts.autoRunExecutor,
+		SpeechSvc:       service.NewSpeechService(db, casStore),
+		TranslationSvc:  service.NewTranslationService(db, casStore),
+		DubbingSvc:      service.NewDubbingService(db, casStore),
+		AudioMixSvc:     audioMixSvc,
+		AudioRoleSvc:    audioRoleSvc,
+		VisualTextSvc:   service.NewVisualTextService(db, casStore),
+		RenderSvc:       service.NewRenderService(db, casStore),
+		ReviewSvc:       service.NewReviewService(db, casStore),
 	}), fakeRegistry, router
+}
+
+func newRuntimeHost(t *testing.T, db *storage.DB, casStore *cas.Store, queueSvc *queue.Service, resScheduler *scheduler.Scheduler) (*server.Server, *provider.Registry, *provider.Router) {
+	return newRuntimeHostWithOptions(t, db, casStore, queueSvc, resScheduler, harnessOptions{})
 }
 
 // createSyntheticMedia creates a valid MP4 file if ffmpeg is available, or a fallback synthetic file.

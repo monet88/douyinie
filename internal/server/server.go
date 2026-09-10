@@ -5,12 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"strconv"
-	"strings"
-	"time"
-
 	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/config"
@@ -21,6 +15,13 @@ import (
 	"github.com/monet88/douyinie/internal/scheduler"
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
+	"io"
+	"log"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 )
 
 // Executor defines an injected execution seam for stage provider execution.
@@ -34,57 +35,64 @@ type Executor func(ctx context.Context, p provider.Provider, attemptNumber int) 
 const runtimeHostWriteTimeout = 30 * time.Minute
 
 type Server struct {
-	db             *storage.DB
-	casStore       *cas.Store
-	ingest         *service.IngestService
-	acquisition    *service.AcquisitionService
-	registry       *provider.Registry
-	policySvc      *governance.PolicyService
-	licenseSvc     *governance.LicenseService
-	credSvc        *governance.CredentialService
-	snapshotSvc    *governance.SnapshotService
-	router         *provider.Router
-	queueSvc       *queue.Service
-	scheduler      *scheduler.Scheduler
-	executor       Executor
-	speechSvc      *service.SpeechService
-	translationSvc *service.TranslationService
-	dubbingSvc     *service.DubbingService
-	audioMixSvc    *service.AudioMixService
-	audioRoleSvc   *service.AudioRoleService
-	visualTextSvc  *service.VisualTextService
-	renderSvc      *service.RenderService
-	reviewSvc      *service.ReviewService
-	bundleSvc      *service.BundleService
-	mux            *http.ServeMux
-	server         *http.Server
+	db              *storage.DB
+	casStore        *cas.Store
+	ingest          *service.IngestService
+	acquisition     *service.AcquisitionService
+	registry        *provider.Registry
+	policySvc       *governance.PolicyService
+	licenseSvc      *governance.LicenseService
+	credSvc         *governance.CredentialService
+	snapshotSvc     *governance.SnapshotService
+	router          *provider.Router
+	queueSvc        *queue.Service
+	scheduler       *scheduler.Scheduler
+	executor        Executor
+	speechSvc       *service.SpeechService
+	translationSvc  *service.TranslationService
+	dubbingSvc      *service.DubbingService
+	audioMixSvc     *service.AudioMixService
+	audioRoleSvc    *service.AudioRoleService
+	visualTextSvc   *service.VisualTextService
+	renderSvc       *service.RenderService
+	reviewSvc       *service.ReviewService
+	bundleSvc       *service.BundleService
+	mux             *http.ServeMux
+	server          *http.Server
+	wakeChan        chan struct{}
+	consumerCancel  context.CancelFunc
+	consumerWg      sync.WaitGroup
+	activeRunMu     sync.Mutex
+	activeRunID     string
+	activeRunCancel context.CancelFunc
 }
 
 // Config specifies initialization options for RuntimeHost Server.
 type Config struct {
-	Addr           string
-	DB             *storage.DB
-	CASStore       *cas.Store
-	Ingest         *service.IngestService
-	Acquisition    *service.AcquisitionService // Douyin URL acquisition ladder (T05)
-	Registry       *provider.Registry
-	PolicySvc      *governance.PolicyService
-	LicenseSvc     *governance.LicenseService
-	CredSvc        *governance.CredentialService
-	Router         *provider.Router
-	SnapshotSvc    *governance.SnapshotService // RC executable model snapshot verification service (Issue #64)
-	QueueSvc       *queue.Service
-	Scheduler      *scheduler.Scheduler
-	Executor       Executor                    // Injected execution seam for testing and custom worker dispatch
-	SpeechSvc      *service.SpeechService      // Speech understanding pipeline (T08)
-	TranslationSvc *service.TranslationService // Translation & Meaning-First Localization pipeline (T06)
-	DubbingSvc     *service.DubbingService     // TTS & Measured-Duration Dubbing pipeline (T14)
-	AudioMixSvc    *service.AudioMixService    // Audio stems + soundtrack preservation + dialogue-suppression mix (T15)
-	AudioRoleSvc   *service.AudioRoleService   // Automatic AudioRolePlan generation (Issue #80)
-	VisualTextSvc  *service.VisualTextService  // OCR detection, tracking, and TextRegionPlan (T09)
-	RenderSvc      *service.RenderService      // NativeRenderBackend + frozen RenderPlan + preview/final parity (T11)
-	ReviewSvc      *service.ReviewService      // Exception-only ReviewItem projection service (T16)
-	BundleSvc      *service.BundleService      // Job export/import + bundle integrity (T21)
+	Addr            string
+	DB              *storage.DB
+	CASStore        *cas.Store
+	Ingest          *service.IngestService
+	Acquisition     *service.AcquisitionService // Douyin URL acquisition ladder (T05)
+	Registry        *provider.Registry
+	PolicySvc       *governance.PolicyService
+	LicenseSvc      *governance.LicenseService
+	CredSvc         *governance.CredentialService
+	Router          *provider.Router
+	SnapshotSvc     *governance.SnapshotService // RC executable model snapshot verification service (Issue #64)
+	QueueSvc        *queue.Service
+	Scheduler       *scheduler.Scheduler
+	Executor        Executor                    // Injected execution seam for testing and custom worker dispatch
+	AutoRunExecutor bool                        // Enable RuntimeHost-owned background queue auto-run consumer (Issue #81)
+	SpeechSvc       *service.SpeechService      // Speech understanding pipeline (T08)
+	TranslationSvc  *service.TranslationService // Translation & Meaning-First Localization pipeline (T06)
+	DubbingSvc      *service.DubbingService     // TTS & Measured-Duration Dubbing pipeline (T14)
+	AudioMixSvc     *service.AudioMixService    // Audio stems + soundtrack preservation + dialogue-suppression mix (T15)
+	AudioRoleSvc    *service.AudioRoleService   // Automatic AudioRolePlan generation (Issue #80)
+	VisualTextSvc   *service.VisualTextService  // OCR detection, tracking, and TextRegionPlan (T09)
+	RenderSvc       *service.RenderService      // NativeRenderBackend + frozen RenderPlan + preview/final parity (T11)
+	ReviewSvc       *service.ReviewService      // Exception-only ReviewItem projection service (T16)
+	BundleSvc       *service.BundleService      // Job export/import + bundle integrity (T21)
 }
 
 // New creates a new RuntimeHost Server instance.
@@ -196,6 +204,15 @@ func New(cfg Config) *Server {
 	}
 	s.routes()
 
+	// Start background serial queue consumer if enabled.
+	if cfg.AutoRunExecutor {
+		s.wakeChan = make(chan struct{}, 1)
+		consumerCtx, consumerCancel := context.WithCancel(context.Background())
+		s.consumerCancel = consumerCancel
+		s.consumerWg.Add(1)
+		go s.runConsumer(consumerCtx)
+		s.wake()
+	}
 	s.server = &http.Server{
 		Addr:         cfg.Addr,
 		Handler:      s.mux,
@@ -321,7 +338,465 @@ func (s *Server) Start() error {
 
 // Shutdown gracefully stops the HTTP server.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.consumerCancel != nil {
+		s.consumerCancel()
+		s.consumerWg.Wait()
+	}
 	return s.server.Shutdown(ctx)
+}
+
+func (s *Server) wake() {
+	if s.wakeChan == nil {
+		return
+	}
+	select {
+	case s.wakeChan <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Server) runConsumer(ctx context.Context) {
+	defer s.consumerWg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.wakeChan:
+			s.drainQueue(ctx)
+		}
+	}
+}
+
+func (s *Server) shouldContinueRun(ctx context.Context, runID string) (bool, error) {
+	s.activeRunMu.Lock()
+	defer s.activeRunMu.Unlock()
+
+	lookupCtx := context.WithoutCancel(ctx)
+	entry, err := s.db.GetQueueEntryByRunID(lookupCtx, runID)
+	if err != nil {
+		return false, fmt.Errorf("check queue boundary for run %s: %w", runID, err)
+	}
+	switch entry.Status {
+	case domain.RunStatusRunning:
+		return true, nil
+	case domain.RunStatusPaused, domain.RunStatusCancelled, domain.RunStatusInterrupted:
+		return false, nil
+	default:
+		return false, fmt.Errorf("unexpected queue status %s for active run %s", entry.Status, runID)
+	}
+}
+
+func (s *Server) completeRunSafely(ctx context.Context, runID string) error {
+	s.activeRunMu.Lock()
+	defer s.activeRunMu.Unlock()
+
+	lookupCtx := context.WithoutCancel(ctx)
+	entry, err := s.db.GetQueueEntryByRunID(lookupCtx, runID)
+	if err != nil {
+		return fmt.Errorf("check queue status before completion for run %s: %w", runID, err)
+	}
+	switch entry.Status {
+	case domain.RunStatusRunning:
+		if err := s.db.UpdateQueueStatus(lookupCtx, runID, domain.RunStatusCompleted, domain.RunStatusCompleted); err != nil {
+			if failErr := s.failRun(lookupCtx, runID, "run_completion", fmt.Sprintf("failed to mark run completed: %v", err)); failErr != nil {
+				return fmt.Errorf("complete run failed: %v (failRun error: %w)", err, failErr)
+			}
+			return fmt.Errorf("complete run failed: %w", err)
+		}
+		return nil
+	case domain.RunStatusPaused, domain.RunStatusCancelled, domain.RunStatusInterrupted:
+		return nil
+	default:
+		return fmt.Errorf("unexpected queue status %s before completion for run %s", entry.Status, runID)
+	}
+}
+
+func (s *Server) drainQueue(ctx context.Context) {
+	if s.queueSvc == nil || s.db == nil {
+		return
+	}
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		entry, err := s.queueSvc.Next(ctx)
+		if err != nil || entry == nil {
+			return
+		}
+		if err := s.queueSvc.MarkRunning(ctx, entry.RunID); err != nil {
+			// Another run active or not queued anymore; stop this drain pass
+			return
+		}
+		runCtx, runCancel := context.WithCancel(ctx)
+		s.activeRunMu.Lock()
+		s.activeRunID = entry.RunID
+		s.activeRunCancel = runCancel
+		s.activeRunMu.Unlock()
+
+		runErr := s.executeRun(runCtx, entry.RunID, entry.JobID)
+
+		s.activeRunMu.Lock()
+		if s.activeRunID == entry.RunID {
+			s.activeRunID = ""
+			s.activeRunCancel = nil
+		}
+		s.activeRunMu.Unlock()
+		runCancel()
+
+		if runErr != nil {
+			log.Printf("[AutoRun] executeRun failed for run %s: %v; stopping queue drain", entry.RunID, runErr)
+			return
+		}
+	}
+}
+
+func (s *Server) failRun(ctx context.Context, runID string, stageName, errMsg string) error {
+	now := time.Now().UTC()
+	se := domain.StageExecution{
+		ID:           uuid.NewString(),
+		RunID:        runID,
+		Stage:        stageName,
+		Status:       domain.StageStatusFailed,
+		ErrorMessage: errMsg,
+		StartedAt:    &now,
+		CompletedAt:  &now,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	errCreate := s.db.CreateStageExecution(ctx, se)
+	errStatus := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusInterrupted, domain.RunStatusInterrupted)
+	if errCreate != nil || errStatus != nil {
+		return fmt.Errorf("failRun persistence error (stage_err=%v, status_err=%v)", errCreate, errStatus)
+	}
+	return nil
+}
+
+func (s *Server) failStageAndInterrupt(ctx context.Context, se *domain.StageExecution, cause error) error {
+	se.Status = domain.StageStatusFailed
+	se.ErrorMessage = cause.Error()
+	nowFin := time.Now().UTC()
+	se.CompletedAt = &nowFin
+	se.UpdatedAt = nowFin
+	errStage := s.db.UpdateStageExecution(ctx, *se)
+	errStatus := s.db.UpdateQueueStatus(ctx, se.RunID, domain.RunStatusInterrupted, domain.RunStatusInterrupted)
+	if errStage != nil || errStatus != nil {
+		return fmt.Errorf("failStageAndInterrupt persistence error (stage_err=%v, status_err=%v)", errStage, errStatus)
+	}
+	return nil
+}
+
+func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
+	if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+		return err
+	}
+
+	job, err := s.db.GetJob(ctx, jobID)
+	if err != nil {
+		return s.failRun(ctx, runID, "job_lookup", fmt.Sprintf("failed to get job %s: %v", jobID, err))
+	}
+	assetID := job.SourceAssetID
+	targetLang := job.TargetLanguage
+	if targetLang == "" {
+		targetLang = domain.TargetLanguageVI
+	}
+
+	// 1. AudioRolePlan
+	rolePlan, err := s.db.GetAudioRolePlan(ctx, assetID)
+	if err != nil || rolePlan == nil {
+		if s.audioRoleSvc != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+
+			now := time.Now().UTC()
+			se := domain.StageExecution{
+				ID:        uuid.NewString(),
+				RunID:     runID,
+				Stage:     "audio_role_plan",
+				Status:    domain.StageStatusRunning,
+				StartedAt: &now,
+				CreatedAt: now,
+				UpdatedAt: now,
+			}
+			if err := s.db.CreateStageExecution(ctx, se); err != nil {
+				return s.failRun(ctx, runID, "audio_role_plan", fmt.Sprintf("failed to record stage start: %v", err))
+			}
+
+			genPlan, genErr := s.audioRoleSvc.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{
+				AssetID: assetID,
+				RunID:   runID,
+				JobID:   jobID,
+			})
+			if genErr != nil {
+				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+					return err
+				}
+				return s.failStageAndInterrupt(ctx, &se, genErr)
+			}
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+
+			rolePlan = genPlan
+			se.Status = domain.StageStatusSucceeded
+			se.ArtifactSHA256 = genPlan.CASHash
+			nowFin := time.Now().UTC()
+			se.CompletedAt = &nowFin
+			se.UpdatedAt = nowFin
+			if err := s.db.UpdateStageExecution(ctx, se); err != nil {
+				return s.failRun(ctx, runID, "audio_role_plan", fmt.Sprintf("failed to record stage completion: %v", err))
+			}
+		} else {
+			return s.failRun(ctx, runID, "audio_role_plan", "audio role plan required but AudioRoleService is not configured")
+		}
+	}
+
+	if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+		return err
+	}
+
+	// Zero-dialogue check: #82 dialogue execution is out of scope for #81.
+	// Fail closed and mark interrupted with a diagnostic StageExecution so the active run slot is released.
+	if domain.IsDubEligible(rolePlan) {
+		return s.failRun(ctx, runID, "dialogue_execution", "zero-dialogue auto-runner encountered dub-eligible dialogue (dialogue auto-run requires #82)")
+	}
+
+	// 2. AudioMix (T15) - separation / passthrough
+	if s.audioMixSvc == nil {
+		return s.failRun(ctx, runID, "audio_mix", "AudioMixService is not configured")
+	}
+	{
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		now := time.Now().UTC()
+		se := domain.StageExecution{
+			ID:        uuid.NewString(),
+			RunID:     runID,
+			Stage:     "audio_mix",
+			Status:    domain.StageStatusRunning,
+			StartedAt: &now,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if err := s.db.CreateStageExecution(ctx, se); err != nil {
+			return s.failRun(ctx, runID, "audio_mix", fmt.Sprintf("failed to record stage start: %v", err))
+		}
+
+		dubMix, mixErr := s.audioMixSvc.MixAudio(ctx, service.AudioMixInput{
+			RunID:          runID,
+			AssetID:        assetID,
+			JobID:          jobID,
+			TargetLanguage: targetLang,
+		})
+		if mixErr != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+			return s.failStageAndInterrupt(ctx, &se, mixErr)
+		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		se.Status = domain.StageStatusSucceeded
+		se.ArtifactSHA256 = dubMix.CASHash
+		nowFin := time.Now().UTC()
+		se.CompletedAt = &nowFin
+		se.UpdatedAt = nowFin
+		if err := s.db.UpdateStageExecution(ctx, se); err != nil {
+			return s.failRun(ctx, runID, "audio_mix", fmt.Sprintf("failed to record stage completion: %v", err))
+		}
+	}
+
+	// 3. Visual Text Detection & Localization (T09 & T10)
+	var subtitleTrackCAS string
+	if s.visualTextSvc == nil {
+		return s.failRun(ctx, runID, "visual_text", "VisualTextService is not configured")
+	}
+	{
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		now := time.Now().UTC()
+		seDetect := domain.StageExecution{
+			ID:        uuid.NewString(),
+			RunID:     runID,
+			Stage:     "text_detection",
+			Status:    domain.StageStatusRunning,
+			StartedAt: &now,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if err := s.db.CreateStageExecution(ctx, seDetect); err != nil {
+			return s.failRun(ctx, runID, "text_detection", fmt.Sprintf("failed to record stage start: %v", err))
+		}
+
+		textPlan, detErr := s.visualTextSvc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+			RunID:   runID,
+			AssetID: assetID,
+			JobID:   jobID,
+		})
+		if detErr != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+			return s.failStageAndInterrupt(ctx, &seDetect, detErr)
+		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		seDetect.Status = domain.StageStatusSucceeded
+		seDetect.ArtifactSHA256 = textPlan.CASHash
+		nowFin := time.Now().UTC()
+		seDetect.CompletedAt = &nowFin
+		seDetect.UpdatedAt = nowFin
+		if err := s.db.UpdateStageExecution(ctx, seDetect); err != nil {
+			return s.failRun(ctx, runID, "text_detection", fmt.Sprintf("failed to record stage completion: %v", err))
+		}
+
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		seLoc := domain.StageExecution{
+			ID:        uuid.NewString(),
+			RunID:     runID,
+			Stage:     "visual_text_localize",
+			Status:    domain.StageStatusRunning,
+			StartedAt: &nowFin,
+			CreatedAt: nowFin,
+			UpdatedAt: nowFin,
+		}
+		if err := s.db.CreateStageExecution(ctx, seLoc); err != nil {
+			return s.failRun(ctx, runID, "visual_text_localize", fmt.Sprintf("failed to record stage start: %v", err))
+		}
+
+		visTrack, locErr := s.visualTextSvc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+			RunID:          runID,
+			AssetID:        assetID,
+			JobID:          jobID,
+			TargetLanguage: targetLang,
+		})
+		if locErr != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+			return s.failStageAndInterrupt(ctx, &seLoc, locErr)
+		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		subtitleTrackCAS = visTrack.SubtitleTrackCAS
+		seLoc.Status = domain.StageStatusSucceeded
+		seLoc.ArtifactSHA256 = visTrack.CASHash
+		nowLocFin := time.Now().UTC()
+		seLoc.CompletedAt = &nowLocFin
+		seLoc.UpdatedAt = nowLocFin
+		if err := s.db.UpdateStageExecution(ctx, seLoc); err != nil {
+			return s.failRun(ctx, runID, "visual_text_localize", fmt.Sprintf("failed to record stage completion: %v", err))
+		}
+	}
+
+	// 4. Freeze RenderPlan & Render Preview (T11)
+	if s.renderSvc == nil {
+		return s.failRun(ctx, runID, "render_plan", "RenderService is not configured")
+	}
+	{
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		now := time.Now().UTC()
+		sePlan := domain.StageExecution{
+			ID:        uuid.NewString(),
+			RunID:     runID,
+			Stage:     "render_plan",
+			Status:    domain.StageStatusRunning,
+			StartedAt: &now,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if err := s.db.CreateStageExecution(ctx, sePlan); err != nil {
+			return s.failRun(ctx, runID, "render_plan", fmt.Sprintf("failed to record stage start: %v", err))
+		}
+
+		renderPlan, planErr := s.renderSvc.FreezeRenderPlan(ctx, service.RenderPlanInput{
+			RunID:           runID,
+			JobID:           jobID,
+			AssetID:         assetID,
+			TargetLanguage:  targetLang,
+			SubtitlePlanCAS: subtitleTrackCAS,
+		})
+		if planErr != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+			return s.failStageAndInterrupt(ctx, &sePlan, planErr)
+		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		sePlan.Status = domain.StageStatusSucceeded
+		sePlan.ArtifactSHA256 = renderPlan.CASHash
+		nowFin := time.Now().UTC()
+		sePlan.CompletedAt = &nowFin
+		sePlan.UpdatedAt = nowFin
+		if err := s.db.UpdateStageExecution(ctx, sePlan); err != nil {
+			return s.failRun(ctx, runID, "render_plan", fmt.Sprintf("failed to record stage completion: %v", err))
+		}
+
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		sePrev := domain.StageExecution{
+			ID:        uuid.NewString(),
+			RunID:     runID,
+			Stage:     "render_preview",
+			Status:    domain.StageStatusRunning,
+			StartedAt: &nowFin,
+			CreatedAt: nowFin,
+			UpdatedAt: nowFin,
+		}
+		if err := s.db.CreateStageExecution(ctx, sePrev); err != nil {
+			return s.failRun(ctx, runID, "render_preview", fmt.Sprintf("failed to record stage start: %v", err))
+		}
+
+		prevArtifact, prevErr := s.renderSvc.RenderPreview(ctx, service.RenderExecutionInput{
+			RunID:          runID,
+			JobID:          jobID,
+			AssetID:        assetID,
+			TargetLanguage: targetLang,
+			PlanProvenance: renderPlan.ProvenanceHash,
+		})
+		if prevErr != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+			return s.failStageAndInterrupt(ctx, &sePrev, prevErr)
+		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		sePrev.Status = domain.StageStatusSucceeded
+		sePrev.ArtifactSHA256 = prevArtifact.CASHash
+		nowPrevFin := time.Now().UTC()
+		sePrev.CompletedAt = &nowPrevFin
+		sePrev.UpdatedAt = nowPrevFin
+		if err := s.db.UpdateStageExecution(ctx, sePrev); err != nil {
+			return s.failRun(ctx, runID, "render_preview", fmt.Sprintf("failed to record stage completion: %v", err))
+		}
+	}
+
+	// Complete the run atomically with state verification
+	return s.completeRunSafely(ctx, runID)
 }
 
 func (s *Server) routes() {
@@ -1642,7 +2117,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to create and enqueue run: "+err.Error())
 		return
 	}
-
+	s.wake()
 	writeJSON(w, http.StatusCreated, map[string]any{"run": run})
 }
 
@@ -1667,7 +2142,13 @@ func (s *Server) handlePauseRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "queue service is not configured")
 		return
 	}
-	if err := s.queueSvc.Pause(r.Context(), id); err != nil {
+	s.activeRunMu.Lock()
+	err := s.queueSvc.Pause(r.Context(), id)
+	if err == nil && s.activeRunID == id && s.activeRunCancel != nil {
+		s.activeRunCancel()
+	}
+	s.activeRunMu.Unlock()
+	if err != nil {
 		if errors.Is(err, queue.ErrNotQueued) {
 			writeError(w, http.StatusConflict, err.Error())
 			return
@@ -1684,7 +2165,13 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "queue service is not configured")
 		return
 	}
-	if err := s.queueSvc.Cancel(r.Context(), id); err != nil {
+	s.activeRunMu.Lock()
+	err := s.queueSvc.Cancel(r.Context(), id)
+	if err == nil && s.activeRunID == id && s.activeRunCancel != nil {
+		s.activeRunCancel()
+	}
+	s.activeRunMu.Unlock()
+	if err != nil {
 		if errors.Is(err, queue.ErrNotQueued) {
 			writeError(w, http.StatusConflict, err.Error())
 			return
@@ -1709,6 +2196,7 @@ func (s *Server) handleResumeRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.wake()
 	writeJSON(w, http.StatusOK, map[string]any{"run_id": id, "status": domain.RunStatusQueued})
 }
 

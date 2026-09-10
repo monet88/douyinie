@@ -15,6 +15,7 @@ import (
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/media"
+	"github.com/monet88/douyinie/internal/queue"
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
 )
@@ -594,5 +595,126 @@ func TestUploadAssetFilenameSanitization(t *testing.T) {
 	}
 	if storedAsset.OriginalFilename != "video.mp4" {
 		t.Fatalf("db original_filename %q, want video.mp4", storedAsset.OriginalFilename)
+	}
+}
+
+func TestExecuteRun_StageFailureRecordsEvidenceAndInterrupts(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	db, err := storage.Open(filepath.Join(tmpDir, "autorun_err_test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	casStore, err := cas.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("open cas: %v", err)
+	}
+
+	now := time.Now().UTC()
+	ra := domain.RightsAttestation{
+		ID:              "att-err",
+		AttestationType: "OPERATOR_CONFIRMED",
+		DeclaredBy:      "operator",
+		TermsAccepted:   true,
+		Notes:           "test",
+		ConfirmedAt:     now,
+	}
+	if err := db.CreateRightsAttestation(ctx, ra); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+
+	asset := domain.SourceAsset{
+		ID:                  "test-asset-err",
+		SHA256:              strings.Repeat("1", 64),
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		OriginalFilename:    "dummy.mp4",
+		RightsAttestationID: ra.ID,
+		CASPath:             "dummy.mp4",
+		CreatedAt:           now,
+	}
+	if err := db.CreateSourceAsset(ctx, asset); err != nil {
+		t.Fatalf("save asset: %v", err)
+	}
+
+	job := domain.LocalizationJob{
+		ID:             "test-job-err",
+		SourceAssetID:  asset.ID,
+		TargetLanguage: domain.TargetLanguageVI,
+		Status:         "pending",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := db.CreateJob(ctx, job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	run := domain.LocalizationRun{
+		ID:        "test-run-err",
+		JobID:     job.ID,
+		Status:    domain.RunStatusRunning,
+		CreatedAt: now,
+	}
+	if err := db.CreateRun(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	qSvc := queue.NewService(db)
+	if _, err := qSvc.Enqueue(ctx, run.ID, job.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := qSvc.MarkRunning(ctx, run.ID); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+
+	// Seed a zero-dialogue AudioRolePlan so audio_role_plan succeeds,
+	// but leave AudioMixSvc nil in server Config so audio_mix stage fails.
+	rolePlan := &domain.AudioRolePlan{
+		ID:      "plan-1",
+		AssetID: asset.ID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+		CreatedAt: now,
+	}
+	if err := db.SaveAudioRolePlan(ctx, *rolePlan); err != nil {
+		t.Fatalf("save audio role plan: %v", err)
+	}
+
+	s := New(Config{
+		Addr:     "127.0.0.1:0",
+		DB:       db,
+		CASStore: casStore,
+		QueueSvc: qSvc,
+	})
+
+	// executeRun should return nil because the service failure was successfully and durably
+	// recorded as failed stage evidence and the queue status updated to interrupted.
+	if err := s.executeRun(ctx, run.ID, job.ID); err != nil {
+		t.Fatalf("expected executeRun to return nil on durably recorded failure, got: %v", err)
+	}
+
+	// Verify queue entry was interrupted
+	entry, err := db.GetQueueEntryByRunID(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("get queue entry: %v", err)
+	}
+	if entry.Status != domain.RunStatusInterrupted {
+		t.Fatalf("expected queue entry %s, got %s", domain.RunStatusInterrupted, entry.Status)
+	}
+
+	// Verify failed diagnostic stage execution exists
+	stages, err := db.ListStageExecutions(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	if len(stages) != 1 {
+		t.Fatalf("expected 1 stage execution, got %d", len(stages))
+	}
+	if stages[0].Stage != "audio_mix" || stages[0].Status != domain.StageStatusFailed {
+		t.Fatalf("expected failed audio_mix stage, got %+v", stages[0])
 	}
 }
