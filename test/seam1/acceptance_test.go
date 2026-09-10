@@ -173,14 +173,24 @@ func newRuntimeHost(t *testing.T, db *storage.DB, casStore *cas.Store, queueSvc 
 
 // createSyntheticMedia creates a valid MP4 file if ffmpeg is available, or a fallback synthetic file.
 func createSyntheticMedia(t *testing.T, dir string, name string) string {
+	return createSyntheticMediaWithDuration(t, dir, name, 1.5)
+}
+
+// createSyntheticMediaWithDuration creates a valid MP4 file with the specified duration in seconds.
+func createSyntheticMediaWithDuration(t *testing.T, dir string, name string, durationSec float64) string {
 	t.Helper()
 	targetPath := filepath.Join(dir, name)
+
+	if durationSec <= 0 {
+		durationSec = 1.5
+	}
+	durStr := fmt.Sprintf("%.1f", durationSec)
 
 	if _, err := exec.LookPath("ffmpeg"); err == nil {
 		cmd := exec.Command("ffmpeg",
 			"-y",
-			"-f", "lavfi", "-i", "testsrc=duration=1.5:size=640x360:rate=30",
-			"-f", "lavfi", "-i", "sine=frequency=880:duration=1.5",
+			"-f", "lavfi", "-i", fmt.Sprintf("testsrc=duration=%s:size=640x360:rate=30", durStr),
+			"-f", "lavfi", "-i", fmt.Sprintf("sine=frequency=880:duration=%s", durStr),
 			"-c:v", "libx264",
 			"-c:a", "aac",
 			targetPath,

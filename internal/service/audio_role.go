@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,8 +24,8 @@ import (
 
 const (
 	// TestAcousticProviderID is the provider identity for the deterministic test/harness analyzer.
-	// NOTE: This analyzer is for deterministic Seam 1 and integration test suites. Production audio
-	// role classification requires an approved ML classifier model (e.g. PyAnnote / Silero / SVD).
+	// NOTE: This analyzer is for deterministic Seam 1 and integration test suites (test-only).
+	// Issue #80 production audio role classification is the governed YAMNet TFLite provider.
 	TestAcousticProviderID   = "test_acoustic_analyzer"
 	TestAcousticModelName    = "deterministic_signal_classifier"
 	TestAcousticModelVersion = "v0.1-test"
@@ -43,6 +44,70 @@ type AudioRoleAnalysisRequest = domain.AudioRoleAnalysisRequest
 type AudioRoleAnalysisResult = domain.AudioRoleAnalysisResult
 type AudioRoleAnalyzer = domain.AudioRoleAnalyzer
 
+type keyLock struct {
+	mu  sync.Mutex
+	ref int
+}
+
+type keyLocker struct {
+	mu    sync.Mutex
+	locks map[string]*keyLock
+}
+
+func newKeyLocker() *keyLocker {
+	return &keyLocker{
+		locks: make(map[string]*keyLock),
+	}
+}
+
+func (kl *keyLocker) Lock(key string) func() {
+	kl.mu.Lock()
+	l, ok := kl.locks[key]
+	if !ok {
+		l = &keyLock{}
+		kl.locks[key] = l
+	}
+	l.ref++
+	kl.mu.Unlock()
+
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		kl.mu.Lock()
+		l.ref--
+		if l.ref == 0 {
+			delete(kl.locks, key)
+		}
+		kl.mu.Unlock()
+	}
+}
+
+type snapshotRuntimeIdentifier interface {
+	SnapshotRuntimeIdentity() (snapshotSHA, runtimeSHA string, err error)
+}
+
+func analyzerProvenanceHash(preflightNormSHA, stemsCASHash string, analyzer domain.AudioRoleAnalyzer) (string, error) {
+	pID, mName, mVer, cfgHash := analyzer.AnalyzerInfo()
+	var snapSHA, rtSHA string
+	if sri, ok := analyzer.(snapshotRuntimeIdentifier); ok {
+		var err error
+		snapSHA, rtSHA, err = sri.SnapshotRuntimeIdentity()
+		if err != nil {
+			return "", err
+		}
+	}
+	return domain.ComputeAudioRolePlanProvenanceHash(
+		preflightNormSHA,
+		stemsCASHash,
+		pID,
+		mName,
+		mVer,
+		cfgHash,
+		snapSHA,
+		rtSHA,
+	), nil
+}
+
 // AudioRoleService coordinates automatic source analysis to generate and persist canonical AudioRolePlans.
 type AudioRoleService struct {
 	db          *storage.DB
@@ -50,6 +115,7 @@ type AudioRoleService struct {
 	audioMixSvc *AudioMixService
 	router      *provider.Router
 	analyzer    AudioRoleAnalyzer
+	assetLocker *keyLocker
 }
 
 // NewAudioRoleService constructs a production AudioRoleService with no direct analyzer.
@@ -60,6 +126,7 @@ func NewAudioRoleService(db *storage.DB, casStore *cas.Store, audioMixSvc *Audio
 		cas:         casStore,
 		audioMixSvc: audioMixSvc,
 		analyzer:    nil,
+		assetLocker: newKeyLocker(),
 	}
 }
 
@@ -70,6 +137,7 @@ func NewAudioRoleServiceWithAnalyzer(db *storage.DB, casStore *cas.Store, audioM
 		cas:         casStore,
 		audioMixSvc: audioMixSvc,
 		analyzer:    analyzer,
+		assetLocker: newKeyLocker(),
 	}
 }
 
@@ -78,7 +146,6 @@ func (s *AudioRoleService) SetAnalyzer(analyzer AudioRoleAnalyzer) {
 	s.analyzer = analyzer
 }
 
-// Analyzer returns the currently configured AudioRoleAnalyzer implementation.
 func (s *AudioRoleService) Analyzer() AudioRoleAnalyzer {
 	return s.analyzer
 }
@@ -93,8 +160,11 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 	if strings.TrimSpace(in.AssetID) == "" {
 		return nil, errors.New("asset_id is required")
 	}
+	if s.assetLocker != nil {
+		unlock := s.assetLocker.Lock(in.AssetID)
+		defer unlock()
+	}
 	startTime := time.Now().UTC()
-
 	// 1. Verify database, source asset, and preflight report
 	if s.db == nil {
 		return nil, errors.New("database is not configured")
@@ -148,10 +218,18 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 	if stems != nil {
 		stemsCASHash = stems.CASHash
 		for _, stem := range stems.Stems {
+			stemPath := stem.AudioCASPath
+			if stemPath == "" && stem.AudioCASHash != "" && s.cas != nil {
+				if p, err := s.cas.ResolvePath(stem.AudioCASHash); err == nil {
+					if _, err := os.Stat(p); err == nil {
+						stemPath = p
+					}
+				}
+			}
 			if stem.Type == domain.StemTypeVocals {
-				vocalsPath = stem.AudioCASPath
+				vocalsPath = stemPath
 			} else if stem.Type == domain.StemTypeBackground {
-				bgPath = stem.AudioCASPath
+				bgPath = stemPath
 			}
 		}
 	}
@@ -169,15 +247,11 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 	// 4. Deterministic Test Analyzer Path (unit and Seam 1 testing harnesses)
 	if s.analyzer != nil {
 		analyzer := s.analyzer
-		providerID, modelName, modelVersion, configHash := analyzer.AnalyzerInfo()
-		provHash := domain.ComputeAudioRolePlanProvenanceHash(
-			preflight.NormalizedAudioSHA256,
-			stemsCASHash,
-			providerID,
-			modelName,
-			modelVersion,
-			configHash,
-		)
+		providerID, modelName, modelVersion, _ := analyzer.AnalyzerInfo()
+		provHash, err := analyzerProvenanceHash(preflight.NormalizedAudioSHA256, stemsCASHash, analyzer)
+		if err != nil {
+			return nil, fmt.Errorf("%w: audio role runtime verification failed: %w", domain.ErrAudioRoleAnalyzerUnavailable, err)
+		}
 
 		if existingIdx, err := s.db.GetAudioRolePlanByProvenance(ctx, provHash); err == nil && existingIdx != nil {
 			existingPlan, err := s.loadAudioRolePlanArtifact(existingIdx)
@@ -247,6 +321,16 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		Stage:            provider.TypeAudioRole,
 		Language:         "*",
 		ExecutionProfile: in.ExecutionProfile,
+		CandidateInputHash: func(p provider.Provider) string {
+			if analyzer, ok := p.(domain.AudioRoleAnalyzer); ok {
+				h, err := analyzerProvenanceHash(preflight.NormalizedAudioSHA256, stemsCASHash, analyzer)
+				if err != nil {
+					return ""
+				}
+				return h
+			}
+			return ""
+		},
 	}
 
 	routeRes, err := s.router.Route(ctx, routeReq)
@@ -267,15 +351,14 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		if !ok {
 			continue
 		}
-		pID, mName, mVer, cfgHash := analyzer.AnalyzerInfo()
-		candProvHash := domain.ComputeAudioRolePlanProvenanceHash(
-			preflight.NormalizedAudioSHA256,
-			stemsCASHash,
-			pID,
-			mName,
-			mVer,
-			cfgHash,
-		)
+		pID, mName, mVer, _ := analyzer.AnalyzerInfo()
+		candProvHash, err := analyzerProvenanceHash(preflight.NormalizedAudioSHA256, stemsCASHash, analyzer)
+		if err != nil {
+			if p.ID() == routeRes.SelectedProvider.ID() {
+				return nil, fmt.Errorf("%w: audio role runtime verification failed for provider %s: %w", domain.ErrAudioRoleAnalyzerUnavailable, pID, err)
+			}
+			continue
+		}
 		if existingIdx, err := s.db.GetAudioRolePlanByProvenance(ctx, candProvHash); err == nil && existingIdx != nil {
 			existingPlan, err := s.loadAudioRolePlanArtifact(existingIdx)
 			if err != nil {
@@ -298,33 +381,24 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 	if !ok {
 		return nil, fmt.Errorf("%w: selected provider %s does not implement AudioRoleAnalyzer", domain.ErrAudioRoleAnalyzerUnavailable, routeRes.SelectedProvider.ID())
 	}
-	selPID, selMName, selMVer, selCfgHash := selectedAnalyzer.AnalyzerInfo()
-	inputHash := domain.ComputeAudioRolePlanProvenanceHash(
-		preflight.NormalizedAudioSHA256,
-		stemsCASHash,
-		selPID,
-		selMName,
-		selMVer,
-		selCfgHash,
-	)
+	inputHash, err := analyzerProvenanceHash(preflight.NormalizedAudioSHA256, stemsCASHash, selectedAnalyzer)
+	if err != nil {
+		return nil, fmt.Errorf("%w: audio role runtime verification failed: %w", domain.ErrAudioRoleAnalyzerUnavailable, err)
+	}
 
 	err = s.router.ExecuteRoutedWithRetry(ctx, routeReq, routeRes, inputHash, 1, func(p provider.Provider, attemptNum int) error {
 		analyzer, ok := p.(domain.AudioRoleAnalyzer)
 		if !ok {
 			return fmt.Errorf("provider %s does not implement AudioRoleAnalyzer", p.ID())
 		}
-		pID, mName, mVer, cfgHash := analyzer.AnalyzerInfo()
+		pID, mName, mVer, _ := analyzer.AnalyzerInfo()
 		executedProviderID = pID
 		executedModelName = mName
 		executedModelVersion = mVer
-		executedProvHash = domain.ComputeAudioRolePlanProvenanceHash(
-			preflight.NormalizedAudioSHA256,
-			stemsCASHash,
-			pID,
-			mName,
-			mVer,
-			cfgHash,
-		)
+		executedProvHash, err = analyzerProvenanceHash(preflight.NormalizedAudioSHA256, stemsCASHash, analyzer)
+		if err != nil {
+			return fmt.Errorf("%w: audio role runtime verification failed: %w", domain.ErrAudioRoleAnalyzerUnavailable, err)
+		}
 
 		res, err := analyzer.AnalyzeAudioRoles(ctx, analysisReq)
 		if err != nil {

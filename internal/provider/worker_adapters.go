@@ -269,7 +269,7 @@ func (b *workerBridge) run(ctx context.Context, cmd worker.Command) ([]byte, err
 									return nil, fmt.Errorf("resolve separator model entrypoint: %w", epErr)
 								}
 								entrypointFile = ep
-							} else if cmd.Family == "audio_role" || cmd.Stage == "audio_role" {
+							} else if (cmd.Family == "audio_role" || cmd.Stage == "audio_role") && cmd.Stage != "audio_role_probe" {
 								if primaryBinding.DependencyName != YAMNetModelID || primaryBinding.Version != YAMNetModelVersion {
 									return nil, fmt.Errorf("invalid YAMNet snapshot binding %s:%s (must be exact RC %s:%s): %w",
 										primaryBinding.DependencyName, primaryBinding.Version, YAMNetModelID, YAMNetModelVersion, domain.ErrSnapshotUnverified)
@@ -327,18 +327,19 @@ func (b *workerBridge) run(ctx context.Context, cmd worker.Command) ([]byte, err
 									}
 								}
 							}
-							if cmd.Family == "audio_role" || cmd.Stage == "audio_role" {
+							if (cmd.Family == "audio_role" || cmd.Stage == "audio_role") && cmd.Stage != "audio_role_probe" {
 								classMapPath, cmErr := domain.ResolveAudioRoleClassMapPath(primaryBinding.Manifest, primaryBinding.LocalPath)
-								if cmErr == nil && classMapPath != "" {
-									envelope.Dependencies = append(envelope.Dependencies, worker.ModelSnapshotRef{
-										Role:                   "class_map",
-										DependencyName:         primaryBinding.DependencyName,
-										Version:                primaryBinding.Version,
-										SnapshotManifestSHA256: primaryBinding.SnapshotManifestSHA256,
-										LocalPath:              primaryBinding.LocalPath,
-										EntrypointFile:         classMapPath,
-									})
+								if cmErr != nil {
+									return nil, fmt.Errorf("resolve audio_role class map: %w", cmErr)
 								}
+								envelope.Dependencies = append(envelope.Dependencies, worker.ModelSnapshotRef{
+									Role:                   "class_map",
+									DependencyName:         primaryBinding.DependencyName,
+									Version:                primaryBinding.Version,
+									SnapshotManifestSHA256: primaryBinding.SnapshotManifestSHA256,
+									LocalPath:              primaryBinding.LocalPath,
+									EntrypointFile:         classMapPath,
+								})
 							}
 							if vadName, ok := cmd.Config["vad_model_name"].(string); ok && vadName != "" {
 								vadVer, _ := cmd.Config["vad_model_version"].(string)

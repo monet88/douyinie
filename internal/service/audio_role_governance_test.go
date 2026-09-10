@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/governance"
+	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
@@ -31,9 +33,16 @@ type mockRouterAudioRoleProvider struct {
 	requiresSnapshot bool
 	invoked          *bool
 	configHash       string
+	snapshotSHA      string
+	runtimeSHA       string
+	qualityScore     float64
+	errToReturn      error
 	segments         []domain.AudioSegment
 }
 
+func (m *mockRouterAudioRoleProvider) SnapshotRuntimeIdentity() (snapshotSHA, runtimeSHA string, err error) {
+	return m.snapshotSHA, m.runtimeSHA, nil
+}
 func (m *mockRouterAudioRoleProvider) ID() string                      { return m.id }
 func (m *mockRouterAudioRoleProvider) Type() provider.ProviderType     { return provider.TypeAudioRole }
 func (m *mockRouterAudioRoleProvider) PolicyState() domain.PolicyState { return m.policy }
@@ -43,12 +52,16 @@ func (m *mockRouterAudioRoleProvider) ModelInfo() (string, string) {
 	return m.modelName, m.modelVersion
 }
 func (m *mockRouterAudioRoleProvider) Capability() domain.ProviderCapability {
+	qs := m.qualityScore
+	if qs == 0 {
+		qs = 0.95
+	}
 	return domain.ProviderCapability{
 		Stage:          string(provider.TypeAudioRole),
 		Languages:      []string{"*"},
 		ExecutionTier:  "local",
 		CostPerUnit:    0,
-		QualityScore:   0.95,
+		QualityScore:   qs,
 		MaxConcurrency: 1,
 		Features:       []string{"yamnet_classification"},
 	}
@@ -61,6 +74,9 @@ func (m *mockRouterAudioRoleProvider) AnalyzerInfo() (providerID, modelName, mod
 func (m *mockRouterAudioRoleProvider) AnalyzeAudioRoles(ctx context.Context, req domain.AudioRoleAnalysisRequest) (*domain.AudioRoleAnalysisResult, error) {
 	if m.invoked != nil {
 		*m.invoked = true
+	}
+	if m.errToReturn != nil {
+		return nil, m.errToReturn
 	}
 	segs := m.segments
 	if len(segs) == 0 {
@@ -156,30 +172,38 @@ func setupGovHarness(t *testing.T) *govHarness {
 func createTestMediaAndPreflight(t *testing.T, h *govHarness, assetID string) {
 	t.Helper()
 	ctx := context.Background()
-	dummy := []byte("RIFF1234WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00")
+	samples := make([]int16, 24000)
+	for i := range samples {
+		samples[i] = int16(i % 1000)
+	}
+	dummy := media.EncodePCM16Samples(samples, 16000, 1)
 	obj, err := h.casStore.Put(bytes.NewReader(dummy))
 	if err != nil {
 		t.Fatalf("put dummy cas: %v", err)
 	}
 
 	attID := uuid.NewString()
-	_ = h.db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+	if err := h.db.CreateRightsAttestation(ctx, domain.RightsAttestation{
 		ID:              attID,
 		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
 		TermsAccepted:   true,
 		ConfirmedAt:     time.Now().UTC(),
-	})
+	}); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
 
-	_ = h.db.CreateSourceAsset(ctx, domain.SourceAsset{
+	if err := h.db.CreateSourceAsset(ctx, domain.SourceAsset{
 		ID:                  assetID,
 		RightsAttestationID: attID,
 		SHA256:              obj.SHA256,
 		CASPath:             obj.Path,
 		ByteSize:            int64(len(dummy)),
 		CreatedAt:           time.Now().UTC(),
-	})
+	}); err != nil {
+		t.Fatalf("create source asset: %v", err)
+	}
 
-	_ = h.db.SavePreflightReport(ctx, domain.PreflightReport{
+	if err := h.db.SavePreflightReport(ctx, domain.PreflightReport{
 		ID:                     uuid.NewString(),
 		AssetID:                assetID,
 		DurationSec:            1.5,
@@ -187,7 +211,9 @@ func createTestMediaAndPreflight(t *testing.T, h *govHarness, assetID string) {
 		NormalizedAudioCASPath: obj.Path,
 		NormalizedAudioSHA256:  obj.SHA256,
 		CreatedAt:              time.Now().UTC(),
-	})
+	}); err != nil {
+		t.Fatalf("save preflight report: %v", err)
+	}
 }
 
 // Case A: Policy-blocked YAMNet provider -> fails before StageWorker invocation.
@@ -454,6 +480,355 @@ func TestAudioRoleService_Governance_NoProviderAvailable_FailsClosedWithoutFallb
 		t.Fatalf("expected nil plan, got %+v", plan)
 	}
 	if !errors.Is(err, domain.ErrNoEligibleProvider) && !errors.Is(err, domain.ErrAudioRoleAnalyzerUnavailable) {
-		t.Logf("got expected fail-closed error: %v", err)
+		t.Fatalf("expected ErrNoEligibleProvider or ErrAudioRoleAnalyzerUnavailable, got unexpected error: %v", err)
+	}
+}
+
+// Item 4: Verified runtime/snapshot identity changes invalidate AudioRolePlan cache
+func TestAudioRoleService_Governance_RuntimeIdentityChange_InvalidatesCache(t *testing.T) {
+	h := setupGovHarness(t)
+	ctx := context.Background()
+
+	invokedCount := 0
+	p := &mockRouterAudioRoleProvider{
+		id:               "mock_yamnet_runtime_test",
+		modelName:        "yamnet",
+		modelVersion:     "v1",
+		policy:           domain.PolicyAllowed,
+		healthy:          true,
+		requiresSnapshot: false,
+		snapshotSHA:      "snap_sha_initial_11111111111111111111111111111111",
+		runtimeSHA:       "rt_sha_initial_22222222222222222222222222222222",
+		segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	if err := h.reg.Register(p); err != nil {
+		t.Fatalf("register provider: %v", err)
+	}
+	if err := h.licSvc.RegisterManifest(ctx, domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: "yamnet",
+		Version:        "v1",
+		SHA256:         "sha256_mock_yamnet",
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Standard",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("register manifest: %v", err)
+	}
+
+	assetID := "asset_runtime_inval_" + uuid.NewString()[:8]
+	createTestMediaAndPreflight(t, h, assetID)
+
+	// Run 1: Fresh generation with runtime SHA 2222...
+	p.invoked = new(bool)
+	plan1, err := h.audioRole.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{
+		AssetID: assetID,
+		RunID:   "run_initial_" + uuid.NewString()[:8],
+	})
+	if err != nil {
+		t.Fatalf("run 1 failed: %v", err)
+	}
+	if !*p.invoked {
+		t.Fatalf("expected provider invoked on run 1")
+	}
+	invokedCount++
+
+	// Run 2: Exact same runtime -> cache HIT, provider NOT invoked
+	p.invoked = new(bool)
+	plan2, err := h.audioRole.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{
+		AssetID: assetID,
+		RunID:   "run_second_" + uuid.NewString()[:8],
+	})
+	if err != nil {
+		t.Fatalf("run 2 failed: %v", err)
+	}
+	if *p.invoked {
+		t.Fatalf("expected cache hit on run 2, but provider was invoked")
+	}
+	if plan2.ID != plan1.ID {
+		t.Fatalf("expected plan2 ID == plan1 ID, got %s vs %s", plan2.ID, plan1.ID)
+	}
+
+	// Run 3: Runtime changed (e.g. ai-edge-litert upgrade or adapter revision)
+	// Provenance hash changes -> cache MUST miss and fresh plan generated!
+	p.runtimeSHA = "rt_sha_upgraded_33333333333333333333333333333333"
+	p.invoked = new(bool)
+	plan3, err := h.audioRole.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{
+		AssetID: assetID,
+		RunID:   "run_third_" + uuid.NewString()[:8],
+	})
+	if err != nil {
+		t.Fatalf("run 3 failed: %v", err)
+	}
+	if !*p.invoked {
+		t.Fatalf("expected provider invoked on run 3 due to runtime change, but got cache hit")
+	}
+	if plan3.ID == plan1.ID {
+		t.Fatalf("expected new plan ID after runtime identity change, but got stale plan ID %s", plan3.ID)
+	}
+}
+
+// Item 9: Router/AudioRole fallback ProviderAttempt.InputHash binds actual provider B, not selected A
+func TestAudioRoleService_Governance_FallbackCandidate_BindsProviderBInputHash(t *testing.T) {
+	h := setupGovHarness(t)
+	ctx := context.Background()
+
+	// Provider A: Primary, fails transiently
+	pA := &mockRouterAudioRoleProvider{
+		id:           "mock_primary_failing",
+		modelName:    "yamnet_primary",
+		modelVersion: "v1",
+		policy:       domain.PolicyAllowed,
+		healthy:      true,
+		qualityScore: 0.99,
+		configHash:   "cfg_hash_A",
+		errToReturn:  errors.New("transient neural engine bus error"),
+	}
+	// Provider B: Fallback, succeeds
+	pB := &mockRouterAudioRoleProvider{
+		id:           "mock_fallback_succeeding",
+		modelName:    "yamnet_fallback",
+		modelVersion: "v2",
+		policy:       domain.PolicyAllowed,
+		healthy:      true,
+		qualityScore: 0.85,
+		configHash:   "cfg_hash_B",
+		segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+
+	if err := h.reg.Register(pA); err != nil {
+		t.Fatalf("register provider pA: %v", err)
+	}
+	if err := h.reg.Register(pB); err != nil {
+		t.Fatalf("register provider pB: %v", err)
+	}
+	for _, p := range []*mockRouterAudioRoleProvider{pA, pB} {
+		mName, mVer := p.ModelInfo()
+		if err := h.licSvc.RegisterManifest(ctx, domain.LicenseManifestEntry{
+			ID:             uuid.NewString(),
+			DependencyName: mName,
+			Version:        mVer,
+			SHA256:         "sha256_" + mName,
+			CodeLicense:    "Apache-2.0",
+			ModelLicense:   "Apache-2.0",
+			DataLicense:    "OpenData",
+			ServiceTerms:   "Standard",
+			Verified:       true,
+			CreatedAt:      time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("register manifest for %s: %v", mName, err)
+		}
+	}
+
+	assetID := "asset_fallback_hash_" + uuid.NewString()[:8]
+	createTestMediaAndPreflight(t, h, assetID)
+	runID := "run_fb_" + uuid.NewString()[:8]
+
+	plan, err := h.audioRole.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{
+		AssetID: assetID,
+		RunID:   runID,
+	})
+	if err != nil {
+		t.Fatalf("expected fallback to succeed, got %v", err)
+	}
+	if plan == nil {
+		t.Fatal("expected non-nil plan from fallback")
+	}
+
+	attempts, err := h.db.ListProviderAttempts(ctx, runID, "audio_role_plan")
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	if len(attempts) < 2 {
+		t.Fatalf("expected at least 2 attempts (failing primary + successful fallback), got %d: %+v", len(attempts), attempts)
+	}
+
+	var attemptA, attemptB *domain.ProviderAttempt
+	for i := range attempts {
+		if attempts[i].ProviderID == pA.ID() {
+			attemptA = &attempts[i]
+		} else if attempts[i].ProviderID == pB.ID() {
+			attemptB = &attempts[i]
+		}
+	}
+
+	if attemptA == nil || attemptB == nil {
+		t.Fatalf("missing attempt records: A=%v, B=%v", attemptA, attemptB)
+	}
+
+	// Provenance hash for A and B must be DIFFERENT because modelName, modelVer, configHash differ!
+	if attemptA.InputHash == attemptB.InputHash {
+		t.Fatalf("Item 9 violation: attempt B reused attempt A input hash %s instead of binding provider B provenance", attemptB.InputHash)
+	}
+
+	preflight, err := h.db.GetPreflightReport(ctx, assetID)
+	if err != nil {
+		t.Fatalf("get preflight: %v", err)
+	}
+	stemsCASHash := ""
+	if stemsIdx, err := h.db.GetAudioStemsArtifactIndex(ctx, assetID); err == nil && stemsIdx != nil {
+		stemsCASHash = stemsIdx.CASHash
+	}
+	expectedHashB := domain.ComputeAudioRolePlanProvenanceHash(
+		preflight.NormalizedAudioSHA256,
+		stemsCASHash,
+		pB.ID(),
+		pB.modelName,
+		pB.modelVersion,
+		pB.configHash,
+	)
+	if attemptB.InputHash != expectedHashB {
+		t.Fatalf("attempt B InputHash mismatch: expected %s, got %s", expectedHashB, attemptB.InputHash)
+	}
+}
+
+// Item 10: Production WorkerAudioRoleProvider must fail closed when runtime identity
+// cannot be verified, even if a stale empty-runtime cache artifact exists in SQLite/CAS.
+func TestAudioRoleService_Governance_WorkerAudioRoleProvider_UnverifiedRuntimeFailsClosedBeforeCacheLookup(t *testing.T) {
+	h := setupGovHarness(t)
+	ctx := context.Background()
+
+	assetID := "asset_unverified_rt_" + uuid.NewString()[:8]
+	createTestMediaAndPreflight(t, h, assetID)
+
+	workerProv, err := provider.NewWorkerAudioRoleProvider("worker_yamnet_prod_test", "yamnet", "v1", 0.95)
+	if err != nil {
+		t.Fatalf("new worker provider: %v", err)
+	}
+	workerProv.SetSnapshotService(h.snapSvc)
+	if err := h.reg.Register(workerProv); err != nil {
+		t.Fatalf("register worker provider: %v", err)
+	}
+
+	snapDir := t.TempDir()
+	tflitePath := filepath.Join(snapDir, "yamnet.tflite")
+	initialBytes := []byte("VALID_YAMNET_TFLITE_MODEL_DATA")
+	if err := os.WriteFile(tflitePath, initialBytes, 0644); err != nil {
+		t.Fatalf("write tflite: %v", err)
+	}
+	sum := sha256.Sum256(initialBytes)
+	fileHash := hex.EncodeToString(sum[:])
+
+	manifest := domain.SnapshotManifest{
+		SchemaVersion: "1.0",
+		ModelID:       "yamnet",
+		ModelVersion:  "v1",
+		Files: []domain.SnapshotFileEntry{
+			{
+				RelativePath: "yamnet.tflite",
+				SHA256:       fileHash,
+				SizeBytes:    int64(len(initialBytes)),
+			},
+		},
+	}
+	manifestSHA, err := domain.ComputeSnapshotManifestSHA256(&manifest)
+	if err != nil {
+		t.Fatalf("compute manifest sha: %v", err)
+	}
+
+	if err := h.licSvc.RegisterManifest(ctx, domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: "yamnet",
+		Version:        "v1",
+		SHA256:         manifestSHA,
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "CC-BY-4.0",
+		ServiceTerms:   "Standard",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("register manifest: %v", err)
+	}
+
+	binding, err := h.snapSvc.RegisterAndVerifySnapshot(ctx, manifest, snapDir)
+	if err != nil {
+		t.Fatalf("register and verify snapshot: %v", err)
+	}
+	snapSHA := binding.SnapshotManifestSHA256
+	preflight, err := h.db.GetPreflightReport(ctx, assetID)
+	if err != nil {
+		t.Fatalf("get preflight: %v", err)
+	}
+	stems, err := h.audioMixSvc.SeparateAudio(ctx, service.AudioSeparationInput{
+		AssetID: assetID,
+		RunID:   "run_prep",
+	})
+	if err != nil {
+		t.Fatalf("separate audio: %v", err)
+	}
+	stemsCASHash := stems.CASHash
+
+	// Stale cache artifact stored under old-style empty-runtime provenance hash
+	staleProvHash := domain.ComputeAudioRolePlanProvenanceHash(
+		preflight.NormalizedAudioSHA256,
+		stemsCASHash,
+		workerProv.ID(),
+		"yamnet",
+		"v1",
+		workerProv.Config().Hash(),
+		snapSHA,
+		"", // empty runtime SHA!
+	)
+	stalePlan := domain.AudioRolePlan{
+		ID:             "stale-plan-" + uuid.NewString()[:8],
+		AssetID:        assetID,
+		ProviderID:     workerProv.ID(),
+		ModelName:      "yamnet",
+		ModelVersion:   "v1",
+		ProvenanceHash: staleProvHash,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	blob, err := json.Marshal(stalePlan)
+	if err != nil {
+		t.Fatalf("marshal stale plan: %v", err)
+	}
+	obj, err := h.casStore.Put(bytes.NewReader(blob))
+	if err != nil {
+		t.Fatalf("put stale plan to cas: %v", err)
+	}
+	stalePlan.CASHash = obj.SHA256
+	if err := h.db.SaveAudioRolePlan(ctx, stalePlan); err != nil {
+		t.Fatalf("save stale plan to db: %v", err)
+	}
+
+	// GenerateAudioRolePlan MUST fail closed because WorkerAudioRoleProvider's runtime identity
+	// cannot be verified (no probe / invalid runtime). It MUST NOT return stalePlan!
+	plan, err := h.audioRole.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{
+		AssetID: assetID,
+		RunID:   "run_stale_lookup_test",
+	})
+	if err == nil {
+		t.Fatalf("expected fail-closed error when runtime identity cannot be verified, but got cache hit plan: %+v", plan)
+	}
+	if plan != nil {
+		t.Fatalf("expected nil plan, got %+v", plan)
+	}
+	if !errors.Is(err, domain.ErrAudioRoleAnalyzerUnavailable) && !errors.Is(err, domain.ErrSnapshotUnverified) {
+		t.Fatalf("expected ErrAudioRoleAnalyzerUnavailable or ErrSnapshotUnverified, got: %v", err)
+	}
+
+	// Injected deterministic analyzer must continue working cleanly
+	detAnalyzer := service.NewDeterministicTestAudioRoleAnalyzer()
+	detAudioRole := service.NewAudioRoleServiceWithAnalyzer(h.db, h.casStore, h.audioMixSvc, detAnalyzer)
+	detPlan, err := detAudioRole.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{
+		AssetID: assetID,
+		RunID:   "run_det_test",
+	})
+	if err != nil {
+		t.Fatalf("deterministic injected analyzer must succeed, got: %v", err)
+	}
+	if detPlan == nil || len(detPlan.Segments) == 0 {
+		t.Fatal("deterministic injected analyzer produced empty plan")
 	}
 }

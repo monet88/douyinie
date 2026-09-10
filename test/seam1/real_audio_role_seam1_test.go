@@ -12,18 +12,67 @@ import (
 	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/governance"
+	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
 	"github.com/monet88/douyinie/internal/worker"
 )
 
+func findRepoRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatalf("go.mod not found; cannot locate repo root from %s", dir)
+		}
+		dir = parent
+	}
+}
+
 func TestSeam1_AudioRole_RealProductionSeam_SmokeEvidence(t *testing.T) {
-	// 1. Check prerequisite local files
-	yamnetModelPath := `D:/douyinie-ref/phase1.1-runtime/staging/yamnet_v1/yamnet.tflite`
-	yamnetClassMapPath := `D:/douyinie-ref/phase1.1-runtime/staging/yamnet_v1/yamnet_class_map.csv`
-	pythonBin := `D:/douyinie-ref/phase1.1-runtime/venvs/audio_role/Scripts/python.exe`
-	fixtureAudio := `D:/douyinie-ref/smoke_evidence/fixture1_16k.wav`
+	// 1. Resolve prerequisite paths from environment with sensible fallbacks
+	root := findRepoRoot(t)
+
+	refDir := os.Getenv("DOUYINIE_REF_DIR")
+	if refDir == "" {
+		refDir = filepath.Join(root, ".ref")
+	}
+	yamnetModelPath := os.Getenv("DOUYINIE_YAMNET_MODEL_PATH")
+	if yamnetModelPath == "" {
+		yamnetModelPath = filepath.Join(refDir, "phase1.1-runtime", "staging", "yamnet_v1", "yamnet.tflite")
+	}
+	yamnetClassMapPath := os.Getenv("DOUYINIE_YAMNET_CLASS_MAP_PATH")
+	if yamnetClassMapPath == "" {
+		yamnetClassMapPath = filepath.Join(refDir, "phase1.1-runtime", "staging", "yamnet_v1", "yamnet_class_map.csv")
+	}
+	pythonBin := os.Getenv("DOUYINIE_AUDIO_ROLE_PYTHON_BIN")
+	if pythonBin == "" {
+		candidates := []string{
+			filepath.Join(refDir, "phase1.1-runtime", "venvs", "audio_role", "Scripts", "python.exe"),
+			filepath.Join(refDir, "phase1.1-runtime", "venvs", "audio_role", "bin", "python"),
+		}
+		for _, cand := range candidates {
+			if _, err := os.Stat(cand); err == nil {
+				pythonBin = cand
+				break
+			}
+		}
+		if pythonBin == "" {
+			pythonBin = candidates[0]
+		}
+	}
+	fixtureAudio := os.Getenv("DOUYINIE_SMOKE_FIXTURE_AUDIO")
+	if fixtureAudio == "" {
+		fixtureAudio = filepath.Join(refDir, "smoke_evidence", "fixture1_16k.wav")
+	}
 
 	if _, err := os.Stat(yamnetModelPath); err != nil {
 		t.Skipf("YAMNet model not found at %s: %v", yamnetModelPath, err)
@@ -32,13 +81,20 @@ func TestSeam1_AudioRole_RealProductionSeam_SmokeEvidence(t *testing.T) {
 		t.Skipf("YAMNet class map not found at %s: %v", yamnetClassMapPath, err)
 	}
 	if _, err := os.Stat(pythonBin); err != nil {
-		t.Skipf("YAMNet python venv not found at %s: %v", pythonBin, err)
+		t.Skipf("YAMNet python runtime not found at %s: %v", pythonBin, err)
+	}
+	if _, err := os.Stat(fixtureAudio); err != nil {
+		t.Skipf("fixture audio not found at %s: %v", fixtureAudio, err)
 	}
 	t.Setenv("DOUYINIE_AUDIO_ROLE_PYTHON_BIN", pythonBin)
-	if wd, err := os.Getwd(); err == nil {
-		adapterPath, _ := filepath.Abs(filepath.Join(wd, "..", "..", "cmd", "stageworker", "adapters", "audio_role_yamnet.py"))
-		t.Setenv("DOUYINIE_AUDIO_ROLE_ADAPTER", adapterPath)
+	adapterPath := os.Getenv("DOUYINIE_AUDIO_ROLE_ADAPTER")
+	if adapterPath == "" {
+		adapterPath = filepath.Join(root, "cmd", "stageworker", "adapters", "audio_role_yamnet.py")
 	}
+	if _, err := os.Stat(adapterPath); err != nil {
+		t.Skipf("YAMNet adapter script not found at %s: %v", adapterPath, err)
+	}
+	t.Setenv("DOUYINIE_AUDIO_ROLE_ADAPTER", adapterPath)
 	// 2. Build StageWorker binary
 	binDir := t.TempDir()
 	workerExe := buildStageWorkerForSeam1(t, binDir)
@@ -129,22 +185,26 @@ func TestSeam1_AudioRole_RealProductionSeam_SmokeEvidence(t *testing.T) {
 	}
 
 	attID := uuid.NewString()
-	_ = h.db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+	if err := h.db.CreateRightsAttestation(ctx, domain.RightsAttestation{
 		ID:              attID,
 		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
 		TermsAccepted:   true,
 		ConfirmedAt:     time.Now().UTC(),
-	})
+	}); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
 	assetID := "asset_real_yamnet_" + uuid.NewString()[:8]
-	_ = h.db.CreateSourceAsset(ctx, domain.SourceAsset{
+	if err := h.db.CreateSourceAsset(ctx, domain.SourceAsset{
 		ID:                  assetID,
 		RightsAttestationID: attID,
 		SHA256:              casObj.SHA256,
 		CASPath:             casObj.Path,
 		ByteSize:            int64(len(fixtureBytes)),
 		CreatedAt:           time.Now().UTC(),
-	})
-	_ = h.db.SavePreflightReport(ctx, domain.PreflightReport{
+	}); err != nil {
+		t.Fatalf("create source asset: %v", err)
+	}
+	if err := h.db.SavePreflightReport(ctx, domain.PreflightReport{
 		ID:                     uuid.NewString(),
 		AssetID:                assetID,
 		ContainerValid:         true,
@@ -152,7 +212,42 @@ func TestSeam1_AudioRole_RealProductionSeam_SmokeEvidence(t *testing.T) {
 		NormalizedAudioCASPath: casObj.Path,
 		NormalizedAudioSHA256:  casObj.SHA256,
 		CreatedAt:              time.Now().UTC(),
-	})
+	}); err != nil {
+		t.Fatalf("save preflight report: %v", err)
+	}
+
+	// Generate distinct vocals and background stem media for realistic CAS storage
+	fixtureSamples, info, err := media.ExtractPCM16Samples(fixtureBytes)
+	if err != nil {
+		t.Fatalf("extract fixture samples: %v", err)
+	}
+	sampleRate := 16000
+	if info != nil && info.SampleRate > 0 {
+		sampleRate = int(info.SampleRate)
+	}
+	vocalsSamples := make([]int16, len(fixtureSamples))
+	bgSamples := make([]int16, len(fixtureSamples))
+	midPoint := 4 * sampleRate
+	if midPoint > len(fixtureSamples) {
+		midPoint = len(fixtureSamples) / 2
+	}
+	copy(vocalsSamples[:midPoint], fixtureSamples[:midPoint])
+	copy(bgSamples[midPoint:], fixtureSamples[midPoint:])
+
+	vocalsWAV := media.EncodePCM16Samples(vocalsSamples, sampleRate, 1)
+	bgWAV := media.EncodePCM16Samples(bgSamples, sampleRate, 1)
+
+	vocalsCAS, err := h.casStore.Put(bytes.NewReader(vocalsWAV))
+	if err != nil {
+		t.Fatalf("store vocals in cas: %v", err)
+	}
+	bgCAS, err := h.casStore.Put(bytes.NewReader(bgWAV))
+	if err != nil {
+		t.Fatalf("store background in cas: %v", err)
+	}
+	if vocalsCAS.SHA256 == bgCAS.SHA256 {
+		t.Fatalf("expected distinct vocals and background CAS hashes")
+	}
 
 	stems := domain.AudioStemArtifacts{
 		ID:            uuid.NewString(),
@@ -163,35 +258,47 @@ func TestSeam1_AudioRole_RealProductionSeam_SmokeEvidence(t *testing.T) {
 		ModelVersion:  "v3",
 		CreatedAt:     time.Now().UTC(),
 		Stems: []domain.AudioStem{
-			{Type: domain.StemTypeVocals, AudioCASHash: casObj.SHA256, DurationMs: 8000, SampleRate: 16000, Channels: 1, Format: "wav"},
-			{Type: domain.StemTypeBackground, AudioCASHash: casObj.SHA256, DurationMs: 8000, SampleRate: 16000, Channels: 1, Format: "wav"},
+			{Type: domain.StemTypeVocals, AudioCASHash: vocalsCAS.SHA256, AudioCASPath: vocalsCAS.Path, DurationMs: 8000, SampleRate: sampleRate, Channels: 1, Format: "wav"},
+			{Type: domain.StemTypeBackground, AudioCASHash: bgCAS.SHA256, AudioCASPath: bgCAS.Path, DurationMs: 8000, SampleRate: sampleRate, Channels: 1, Format: "wav"},
 		},
 	}
-	stemsBytes, _ := json.Marshal(stems)
-	stemsCAS, _ := h.casStore.Put(bytes.NewReader(stemsBytes))
-	_ = h.db.SaveAudioStemsArtifactIndex(ctx, storage.AudioStemsArtifactIndex{
+	stemsBytes, err := json.Marshal(stems)
+	if err != nil {
+		t.Fatalf("marshal stems artifact: %v", err)
+	}
+	stemsCAS, err := h.casStore.Put(bytes.NewReader(stemsBytes))
+	if err != nil {
+		t.Fatalf("store stems in cas: %v", err)
+	}
+	if err := h.db.SaveAudioStemsArtifactIndex(ctx, storage.AudioStemsArtifactIndex{
 		ID:             uuid.NewString(),
 		AssetID:        assetID,
 		CASHash:        stemsCAS.SHA256,
 		ProvenanceHash: "prov_stems_real",
 		CreatedAt:      time.Now().UTC(),
-	})
+	}); err != nil {
+		t.Fatalf("save audio stems artifact index: %v", err)
+	}
 	jobID := "job_real_yamnet_" + uuid.NewString()[:8]
-	_ = h.db.CreateJob(ctx, domain.LocalizationJob{
+	if err := h.db.CreateJob(ctx, domain.LocalizationJob{
 		ID:             jobID,
 		SourceAssetID:  assetID,
 		TargetLanguage: "vi",
 		Status:         "queued",
 		CreatedAt:      time.Now().UTC(),
 		UpdatedAt:      time.Now().UTC(),
-	})
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
 	runID := "run_real_yamnet_" + uuid.NewString()[:8]
-	_ = h.db.CreateRun(ctx, domain.LocalizationRun{
+	if err := h.db.CreateRun(ctx, domain.LocalizationRun{
 		ID:        runID,
 		JobID:     jobID,
 		Status:    "queued",
 		CreatedAt: time.Now().UTC(),
-	})
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
 
 	// 8. Generate AudioRolePlan through production AudioRoleService
 	plan, err := audioRoleSvc.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{
@@ -200,8 +307,8 @@ func TestSeam1_AudioRole_RealProductionSeam_SmokeEvidence(t *testing.T) {
 		JobID:   jobID,
 	})
 	if err != nil {
-		decisions, _ := h.db.ListSelectionDecisions(ctx, runID, "audio_role_plan")
-		if len(decisions) > 0 {
+		decisions, diagErr := h.db.ListSelectionDecisions(ctx, runID, "audio_role_plan")
+		if diagErr == nil && len(decisions) > 0 {
 			t.Fatalf("generate audio role plan failed: %v, evals: %+v", err, decisions[0].CandidatesEvaluated)
 		}
 		t.Fatalf("generate audio role plan via production seam failed: %v", err)
@@ -263,31 +370,39 @@ func TestSeam1_AudioRole_RealProductionSeam_SmokeEvidence(t *testing.T) {
 	}
 
 	// 11. Write durable evidence JSON outside Git
-	evidenceDir := `D:/douyinie-ref/smoke_evidence`
-	if err := os.MkdirAll(evidenceDir, 0755); err == nil {
-		evidenceFile := filepath.Join(evidenceDir, "production_seam_evidence.json")
-		evidenceData := map[string]any{
-			"timestamp":          time.Now().UTC().Format(time.RFC3339),
-			"stage":              "audio_role_plan",
-			"provider_id":        provider.YAMNetProviderID,
-			"model_id":           domain.PinnedYAMNetModelID,
-			"model_version":      domain.PinnedYAMNetModelVersion,
-			"manifest_sha256":    domain.PinnedYAMNetManifestSHA256,
-			"run_id":             runID,
-			"asset_id":           assetID,
-			"provenance_hash":    plan.ProvenanceHash,
-			"segments_count":     len(plan.Segments),
-			"has_uncertain":      hasUncertain,
-			"review_projected":   foundUncertainReview,
-			"review_status":      "REVIEW_REQUIRED",
-			"no_dub_autonomous":  false,
-			"decisions_recorded": len(decisions),
-			"attempts_recorded":  len(attempts),
-			"stageworker_binary": workerExe,
-			"python_binary":      pythonBin,
-		}
-		if raw, err := json.MarshalIndent(evidenceData, "", "  "); err == nil {
-			_ = os.WriteFile(evidenceFile, raw, 0644)
-		}
+	evidenceDir := os.Getenv("DOUYINIE_SMOKE_EVIDENCE_DIR")
+	if evidenceDir == "" {
+		evidenceDir = filepath.Join(root, ".ref", "smoke_evidence", "audio_role")
+	}
+	if err := os.MkdirAll(evidenceDir, 0755); err != nil {
+		t.Fatalf("mkdir evidence dir: %v", err)
+	}
+	evidenceFile := filepath.Join(evidenceDir, "production_seam_evidence.json")
+	evidenceData := map[string]any{
+		"timestamp":          time.Now().UTC().Format(time.RFC3339),
+		"stage":              "audio_role_plan",
+		"provider_id":        provider.YAMNetProviderID,
+		"model_id":           domain.PinnedYAMNetModelID,
+		"model_version":      domain.PinnedYAMNetModelVersion,
+		"manifest_sha256":    domain.PinnedYAMNetManifestSHA256,
+		"run_id":             runID,
+		"asset_id":           assetID,
+		"provenance_hash":    plan.ProvenanceHash,
+		"segments_count":     len(plan.Segments),
+		"has_uncertain":      hasUncertain,
+		"review_projected":   foundUncertainReview,
+		"review_status":      "REVIEW_REQUIRED",
+		"no_dub_autonomous":  false,
+		"decisions_recorded": len(decisions),
+		"attempts_recorded":  len(attempts),
+		"stageworker_binary": workerExe,
+		"python_binary":      pythonBin,
+	}
+	raw, err := json.MarshalIndent(evidenceData, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal evidence json: %v", err)
+	}
+	if err := os.WriteFile(evidenceFile, raw, 0644); err != nil {
+		t.Fatalf("write evidence file: %v", err)
 	}
 }

@@ -11,7 +11,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/service"
@@ -993,39 +995,74 @@ func TestSeam1_SpeechUnderstand_AudioRoleErrorClassification(t *testing.T) {
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
-	speechBody, _ := json.Marshal(map[string]any{"run_id": runID})
+	speechBody, err := json.Marshal(map[string]any{"run_id": runID})
+	if err != nil {
+		t.Fatalf("marshal speech body: %v", err)
+	}
 	speechResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/speech-understand", h.server.URL, assetID), "application/json", bytes.NewReader(speechBody))
 	if err != nil {
 		t.Fatalf("speech-understand request failed: %v", err)
 	}
 	defer speechResp.Body.Close()
-	if speechResp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 Service Unavailable when audio role analyzer/provider is unavailable, got %d", speechResp.StatusCode)
-	}
-
-	// Case 2: Source asset has NO preflight report in DB
-	// -> Automatic prerequisite generation fails with 422 Unprocessable Entity
-	jobID2, runID2 := createJobAndRun(t, h)
-	job2 := getJobViaAPI(t, h, jobID2)
-	assetID2 := job2.SourceAssetID
-
-	// Overwrite preflight report with empty normalized audio to test prerequisite missing classification
-	err = h.db.SavePreflightReport(context.Background(), domain.PreflightReport{
-		AssetID:                assetID2,
-		NormalizedAudioCASPath: "",
-		NormalizedAudioSHA256:  "",
-	})
+	bodyBytes, err := io.ReadAll(speechResp.Body)
 	if err != nil {
-		t.Fatalf("save empty preflight report: %v", err)
+		t.Fatalf("read speechResp body: %v", err)
+	}
+	if speechResp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable when audio role analyzer/provider is unavailable, got %d (body: %s)", speechResp.StatusCode, string(bodyBytes))
 	}
 
-	speechBody2, _ := json.Marshal(map[string]any{"run_id": runID2})
-	resp2, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/speech-understand", h.server.URL, assetID2), "application/json", bytes.NewReader(speechBody2))
+	// Also verify dedicated generation endpoint returns 503
+	genResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan/generate", h.server.URL, assetID), "application/json", bytes.NewReader(speechBody))
+	if err != nil {
+		t.Fatalf("dedicated generate request failed: %v", err)
+	}
+	defer genResp.Body.Close()
+	if genResp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable from dedicated generate endpoint, got %d", genResp.StatusCode)
+	}
+
+	// Case 2: Source asset has NO preflight report in DB (truthful unseeded asset)
+	// -> Generation fails with 422 Unprocessable Entity
+	attID := uuid.NewString()
+	if err := h.db.CreateRightsAttestation(context.Background(), domain.RightsAttestation{
+		ID:              attID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+	unseededAsset := domain.SourceAsset{
+		ID:                  "asset-unseeded-" + uuid.NewString()[:8],
+		RightsAttestationID: attID,
+		SHA256:              "sha256-unseeded-asset-evidence-missing",
+		ByteSize:            1024,
+		CreatedAt:           time.Now().UTC(),
+	}
+	if err := h.db.CreateSourceAsset(context.Background(), unseededAsset); err != nil {
+		t.Fatalf("create unseeded source asset: %v", err)
+	}
+	speechBody2, err := json.Marshal(map[string]any{"run_id": uuid.NewString()})
+	if err != nil {
+		t.Fatalf("marshal speech body 2: %v", err)
+	}
+	resp2, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/speech-understand", h.server.URL, unseededAsset.ID), "application/json", bytes.NewReader(speechBody2))
 	if err != nil {
 		t.Fatalf("speech-understand request failed: %v", err)
 	}
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 Unprocessable Entity when preflight is missing, got %d", resp2.StatusCode)
+	}
+
+	// Also verify dedicated generation endpoint returns 422 for unseeded asset
+	genResp2, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan/generate", h.server.URL, unseededAsset.ID), "application/json", bytes.NewReader(speechBody2))
+	if err != nil {
+		t.Fatalf("dedicated generate request failed: %v", err)
+	}
+	defer genResp2.Body.Close()
+	if genResp2.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity from dedicated generate endpoint when preflight missing, got %d", genResp2.StatusCode)
 	}
 }

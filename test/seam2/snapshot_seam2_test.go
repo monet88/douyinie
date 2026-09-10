@@ -1752,7 +1752,7 @@ func TestSeam2_AudioRoleStage_YAMNet_StrictModeAndExecution(t *testing.T) {
 		},
 	}
 	_, err := client.Run(context.Background(), cmdStrict, 10*time.Second, 10*time.Second)
-	if err == nil || !strings.Contains(err.Error(), "WORKER_SNAPSHOT_PATH_REQUIRED") {
-		t.Fatalf("expected strict mode to fail closed with WORKER_SNAPSHOT_PATH_REQUIRED when model asset missing, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "AUDIO_ROLE_MODEL_ASSET_MISSING") {
+		t.Fatalf("expected strict mode to fail closed with AUDIO_ROLE_MODEL_ASSET_MISSING when model asset missing, got: %v", err)
 	}
 }

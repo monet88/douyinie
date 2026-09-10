@@ -36,13 +36,15 @@ const (
 
 // AudioRolePlanProvenance captures deterministic provenance for AudioRolePlan.
 type AudioRolePlanProvenance struct {
-	AssetSHA256   string `json:"asset_sha256"`
-	StemsCASHash  string `json:"stems_cas_hash,omitempty"`
-	ProviderID    string `json:"provider_id"`
-	ModelName     string `json:"model_name"`
-	ModelVersion  string `json:"model_version"`
-	ConfigHash    string `json:"config_hash,omitempty"`
-	SchemaVersion int    `json:"schema_version"`
+	AssetSHA256            string `json:"asset_sha256"`
+	StemsCASHash           string `json:"stems_cas_hash,omitempty"`
+	ProviderID             string `json:"provider_id"`
+	ModelName              string `json:"model_name"`
+	ModelVersion           string `json:"model_version"`
+	ConfigHash             string `json:"config_hash,omitempty"`
+	SnapshotManifestSHA256 string `json:"snapshot_manifest_sha256,omitempty"`
+	RuntimeManifestSHA256  string `json:"runtime_manifest_sha256,omitempty"`
+	SchemaVersion          int    `json:"schema_version"`
 }
 
 func (p AudioRolePlanProvenance) Hash() string {
@@ -55,15 +57,24 @@ func (p AudioRolePlanProvenance) Hash() string {
 }
 
 // ComputeAudioRolePlanProvenanceHash computes the deterministic hash for AudioRolePlan.
-func ComputeAudioRolePlanProvenanceHash(assetSHA256, stemsCASHash, providerID, modelName, modelVersion, configHash string) string {
+func ComputeAudioRolePlanProvenanceHash(assetSHA256, stemsCASHash, providerID, modelName, modelVersion, configHash string, snapshotAndRuntimeIdentities ...string) string {
+	var snapSHA, rtSHA string
+	if len(snapshotAndRuntimeIdentities) > 0 {
+		snapSHA = snapshotAndRuntimeIdentities[0]
+	}
+	if len(snapshotAndRuntimeIdentities) > 1 {
+		rtSHA = snapshotAndRuntimeIdentities[1]
+	}
 	return AudioRolePlanProvenance{
-		AssetSHA256:   assetSHA256,
-		StemsCASHash:  stemsCASHash,
-		ProviderID:    providerID,
-		ModelName:     modelName,
-		ModelVersion:  modelVersion,
-		ConfigHash:    configHash,
-		SchemaVersion: AudioRolePlanSchemaVersion,
+		AssetSHA256:            assetSHA256,
+		StemsCASHash:           stemsCASHash,
+		ProviderID:             providerID,
+		ModelName:              modelName,
+		ModelVersion:           modelVersion,
+		ConfigHash:             configHash,
+		SnapshotManifestSHA256: snapSHA,
+		RuntimeManifestSHA256:  rtSHA,
+		SchemaVersion:          AudioRolePlanSchemaVersion,
 	}.Hash()
 }
 

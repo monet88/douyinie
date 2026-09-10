@@ -1199,20 +1199,24 @@ func TestStorage_MigrationV19_AudioRolePlanArtifactsIndex(t *testing.T) {
 
 	// Create attestation and asset
 	attID := uuid.NewString()
-	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+	if err := db.CreateRightsAttestation(ctx, domain.RightsAttestation{
 		ID:              attID,
 		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
 		TermsAccepted:   true,
 		ConfirmedAt:     time.Now().UTC(),
-	})
+	}); err != nil {
+		t.Fatalf("CreateRightsAttestation: %v", err)
+	}
 	assetID := uuid.NewString()
-	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{
 		ID:                  assetID,
 		RightsAttestationID: attID,
 		SHA256:              "sha256-test-v19",
 		CASPath:             "cas-path",
 		CreatedAt:           time.Now().UTC(),
-	})
+	}); err != nil {
+		t.Fatalf("CreateSourceAsset: %v", err)
+	}
 
 	// Save AudioRolePlan with CAS and Provenance hashes
 	planID := uuid.NewString()

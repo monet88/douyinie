@@ -26,11 +26,12 @@ class TestAudioRoleYAMNetAdapter(unittest.TestCase):
     def setUp(self):
         audio_role_yamnet._YAMNET_MODEL_FACTORY = None
         audio_role_yamnet._YAMNET_PROBE_FACTORY = None
+        audio_role_yamnet._YAMNET_PROBE_VERSION_RESOLVER = None
 
     def tearDown(self):
         audio_role_yamnet._YAMNET_MODEL_FACTORY = None
         audio_role_yamnet._YAMNET_PROBE_FACTORY = None
-
+        audio_role_yamnet._YAMNET_PROBE_VERSION_RESOLVER = None
     def _create_wav(self, duration_sec=2.0, amplitude=10000, sample_rate=16000, channels=1):
         fd, path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
@@ -49,23 +50,25 @@ class TestAudioRoleYAMNetAdapter(unittest.TestCase):
         return path
 
     def test_probe_runtime_identity(self):
+        audio_role_yamnet._YAMNET_PROBE_VERSION_RESOLVER = lambda: "2.2.0"
         res = audio_role_yamnet.probe_runtime_identity()
         self.assertEqual(res["status"], "ok")
         self.assertEqual(res["package_name"], "ai-edge-litert")
         self.assertEqual(res["package_version"], "2.2.0")
         self.assertEqual(res["runtime_versions"]["ai-edge-litert"], "2.2.0")
-        self.assertTrue(res["adapter_revision"].startswith("cmd/stageworker/adapters/audio_role_yamnet.py@v2.2.0"))
+        self.assertEqual(res["adapter_revision"], "cmd/stageworker/adapters/audio_role_yamnet.py@v2.2.0")
+
     def test_probe_runtime_version_mismatch(self):
-        import ai_edge_litert
-        orig_ver = getattr(ai_edge_litert, "__version__", None)
-        try:
-            ai_edge_litert.__version__ = "2.1.0"
-            with self.assertRaises(RuntimeError) as ctx:
-                audio_role_yamnet.probe_runtime_identity()
-            self.assertIn("ai-edge-litert runtime mismatch", str(ctx.exception))
-        finally:
-            if orig_ver is not None:
-                ai_edge_litert.__version__ = orig_ver
+        audio_role_yamnet._YAMNET_PROBE_VERSION_RESOLVER = lambda: "2.1.0"
+        with self.assertRaises(RuntimeError) as ctx:
+            audio_role_yamnet.probe_runtime_identity()
+        self.assertIn("ai-edge-litert runtime mismatch", str(ctx.exception))
+
+    def test_probe_runtime_missing(self):
+        audio_role_yamnet._YAMNET_PROBE_VERSION_RESOLVER = lambda: ""
+        with self.assertRaises(RuntimeError) as ctx:
+            audio_role_yamnet.probe_runtime_identity()
+        self.assertIn("ai-edge-litert runtime mismatch", str(ctx.exception))
     def test_missing_audio_files_fails_closed(self):
         req = {
             "vocals_audio": "nonexistent_vocals.wav",
@@ -297,6 +300,27 @@ class TestAudioRoleYAMNetAdapter(unittest.TestCase):
                              "source-only fallback must be conservative and not infer confident no-dub")
         finally:
             os.remove(s_path)
+
+    def test_output_contract_provider_id_and_aligned_duration(self):
+        v_path = self._create_wav(duration_sec=1.0, amplitude=1000)
+        b_path = self._create_wav(duration_sec=2.5, amplitude=1000)
+        try:
+            scores = [0.0] * 521
+            scores[0] = 0.90
+            audio_role_yamnet._YAMNET_MODEL_FACTORY = lambda p: MockYAMNetImpl(scores)
+
+            res = audio_role_yamnet.run_audio_role_analysis({
+                "vocals_audio": v_path,
+                "background_audio": b_path,
+                "model_path": "fake_root",
+            })
+            self.assertEqual(res["provider_id"], "worker_yamnet")
+            self.assertTrue(len(res["segments"]) > 0)
+            last_end = res["segments"][-1]["end_ms"]
+            self.assertEqual(last_end, 2500, "duration must derive from aligned sample lengths, not short stem")
+        finally:
+            os.remove(v_path)
+            os.remove(b_path)
 
 
 if __name__ == "__main__":

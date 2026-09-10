@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -877,5 +879,85 @@ func TestAudioRoleService_GovernanceCacheCompleteness(t *testing.T) {
 	attempts2, err := h.db.ListProviderAttempts(ctx, runID2, "audio_role_plan")
 	if err != nil || len(attempts2) == 0 {
 		t.Fatalf("governance bypassed on cache hit: expected provider attempt for run2, got %v (err=%v)", attempts2, err)
+	}
+}
+
+func TestAudioRoleService_ConcurrentGeneration_SerializedPerAsset(t *testing.T) {
+	h := setupAudioRoleTestHarness(t)
+	ctx := context.Background()
+
+	// Seed Asset A
+	samplesA := make([]int16, 32000)
+	for i := range samplesA {
+		samplesA[i] = int16(1000 * math.Sin(2*math.Pi*440*float64(i)/16000))
+	}
+	assetIDA, _ := createControlledAsset(t, h, 2000, samplesA, nil)
+
+	// Seed Asset B
+	samplesB := make([]int16, 32000)
+	for i := range samplesB {
+		samplesB[i] = int16(1000 * math.Sin(2*math.Pi*880*float64(i)/16000))
+	}
+	assetIDB, _ := createControlledAsset(t, h, 2000, samplesB, nil)
+
+	const concurrency = 8
+	plansA := make([]*domain.AudioRolePlan, concurrency)
+	errsA := make([]error, concurrency)
+	plansB := make([]*domain.AudioRolePlan, concurrency)
+	errsB := make([]error, concurrency)
+
+	var wg sync.WaitGroup
+	wg.Add(concurrency * 2)
+
+	for idx := range concurrency {
+		go func() {
+			defer wg.Done()
+			runID := fmt.Sprintf("run_a_%d_%s", idx, uuid.NewString()[:6])
+			plansA[idx], errsA[idx] = h.audioRole.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{
+				AssetID: assetIDA,
+				RunID:   runID,
+			})
+		}()
+
+		go func() {
+			defer wg.Done()
+			runID := fmt.Sprintf("run_b_%d_%s", idx, uuid.NewString()[:6])
+			plansB[idx], errsB[idx] = h.audioRole.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{
+				AssetID: assetIDB,
+				RunID:   runID,
+			})
+		}()
+	}
+
+	wg.Wait()
+
+	// Verify Asset A results
+	for i := range concurrency {
+		if errsA[i] != nil {
+			t.Fatalf("goroutine %d for asset A failed: %v", i, errsA[i])
+		}
+		if plansA[i] == nil || plansA[i].ID == "" {
+			t.Fatalf("goroutine %d for asset A returned nil or empty plan", i)
+		}
+		if plansA[i].ID != plansA[0].ID {
+			t.Fatalf("goroutine %d for asset A got plan ID %s, expected identical ID %s", i, plansA[i].ID, plansA[0].ID)
+		}
+	}
+
+	// Verify Asset B results
+	for i := range concurrency {
+		if errsB[i] != nil {
+			t.Fatalf("goroutine %d for asset B failed: %v", i, errsB[i])
+		}
+		if plansB[i] == nil || plansB[i].ID == "" {
+			t.Fatalf("goroutine %d for asset B returned nil or empty plan", i)
+		}
+		if plansB[i].ID != plansB[0].ID {
+			t.Fatalf("goroutine %d for asset B got plan ID %s, expected identical ID %s", i, plansB[i].ID, plansB[0].ID)
+		}
+	}
+	// Ensure Asset A and Asset B are distinct
+	if plansA[0].ID == plansB[0].ID {
+		t.Fatalf("asset A and asset B produced identical plan ID %s", plansA[0].ID)
 	}
 }

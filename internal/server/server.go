@@ -769,6 +769,24 @@ func (s *Server) handleGenerateAudioRolePlan(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
+		if errors.Is(err, domain.ErrAudioRoleAnalyzerUnavailable) ||
+			errors.Is(err, domain.ErrNoEligibleProvider) ||
+			errors.Is(err, domain.ErrPolicyBlocked) ||
+			errors.Is(err, domain.ErrLicenseManifestMissing) ||
+			errors.Is(err, domain.ErrSnapshotUnverified) ||
+			errors.Is(err, domain.ErrSnapshotDigestMismatch) ||
+			errors.Is(err, domain.ErrSnapshotMutatedRehashRequired) ||
+			errors.Is(err, domain.ErrSnapshotFileCorrupted) ||
+			errors.Is(err, domain.ErrAudioRoleModelAssetMissing) ||
+			errors.Is(err, domain.ErrCircuitOpen) {
+			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("audio role analyzer unavailable: %v", err))
+			return
+		}
+		if errors.Is(err, domain.ErrAudioRolePreflightRequired) ||
+			errors.Is(err, domain.ErrAudioRoleEvidenceMissing) {
+			writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("audio role plan prerequisite missing: %v", err))
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "generate audio role plan: "+err.Error())
 		return
 	}

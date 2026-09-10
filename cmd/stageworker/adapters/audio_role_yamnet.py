@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 _YAMNET_MODEL_FACTORY = None
 _YAMNET_PROBE_FACTORY = None
-
+_YAMNET_PROBE_VERSION_RESOLVER = None
 PINNED_YAMNET_PACKAGE = "ai-edge-litert"
 PINNED_YAMNET_VERSION = "2.2.0"
 PINNED_ADAPTER_REVISION = "cmd/stageworker/adapters/audio_role_yamnet.py@v2.2.0"
@@ -111,16 +111,18 @@ def probe_runtime_identity() -> Dict[str, Any]:
     if _YAMNET_PROBE_FACTORY is not None and callable(_YAMNET_PROBE_FACTORY):
         return _YAMNET_PROBE_FACTORY()
 
-    try:
-        import ai_edge_litert
-        ver = getattr(ai_edge_litert, "__version__", "")
-    except ImportError:
+    if _YAMNET_PROBE_VERSION_RESOLVER is not None and callable(_YAMNET_PROBE_VERSION_RESOLVER):
+        ver = _YAMNET_PROBE_VERSION_RESOLVER()
+    else:
         try:
-            import importlib.metadata
-            ver = importlib.metadata.version("ai-edge-litert")
-        except Exception:
-            ver = ""
-
+            import ai_edge_litert
+            ver = getattr(ai_edge_litert, "__version__", "")
+        except ImportError:
+            try:
+                import importlib.metadata
+                ver = importlib.metadata.version("ai-edge-litert")
+            except Exception:
+                ver = ""
     if ver != PINNED_YAMNET_VERSION:
         raise RuntimeError(
             f"ai-edge-litert runtime mismatch: expected {PINNED_YAMNET_VERSION}, found {ver or 'missing'}"
@@ -306,13 +308,16 @@ def run_audio_role_analysis(req: Dict[str, Any]) -> Dict[str, Any]:
     window_samples = cfg.get("window_samples", 15600)
     raw_segments = []
 
-    if max_len == 0 or duration_ms == 0:
+    if max_len == 0:
         raise ValueError("audio input is empty or contains zero readable samples; fail-closed")
+    aligned_duration_ms = int(max_len * 1000 / sr)
+    if aligned_duration_ms == 0:
+        raise ValueError("audio input duration is zero; fail-closed")
 
     is_source_only = not bool(vocals_path)
     for idx in range(0, max_len, window_samples):
         start_ms = int(idx * 1000 / sr)
-        end_ms = min(duration_ms, int((idx + window_samples) * 1000 / sr))
+        end_ms = min(aligned_duration_ms, int((idx + window_samples) * 1000 / sr))
         v_win = vocals_samples[idx : idx + window_samples]
         b_win = bg_samples[idx : idx + window_samples]
         role = classify_window(v_win, b_win, classifier, cfg, is_source_only=is_source_only)
@@ -329,7 +334,7 @@ def run_audio_role_analysis(req: Dict[str, Any]) -> Dict[str, Any]:
         "model_name": PINNED_MODEL_NAME,
         "model_version": PINNED_MODEL_VERSION,
         "runtime_identity": f"{PINNED_YAMNET_PACKAGE} {PINNED_YAMNET_VERSION}",
-        "provider_id": "yamnet_worker",
+        "provider_id": "worker_yamnet",
     }
 
 

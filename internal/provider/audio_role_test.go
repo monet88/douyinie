@@ -2,7 +2,15 @@ package provider_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -145,4 +153,221 @@ func TestBootstrapYAMNetLicenseManifest_MismatchedExisting_FailsClosed(t *testin
 			}
 		})
 	}
+}
+
+func TestWorkerAudioRoleProvider_EnsureRuntimeIdentity_ExactRevisionAndStatusOK(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	db, err := storage.Open(filepath.Join(tmpDir, "test_ensure_rt.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	licSvc := governance.NewLicenseService(db)
+	snapSvc := governance.NewSnapshotService(db, licSvc)
+
+	// 1. Build stageworker binary
+	stageWorkerExe := filepath.Join(tmpDir, "stageworker-ar")
+	if runtime.GOOS == "windows" {
+		stageWorkerExe += ".exe"
+	}
+	buildCmd := exec.Command("go", "build", "-o", stageWorkerExe, "github.com/monet88/douyinie/cmd/stageworker")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("build stageworker: %v: %s", err, string(out))
+	}
+	t.Setenv("DOUYINIE_STAGEWORKER_BIN", stageWorkerExe)
+
+	// 2. Setup mock python adapter returning controlled probe JSON
+	configFile := filepath.Join(tmpDir, "mock_probe_config.json")
+	pyInterpScript := filepath.Join(tmpDir, "mock_probe_interp.py")
+	scriptContent := fmt.Sprintf(`import sys, json, os
+input_data = sys.stdin.read()
+req = json.loads(input_data) if input_data.strip() else {}
+config_file = %q
+cfg = {}
+if os.path.exists(config_file):
+    with open(config_file, "r") as f:
+        cfg = json.load(f)
+print(json.dumps(cfg))
+sys.exit(0)
+`, configFile)
+	if err := os.WriteFile(pyInterpScript, []byte(scriptContent), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	var pyLauncher string
+	if runtime.GOOS == "windows" {
+		pyLauncher = filepath.Join(tmpDir, "mock_py.bat")
+		batContent := fmt.Sprintf("@echo off\npython -u %q %%*\n", pyInterpScript)
+		if err := os.WriteFile(pyLauncher, []byte(batContent), 0755); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		pyLauncher = filepath.Join(tmpDir, "mock_py.sh")
+		shContent := fmt.Sprintf("#!/bin/sh\npython3 -u %q \"$@\"\n", pyInterpScript)
+		if err := os.WriteFile(pyLauncher, []byte(shContent), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("DOUYINIE_AUDIO_ROLE_PYTHON_BIN", pyLauncher)
+	t.Setenv("DOUYINIE_AUDIO_ROLE_ADAPTER", "")
+	t.Setenv("DOUYINIE_AUDIO_ROLE_BIN", "")
+
+	// 3. Setup YAMNet license and snapshot
+	yamnetDir := filepath.Join(tmpDir, "yamnet_snap")
+	if err := os.MkdirAll(yamnetDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	tfliteFile := filepath.Join(yamnetDir, "yamnet.tflite")
+	if err := os.WriteFile(tfliteFile, []byte("fake_tflite_bytes"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	classMapFile := filepath.Join(yamnetDir, "yamnet_class_map.csv")
+	if err := os.WriteFile(classMapFile, []byte("fake_csv_bytes"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	hTflite := sha256.Sum256([]byte("fake_tflite_bytes"))
+	hClassMap := sha256.Sum256([]byte("fake_csv_bytes"))
+	snapManifest := domain.SnapshotManifest{
+		SchemaVersion: "1.0",
+		ModelID:       provider.YAMNetModelID,
+		ModelVersion:  provider.YAMNetModelVersion,
+		Files: []domain.SnapshotFileEntry{
+			{
+				RelativePath: "yamnet.tflite",
+				SHA256:       hex.EncodeToString(hTflite[:]),
+				SizeBytes:    int64(len("fake_tflite_bytes")),
+			},
+			{
+				RelativePath: "yamnet_class_map.csv",
+				SHA256:       hex.EncodeToString(hClassMap[:]),
+				SizeBytes:    int64(len("fake_csv_bytes")),
+			},
+		},
+	}
+	cSHA, err := domain.ComputeSnapshotManifestSHA256(&snapManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapManifest.SnapshotManifestSHA256 = cSHA
+
+	if err := licSvc.RegisterManifest(ctx, domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: provider.YAMNetModelID,
+		Version:        provider.YAMNetModelVersion,
+		SHA256:         cSHA,
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "AudioSet",
+		ServiceTerms:   "Local-Offline",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("register manifest: %v", err)
+	}
+
+	_, err = snapSvc.RegisterAndVerifySnapshot(ctx, snapManifest, yamnetDir)
+	if err != nil {
+		t.Fatalf("RegisterAndVerifySnapshot failed: %v", err)
+	}
+
+	newTestProvider := func() *provider.WorkerAudioRoleProvider {
+		p, pErr := provider.NewWorkerAudioRoleProvider(provider.YAMNetProviderID, provider.YAMNetModelID, provider.YAMNetModelVersion, 0.95)
+		if pErr != nil {
+			t.Fatal(pErr)
+		}
+		p.SetSnapshotService(snapSvc)
+		p.SetRequiresSnapshot(true)
+		return p
+	}
+
+	// Subtest 1: Probe status is not "ok" -> fails closed with ErrSnapshotUnverified
+	t.Run("ProbeStatusNotOK_FailsClosed", func(t *testing.T) {
+		probeData := map[string]any{
+			"status":           "error",
+			"package_name":     "ai-edge-litert",
+			"package_version":  domain.PinnedYAMNetPackageVersion,
+			"source_revision":  "google/yamnet@v1",
+			"adapter_revision": domain.PinnedYAMNetAdapterRevision,
+			"runtime_versions": map[string]string{
+				"ai-edge-litert": domain.PinnedYAMNetPackageVersion,
+			},
+		}
+		b, err := json.Marshal(probeData)
+		if err != nil {
+			t.Fatalf("marshal probeData: %v", err)
+		}
+		if err := os.WriteFile(configFile, b, 0644); err != nil {
+			t.Fatalf("write probe config file: %v", err)
+		}
+
+		p := newTestProvider()
+		err = p.EnsureRuntimeIdentity(ctx)
+		if err == nil {
+			t.Fatal("expected EnsureRuntimeIdentity to fail when probe status is error")
+		}
+		if !errors.Is(err, domain.ErrSnapshotUnverified) {
+			t.Fatalf("expected ErrSnapshotUnverified, got: %v", err)
+		}
+	})
+
+	// Subtest 2: Adapter revision is a prefix match but not exact -> fails closed with ErrSnapshotUnverified
+	t.Run("PrefixRevision_FailsClosed", func(t *testing.T) {
+		probeData := map[string]any{
+			"status":           "ok",
+			"package_name":     "ai-edge-litert",
+			"package_version":  domain.PinnedYAMNetPackageVersion,
+			"source_revision":  "google/yamnet@v1",
+			"adapter_revision": domain.PinnedYAMNetAdapterRevision + "-custom",
+			"runtime_versions": map[string]string{
+				"ai-edge-litert": domain.PinnedYAMNetPackageVersion,
+			},
+		}
+		b, err := json.Marshal(probeData)
+		if err != nil {
+			t.Fatalf("marshal probeData: %v", err)
+		}
+		if err := os.WriteFile(configFile, b, 0644); err != nil {
+			t.Fatalf("write probe config file: %v", err)
+		}
+
+		p := newTestProvider()
+		err = p.EnsureRuntimeIdentity(ctx)
+		if err == nil {
+			t.Fatal("expected EnsureRuntimeIdentity to fail on non-exact adapter revision prefix")
+		}
+		if !errors.Is(err, domain.ErrSnapshotUnverified) {
+			t.Fatalf("expected ErrSnapshotUnverified, got: %v", err)
+		}
+	})
+
+	// Subtest 3: Exact revision and status ok -> succeeds
+	t.Run("ExactRevisionAndStatusOK_Succeeds", func(t *testing.T) {
+		probeData := map[string]any{
+			"status":           "ok",
+			"package_name":     "ai-edge-litert",
+			"package_version":  domain.PinnedYAMNetPackageVersion,
+			"source_revision":  "google/yamnet@v1",
+			"adapter_revision": domain.PinnedYAMNetAdapterRevision,
+			"runtime_versions": map[string]string{
+				"ai-edge-litert": domain.PinnedYAMNetPackageVersion,
+			},
+		}
+		b, err := json.Marshal(probeData)
+		if err != nil {
+			t.Fatalf("marshal probeData: %v", err)
+		}
+		if err := os.WriteFile(configFile, b, 0644); err != nil {
+			t.Fatalf("write probe config file: %v", err)
+		}
+
+		p := newTestProvider()
+		err = p.EnsureRuntimeIdentity(ctx)
+		if err != nil {
+			t.Fatalf("expected EnsureRuntimeIdentity to succeed with exact revision and status ok, got: %v", err)
+		}
+	})
 }

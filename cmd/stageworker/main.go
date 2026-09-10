@@ -1432,7 +1432,8 @@ func runAudioRoleAdapter(ctx context.Context, cmd worker.Command, enc *worker.En
 		}
 	}
 
-	if reqSnap, _ := cmd.Config["require_model_snapshot"].(bool); reqSnap {
+	reqSnap, _ := cmd.Config["require_model_snapshot"].(bool)
+	if reqSnap {
 		if modelPath == "" {
 			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
 				"audio_role requires verified primary yamnet snapshot local_path",
@@ -1442,9 +1443,7 @@ func runAudioRoleAdapter(ctx context.Context, cmd worker.Command, enc *worker.En
 			if fi, err := os.Stat(modelPath); err == nil && !fi.IsDir() {
 				entrypointFile = modelPath
 			} else {
-				return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
-					"verified model_snapshot envelope missing required entrypoint_file for YAMNet audio_role",
-					map[string]any{"stage": "audio_role", "command_id": cmd.ID})
+				entrypointFile = filepath.Join(modelPath, "yamnet.tflite")
 			}
 		}
 		if rel, err := filepath.Rel(modelPath, entrypointFile); err != nil || strings.HasPrefix(rel, "..") {
@@ -1452,7 +1451,7 @@ func runAudioRoleAdapter(ctx context.Context, cmd worker.Command, enc *worker.En
 				fmt.Sprintf("YAMNet entrypoint file (%s) escapes snapshot root (%s)", entrypointFile, modelPath), nil)
 		}
 		if _, err := os.Stat(entrypointFile); err != nil {
-			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+			return worker.ArtifactRef{}, worker.NewError("AUDIO_ROLE_MODEL_ASSET_MISSING",
 				fmt.Sprintf("yamnet.tflite entrypoint missing from snapshot path: %s", entrypointFile),
 				map[string]any{"stage": "audio_role", "command_id": cmd.ID})
 		}
@@ -1462,7 +1461,7 @@ func runAudioRoleAdapter(ctx context.Context, cmd worker.Command, enc *worker.En
 				fmt.Sprintf("model path inaccessible: %s", modelPath), nil)
 		}
 	}
-	runner, err := resolveAudioRoleRunner()
+	runner, err := resolveAudioRoleRunner(reqSnap)
 	if err != nil {
 		return worker.ArtifactRef{}, err
 	}
@@ -1477,13 +1476,8 @@ func runAudioRoleAdapter(ctx context.Context, cmd worker.Command, enc *worker.En
 	if sa, ok := cmd.Config["source_audio"].(string); ok {
 		srcAudio = sa
 	}
-	if len(cmd.Inputs) > 0 {
-		if vocalsAudio == "" {
-			vocalsAudio = cmd.Inputs[0].Path
-		}
-		if len(cmd.Inputs) > 1 && bgAudio == "" {
-			bgAudio = cmd.Inputs[1].Path
-		}
+	if len(cmd.Inputs) > 0 && srcAudio == "" {
+		srcAudio = cmd.Inputs[0].Path
 	}
 
 	if vocalsAudio == "" && srcAudio == "" {
@@ -1524,7 +1518,8 @@ func runAudioRoleAdapter(ctx context.Context, cmd worker.Command, enc *worker.En
 }
 
 func runAudioRoleProbeAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder) (worker.ArtifactRef, error) {
-	runner, err := resolveAudioRoleRunner()
+	reqSnap, _ := cmd.Config["require_model_snapshot"].(bool)
+	runner, err := resolveAudioRoleRunner(reqSnap)
 	if err != nil {
 		return worker.ArtifactRef{}, err
 	}
@@ -1555,6 +1550,11 @@ func runAudioRoleProbeAdapter(ctx context.Context, cmd worker.Command, enc *work
 			out.Error,
 			map[string]any{"stage": "audio_role_probe", "command_id": cmd.ID})
 	}
+	if out.Status != "" && out.Status != "ok" {
+		return worker.ArtifactRef{}, worker.NewError("AUDIO_ROLE_RUNTIME_PROBE_FAILED",
+			fmt.Sprintf("audio role runtime probe status is not ok (%q)", out.Status),
+			map[string]any{"stage": "audio_role_probe", "command_id": cmd.ID})
+	}
 	if out.SourceRevision == "" {
 		return worker.ArtifactRef{}, worker.NewError("AUDIO_ROLE_RUNTIME_PROBE_FAILED",
 			"audio role runtime probe returned empty source revision",
@@ -1563,29 +1563,12 @@ func runAudioRoleProbeAdapter(ctx context.Context, cmd worker.Command, enc *work
 	return writeOutputArtifact(cmd, out)
 }
 
-func resolveAudioRoleRunner() (commandRunner, error) {
-	if bin := os.Getenv("DOUYINIE_AUDIO_ROLE_BIN"); bin != "" {
-		if path, err := exec.LookPath(bin); err == nil {
-			return commandRunner{binary: path}, nil
-		}
-		return commandRunner{}, worker.NewError("AUDIO_ROLE_BINARY_NOT_FOUND",
-			fmt.Sprintf("DOUYINIE_AUDIO_ROLE_BIN %q not found", bin), nil)
-	}
-
-	if script := os.Getenv("DOUYINIE_AUDIO_ROLE_ADAPTER"); script != "" {
-		if _, err := os.Stat(script); err == nil {
-			pyBin := resolveAudioRolePythonBinary()
-			if pyBin != "" {
-				return commandRunner{binary: pyBin, args: []string{script}}, nil
-			}
-			return commandRunner{}, worker.NewError("AUDIO_ROLE_BINARY_NOT_FOUND",
-				"python runtime not found to execute DOUYINIE_AUDIO_ROLE_ADAPTER", nil)
-		}
-	}
-
+func resolveAudioRoleRunner(requireSnap bool) (commandRunner, error) {
 	adapterPaths := []string{
 		filepath.Join("cmd", "stageworker", "adapters", "audio_role_yamnet.py"),
 		filepath.Join("adapters", "audio_role_yamnet.py"),
+		filepath.Join("..", "..", "cmd", "stageworker", "adapters", "audio_role_yamnet.py"),
+		filepath.Join("..", "cmd", "stageworker", "adapters", "audio_role_yamnet.py"),
 	}
 	if exe, err := os.Executable(); err == nil {
 		exeDir := filepath.Dir(exe)
@@ -1596,14 +1579,62 @@ func resolveAudioRoleRunner() (commandRunner, error) {
 		)
 	}
 
+	var repoAdapterPath string
 	for _, p := range adapterPaths {
 		if absP, err := filepath.Abs(p); err == nil {
-			if _, err := os.Stat(absP); err == nil {
-				pyBin := resolveAudioRolePythonBinary()
-				if pyBin != "" {
-					return commandRunner{binary: pyBin, args: []string{absP}}, nil
+			if fi, err := os.Stat(absP); err == nil && !fi.IsDir() {
+				repoAdapterPath = absP
+				break
+			}
+		}
+	}
+
+	if bin := os.Getenv("DOUYINIE_AUDIO_ROLE_BIN"); bin != "" {
+		if requireSnap {
+			return commandRunner{}, worker.NewError("AUDIO_ROLE_RUNNER_OVERRIDE_REJECTED",
+				fmt.Sprintf("arbitrary runner binary DOUYINIE_AUDIO_ROLE_BIN=%q cannot self-attest RC provenance on snapshot-required route", bin),
+				nil)
+		}
+		if path, err := exec.LookPath(bin); err == nil {
+			return commandRunner{binary: path}, nil
+		}
+		return commandRunner{}, worker.NewError("AUDIO_ROLE_BINARY_NOT_FOUND",
+			fmt.Sprintf("DOUYINIE_AUDIO_ROLE_BIN %q not found", bin), nil)
+	}
+
+	if script := os.Getenv("DOUYINIE_AUDIO_ROLE_ADAPTER"); script != "" {
+		if fi, err := os.Stat(script); err == nil && !fi.IsDir() {
+			absScript, _ := filepath.Abs(script)
+			isRepo := false
+			if repoAdapterPath != "" {
+				if strings.EqualFold(filepath.Clean(absScript), filepath.Clean(repoAdapterPath)) {
+					isRepo = true
+				} else if rfi, rerr := os.Stat(repoAdapterPath); rerr == nil && os.SameFile(fi, rfi) {
+					isRepo = true
 				}
 			}
+
+			if requireSnap && !isRepo {
+				return commandRunner{}, worker.NewError("AUDIO_ROLE_RUNNER_OVERRIDE_REJECTED",
+					fmt.Sprintf("arbitrary runner adapter DOUYINIE_AUDIO_ROLE_ADAPTER=%q cannot self-attest RC provenance on snapshot-required route (repo-owned adapter required)", script),
+					nil)
+			}
+
+			pyBin := resolveAudioRolePythonBinary()
+			if pyBin != "" {
+				return commandRunner{binary: pyBin, args: []string{absScript}}, nil
+			}
+			return commandRunner{}, worker.NewError("AUDIO_ROLE_BINARY_NOT_FOUND",
+				"python runtime not found to execute DOUYINIE_AUDIO_ROLE_ADAPTER", nil)
+		}
+		return commandRunner{}, worker.NewError("AUDIO_ROLE_BINARY_NOT_FOUND",
+			fmt.Sprintf("DOUYINIE_AUDIO_ROLE_ADAPTER script %q not found", script), nil)
+	}
+
+	if repoAdapterPath != "" {
+		pyBin := resolveAudioRolePythonBinary()
+		if pyBin != "" {
+			return commandRunner{binary: pyBin, args: []string{repoAdapterPath}}, nil
 		}
 	}
 
@@ -1611,6 +1642,7 @@ func resolveAudioRoleRunner() (commandRunner, error) {
 		"YAMNet audio role adapter not available: configure DOUYINIE_AUDIO_ROLE_PYTHON_BIN / DOUYINIE_AUDIO_ROLE_ADAPTER",
 		nil)
 }
+
 func resolveOCRRunner() (commandRunner, error) {
 	if bin := os.Getenv("DOUYINIE_OCR_BIN"); bin != "" {
 		if path, err := exec.LookPath(bin); err == nil {
@@ -1980,14 +2012,6 @@ func resolveAudioRolePythonBinary() string {
 			if _, err := os.Stat(exe); err == nil {
 				return exe
 			}
-		}
-	}
-	for _, candidate := range []string{
-		`D:\douyinie-ref\phase1.1-runtime\venvs\audio_role\Scripts\python.exe`,
-		`D:/douyinie-ref/phase1.1-runtime/venvs/audio_role/Scripts/python.exe`,
-	} {
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate
 		}
 	}
 	return resolvePythonBinary()

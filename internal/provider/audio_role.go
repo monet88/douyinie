@@ -176,6 +176,42 @@ func (p *WorkerAudioRoleProvider) AnalyzerInfo() (providerID, modelName, modelVe
 	return p.id, p.modelName, p.modelVer, p.config.Hash()
 }
 
+func (p *WorkerAudioRoleProvider) SnapshotRuntimeIdentity() (snapshotSHA, runtimeSHA string, err error) {
+	if p.requiresSnapshot {
+		if err := p.EnsureRuntimeIdentity(context.Background()); err != nil {
+			return "", "", err
+		}
+	} else if p.snapshotSvc != nil {
+		_ = p.EnsureRuntimeIdentity(context.Background())
+	}
+	if p.snapshotSvc != nil {
+		binding, _ := p.snapshotSvc.GetBinding(p.modelName, p.modelVer)
+		if binding == nil {
+			binding, _ = p.snapshotSvc.GetBinding(YAMNetModelID, YAMNetModelVersion)
+		}
+		if binding != nil {
+			snapSHA := binding.SnapshotManifestSHA256
+			rtSHA := ""
+			if binding.RuntimeIdentity != nil {
+				rtSHA = binding.RuntimeIdentity.RuntimeManifestSHA256
+				if rtSHA == "" {
+					rtSHA = binding.RuntimeIdentity.ComputeRuntimeManifestSHA256()
+				}
+			}
+			if p.requiresSnapshot && rtSHA == "" {
+				return "", "", fmt.Errorf("%w: missing runtime identity for audio role %s:%s",
+					domain.ErrSnapshotUnverified, p.modelName, p.modelVer)
+			}
+			return snapSHA, rtSHA, nil
+		}
+	}
+	if p.requiresSnapshot {
+		return "", "", fmt.Errorf("%w: missing snapshot binding for audio role %s:%s",
+			domain.ErrSnapshotUnverified, p.modelName, p.modelVer)
+	}
+	return "", "", nil
+}
+
 // EnsureRuntimeIdentity probes the configured audio role Python runtime and establishes
 // validated RuntimeIdentity evidence via SnapshotService.SetRuntimeIdentity if not already set.
 func (p *WorkerAudioRoleProvider) EnsureRuntimeIdentity(ctx context.Context) error {
@@ -246,11 +282,14 @@ func (p *WorkerAudioRoleProvider) EnsureRuntimeIdentity(ctx context.Context) err
 	if probeArt.Error != "" {
 		return fmt.Errorf("%w: %s", domain.ErrSnapshotUnverified, probeArt.Error)
 	}
-	if !strings.HasPrefix(probeArt.AdapterRevision, "cmd/stageworker/adapters/audio_role_yamnet.py@v") {
-		return fmt.Errorf("%w: unverified adapter revision %q in runtime identity",
-			domain.ErrSnapshotUnverified, probeArt.AdapterRevision)
+	if probeArt.Status != "ok" {
+		return fmt.Errorf("%w: audio role runtime probe status is not ok (%q)",
+			domain.ErrSnapshotUnverified, probeArt.Status)
 	}
-
+	if probeArt.AdapterRevision != domain.PinnedYAMNetAdapterRevision {
+		return fmt.Errorf("%w: unverified adapter revision %q in runtime identity (expected exact %q)",
+			domain.ErrSnapshotUnverified, probeArt.AdapterRevision, domain.PinnedYAMNetAdapterRevision)
+	}
 	if ver, ok := probeArt.RuntimeVersions["ai-edge-litert"]; !ok || ver != domain.PinnedYAMNetPackageVersion {
 		return fmt.Errorf("%w: ai-edge-litert runtime package version mismatch: expected exact %s, got %s",
 			domain.ErrSnapshotUnverified, domain.PinnedYAMNetPackageVersion, ver)
