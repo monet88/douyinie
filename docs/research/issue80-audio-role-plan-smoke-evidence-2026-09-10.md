@@ -1,12 +1,12 @@
 # Issue #80: Production AudioRolePlan Real Media Smoke Test Evidence
 
-**Date:** 2026-09-10  
-**Environment:** Windows 11 Pro, Intel Core i5-12400F, NVIDIA GeForce RTX 2060 SUPER  
-**Model:** Google YAMNet `v1` (TFLite, 521 AudioSet classes, uncalibrated activations)  
-**Model Location:** `D:/douyinie-ref/phase1.1-runtime/staging/yamnet_v1/yamnet.tflite`  
-**License Manifest:** SHA-256 `305743f2153ec1250ed1149fcb5acbfe1944d548630f9b23c6c53655dea79943`  
-**Runtime:** `ai-edge-litert 2.2.0` in `D:/douyinie-ref/phase1.1-runtime/venvs/audio_role/`  
-**Adapter:** `cmd/stageworker/adapters/audio_role_yamnet.py` (Revision: `v2.2.0`)  
+**Date:** 2026-09-10
+**Environment:** Windows 11 Pro, Intel Core i5-12400F, NVIDIA GeForce RTX 2060 SUPER
+**Model:** Google YAMNet `v1` (TFLite, 521 AudioSet classes, uncalibrated activations)
+**Model Location:** `D:/douyinie-ref/phase1.1-runtime/staging/yamnet_v1/yamnet.tflite`
+**License Manifest:** SHA-256 `305743f2153ec1250ed1149fcb5acbfe1944d548630f9b23c6c53655dea79943`
+**Runtime:** `ai-edge-litert 2.2.0` in `D:/douyinie-ref/phase1.1-runtime/venvs/audio_role/`
+**Adapter:** `cmd/stageworker/adapters/audio_role_yamnet.py` (Revision: `v2.2.0`)
 
 ---
 

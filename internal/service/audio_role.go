@@ -52,8 +52,8 @@ type AudioRoleService struct {
 	analyzer    AudioRoleAnalyzer
 }
 
-// NewAudioRoleService constructs a new production AudioRoleService instance with no default analyzer.
-// Production RuntimeHost must explicitly set or inject a verified production analyzer, or calls fail closed.
+// NewAudioRoleService constructs a production AudioRoleService with no direct analyzer.
+// Production execution is configured through ConfigureRouter so provider governance remains authoritative.
 func NewAudioRoleService(db *storage.DB, casStore *cas.Store, audioMixSvc *AudioMixService) *AudioRoleService {
 	return &AudioRoleService{
 		db:          db,
@@ -63,7 +63,7 @@ func NewAudioRoleService(db *storage.DB, casStore *cas.Store, audioMixSvc *Audio
 	}
 }
 
-// NewAudioRoleServiceWithAnalyzer constructs an AudioRoleService with an explicitly provided analyzer.
+// NewAudioRoleServiceWithAnalyzer constructs an AudioRoleService with an explicitly provided analyzer for deterministic test harnesses.
 func NewAudioRoleServiceWithAnalyzer(db *storage.DB, casStore *cas.Store, audioMixSvc *AudioMixService, analyzer AudioRoleAnalyzer) *AudioRoleService {
 	return &AudioRoleService{
 		db:          db,
@@ -180,14 +180,16 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 		)
 
 		if existingIdx, err := s.db.GetAudioRolePlanByProvenance(ctx, provHash); err == nil && existingIdx != nil {
-			if existingPlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID); err == nil && existingPlan != nil {
-				if in.RunID != "" {
-					if err := s.ensureGovernanceRecords(ctx, in.RunID, providerID, modelName, modelVersion, provHash, 0); err != nil {
-						return nil, fmt.Errorf("ensure audio role governance records on cache hit: %w", err)
-					}
-				}
-				return existingPlan, nil
+			existingPlan, err := s.loadAudioRolePlanArtifact(existingIdx)
+			if err != nil {
+				return nil, fmt.Errorf("load cached audio role plan: %w", err)
 			}
+			if in.RunID != "" {
+				if err := s.ensureGovernanceRecords(ctx, in.RunID, providerID, modelName, modelVersion, provHash, 0); err != nil {
+					return nil, fmt.Errorf("ensure audio role governance records on cache hit: %w", err)
+				}
+			}
+			return existingPlan, nil
 		}
 
 		analysisRes, err := analyzer.AnalyzeAudioRoles(ctx, analysisReq)
@@ -275,15 +277,17 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 			cfgHash,
 		)
 		if existingIdx, err := s.db.GetAudioRolePlanByProvenance(ctx, candProvHash); err == nil && existingIdx != nil {
-			if existingPlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID); err == nil && existingPlan != nil {
-				// Cache hit for a new run: ensure provider attempt is recorded for in.RunID so governance evidence is complete.
-				if in.RunID != "" {
-					if err := s.ensureAttemptRecord(ctx, in.RunID, pID, mName, mVer, candProvHash, 0); err != nil {
-						return nil, fmt.Errorf("ensure audio role attempt on cache hit: %w", err)
-					}
-				}
-				return existingPlan, nil
+			existingPlan, err := s.loadAudioRolePlanArtifact(existingIdx)
+			if err != nil {
+				return nil, fmt.Errorf("load cached audio role plan: %w", err)
 			}
+			// Cache hit for a new run: ensure provider attempt is recorded for in.RunID so governance evidence is complete.
+			if in.RunID != "" {
+				if err := s.ensureAttemptRecord(ctx, in.RunID, pID, mName, mVer, candProvHash, 0); err != nil {
+					return nil, fmt.Errorf("ensure audio role attempt on cache hit: %w", err)
+				}
+			}
+			return existingPlan, nil
 		}
 	}
 
@@ -364,6 +368,28 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 	}
 
 	_ = asset
+	return &plan, nil
+}
+
+func (s *AudioRoleService) loadAudioRolePlanArtifact(idx *storage.AudioRolePlanIndex) (*domain.AudioRolePlan, error) {
+	if s.cas == nil || idx == nil || idx.CASHash == "" {
+		return nil, errors.New("cached audio role plan artifact is unavailable")
+	}
+
+	rc, err := s.cas.Get(idx.CASHash)
+	if err != nil {
+		return nil, fmt.Errorf("read CAS artifact %s: %w", idx.CASHash, err)
+	}
+	defer rc.Close()
+
+	var plan domain.AudioRolePlan
+	if err := json.NewDecoder(rc).Decode(&plan); err != nil {
+		return nil, fmt.Errorf("decode CAS artifact %s: %w", idx.CASHash, err)
+	}
+	if plan.ID != idx.ID || plan.AssetID != idx.AssetID || plan.ProviderID != idx.ProviderID || plan.ModelName != idx.ModelName || plan.ModelVersion != idx.ModelVersion || plan.ProvenanceHash != idx.ProvenanceHash {
+		return nil, errors.New("cached audio role plan artifact metadata does not match provenance index")
+	}
+	plan.CASHash = idx.CASHash
 	return &plan, nil
 }
 

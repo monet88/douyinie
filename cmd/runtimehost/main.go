@@ -190,19 +190,11 @@ func main() {
 		TranslationSvc: translationSvc,
 		DubbingSvc:     dubbingSvc,
 		AudioMixSvc:    audioMixSvc,
-		AudioRoleSvc: func() *service.AudioRoleService {
-			var analyzer domain.AudioRoleAnalyzer
-			if p, ok := reg.Get(provider.YAMNetProviderID); ok && p != nil {
-				if a, ok := p.(domain.AudioRoleAnalyzer); ok {
-					analyzer = a
-				}
-			}
-			return service.NewAudioRoleServiceWithAnalyzer(db, casStore, audioMixSvc, analyzer)
-		}(),
-		VisualTextSvc: visualTextSvc,
-		RenderSvc:     renderSvc,
-		BundleSvc:     service.NewBundleService(db, casStore, licSvc),
-		SnapshotSvc:   snapSvc,
+		AudioRoleSvc:   service.NewAudioRoleService(db, casStore, audioMixSvc),
+		VisualTextSvc:  visualTextSvc,
+		RenderSvc:      renderSvc,
+		BundleSvc:      service.NewBundleService(db, casStore, licSvc),
+		SnapshotSvc:    snapSvc,
 	})
 	go func() {
 		log.Printf("[RuntimeHost] API daemon listening on http://%s", addr)

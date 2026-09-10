@@ -575,6 +575,29 @@ func (m *mockCustomAnalyzer) AnalyzeAudioRoles(ctx context.Context, req service.
 	}, nil
 }
 
+type provenanceRoleAnalyzer struct {
+	pID     string
+	mName   string
+	mVer    string
+	cfgHash string
+	role    domain.AudioRole
+}
+
+func (a *provenanceRoleAnalyzer) AnalyzerInfo() (string, string, string, string) {
+	return a.pID, a.mName, a.mVer, a.cfgHash
+}
+
+func (a *provenanceRoleAnalyzer) AnalyzeAudioRoles(ctx context.Context, req service.AudioRoleAnalysisRequest) (*service.AudioRoleAnalysisResult, error) {
+	return &service.AudioRoleAnalysisResult{
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: req.DurationMs, Role: a.role},
+		},
+		ProviderID:   a.pID,
+		ModelName:    a.mName,
+		ModelVersion: a.mVer,
+	}, nil
+}
+
 func TestAudioRoleService_InjectedAnalyzerProvenance(t *testing.T) {
 	h := setupAudioRoleTestHarness(t)
 	ctx := context.Background()
@@ -644,6 +667,67 @@ func TestAudioRoleService_InjectedAnalyzerProvenance(t *testing.T) {
 	}
 	if idx.ProviderID != "vendor_audio_lab" || idx.ModelName != "deep_acoustic_role_classifier" {
 		t.Errorf("indexed metadata mismatch: %+v", idx)
+	}
+}
+
+func TestAudioRoleService_ProvenanceCacheReturnsExactArtifactAfterABASwitch(t *testing.T) {
+	h := setupAudioRoleTestHarness(t)
+	ctx := context.Background()
+
+	durationMs := int64(3000)
+	sampleRate := 16000
+	totalSamples := (sampleRate * int(durationMs)) / 1000
+	vocalSamples := make([]int16, totalSamples)
+	bgSamples := make([]int16, totalSamples)
+	assetID, _ := createControlledAsset(t, h, durationMs, vocalSamples, bgSamples)
+
+	analyzerA := &provenanceRoleAnalyzer{
+		pID:     "test_audio_role_provider",
+		mName:   "role_classifier",
+		mVer:    "v1",
+		cfgHash: "config-a",
+		role:    domain.AudioRoleNarrationDialogue,
+	}
+	analyzerB := &provenanceRoleAnalyzer{
+		pID:     "test_audio_role_provider",
+		mName:   "role_classifier",
+		mVer:    "v1",
+		cfgHash: "config-b",
+		role:    domain.AudioRoleAmbienceSFX,
+	}
+
+	h.audioRole.SetAnalyzer(analyzerA)
+	planA, err := h.audioRole.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{AssetID: assetID, RunID: uuid.NewString()})
+	if err != nil {
+		t.Fatalf("generate plan A: %v", err)
+	}
+
+	h.audioRole.SetAnalyzer(analyzerB)
+	planB, err := h.audioRole.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{AssetID: assetID, RunID: uuid.NewString()})
+	if err != nil {
+		t.Fatalf("generate plan B: %v", err)
+	}
+	if planA.ProvenanceHash == planB.ProvenanceHash {
+		t.Fatal("test setup requires distinct provenance hashes for A and B")
+	}
+
+	h.audioRole.SetAnalyzer(analyzerA)
+	planAAgain, err := h.audioRole.GenerateAudioRolePlan(ctx, service.AudioRolePlanInput{AssetID: assetID, RunID: uuid.NewString()})
+	if err != nil {
+		t.Fatalf("reuse plan A after B: %v", err)
+	}
+
+	if planAAgain.ID != planA.ID {
+		t.Fatalf("expected exact cached plan A ID %s, got %s", planA.ID, planAAgain.ID)
+	}
+	if planAAgain.ProvenanceHash != planA.ProvenanceHash {
+		t.Fatalf("expected plan A provenance %s, got %s", planA.ProvenanceHash, planAAgain.ProvenanceHash)
+	}
+	if planAAgain.CASHash != planA.CASHash {
+		t.Fatalf("expected plan A CAS hash %s, got %s", planA.CASHash, planAAgain.CASHash)
+	}
+	if len(planAAgain.Segments) != 1 || planAAgain.Segments[0].Role != domain.AudioRoleNarrationDialogue {
+		t.Fatalf("expected cached plan A dialogue segment, got %+v", planAAgain.Segments)
 	}
 }
 
