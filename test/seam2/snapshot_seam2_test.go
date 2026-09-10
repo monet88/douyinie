@@ -1679,7 +1679,7 @@ class Diarization3Dspeaker:
 	}
 }
 
-func TestSeam2_AudioRoleStage_YAMNet_StrictModeAndExecution(t *testing.T) {
+func TestSeam2_AudioRoleStage_YAMNet_StrictMode_FailClosed(t *testing.T) {
 	cacheRoot := t.TempDir()
 	yamnetDir := filepath.Join(cacheRoot, "yamnet")
 	if err := os.MkdirAll(yamnetDir, 0755); err != nil {
