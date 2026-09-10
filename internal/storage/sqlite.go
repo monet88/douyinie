@@ -2594,10 +2594,10 @@ func (s *DB) UpdateQueueStatus(ctx context.Context, runID, queueStatus, runStatu
 		if _, err := tx.ExecContext(ctx, stageSnapSQL, domain.StageStatusQueued, nowStr, runID); err != nil {
 			return fmt.Errorf("snap stages to queued on pause: %w", err)
 		}
-	case domain.RunStatusCancelled:
-		// Deliberate termination mid-execution is interrupted (same as crash recovery).
+	case domain.RunStatusCancelled, domain.RunStatusInterrupted:
+		// Deliberate termination or failure mid-execution is interrupted (same as crash recovery).
 		if _, err := tx.ExecContext(ctx, stageSnapSQL, domain.StageStatusInterrupted, nowStr, runID); err != nil {
-			return fmt.Errorf("snap stages to interrupted on cancel: %w", err)
+			return fmt.Errorf("snap stages to interrupted on %s: %w", queueStatus, err)
 		}
 	}
 
