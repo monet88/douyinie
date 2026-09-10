@@ -22,9 +22,13 @@ import (
 
 // createJobAndRun ingests synthetic media and creates a job + run, returning IDs.
 func createJobAndRun(t *testing.T, h *testHarness) (jobID, runID string) {
-	t.Helper()
-	mediaPath := createSyntheticMedia(t, h.dir, "queue_source.mp4")
+	return createJobAndRunWithDuration(t, h, 1.5)
+}
 
+// createJobAndRunWithDuration ingests synthetic media of specified duration and creates a job + run, returning IDs.
+func createJobAndRunWithDuration(t *testing.T, h *testHarness, durationSec float64) (jobID, runID string) {
+	t.Helper()
+	mediaPath := createSyntheticMediaWithDuration(t, h.dir, "queue_source.mp4", durationSec)
 	ingestPayload := map[string]any{
 		"file_path": mediaPath,
 		"attestation": map[string]any{

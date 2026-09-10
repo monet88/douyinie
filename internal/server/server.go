@@ -51,6 +51,7 @@ type Server struct {
 	translationSvc *service.TranslationService
 	dubbingSvc     *service.DubbingService
 	audioMixSvc    *service.AudioMixService
+	audioRoleSvc   *service.AudioRoleService
 	visualTextSvc  *service.VisualTextService
 	renderSvc      *service.RenderService
 	reviewSvc      *service.ReviewService
@@ -79,6 +80,7 @@ type Config struct {
 	TranslationSvc *service.TranslationService // Translation & Meaning-First Localization pipeline (T06)
 	DubbingSvc     *service.DubbingService     // TTS & Measured-Duration Dubbing pipeline (T14)
 	AudioMixSvc    *service.AudioMixService    // Audio stems + soundtrack preservation + dialogue-suppression mix (T15)
+	AudioRoleSvc   *service.AudioRoleService   // Automatic AudioRolePlan generation (Issue #80)
 	VisualTextSvc  *service.VisualTextService  // OCR detection, tracking, and TextRegionPlan (T09)
 	RenderSvc      *service.RenderService      // NativeRenderBackend + frozen RenderPlan + preview/final parity (T11)
 	ReviewSvc      *service.ReviewService      // Exception-only ReviewItem projection service (T16)
@@ -136,6 +138,9 @@ func New(cfg Config) *Server {
 	if cfg.AudioMixSvc != nil && cfg.Router != nil {
 		cfg.AudioMixSvc.ConfigureRouter(cfg.Router)
 	}
+	if cfg.AudioRoleSvc == nil && cfg.DB != nil && cfg.CASStore != nil {
+		cfg.AudioRoleSvc = service.NewAudioRoleService(cfg.DB, cfg.CASStore, cfg.AudioMixSvc)
+	}
 	if cfg.VisualTextSvc != nil {
 		if cfg.Router != nil {
 			cfg.VisualTextSvc.ConfigureRouter(cfg.Router)
@@ -161,6 +166,9 @@ func New(cfg Config) *Server {
 			cfg.ReviewSvc.SetRenderService(cfg.RenderSvc)
 		}
 	}
+	if cfg.AudioRoleSvc != nil && cfg.Router != nil {
+		cfg.AudioRoleSvc.ConfigureRouter(cfg.Router)
+	}
 	s := &Server{
 		db:             cfg.DB,
 		casStore:       cfg.CASStore,
@@ -179,6 +187,7 @@ func New(cfg Config) *Server {
 		translationSvc: cfg.TranslationSvc,
 		dubbingSvc:     cfg.DubbingSvc,
 		audioMixSvc:    cfg.AudioMixSvc,
+		audioRoleSvc:   cfg.AudioRoleSvc,
 		visualTextSvc:  cfg.VisualTextSvc,
 		renderSvc:      cfg.RenderSvc,
 		reviewSvc:      cfg.ReviewSvc,
@@ -243,6 +252,14 @@ func (s *Server) SetAudioMixService(svc *service.AudioMixService) {
 	}
 	if s.reviewSvc != nil {
 		s.reviewSvc.SetAudioMixService(svc)
+	}
+}
+
+// SetAudioRoleService sets or replaces the injected audio role service (Issue #80).
+func (s *Server) SetAudioRoleService(svc *service.AudioRoleService) {
+	s.audioRoleSvc = svc
+	if svc != nil && s.router != nil {
+		svc.ConfigureRouter(s.router)
 	}
 }
 
@@ -323,6 +340,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/assets/{id}", s.handleGetAsset)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/preflight", s.handleGetAssetPreflight)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/audio-role-plan", s.handleSaveAudioRolePlan)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/audio-role-plan/generate", s.handleGenerateAudioRolePlan)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/audio-role-plan", s.handleGetAudioRolePlan)
 
 	// Localization Jobs & Runs
@@ -713,6 +731,67 @@ func (s *Server) handleSaveAudioRolePlan(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusCreated, map[string]any{"audio_role_plan": plan})
 }
 
+func (s *Server) handleGenerateAudioRolePlan(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if _, err := s.db.GetSourceAsset(r.Context(), assetID); err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if s.audioRoleSvc == nil {
+		writeError(w, http.StatusInternalServerError, "audio role service is not configured")
+		return
+	}
+
+	var body struct {
+		RunID            string                  `json:"run_id,omitempty"`
+		JobID            string                  `json:"job_id,omitempty"`
+		ExecutionProfile domain.ExecutionProfile `json:"execution_profile,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	in := service.AudioRolePlanInput{
+		AssetID:          assetID,
+		RunID:            body.RunID,
+		JobID:            body.JobID,
+		ExecutionProfile: body.ExecutionProfile,
+	}
+	plan, err := s.audioRoleSvc.GenerateAudioRolePlan(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) || errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrAudioRoleAnalyzerUnavailable) ||
+			errors.Is(err, domain.ErrNoEligibleProvider) ||
+			errors.Is(err, domain.ErrPolicyBlocked) ||
+			errors.Is(err, domain.ErrLicenseManifestMissing) ||
+			errors.Is(err, domain.ErrSnapshotUnverified) ||
+			errors.Is(err, domain.ErrSnapshotDigestMismatch) ||
+			errors.Is(err, domain.ErrSnapshotMutatedRehashRequired) ||
+			errors.Is(err, domain.ErrSnapshotFileCorrupted) ||
+			errors.Is(err, domain.ErrAudioRoleModelAssetMissing) ||
+			errors.Is(err, domain.ErrCircuitOpen) {
+			writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("audio role analyzer unavailable: %v", err))
+			return
+		}
+		if errors.Is(err, domain.ErrAudioRolePreflightRequired) ||
+			errors.Is(err, domain.ErrAudioRoleEvidenceMissing) {
+			writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("audio role plan prerequisite missing: %v", err))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "generate audio role plan: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"audio_role_plan": plan})
+}
 func (s *Server) handleGetAudioRolePlan(w http.ResponseWriter, r *http.Request) {
 	assetID := r.PathValue("id")
 	plan, err := s.db.GetAudioRolePlan(r.Context(), assetID)
@@ -768,6 +847,40 @@ func (s *Server) handleRunSpeechUnderstand(w http.ResponseWriter, r *http.Reques
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+
+	// Automatic prerequisite generation on the normal production speech path:
+	// If no AudioRolePlan has been pre-seeded or generated for this asset,
+	// automatically generate and persist the canonical plan using production
+	// source analysis before invoking SpeechService.
+	if rolePlan == nil && s.audioRoleSvc != nil {
+		genPlan, err := s.audioRoleSvc.GenerateAudioRolePlan(r.Context(), service.AudioRolePlanInput{
+			AssetID: assetID,
+			RunID:   body.RunID,
+		})
+		if err != nil {
+			if errors.Is(err, domain.ErrAudioRoleAnalyzerUnavailable) ||
+				errors.Is(err, domain.ErrNoEligibleProvider) ||
+				errors.Is(err, domain.ErrPolicyBlocked) ||
+				errors.Is(err, domain.ErrLicenseManifestMissing) ||
+				errors.Is(err, domain.ErrSnapshotUnverified) ||
+				errors.Is(err, domain.ErrSnapshotDigestMismatch) ||
+				errors.Is(err, domain.ErrSnapshotMutatedRehashRequired) ||
+				errors.Is(err, domain.ErrSnapshotFileCorrupted) ||
+				errors.Is(err, domain.ErrAudioRoleModelAssetMissing) ||
+				errors.Is(err, domain.ErrCircuitOpen) {
+				writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("automatic audio role plan analyzer unavailable: %v", err))
+				return
+			}
+			if errors.Is(err, domain.ErrAudioRolePreflightRequired) ||
+				errors.Is(err, domain.ErrAudioRoleEvidenceMissing) {
+				writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("automatic audio role plan prerequisite missing: %v", err))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("automatic audio role plan generation failed: %v", err))
+			return
+		}
+		rolePlan = genPlan
 	}
 
 	// Resolve the source media from the asset's CAS metadata on the RuntimeHost

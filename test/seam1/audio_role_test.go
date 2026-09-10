@@ -4,15 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/provider"
+	"github.com/monet88/douyinie/internal/service"
+	"github.com/monet88/douyinie/internal/storage"
 )
 
 func getRoutingDecisions(t *testing.T, h *testHarness, runID, stage string) []domain.SelectionDecision {
@@ -844,5 +849,220 @@ func TestSeam1_NoDub_EndToEnd_Video1StyleFixture(t *testing.T) {
 	if preview.ConsumedPlan.SubtitlePlan.CASHash != final.ConsumedPlan.SubtitlePlan.CASHash {
 		t.Errorf("parity violation: SubtitlePlan CAS mismatch: preview=%s, final=%s",
 			preview.ConsumedPlan.SubtitlePlan.CASHash, final.ConsumedPlan.SubtitlePlan.CASHash)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Issue #80: Automatic Production AudioRolePlan Generation
+// ---------------------------------------------------------------------------
+
+func TestSeam1_AudioRolePlan_DedicatedGenerationEndpoint(t *testing.T) {
+	h := setupHarness(t)
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// 1. Call dedicated POST /api/v1/assets/{id}/audio-role-plan/generate
+	genResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan/generate", h.server.URL, assetID), "application/json", bytes.NewReader([]byte(`{"run_id":"`+runID+`"}`)))
+	if err != nil {
+		t.Fatalf("generate audio-role-plan request failed: %v", err)
+	}
+	defer genResp.Body.Close()
+	if genResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created from dedicated generation endpoint, got %d", genResp.StatusCode)
+	}
+
+	var res struct {
+		Plan domain.AudioRolePlan `json:"audio_role_plan"`
+	}
+	if err := json.NewDecoder(genResp.Body).Decode(&res); err != nil {
+		t.Fatalf("decode generated plan: %v", err)
+	}
+	if res.Plan.ID == "" || res.Plan.AssetID != assetID {
+		t.Fatalf("invalid generated plan: %+v", res.Plan)
+	}
+	if len(res.Plan.Segments) == 0 {
+		t.Fatalf("expected non-empty segments in generated plan")
+	}
+
+	// 2. Verify plan is persisted and retrievable via GET
+	getResp, err := http.Get(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID))
+	if err != nil {
+		t.Fatalf("get audio-role-plan failed: %v", err)
+	}
+	defer getResp.Body.Close()
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from GET audio-role-plan, got %d", getResp.StatusCode)
+	}
+
+	// 3. Verify governance records (SelectionDecision and ProviderAttempt)
+	decisions := getRoutingDecisions(t, h, runID, "audio_role_plan")
+	if len(decisions) == 0 {
+		t.Errorf("expected selection decisions for audio_role_plan stage")
+	}
+
+	attempts, err := h.db.ListProviderAttempts(context.Background(), runID, "audio_role_plan")
+	if err != nil {
+		t.Fatalf("list provider attempts: %v", err)
+	}
+	if len(attempts) == 0 {
+		t.Errorf("expected provider attempts for audio_role_plan stage")
+	}
+}
+
+func TestSeam1_SpeechUnderstand_AutomaticPrerequisiteGeneration(t *testing.T) {
+	h := setupHarness(t)
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// Verify no AudioRolePlan exists initially
+	_, err := h.db.GetAudioRolePlan(context.Background(), assetID)
+	if err == nil || !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected no AudioRolePlan initially, got err=%v", err)
+	}
+
+	// 1. Direct call to speech-understand WITHOUT calling any pre-generation endpoint!
+	// Normal production media must automatically generate and persist the canonical prerequisite.
+	speechBody, _ := json.Marshal(map[string]any{"run_id": runID})
+	speechResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/speech-understand", h.server.URL, assetID), "application/json", bytes.NewReader(speechBody))
+	if err != nil {
+		t.Fatalf("speech-understand request failed: %v", err)
+	}
+	defer speechResp.Body.Close()
+
+	// Must NOT fail with ErrAudioRolePlanRequired (it generated the plan automatically!)
+	if speechResp.StatusCode != http.StatusCreated && speechResp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 201 Created or 422 NoDubEligible, got status %d", speechResp.StatusCode)
+	}
+
+	// 2. Verify AudioRolePlan was automatically generated and persisted in the database
+	plan, err := h.db.GetAudioRolePlan(context.Background(), assetID)
+	if err != nil {
+		t.Fatalf("expected AudioRolePlan to be persisted after automatic prerequisite generation: %v", err)
+	}
+	if plan == nil || len(plan.Segments) == 0 {
+		t.Fatalf("expected non-empty persisted AudioRolePlan, got %+v", plan)
+	}
+
+	// 3. Verify governance records for audio_role_plan were recorded during prerequisite generation
+	decisions := getRoutingDecisions(t, h, runID, "audio_role_plan")
+	if len(decisions) == 0 {
+		t.Errorf("expected selection decision for automatically generated audio_role_plan")
+	}
+	attempts, err := h.db.ListProviderAttempts(context.Background(), runID, "audio_role_plan")
+	if err != nil {
+		t.Fatalf("list provider attempts: %v", err)
+	}
+	if len(attempts) == 0 {
+		t.Errorf("expected provider attempts for automatically generated audio_role_plan")
+	}
+
+	// 4. Verify SpeechService guard is NOT relaxed:
+	// If audio role service is disabled/unconfigured, speech-understand MUST fail closed with 422 ErrAudioRolePlanRequired
+	h.srv.SetAudioRoleService(nil)
+
+	jobID2, runID2 := createJobAndRun(t, h)
+	job2 := getJobViaAPI(t, h, jobID2)
+	assetID2 := job2.SourceAssetID
+
+	speechBody2, _ := json.Marshal(map[string]any{"run_id": runID2})
+	speechResp2, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/speech-understand", h.server.URL, assetID2), "application/json", bytes.NewReader(speechBody2))
+	if err != nil {
+		t.Fatalf("speech-understand request failed: %v", err)
+	}
+	defer speechResp2.Body.Close()
+	if speechResp2.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("expected fail-closed 422 Unprocessable Entity when audio role service is nil, got %d", speechResp2.StatusCode)
+	}
+}
+
+func TestSeam1_SpeechUnderstand_AudioRoleErrorClassification(t *testing.T) {
+	h := setupHarness(t)
+
+	// Case 1: AudioRoleService configured with NO analyzer and an empty router (no eligible provider)
+	// -> Automatic prerequisite generation fails with 503 Service Unavailable
+	audioMixSvc := service.NewAudioMixService(h.db, h.casStore)
+	emptyReg := provider.NewRegistry()
+	emptyRouter := provider.NewRouter(emptyReg, nil, nil, nil, nil, h.db)
+	emptyAudioRole := service.NewAudioRoleService(h.db, h.casStore, audioMixSvc)
+	emptyAudioRole.ConfigureRouter(emptyRouter)
+	h.srv.SetAudioRoleService(emptyAudioRole)
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	speechBody, err := json.Marshal(map[string]any{"run_id": runID})
+	if err != nil {
+		t.Fatalf("marshal speech body: %v", err)
+	}
+	speechResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/speech-understand", h.server.URL, assetID), "application/json", bytes.NewReader(speechBody))
+	if err != nil {
+		t.Fatalf("speech-understand request failed: %v", err)
+	}
+	defer speechResp.Body.Close()
+	bodyBytes, err := io.ReadAll(speechResp.Body)
+	if err != nil {
+		t.Fatalf("read speechResp body: %v", err)
+	}
+	if speechResp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable when audio role analyzer/provider is unavailable, got %d (body: %s)", speechResp.StatusCode, string(bodyBytes))
+	}
+
+	// Also verify dedicated generation endpoint returns 503
+	genResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan/generate", h.server.URL, assetID), "application/json", bytes.NewReader(speechBody))
+	if err != nil {
+		t.Fatalf("dedicated generate request failed: %v", err)
+	}
+	defer genResp.Body.Close()
+	if genResp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable from dedicated generate endpoint, got %d", genResp.StatusCode)
+	}
+
+	// Case 2: Source asset has NO preflight report in DB (truthful unseeded asset)
+	// -> Generation fails with 422 Unprocessable Entity
+	attID := uuid.NewString()
+	if err := h.db.CreateRightsAttestation(context.Background(), domain.RightsAttestation{
+		ID:              attID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+	unseededAsset := domain.SourceAsset{
+		ID:                  "asset-unseeded-" + uuid.NewString()[:8],
+		RightsAttestationID: attID,
+		SHA256:              "sha256-unseeded-asset-evidence-missing",
+		ByteSize:            1024,
+		CreatedAt:           time.Now().UTC(),
+	}
+	if err := h.db.CreateSourceAsset(context.Background(), unseededAsset); err != nil {
+		t.Fatalf("create unseeded source asset: %v", err)
+	}
+	speechBody2, err := json.Marshal(map[string]any{"run_id": uuid.NewString()})
+	if err != nil {
+		t.Fatalf("marshal speech body 2: %v", err)
+	}
+	resp2, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/speech-understand", h.server.URL, unseededAsset.ID), "application/json", bytes.NewReader(speechBody2))
+	if err != nil {
+		t.Fatalf("speech-understand request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity when preflight is missing, got %d", resp2.StatusCode)
+	}
+
+	// Also verify dedicated generation endpoint returns 422 for unseeded asset
+	genResp2, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan/generate", h.server.URL, unseededAsset.ID), "application/json", bytes.NewReader(speechBody2))
+	if err != nil {
+		t.Fatalf("dedicated generate request failed: %v", err)
+	}
+	defer genResp2.Body.Close()
+	if genResp2.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity from dedicated generate endpoint when preflight missing, got %d", genResp2.StatusCode)
 	}
 }

@@ -37,7 +37,7 @@ func TestSeam1_FullDub_VerticalSlice_EndToEnd(t *testing.T) {
 	h := setupHarness(t)
 
 	// 1. Create Job and Run (ingests media and completes preflight)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, runID := createJobAndRunWithDuration(t, h, 10.0)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -181,8 +181,77 @@ func TestSeam1_FullDub_VerticalSlice_EndToEnd(t *testing.T) {
 
 	// Invariant: Non-tautological acoustic signal verification from CAS audio samples
 	// Proves output audio behavior from actual CAS samples (T15 contract):
-	// - Outside speech windows: mixed output preserves original soundtrack background (1000)
-	// - Inside speech windows: source dialogue (4000) suppressed (0) + background (1000) + localized dub (5000) = 6000
+	// - Outside speech windows: mixed output preserves original soundtrack background
+	// - Inside speech windows: active dub matches background + localized dub (excluding vocals/dialogue);
+	//   after dub ends, mixed matches background while vocals remain suppressed.
+	var bgStem, vocalsStem domain.AudioStem
+	for _, s := range stems.Stems {
+		if s.Type == domain.StemTypeBackground {
+			bgStem = s
+		} else if s.Type == domain.StemTypeVocals {
+			vocalsStem = s
+		}
+	}
+	if bgStem.AudioCASHash == "" || vocalsStem.AudioCASHash == "" {
+		t.Fatalf("missing bg or vocals stem in stems artifact: %+v", stems)
+	}
+
+	rBG, err := h.casStore.Get(bgStem.AudioCASHash)
+	if err != nil {
+		t.Fatalf("failed to read bg stem from CAS (%s): %v", bgStem.AudioCASHash, err)
+	}
+	defer rBG.Close()
+	bgData, err := io.ReadAll(rBG)
+	if err != nil {
+		t.Fatalf("read bg stem bytes failed: %v", err)
+	}
+	bgSamples, _, err := media.ExtractPCM16Samples(bgData)
+	if err != nil {
+		t.Fatalf("extract bg PCM16 samples failed: %v", err)
+	}
+
+	rVocals, err := h.casStore.Get(vocalsStem.AudioCASHash)
+	if err != nil {
+		t.Fatalf("failed to read vocals stem from CAS (%s): %v", vocalsStem.AudioCASHash, err)
+	}
+	defer rVocals.Close()
+	vocalsData, err := io.ReadAll(rVocals)
+	if err != nil {
+		t.Fatalf("read vocals stem bytes failed: %v", err)
+	}
+	vocalsSamples, _, err := media.ExtractPCM16Samples(vocalsData)
+	if err != nil {
+		t.Fatalf("extract vocals PCM16 samples failed: %v", err)
+	}
+
+	rDub0, err := h.casStore.Get(dubSegmentsVariant.Segments[0].AudioSHA256)
+	if err != nil {
+		t.Fatalf("failed to read dub segment 0 from CAS: %v", err)
+	}
+	defer rDub0.Close()
+	dub0Data, err := io.ReadAll(rDub0)
+	if err != nil {
+		t.Fatalf("read dub segment 0 bytes failed: %v", err)
+	}
+	dub0Samples, _, err := media.ExtractPCM16Samples(dub0Data)
+	if err != nil {
+		t.Fatalf("extract dub segment 0 PCM16 samples failed: %v", err)
+	}
+
+	rDub1, err := h.casStore.Get(dubSegmentsVariant.Segments[1].AudioSHA256)
+	if err != nil {
+		t.Fatalf("failed to read dub segment 1 from CAS: %v", err)
+	}
+	defer rDub1.Close()
+	dub1Data, err := io.ReadAll(rDub1)
+	if err != nil {
+		t.Fatalf("read dub segment 1 bytes failed: %v", err)
+	}
+	dub1Samples, _, err := media.ExtractPCM16Samples(dub1Data)
+	if err != nil {
+		t.Fatalf("extract dub segment 1 PCM16 samples failed: %v", err)
+	}
+
 	rAudio, err := h.casStore.Get(dubMix.AudioCASHash)
 	if err != nil {
 		t.Fatalf("failed to read mixed audio from CAS (%s): %v", dubMix.AudioCASHash, err)
@@ -201,42 +270,67 @@ func TestSeam1_FullDub_VerticalSlice_EndToEnd(t *testing.T) {
 		t.Fatalf("invalid mixed audio sample rate: %d", mixRate)
 	}
 
-	// 1. Outside speech window (gap [3000ms, 3500ms] at t=3250ms): original BGM preserved (1000)
+	// 1. Outside speech window (gap [3000ms, 3500ms] at t=3250ms): original background preserved
 	sampleAtGap := mixedSamples[(mixRate*3250)/1000]
-	if sampleAtGap != 1000 {
-		t.Errorf("expected sample at 3250ms (outside speech window / gap) to preserve background 1000, got %d", sampleAtGap)
+	expectedAtGap := bgSamples[(mixRate*3250)/1000]
+	if sampleAtGap != expectedAtGap {
+		t.Errorf("expected sample at 3250ms (outside speech window / gap) to preserve background %d, got %d", expectedAtGap, sampleAtGap)
 	}
 
-	// 2. Outside speech window (outro [6500ms, 10000ms] at t=8000ms): original BGM preserved (1000)
+	// 2. Outside speech window (outro [6500ms, 10000ms] at t=8000ms): original background preserved
 	sampleAtOutro := mixedSamples[(mixRate*8000)/1000]
-	if sampleAtOutro != 1000 {
-		t.Errorf("expected sample at 8000ms (outside speech window / outro) to preserve background 1000, got %d", sampleAtOutro)
+	expectedAtOutro := bgSamples[(mixRate*8000)/1000]
+	if sampleAtOutro != expectedAtOutro {
+		t.Errorf("expected sample at 8000ms (outside speech window / outro) to preserve background %d, got %d", expectedAtOutro, sampleAtOutro)
 	}
 
-	// 3. Inside speech window 0 during active dub ([0ms, 1320ms] at t=500ms): dialogue suppressed (0) + bg (1000) + dub (5000) = 6000
-	sampleAtTurn0Active := mixedSamples[(mixRate*500)/1000]
-	if math.Abs(float64(sampleAtTurn0Active-6000)) > 50 {
-		t.Errorf("expected sample at 500ms (turn 0 active dub) to be ~6000 (bg 1000 + dub 5000), got %d", sampleAtTurn0Active)
+	// 3. Inside speech window 0 during active dub ([0ms, 1320ms] at t=500ms): dialogue suppressed + bg + dub
+	idx500 := (mixRate * 500) / 1000
+	sampleAtTurn0Active := mixedSamples[idx500]
+	dub0Idx500 := (mixRate * (500 - int(dubSegmentsVariant.Segments[0].StartMs))) / 1000
+	expectedTurn0Active := int16(int32(bgSamples[idx500]) + int32(dub0Samples[dub0Idx500]))
+	if math.Abs(float64(sampleAtTurn0Active-expectedTurn0Active)) > 50 {
+		t.Errorf("expected sample at 500ms (turn 0 active dub) to be ~%d (bg %d + dub %d), got %d",
+			expectedTurn0Active, bgSamples[idx500], dub0Samples[dub0Idx500], sampleAtTurn0Active)
+	}
+	if vocalsSamples[idx500] != 0 && sampleAtTurn0Active == expectedTurn0Active+vocalsSamples[idx500] {
+		t.Errorf("expected source vocals (%d) to be excluded from mixed output at 500ms", vocalsSamples[idx500])
 	}
 
-	// 4. Inside speech window 0 during natural gap ([1320ms, 3000ms] at t=2000ms): source dialogue (4000) suppressed to 0, leaving bg 1000
-	sampleAtTurn0Suppressed := mixedSamples[(mixRate*2000)/1000]
-	if sampleAtTurn0Suppressed != 1000 {
-		t.Errorf("expected sample at 2000ms (turn 0 dialogue suppressed) to be 1000, got %d", sampleAtTurn0Suppressed)
+	// 4. Inside speech window 0 during natural gap ([1320ms, 3000ms] at t=2000ms): source dialogue suppressed to 0, leaving bg
+	idx2000 := (mixRate * 2000) / 1000
+	sampleAtTurn0Suppressed := mixedSamples[idx2000]
+	expectedTurn0Suppressed := bgSamples[idx2000]
+	if sampleAtTurn0Suppressed != expectedTurn0Suppressed {
+		t.Errorf("expected sample at 2000ms (turn 0 dialogue suppressed) to match bg %d, got %d", expectedTurn0Suppressed, sampleAtTurn0Suppressed)
+	}
+	if vocalsSamples[idx2000] != 0 && sampleAtTurn0Suppressed == expectedTurn0Suppressed+vocalsSamples[idx2000] {
+		t.Errorf("expected source vocals (%d) to remain suppressed at 2000ms", vocalsSamples[idx2000])
 	}
 
-	// 5. Inside speech window 1 during active dub ([3500ms, 4820ms] at t=4000ms): dialogue suppressed (0) + bg (1000) + dub (5000) = 6000
-	sampleAtTurn1Active := mixedSamples[(mixRate*4000)/1000]
-	if math.Abs(float64(sampleAtTurn1Active-6000)) > 50 {
-		t.Errorf("expected sample at 4000ms (turn 1 active dub) to be ~6000 (bg 1000 + dub 5000), got %d", sampleAtTurn1Active)
+	// 5. Inside speech window 1 during active dub ([3500ms, 4820ms] at t=4000ms): dialogue suppressed + bg + dub
+	idx4000 := (mixRate * 4000) / 1000
+	sampleAtTurn1Active := mixedSamples[idx4000]
+	dub1Idx4000 := (mixRate * (4000 - int(dubSegmentsVariant.Segments[1].StartMs))) / 1000
+	expectedTurn1Active := int16(int32(bgSamples[idx4000]) + int32(dub1Samples[dub1Idx4000]))
+	if math.Abs(float64(sampleAtTurn1Active-expectedTurn1Active)) > 50 {
+		t.Errorf("expected sample at 4000ms (turn 1 active dub) to be ~%d (bg %d + dub %d), got %d",
+			expectedTurn1Active, bgSamples[idx4000], dub1Samples[dub1Idx4000], sampleAtTurn1Active)
+	}
+	if vocalsSamples[idx4000] != 0 && sampleAtTurn1Active == expectedTurn1Active+vocalsSamples[idx4000] {
+		t.Errorf("expected source vocals (%d) to be excluded from mixed output at 4000ms", vocalsSamples[idx4000])
 	}
 
-	// 6. Inside speech window 1 during natural gap ([4820ms, 6500ms] at t=5500ms): source dialogue (4000) suppressed to 0, leaving bg 1000
-	sampleAtTurn1Suppressed := mixedSamples[(mixRate*5500)/1000]
-	if sampleAtTurn1Suppressed != 1000 {
-		t.Errorf("expected sample at 5500ms (turn 1 dialogue suppressed) to be 1000, got %d", sampleAtTurn1Suppressed)
+	// 6. Inside speech window 1 during natural gap ([4820ms, 6500ms] at t=5500ms): source dialogue suppressed to 0, leaving bg
+	idx5500 := (mixRate * 5500) / 1000
+	sampleAtTurn1Suppressed := mixedSamples[idx5500]
+	expectedTurn1Suppressed := bgSamples[idx5500]
+	if sampleAtTurn1Suppressed != expectedTurn1Suppressed {
+		t.Errorf("expected sample at 5500ms (turn 1 dialogue suppressed) to match bg %d, got %d", expectedTurn1Suppressed, sampleAtTurn1Suppressed)
 	}
-
+	if vocalsSamples[idx5500] != 0 && sampleAtTurn1Suppressed == expectedTurn1Suppressed+vocalsSamples[idx5500] {
+		t.Errorf("expected source vocals (%d) to remain suppressed at 5500ms", vocalsSamples[idx5500])
+	}
 	detectBody, _ := json.Marshal(map[string]any{"run_id": runID})
 	respDetect, err := http.Post(
 		fmt.Sprintf("%s/api/v1/assets/%s/detect-text", h.server.URL, assetID),

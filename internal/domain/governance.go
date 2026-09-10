@@ -26,6 +26,8 @@ var (
 	ErrSnapshotEntrypointAmbiguous   = errors.New("fail-closed: expected manifest-declared GGUF entrypoint is ambiguous")
 	ErrTTSVoiceAssetMissing          = errors.New("fail-closed: selected voice asset missing or unverified in snapshot")
 	ErrSeparatorModelAssetMissing    = errors.New("fail-closed: selected separator model asset missing, unverified, or invalid in snapshot")
+	ErrAudioRoleModelAssetMissing    = errors.New("fail-closed: selected audio role model asset missing, unverified, or invalid in snapshot")
+	ErrAudioRoleAnalyzerUnavailable  = errors.New("fail-closed: production audio role analyzer unavailable or unverified")
 )
 
 // PolicyState represents the four governance states for provider/model routing.

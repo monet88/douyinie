@@ -51,6 +51,8 @@ func localWorkerProviderBase(p Provider) (*workerProviderBase, bool) {
 		return &v.workerProviderBase, true
 	case *WorkerTranslationProvider:
 		return &v.workerProviderBase, true
+	case *WorkerAudioRoleProvider:
+		return &v.workerProviderBase, true
 	default:
 		return nil, false
 	}

@@ -25,6 +25,7 @@ type RouteRequest struct {
 	RequiredFeatures      []string
 	ExcludedProviders     []string
 	PreferredProviderID   string
+	CandidateInputHash    func(p Provider) string // Optional per-candidate input hash generator for fallback provenance
 }
 
 // RouteResult returns the selected provider, fallback candidates, and the selection decision.
@@ -674,6 +675,12 @@ func (r *Router) ExecuteRoutedWithRetry(
 	attemptGlobal := 0
 
 	for idx, p := range candidates {
+		candInputHash := inputHash
+		if req.CandidateInputHash != nil {
+			if h := req.CandidateInputHash(p); h != "" {
+				candInputHash = h
+			}
+		}
 		modelName, modelVer := p.ModelInfo()
 		primaryRequired := primaryCheckpointRequired(p)
 		var effectivePolicy domain.PolicyState
@@ -759,7 +766,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 				ProviderID:    p.ID(),
 				ModelName:     modelName,
 				ModelVersion:  modelVer,
-				InputHash:     inputHash,
+				InputHash:     candInputHash,
 				AttemptNumber: attemptGlobal,
 				Status:        "circuit_broken",
 				ErrorMessage:  domain.ErrCircuitOpen.Error(),
@@ -829,7 +836,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 					ProviderID:    p.ID(),
 					ModelName:     modelName,
 					ModelVersion:  modelVer,
-					InputHash:     inputHash,
+					InputHash:     candInputHash,
 					AttemptNumber: attemptGlobal,
 					Status:        "succeeded",
 					LatencyMs:     latency,
@@ -867,7 +874,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 					ProviderID:    p.ID(),
 					ModelName:     modelName,
 					ModelVersion:  modelVer,
-					InputHash:     inputHash,
+					InputHash:     candInputHash,
 					AttemptNumber: attemptGlobal,
 					Status:        "policy_rejected",
 					ErrorMessage:  err.Error(),
@@ -893,7 +900,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 					ProviderID:    p.ID(),
 					ModelName:     modelName,
 					ModelVersion:  modelVer,
-					InputHash:     inputHash,
+					InputHash:     candInputHash,
 					AttemptNumber: attemptGlobal,
 					Status:        "quality_failed",
 					ErrorMessage:  err.Error(),
@@ -918,7 +925,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 				ProviderID:    p.ID(),
 				ModelName:     modelName,
 				ModelVersion:  modelVer,
-				InputHash:     inputHash,
+				InputHash:     candInputHash,
 				AttemptNumber: attemptGlobal,
 				Status:        "failed",
 				ErrorMessage:  err.Error(),

@@ -264,3 +264,78 @@ func TestRunTTSAdapter_VoicePresetValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestAudioRole_RunnerOverrideRejected_StrictMode(t *testing.T) {
+	t.Setenv("DOUYINIE_AUDIO_ROLE_BIN", "arbitrary_python_binary")
+	_, err := resolveAudioRoleRunner(true)
+	if err == nil || !strings.Contains(err.Error(), "AUDIO_ROLE_RUNNER_OVERRIDE_REJECTED") {
+		t.Fatalf("expected AUDIO_ROLE_RUNNER_OVERRIDE_REJECTED on strict snapshot route, got: %v", err)
+	}
+
+	t.Setenv("DOUYINIE_AUDIO_ROLE_BIN", "")
+	fakeAdapter := filepath.Join(t.TempDir(), "fake_audio_role.py")
+	if err := os.WriteFile(fakeAdapter, []byte("print('fake')\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DOUYINIE_AUDIO_ROLE_ADAPTER", fakeAdapter)
+	_, err = resolveAudioRoleRunner(true)
+	if err == nil || !strings.Contains(err.Error(), "AUDIO_ROLE_RUNNER_OVERRIDE_REJECTED") {
+		t.Fatalf("expected AUDIO_ROLE_RUNNER_OVERRIDE_REJECTED for arbitrary adapter on strict route, got: %v", err)
+	}
+
+	// Non-strict route allows test override
+	t.Setenv("DOUYINIE_AUDIO_ROLE_PYTHON_BIN", "python")
+	runner, err := resolveAudioRoleRunner(false)
+	if err != nil {
+		t.Fatalf("expected non-strict route to allow test adapter override, got: %v", err)
+	}
+	if len(runner.args) == 0 || runner.args[0] != fakeAdapter {
+		t.Fatalf("expected runner to use test adapter %s, got: %+v", fakeAdapter, runner)
+	}
+}
+
+func TestAudioRole_SourceMixNotMappedToVocalsWhenExplicitVocalsAbsent(t *testing.T) {
+	// Verify that when vocals_audio is not specified in config, cmd.Inputs[0] is NOT treated as isolated vocals.
+	// This ensures source-only fallback mode remains conservative.
+	dir := t.TempDir()
+	audio := filepath.Join(dir, "mix.wav")
+	if err := os.WriteFile(audio, []byte("fake wav"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := worker.Command{
+		ID:     "cmd-source-only",
+		Family: "audio_role",
+		Stage:  "audio_role",
+		Inputs: []worker.ArtifactRef{{Path: audio}},
+		Config: map[string]any{
+			"model_name": "yamnet",
+		},
+		OutputPath: filepath.Join(dir, "out.json"),
+	}
+
+	// Without vocals_audio in config, srcAudio must be cmd.Inputs[0].Path and vocalsAudio empty.
+	var vocalsAudio, bgAudio, srcAudio string
+	if va, ok := cmd.Config["vocals_audio"].(string); ok {
+		vocalsAudio = va
+	}
+	if ba, ok := cmd.Config["background_audio"].(string); ok {
+		bgAudio = ba
+	}
+	if sa, ok := cmd.Config["source_audio"].(string); ok {
+		srcAudio = sa
+	}
+	if len(cmd.Inputs) > 0 && srcAudio == "" {
+		srcAudio = cmd.Inputs[0].Path
+	}
+
+	if vocalsAudio != "" {
+		t.Fatalf("expected vocalsAudio to remain empty for source-only input, got %q", vocalsAudio)
+	}
+	if srcAudio != audio {
+		t.Fatalf("expected srcAudio to be mapped to cmd.Inputs[0].Path %q, got %q", audio, srcAudio)
+	}
+	if bgAudio != "" {
+		t.Fatalf("expected bgAudio to remain empty, got %q", bgAudio)
+	}
+}

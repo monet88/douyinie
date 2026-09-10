@@ -87,18 +87,42 @@ func (s *AudioMixService) SeparateAudio(ctx context.Context, input AudioSeparati
 	if strings.TrimSpace(input.AssetID) == "" {
 		return nil, errors.New("asset_id is required")
 	}
+	if s.db == nil {
+		return nil, errors.New("database is not configured")
+	}
 
-	asset, err := s.db.GetSourceAsset(ctx, input.AssetID)
-	if err != nil {
+	if _, err := s.db.GetSourceAsset(ctx, input.AssetID); err != nil {
 		return nil, fmt.Errorf("load source asset: %w", err)
 	}
+
+	report, err := s.db.GetPreflightReport(ctx, input.AssetID)
+	if err != nil {
+		return nil, fmt.Errorf("preflight report required for audio separation: %w", err)
+	}
+	if report.NormalizedAudioSHA256 == "" || report.NormalizedAudioCASPath == "" {
+		return nil, fmt.Errorf("normalized audio missing from preflight report for asset %s", input.AssetID)
+	}
+
+	normPath := report.NormalizedAudioCASPath
+	if _, err := os.Stat(normPath); err != nil && report.NormalizedAudioSHA256 != "" && s.cas != nil {
+		if p, err := s.cas.ResolvePath(report.NormalizedAudioSHA256); err == nil {
+			if _, err := os.Stat(p); err == nil {
+				normPath = p
+			}
+		}
+	}
+	f, err := os.Open(normPath)
+	if err != nil {
+		return nil, fmt.Errorf("normalized audio artifact missing or unreadable at %s: %w", normPath, err)
+	}
+	_ = f.Close()
 
 	rolePlan, _ := s.db.GetAudioRolePlan(ctx, input.AssetID)
 
 	// If router is available, pre-route to check for cached artifact by provenance across eligible order
 	sourceAudioRef := worker.ArtifactRef{
-		SHA256: asset.SHA256,
-		Path:   asset.CASPath,
+		SHA256: report.NormalizedAudioSHA256,
+		Path:   normPath,
 	}
 
 	req := provider.SeparationRequest{
@@ -160,7 +184,7 @@ func (s *AudioMixService) SeparateAudio(ctx context.Context, input AudioSeparati
 			}
 		}
 
-		err = s.router.ExecuteRoutedWithRetry(ctx, routeReq, routeRes, asset.SHA256, 3, func(p provider.Provider, attemptNum int) error {
+		err = s.router.ExecuteRoutedWithRetry(ctx, routeReq, routeRes, report.NormalizedAudioSHA256, 3, func(p provider.Provider, attemptNum int) error {
 			sepProv, ok := p.(provider.AudioSeparatorProvider)
 			if !ok {
 				return fmt.Errorf("provider %s does not implement AudioSeparatorProvider", p.ID())
