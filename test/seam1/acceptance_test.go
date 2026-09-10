@@ -43,7 +43,8 @@ func (h *testHarness) SetExecutor(exec server.Executor) {
 }
 
 type harnessOptions struct {
-	autoRunExecutor bool
+	autoRunExecutor   bool
+	audioRoleAnalyzer domain.AudioRoleAnalyzer
 }
 
 func setupHarnessWithOptions(t *testing.T, opts harnessOptions) *testHarness {
@@ -160,7 +161,11 @@ func newRuntimeHostWithOptions(t *testing.T, db *storage.DB, casStore *cas.Store
 	router := provider.NewRouter(fakeRegistry, polSvc, licSvc, credSvc, nil, db)
 
 	audioMixSvc := service.NewAudioMixService(db, casStore)
-	audioRoleSvc := service.NewAudioRoleServiceWithAnalyzer(db, casStore, audioMixSvc, service.NewDeterministicTestAudioRoleAnalyzer())
+	analyzer := opts.audioRoleAnalyzer
+	if analyzer == nil {
+		analyzer = service.NewDeterministicTestAudioRoleAnalyzer()
+	}
+	audioRoleSvc := service.NewAudioRoleServiceWithAnalyzer(db, casStore, audioMixSvc, analyzer)
 	return server.New(server.Config{
 		Addr:            "127.0.0.1:0",
 		DB:              db,

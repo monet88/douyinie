@@ -35,33 +35,36 @@ type Executor func(ctx context.Context, p provider.Provider, attemptNumber int) 
 const runtimeHostWriteTimeout = 30 * time.Minute
 
 type Server struct {
-	db             *storage.DB
-	casStore       *cas.Store
-	ingest         *service.IngestService
-	acquisition    *service.AcquisitionService
-	registry       *provider.Registry
-	policySvc      *governance.PolicyService
-	licenseSvc     *governance.LicenseService
-	credSvc        *governance.CredentialService
-	snapshotSvc    *governance.SnapshotService
-	router         *provider.Router
-	queueSvc       *queue.Service
-	scheduler      *scheduler.Scheduler
-	executor       Executor
-	speechSvc      *service.SpeechService
-	translationSvc *service.TranslationService
-	dubbingSvc     *service.DubbingService
-	audioMixSvc    *service.AudioMixService
-	audioRoleSvc   *service.AudioRoleService
-	visualTextSvc  *service.VisualTextService
-	renderSvc      *service.RenderService
-	reviewSvc      *service.ReviewService
-	bundleSvc      *service.BundleService
-	mux            *http.ServeMux
-	server         *http.Server
-	wakeChan       chan struct{}
-	consumerCancel context.CancelFunc
-	consumerWg     sync.WaitGroup
+	db              *storage.DB
+	casStore        *cas.Store
+	ingest          *service.IngestService
+	acquisition     *service.AcquisitionService
+	registry        *provider.Registry
+	policySvc       *governance.PolicyService
+	licenseSvc      *governance.LicenseService
+	credSvc         *governance.CredentialService
+	snapshotSvc     *governance.SnapshotService
+	router          *provider.Router
+	queueSvc        *queue.Service
+	scheduler       *scheduler.Scheduler
+	executor        Executor
+	speechSvc       *service.SpeechService
+	translationSvc  *service.TranslationService
+	dubbingSvc      *service.DubbingService
+	audioMixSvc     *service.AudioMixService
+	audioRoleSvc    *service.AudioRoleService
+	visualTextSvc   *service.VisualTextService
+	renderSvc       *service.RenderService
+	reviewSvc       *service.ReviewService
+	bundleSvc       *service.BundleService
+	mux             *http.ServeMux
+	server          *http.Server
+	wakeChan        chan struct{}
+	consumerCancel  context.CancelFunc
+	consumerWg      sync.WaitGroup
+	activeRunMu     sync.Mutex
+	activeRunID     string
+	activeRunCancel context.CancelFunc
 }
 
 // Config specifies initialization options for RuntimeHost Server.
@@ -364,6 +367,50 @@ func (s *Server) runConsumer(ctx context.Context) {
 	}
 }
 
+func (s *Server) shouldContinueRun(ctx context.Context, runID string) (bool, error) {
+	s.activeRunMu.Lock()
+	defer s.activeRunMu.Unlock()
+
+	lookupCtx := context.WithoutCancel(ctx)
+	entry, err := s.db.GetQueueEntryByRunID(lookupCtx, runID)
+	if err != nil {
+		return false, fmt.Errorf("check queue boundary for run %s: %w", runID, err)
+	}
+	switch entry.Status {
+	case domain.RunStatusRunning:
+		return true, nil
+	case domain.RunStatusPaused, domain.RunStatusCancelled, domain.RunStatusInterrupted:
+		return false, nil
+	default:
+		return false, fmt.Errorf("unexpected queue status %s for active run %s", entry.Status, runID)
+	}
+}
+
+func (s *Server) completeRunSafely(ctx context.Context, runID string) error {
+	s.activeRunMu.Lock()
+	defer s.activeRunMu.Unlock()
+
+	lookupCtx := context.WithoutCancel(ctx)
+	entry, err := s.db.GetQueueEntryByRunID(lookupCtx, runID)
+	if err != nil {
+		return fmt.Errorf("check queue status before completion for run %s: %w", runID, err)
+	}
+	switch entry.Status {
+	case domain.RunStatusRunning:
+		if err := s.db.UpdateQueueStatus(lookupCtx, runID, domain.RunStatusCompleted, domain.RunStatusCompleted); err != nil {
+			if failErr := s.failRun(lookupCtx, runID, "run_completion", fmt.Sprintf("failed to mark run completed: %v", err)); failErr != nil {
+				return fmt.Errorf("complete run failed: %v (failRun error: %w)", err, failErr)
+			}
+			return fmt.Errorf("complete run failed: %w", err)
+		}
+		return nil
+	case domain.RunStatusPaused, domain.RunStatusCancelled, domain.RunStatusInterrupted:
+		return nil
+	default:
+		return fmt.Errorf("unexpected queue status %s before completion for run %s", entry.Status, runID)
+	}
+}
+
 func (s *Server) drainQueue(ctx context.Context) {
 	if s.queueSvc == nil || s.db == nil {
 		return
@@ -380,8 +427,24 @@ func (s *Server) drainQueue(ctx context.Context) {
 			// Another run active or not queued anymore; stop this drain pass
 			return
 		}
-		if err := s.executeRun(ctx, entry.RunID, entry.JobID); err != nil {
-			log.Printf("[AutoRun] executeRun failed for run %s: %v; stopping queue drain", entry.RunID, err)
+		runCtx, runCancel := context.WithCancel(ctx)
+		s.activeRunMu.Lock()
+		s.activeRunID = entry.RunID
+		s.activeRunCancel = runCancel
+		s.activeRunMu.Unlock()
+
+		runErr := s.executeRun(runCtx, entry.RunID, entry.JobID)
+
+		s.activeRunMu.Lock()
+		if s.activeRunID == entry.RunID {
+			s.activeRunID = ""
+			s.activeRunCancel = nil
+		}
+		s.activeRunMu.Unlock()
+		runCancel()
+
+		if runErr != nil {
+			log.Printf("[AutoRun] executeRun failed for run %s: %v; stopping queue drain", entry.RunID, runErr)
 			return
 		}
 	}
@@ -423,6 +486,10 @@ func (s *Server) failStageAndInterrupt(ctx context.Context, se *domain.StageExec
 }
 
 func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
+	if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+		return err
+	}
+
 	job, err := s.db.GetJob(ctx, jobID)
 	if err != nil {
 		return s.failRun(ctx, runID, "job_lookup", fmt.Sprintf("failed to get job %s: %v", jobID, err))
@@ -437,6 +504,10 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 	rolePlan, err := s.db.GetAudioRolePlan(ctx, assetID)
 	if err != nil || rolePlan == nil {
 		if s.audioRoleSvc != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+
 			now := time.Now().UTC()
 			se := domain.StageExecution{
 				ID:        uuid.NewString(),
@@ -457,8 +528,15 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 				JobID:   jobID,
 			})
 			if genErr != nil {
+				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+					return err
+				}
 				return s.failStageAndInterrupt(ctx, &se, genErr)
 			}
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+
 			rolePlan = genPlan
 			se.Status = domain.StageStatusSucceeded
 			se.ArtifactSHA256 = genPlan.CASHash
@@ -473,6 +551,10 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		}
 	}
 
+	if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+		return err
+	}
+
 	// Zero-dialogue check: #82 dialogue execution is out of scope for #81.
 	// Fail closed and mark interrupted with a diagnostic StageExecution so the active run slot is released.
 	if domain.IsDubEligible(rolePlan) {
@@ -484,6 +566,10 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		return s.failRun(ctx, runID, "audio_mix", "AudioMixService is not configured")
 	}
 	{
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
 		now := time.Now().UTC()
 		se := domain.StageExecution{
 			ID:        uuid.NewString(),
@@ -505,8 +591,15 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 			TargetLanguage: targetLang,
 		})
 		if mixErr != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
 			return s.failStageAndInterrupt(ctx, &se, mixErr)
 		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
 		se.Status = domain.StageStatusSucceeded
 		se.ArtifactSHA256 = dubMix.CASHash
 		nowFin := time.Now().UTC()
@@ -523,6 +616,10 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		return s.failRun(ctx, runID, "visual_text", "VisualTextService is not configured")
 	}
 	{
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
 		now := time.Now().UTC()
 		seDetect := domain.StageExecution{
 			ID:        uuid.NewString(),
@@ -543,8 +640,15 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 			JobID:   jobID,
 		})
 		if detErr != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
 			return s.failStageAndInterrupt(ctx, &seDetect, detErr)
 		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
 		seDetect.Status = domain.StageStatusSucceeded
 		seDetect.ArtifactSHA256 = textPlan.CASHash
 		nowFin := time.Now().UTC()
@@ -552,6 +656,10 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		seDetect.UpdatedAt = nowFin
 		if err := s.db.UpdateStageExecution(ctx, seDetect); err != nil {
 			return s.failRun(ctx, runID, "text_detection", fmt.Sprintf("failed to record stage completion: %v", err))
+		}
+
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
 		}
 
 		seLoc := domain.StageExecution{
@@ -574,8 +682,15 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 			TargetLanguage: targetLang,
 		})
 		if locErr != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
 			return s.failStageAndInterrupt(ctx, &seLoc, locErr)
 		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
 		subtitleTrackCAS = visTrack.SubtitleTrackCAS
 		seLoc.Status = domain.StageStatusSucceeded
 		seLoc.ArtifactSHA256 = visTrack.CASHash
@@ -592,6 +707,10 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		return s.failRun(ctx, runID, "render_plan", "RenderService is not configured")
 	}
 	{
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
 		now := time.Now().UTC()
 		sePlan := domain.StageExecution{
 			ID:        uuid.NewString(),
@@ -614,8 +733,15 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 			SubtitlePlanCAS: subtitleTrackCAS,
 		})
 		if planErr != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
 			return s.failStageAndInterrupt(ctx, &sePlan, planErr)
 		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
 		sePlan.Status = domain.StageStatusSucceeded
 		sePlan.ArtifactSHA256 = renderPlan.CASHash
 		nowFin := time.Now().UTC()
@@ -623,6 +749,10 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		sePlan.UpdatedAt = nowFin
 		if err := s.db.UpdateStageExecution(ctx, sePlan); err != nil {
 			return s.failRun(ctx, runID, "render_plan", fmt.Sprintf("failed to record stage completion: %v", err))
+		}
+
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
 		}
 
 		sePrev := domain.StageExecution{
@@ -646,8 +776,15 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 			PlanProvenance: renderPlan.ProvenanceHash,
 		})
 		if prevErr != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
 			return s.failStageAndInterrupt(ctx, &sePrev, prevErr)
 		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
 		sePrev.Status = domain.StageStatusSucceeded
 		sePrev.ArtifactSHA256 = prevArtifact.CASHash
 		nowPrevFin := time.Now().UTC()
@@ -658,14 +795,8 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		}
 	}
 
-	// Complete the run
-	if err := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusCompleted, domain.RunStatusCompleted); err != nil {
-		if failErr := s.failRun(ctx, runID, "run_completion", fmt.Sprintf("failed to mark run completed: %v", err)); failErr != nil {
-			return fmt.Errorf("complete run failed: %v (failRun error: %w)", err, failErr)
-		}
-		return fmt.Errorf("complete run failed: %w", err)
-	}
-	return nil
+	// Complete the run atomically with state verification
+	return s.completeRunSafely(ctx, runID)
 }
 
 func (s *Server) routes() {
@@ -2011,7 +2142,13 @@ func (s *Server) handlePauseRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "queue service is not configured")
 		return
 	}
-	if err := s.queueSvc.Pause(r.Context(), id); err != nil {
+	s.activeRunMu.Lock()
+	err := s.queueSvc.Pause(r.Context(), id)
+	if err == nil && s.activeRunID == id && s.activeRunCancel != nil {
+		s.activeRunCancel()
+	}
+	s.activeRunMu.Unlock()
+	if err != nil {
 		if errors.Is(err, queue.ErrNotQueued) {
 			writeError(w, http.StatusConflict, err.Error())
 			return
@@ -2028,7 +2165,13 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "queue service is not configured")
 		return
 	}
-	if err := s.queueSvc.Cancel(r.Context(), id); err != nil {
+	s.activeRunMu.Lock()
+	err := s.queueSvc.Cancel(r.Context(), id)
+	if err == nil && s.activeRunID == id && s.activeRunCancel != nil {
+		s.activeRunCancel()
+	}
+	s.activeRunMu.Unlock()
+	if err != nil {
 		if errors.Is(err, queue.ErrNotQueued) {
 			writeError(w, http.StatusConflict, err.Error())
 			return
@@ -2053,6 +2196,7 @@ func (s *Server) handleResumeRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.wake()
 	writeJSON(w, http.StatusOK, map[string]any{"run_id": id, "status": domain.RunStatusQueued})
 }
 

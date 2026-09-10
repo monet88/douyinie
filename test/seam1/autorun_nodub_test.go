@@ -355,3 +355,188 @@ func TestSeam1_AutoRun_StartupDrainQueuedRun(t *testing.T) {
 		t.Fatalf("expected queued run to auto-complete on startup drain, got status %q", finalRun.Status)
 	}
 }
+
+// TestSeam1_AutoRun_ResumeWakesAndCompletes proves that resuming a paused run
+// transitions it back to queued and wakes the RuntimeHost consumer so it completes
+// without requiring another enqueue or daemon startup event.
+func TestSeam1_AutoRun_ResumeWakesAndCompletes(t *testing.T) {
+	tmpDir := t.TempDir()
+	casStore, err := cas.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("setup CAS store: %v", err)
+	}
+	db, err := storage.Open(filepath.Join(tmpDir, "douyinie_test.db"))
+	if err != nil {
+		t.Fatalf("setup SQLite: %v", err)
+	}
+	queueSvc := queue.NewService(db)
+	resScheduler := scheduler.New()
+
+	// Step 1: Create initial server with AutoRunExecutor FALSE to enqueue and pause without consumer running
+	srvDisabled, _, _ := newRuntimeHostWithOptions(t, db, casStore, queueSvc, resScheduler, harnessOptions{autoRunExecutor: false})
+	tsDisabled := httptest.NewServer(srvDisabled.Handler())
+
+	assetID := ingestSyntheticAsset(t, tsDisabled.URL, tmpDir, "resume_wake.mp4", 1.5)
+	postAudioRolePlan(t, tsDisabled.URL, assetID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleInstrumentalBgm},
+	})
+	jobID := createJob(t, tsDisabled.URL, assetID, domain.TargetLanguageVI)
+	runID := enqueueRun(t, tsDisabled.URL, jobID)
+
+	// Pause the queued run
+	pauseResp, err := http.Post(fmt.Sprintf("%s/api/v1/runs/%s/pause", tsDisabled.URL, runID), "application/json", nil)
+	if err != nil {
+		t.Fatalf("pause request failed: %v", err)
+	}
+	pauseResp.Body.Close()
+	if pauseResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for pause, got %d", pauseResp.StatusCode)
+	}
+
+	tsDisabled.Close()
+	_ = srvDisabled.Shutdown(context.Background())
+
+	// Step 2: Start new server with AutoRunExecutor TRUE over the same DB
+	srvEnabled, _, _ := newRuntimeHostWithOptions(t, db, casStore, queueSvc, resScheduler, harnessOptions{autoRunExecutor: true})
+	tsEnabled := httptest.NewServer(srvEnabled.Handler())
+	defer func() {
+		_ = srvEnabled.Shutdown(context.Background())
+		tsEnabled.Close()
+		_ = db.Close()
+	}()
+
+	// At startup, the run is paused, so startup drain does NOT execute it
+	time.Sleep(100 * time.Millisecond)
+	initCheck := pollRunStatus(t, tsEnabled.URL, runID, domain.RunStatusPaused, 500*time.Millisecond)
+	if initCheck.Status != domain.RunStatusPaused {
+		t.Fatalf("expected run to remain %q on startup, got %q", domain.RunStatusPaused, initCheck.Status)
+	}
+
+	// Call resume via API. It MUST wake the consumer and run to completed WITHOUT another enqueue!
+	resumeResp, err := http.Post(fmt.Sprintf("%s/api/v1/runs/%s/resume", tsEnabled.URL, runID), "application/json", nil)
+	if err != nil {
+		t.Fatalf("resume request failed: %v", err)
+	}
+	resumeResp.Body.Close()
+	if resumeResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for resume, got %d", resumeResp.StatusCode)
+	}
+
+	finalRun := pollRunStatus(t, tsEnabled.URL, runID, domain.RunStatusCompleted, 5*time.Second)
+	if finalRun.Status != domain.RunStatusCompleted {
+		t.Fatalf("expected resumed run to auto-complete, got %q", finalRun.Status)
+	}
+}
+
+type blockingAudioRoleAnalyzer struct {
+	startedCh chan struct{}
+	unblockCh chan struct{}
+}
+
+func (b *blockingAudioRoleAnalyzer) AnalyzerInfo() (string, string, string, string) {
+	return "blocking_analyzer", "blocking_model", "v1", "test"
+}
+
+func (b *blockingAudioRoleAnalyzer) AnalyzeAudioRoles(ctx context.Context, req domain.AudioRoleAnalysisRequest) (*domain.AudioRoleAnalysisResult, error) {
+	select {
+	case b.startedCh <- struct{}{}:
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-b.unblockCh:
+		return &domain.AudioRoleAnalysisResult{
+			Segments: []domain.AudioSegment{
+				{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleInstrumentalBgm},
+			},
+			ProviderID: "blocking_analyzer",
+		}, nil
+	}
+}
+
+// TestSeam1_AutoRun_PauseDuringExecutionCannotBecomeCompleted proves that pausing
+// an actively executing auto-run aborts execution and cannot be overwritten by a later completed transition.
+func TestSeam1_AutoRun_PauseDuringExecutionCannotBecomeCompleted(t *testing.T) {
+	analyzer := &blockingAudioRoleAnalyzer{
+		startedCh: make(chan struct{}, 1),
+		unblockCh: make(chan struct{}),
+	}
+	h := setupHarnessWithOptions(t, harnessOptions{
+		autoRunExecutor:   true,
+		audioRoleAnalyzer: analyzer,
+	})
+
+	assetID := ingestSyntheticAsset(t, h.server.URL, h.dir, "pause_active.mp4", 1.5)
+	jobID := createJob(t, h.server.URL, assetID, domain.TargetLanguageVI)
+	runID := enqueueRun(t, h.server.URL, jobID)
+
+	// Wait until analyzer has entered execution
+	select {
+	case <-analyzer.startedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for analyzer to start")
+	}
+
+	// Pause the run while in-flight
+	pauseResp, err := http.Post(fmt.Sprintf("%s/api/v1/runs/%s/pause", h.server.URL, runID), "application/json", nil)
+	if err != nil {
+		t.Fatalf("pause request failed: %v", err)
+	}
+	defer pauseResp.Body.Close()
+	if pauseResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for pause, got %d", pauseResp.StatusCode)
+	}
+
+	// Allow execution loop to settle
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify run status remains paused and did NOT become completed or interrupted
+	currentRun := pollRunStatus(t, h.server.URL, runID, domain.RunStatusPaused, 2*time.Second)
+	if currentRun.Status != domain.RunStatusPaused {
+		t.Fatalf("expected run status to remain %q, but got %q", domain.RunStatusPaused, currentRun.Status)
+	}
+}
+
+// TestSeam1_AutoRun_CancelDuringExecutionCannotBecomeCompleted proves that cancelling
+// an actively executing auto-run aborts execution and cannot be overwritten by a later completed transition.
+func TestSeam1_AutoRun_CancelDuringExecutionCannotBecomeCompleted(t *testing.T) {
+	analyzer := &blockingAudioRoleAnalyzer{
+		startedCh: make(chan struct{}, 1),
+		unblockCh: make(chan struct{}),
+	}
+	h := setupHarnessWithOptions(t, harnessOptions{
+		autoRunExecutor:   true,
+		audioRoleAnalyzer: analyzer,
+	})
+
+	assetID := ingestSyntheticAsset(t, h.server.URL, h.dir, "cancel_active.mp4", 1.5)
+	jobID := createJob(t, h.server.URL, assetID, domain.TargetLanguageVI)
+	runID := enqueueRun(t, h.server.URL, jobID)
+
+	// Wait until analyzer has entered execution
+	select {
+	case <-analyzer.startedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for analyzer to start")
+	}
+
+	// Cancel the run while in-flight
+	cancelResp, err := http.Post(fmt.Sprintf("%s/api/v1/runs/%s/cancel", h.server.URL, runID), "application/json", nil)
+	if err != nil {
+		t.Fatalf("cancel request failed: %v", err)
+	}
+	defer cancelResp.Body.Close()
+	if cancelResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for cancel, got %d", cancelResp.StatusCode)
+	}
+
+	// Allow execution loop to settle
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify run status remains cancelled and did NOT become completed or interrupted
+	currentRun := pollRunStatus(t, h.server.URL, runID, domain.RunStatusCancelled, 2*time.Second)
+	if currentRun.Status != domain.RunStatusCancelled {
+		t.Fatalf("expected run status to remain %q, but got %q", domain.RunStatusCancelled, currentRun.Status)
+	}
+}
