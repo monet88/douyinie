@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Douyinie Operator</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23e7ff57'/%3E%3Cpath d='M20 16h13c12 0 19 6 19 16s-7 16-19 16H20V16Zm13 24c7 0 11-3 11-8s-4-8-11-8h-5v16h5Z' fill='%23111400'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Điều hướng chính">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">D</div>
+        <div>
+          <strong>Douyinie</strong>
+          <span>Operator</span>
+        </div>
+      </div>
+
+      <nav class="nav-list">
+        <button class="nav-item is-active" data-view-target="new" type="button">
+          <span class="nav-index">01</span>
+          <span><strong>Job mới</strong><small>Nguồn → VI/EN</small></span>
+        </button>
+        <button class="nav-item" data-view-target="jobs" type="button">
+          <span class="nav-index">02</span>
+          <span><strong>Jobs & Queue</strong><small>Tiến độ pipeline</small></span>
+        </button>
+        <button class="nav-item" data-view-target="inspector" type="button">
+          <span class="nav-index">03</span>
+          <span><strong>Inspector</strong><small>Chỉ xử lý exception</small></span>
+        </button>
+        <button class="nav-item" data-view-target="result" type="button">
+          <span class="nav-index">04</span>
+          <span><strong>Kết quả</strong><small>Preview & final render</small></span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="runtime-state" id="runtime-state">
+          <span class="status-dot" aria-hidden="true"></span>
+          <div><strong>RuntimeHost</strong><span>Đang kiểm tra…</span></div>
+        </div>
+        <button class="text-button" id="refresh-all" type="button">Làm mới dữ liệu</button>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Local production workspace</p>
+          <h1 id="page-title">Tạo localization job</h1>
+        </div>
+        <div class="run-context" id="run-context">
+          <span>Run đang chọn</span>
+          <strong>Chưa chọn</strong>
+        </div>
+      </header>
+
+      <div class="view-stack">
+        <section class="view is-active" data-view="new" aria-labelledby="new-title">
+          <div class="hero-grid">
+            <div>
+              <p class="section-kicker">Bắt đầu</p>
+              <h2 id="new-title">Từ video nguồn đến bản VI/EN</h2>
+              <p class="lead">Dán URL Douyin hoặc chọn video trên máy để tạo job và đưa run vào RuntimeHost queue. Inspector hiển thị các exception do pipeline production tạo ra để operator xử lý đúng điểm cần quyết định.</p>
+            </div>
+            <div class="principle-card">
+              <span class="principle-label">Production translation</span>
+              <strong>Gemini 3.8 Flash</strong>
+              <span class="ladder-arrow">→</span>
+              <strong>DeepSeek V4 Flash Vision Exp</strong>
+              <small>Remote-only. Không dùng local LLM làm fallback dịch.</small>
+            </div>
+          </div>
+
+          <form class="panel form-panel" id="new-job-form">
+            <div class="form-section">
+              <div class="section-heading">
+                <span>01</span>
+                <div><h3>Nguồn video</h3><p>Chọn một trong hai cách nhập.</p></div>
+              </div>
+              <div class="segmented-control" role="group" aria-label="Loại nguồn video">
+                <button type="button" class="segment is-active" data-source-mode="douyin_url">Douyin URL</button>
+                <button type="button" class="segment" data-source-mode="local_file">File local</button>
+              </div>
+              <label class="field field-wide">
+                <span id="source-label">Douyin URL</span>
+                <input id="source-input" name="source" type="url" required autocomplete="off" placeholder="https://www.douyin.com/video/…">
+                <small id="source-help">Nguồn chỉ được acquire khi policy và quyền sử dụng hợp lệ.</small>
+              </label>
+            </div>
+
+            <div class="form-section two-column">
+              <div>
+                <div class="section-heading compact">
+                  <span>02</span>
+                  <div><h3>Ngôn ngữ đích</h3><p>Phase 1 hỗ trợ VI và EN.</p></div>
+                </div>
+                <div class="language-picker" role="radiogroup" aria-label="Ngôn ngữ đích">
+                  <label class="language-option is-selected"><input type="radio" name="target_language" value="vi" checked><strong>VI</strong><span>Tiếng Việt</span></label>
+                  <label class="language-option"><input type="radio" name="target_language" value="en"><strong>EN</strong><span>English</span></label>
+                </div>
+              </div>
+              <div>
+                <div class="section-heading compact">
+                  <span>03</span>
+                  <div><h3>Người vận hành</h3><p>Ghi vào audit trail.</p></div>
+                </div>
+                <label class="field">
+                  <span>Tên operator</span>
+                  <input id="operator-input" name="operator" type="text" value="local-operator" required autocomplete="off">
+                </label>
+              </div>
+            </div>
+
+            <div class="rights-row">
+              <label class="check-field">
+                <input id="rights-confirm" type="checkbox" required>
+                <span><strong>Tôi xác nhận có quyền xử lý media này.</strong><small>Douyinie lưu attestation vào job evidence; không bypass policy.</small></span>
+              </label>
+              <button class="primary-button" id="start-job" type="submit"><span>Tạo job & đưa vào queue</span><span aria-hidden="true">→</span></button>
+            </div>
+          </form>
+        </section>
+
+        <section class="view" data-view="jobs" aria-labelledby="jobs-title">
+          <div class="section-header-row">
+            <div><p class="section-kicker">Control plane</p><h2 id="jobs-title">Jobs & Queue</h2><p class="lead compact-lead">Theo dõi run hiện tại, stage đang chạy và điều khiển pause / resume / cancel.</p></div>
+            <button class="secondary-button" id="jobs-refresh" type="button">Refresh</button>
+          </div>
+
+          <div class="metric-grid">
+            <article class="metric-card"><span>Jobs</span><strong id="metric-jobs">0</strong><small>đã tạo</small></article>
+            <article class="metric-card"><span>Queue</span><strong id="metric-queue">0</strong><small>run được lưu</small></article>
+            <article class="metric-card"><span>Pending review</span><strong id="metric-review">0</strong><small>cần quyết định</small></article>
+          </div>
+
+          <div class="dashboard-grid">
+            <article class="panel">
+              <div class="panel-heading"><div><span class="section-kicker">Queue</span><h3>Runs</h3></div><span class="quiet" id="queue-summary">Không có run</span></div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Run</th><th>Job</th><th>Trạng thái</th><th>Vị trí</th><th></th></tr></thead>
+                  <tbody id="queue-body"><tr><td colspan="5" class="empty-cell">Chưa có dữ liệu queue.</td></tr></tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="panel run-panel">
+              <div class="panel-heading"><div><span class="section-kicker">Selected run</span><h3 id="run-title">Chưa chọn run</h3></div><span class="status-pill muted" id="run-status">—</span></div>
+              <dl class="detail-list" id="run-details">
+                <div><dt>Job</dt><dd>—</dd></div><div><dt>Target</dt><dd>—</dd></div><div><dt>Created</dt><dd>—</dd></div>
+              </dl>
+              <div class="run-actions">
+                <button class="secondary-button" data-run-action="pause" type="button" disabled>Pause</button>
+                <button class="secondary-button" data-run-action="resume" type="button" disabled>Resume</button>
+                <button class="danger-button" data-run-action="cancel" type="button" disabled>Cancel</button>
+              </div>
+              <div class="stage-list" id="stage-list"><div class="empty-state"><strong>Chưa có run được chọn.</strong><span>Chọn một run từ bảng bên trái.</span></div></div>
+            </article>
+          </div>
+
+          <article class="panel jobs-panel">
+            <div class="panel-heading"><div><span class="section-kicker">Library</span><h3>Localization jobs</h3></div></div>
+            <div class="job-cards" id="job-cards"><div class="empty-state"><strong>Chưa có job.</strong><span>Tạo job đầu tiên ở màn hình Job mới.</span></div></div>
+          </article>
+        </section>
+
+        <section class="view" data-view="inspector" aria-labelledby="inspector-title">
+          <div class="section-header-row">
+            <div><p class="section-kicker">Exception-only review</p><h2 id="inspector-title">Inspector</h2><p class="lead compact-lead">Không chỉnh timeline toàn cục. Chỉ sửa đúng segment, voice hoặc text region bị quality gate đánh dấu.</p></div>
+            <label class="toggle-field"><input id="include-resolved" type="checkbox"><span>Hiện đã xử lý</span></label>
+          </div>
+
+          <div class="inspector-layout">
+            <aside class="panel exception-panel">
+              <div class="panel-heading"><div><span class="section-kicker">Exceptions</span><h3 id="exception-count">0 pending</h3></div></div>
+              <div class="exception-list" id="exception-list"><div class="empty-state"><strong>Chưa có exception.</strong><span>Chọn run để tải review queue.</span></div></div>
+            </aside>
+
+            <article class="panel inspector-panel">
+              <div id="inspector-empty" class="inspector-empty">
+                <div class="empty-glyph">⌁</div>
+                <strong>Chọn một exception để xử lý</strong>
+                <p>Mỗi thay đổi tạo candidate mới và chỉ rerun descendant stages liên quan.</p>
+              </div>
+
+              <div id="inspector-editor" class="hidden">
+                <div class="inspector-header">
+                  <div><span class="status-pill" id="inspect-severity">warning</span><h3 id="inspect-title">Exception</h3><p id="inspect-reason"></p></div>
+                  <span class="mono" id="inspect-id"></span>
+                </div>
+                <dl class="detail-list three" id="inspect-meta"></dl>
+
+                <div class="editor-tabs" role="tablist" aria-label="Loại sửa">
+                  <button type="button" class="editor-tab is-active" data-editor-tab="accept">Accept</button>
+                  <button type="button" class="editor-tab" data-editor-tab="text">Sửa text</button>
+                  <button type="button" class="editor-tab" data-editor-tab="voice">Đổi voice</button>
+                  <button type="button" class="editor-tab" data-editor-tab="region">Chỉnh region</button>
+                </div>
+
+                <form class="editor-form" data-editor-panel="accept" id="accept-form">
+                  <div class="callout"><strong>Manual override không đổi QA lịch sử thành PASS.</strong><span>Quyết định được ghi append-only với lý do và operator.</span></div>
+                  <label class="field"><span>Lý do chấp nhận</span><textarea id="accept-reason" rows="4" required placeholder="Ví dụ: subtitle hiện tại vẫn đọc rõ và không che nội dung chính…"></textarea></label>
+                  <button class="primary-button" type="submit">Chấp nhận có audit</button>
+                </form>
+
+                <form class="editor-form hidden" data-editor-panel="text" id="text-form">
+                  <div class="form-grid">
+                    <label class="field"><span>Segment index</span><input id="text-segment-index" type="number" min="0" required></label>
+                    <label class="field field-span-2"><span>Target text mới</span><textarea id="text-target" rows="4" required></textarea></label>
+                    <label class="field field-span-2"><span>Lý do</span><input id="text-reason" type="text" value="Operator corrected translation from Inspector"></label>
+                  </div>
+                  <button class="primary-button" type="submit">Lưu & targeted rerun</button>
+                </form>
+
+                <form class="editor-form hidden" data-editor-panel="voice" id="voice-form">
+                  <div class="form-grid">
+                    <label class="field"><span>Speaker ID</span><input id="voice-speaker" type="text" required></label>
+                    <label class="field"><span>Profile ID</span><input id="voice-profile-id" type="text" required placeholder="kokoro_en_female_1"></label>
+                    <label class="field"><span>Provider ID</span><input id="voice-provider-id" type="text" required placeholder="kokoro_tts_en"></label>
+                    <label class="field"><span>Voice ID</span><input id="voice-engine-id" type="text" required placeholder="af_heart"></label>
+                    <label class="field"><span>Tên hiển thị</span><input id="voice-name" type="text" required placeholder="Warm female"></label>
+                    <label class="field"><span>Language</span><select id="voice-language"><option value="vi">vi</option><option value="en">en</option></select></label>
+                    <label class="field field-span-2"><span>Lý do</span><input id="voice-reason" type="text" value="Operator reassigned voice from Inspector"></label>
+                  </div>
+                  <button class="primary-button" type="submit">Đổi voice & targeted rerun</button>
+                </form>
+
+                <form class="editor-form hidden" data-editor-panel="region" id="region-form">
+                  <div class="form-grid region-grid">
+                    <label class="field field-span-2"><span>Region ID</span><input id="region-id" type="text" required></label>
+                    <label class="field"><span>Δ X</span><input id="region-dx" type="number" value="0"></label>
+                    <label class="field"><span>Δ Y</span><input id="region-dy" type="number" value="0"></label>
+                    <label class="field"><span>Δ Width</span><input id="region-dw" type="number" value="0"></label>
+                    <label class="field"><span>Δ Height</span><input id="region-dh" type="number" value="0"></label>
+                    <label class="field field-span-2"><span>Reclassify</span><select id="region-role"><option value="">Giữ nguyên</option><option value="speech_subtitle">speech_subtitle</option><option value="semantic_text">semantic_text</option><option value="instructional_ui_text">instructional_ui_text</option><option value="brand_keep">brand_keep</option><option value="ignore/noise">ignore/noise</option><option value="uncertain">uncertain</option></select></label>
+                    <label class="field field-span-2"><span>Text mới (tùy chọn)</span><input id="region-text" type="text"></label>
+                    <label class="field field-span-2"><span>Lý do</span><input id="region-reason" type="text" value="Operator adjusted text region from Inspector"></label>
+                  </div>
+                  <button class="primary-button" type="submit">Áp dụng & targeted rerun</button>
+                </form>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" data-view="result" aria-labelledby="result-title">
+          <div class="section-header-row">
+            <div><p class="section-kicker">Render handoff</p><h2 id="result-title">Kết quả</h2><p class="lead compact-lead">Queue phải về zero trước khi final render trong Review mode.</p></div>
+            <button class="secondary-button" id="result-refresh" type="button">Refresh result</button>
+          </div>
+
+          <div class="result-grid">
+            <article class="panel result-preview">
+              <div class="media-placeholder" id="media-placeholder">
+                <div class="media-icon">▶</div>
+                <strong>Preview render</strong>
+                <span>Chưa có preview artifact cho run đang chọn.</span>
+              </div>
+              <div class="artifact-details" id="preview-details"></div>
+            </article>
+
+            <article class="panel result-actions">
+              <div class="panel-heading"><div><span class="section-kicker">Readiness</span><h3>Final render</h3></div><span class="status-pill muted" id="handoff-status">Chưa kiểm tra</span></div>
+              <div class="handoff-box" id="handoff-box"><strong>Chọn run trước.</strong><span>Douyinie sẽ kiểm tra pending review items trước khi cho phép render.</span></div>
+              <button class="primary-button full" id="check-handoff" type="button" disabled>Kiểm tra final-render handoff</button>
+              <button class="secondary-button full" id="start-final-render" type="button" disabled>Bắt đầu final render</button>
+              <div class="artifact-details" id="final-details"></div>
+            </article>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <script type="module" src="/ui/app.js"></script>
+</body>
+</html>

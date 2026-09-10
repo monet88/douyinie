@@ -325,6 +325,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) routes() {
+	// Browser-on-localhost operator shell (Queue + Inspector).
+	s.mux.HandleFunc("GET /{$}", s.handleOperatorUIIndex)
+	s.mux.HandleFunc("GET /ui/{asset}", s.handleOperatorUIAsset)
+
 	// Health checks
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)
@@ -335,6 +339,7 @@ func (s *Server) routes() {
 
 	// Source Asset Ingest & Retrieval
 	s.mux.HandleFunc("POST /api/v1/assets/ingest", s.handleIngestAsset)
+	s.mux.HandleFunc("POST /api/v1/assets/upload", s.handleUploadAsset)
 	s.mux.HandleFunc("POST /api/v1/sources/probe", s.handleProbeSource)
 	s.mux.HandleFunc("POST /api/v1/sources/acquire", s.handleAcquireSource)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}", s.handleGetAsset)
@@ -441,8 +446,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/render-plan", s.handleGetRenderPlan)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/render/preview", s.handleRenderPreview)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/render/preview", s.handleGetRenderPreview)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/render/preview/media", s.handleGetRenderPreviewMedia)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/render/final", s.handleRenderFinal)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/render/final", s.handleGetRenderFinal)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/render/final/media", s.handleGetRenderFinalMedia)
 	// Exception-only Review Items Projection & Approval Overrides (T16, T19)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/review-items", s.handleGetReviewItems)
 	s.mux.HandleFunc("GET /api/v1/runs/{id}/review-items", s.handleGetRunReviewItems)
@@ -2876,14 +2883,35 @@ func (s *Server) handleRenderPreview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"preview_render": artifact})
 }
 
+func (s *Server) resolveRenderArtifactIndex(ctx context.Context, assetID, runID, targetLang, kind string) (*storage.RenderArtifactIndex, error) {
+	if runID != "" {
+		indices, err := s.db.GetRenderArtifactIndicesByRun(ctx, runID)
+		if err != nil {
+			return nil, err
+		}
+		for i := len(indices) - 1; i >= 0; i-- {
+			idx := indices[i]
+			if idx.Kind == kind && (targetLang == "" || idx.TargetLanguage == targetLang) {
+				if assetID != "" && idx.AssetID != assetID {
+					return nil, storage.ErrNotFound
+				}
+				return &idx, nil
+			}
+		}
+		return nil, storage.ErrNotFound
+	}
+	return s.db.GetLatestRenderArtifactIndex(ctx, assetID, targetLang, kind)
+}
+
 func (s *Server) handleGetRenderPreview(w http.ResponseWriter, r *http.Request) {
 	assetID := r.PathValue("id")
 	targetLang := r.URL.Query().Get("target_language")
 	if targetLang == "" {
 		targetLang = "vi"
 	}
+	runID := r.URL.Query().Get("run_id")
 
-	idx, err := s.db.GetLatestRenderArtifactIndex(r.Context(), assetID, targetLang, domain.RenderKindPreview)
+	idx, err := s.resolveRenderArtifactIndex(r.Context(), assetID, runID, targetLang, domain.RenderKindPreview)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "preview render artifact not found")
@@ -2967,8 +2995,9 @@ func (s *Server) handleGetRenderFinal(w http.ResponseWriter, r *http.Request) {
 	if targetLang == "" {
 		targetLang = "vi"
 	}
+	runID := r.URL.Query().Get("run_id")
 
-	idx, err := s.db.GetLatestRenderArtifactIndex(r.Context(), assetID, targetLang, domain.RenderKindFinal)
+	idx, err := s.resolveRenderArtifactIndex(r.Context(), assetID, runID, targetLang, domain.RenderKindFinal)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "final render artifact not found")

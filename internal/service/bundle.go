@@ -797,11 +797,22 @@ func (s *BundleService) ImportBundle(ctx context.Context, r io.ReaderAt, size in
 						ID:             rad.Preview.ID,
 						AssetID:        rad.Preview.AssetID,
 						RunID:          rad.Preview.RunID,
+						JobID:          rad.Preview.JobID,
 						TargetLanguage: rad.Preview.TargetLanguage,
 						Kind:           "preview",
+						PlanProvenance: rad.Preview.ConsumedPlan.PlanProvenanceHash,
+						PlanCASHash:    rad.Preview.ConsumedPlan.PlanCASHash,
+						OutputCASHash:  rad.Preview.OutputCASHash,
 						CASHash:        obj.SHA256,
 						ProvenanceHash: rad.Preview.ProvenanceHash,
+						OverallStatus:  rad.Preview.OverallStatus,
 						CreatedAt:      rad.Preview.CreatedAt,
+					}
+					if idx.JobID == "" {
+						idx.JobID = runData.Run.JobID
+					}
+					if idx.OverallStatus == "" {
+						idx.OverallStatus = "PASS"
 					}
 					_ = s.db.UpsertRenderArtifactIndex(ctx, idx)
 				}
@@ -816,11 +827,22 @@ func (s *BundleService) ImportBundle(ctx context.Context, r io.ReaderAt, size in
 						ID:             rad.Final.ID,
 						AssetID:        rad.Final.AssetID,
 						RunID:          rad.Final.RunID,
+						JobID:          rad.Final.JobID,
 						TargetLanguage: rad.Final.TargetLanguage,
 						Kind:           "final",
+						PlanProvenance: rad.Final.ConsumedPlan.PlanProvenanceHash,
+						PlanCASHash:    rad.Final.ConsumedPlan.PlanCASHash,
+						OutputCASHash:  rad.Final.OutputCASHash,
 						CASHash:        obj.SHA256,
 						ProvenanceHash: rad.Final.ProvenanceHash,
+						OverallStatus:  rad.Final.OverallStatus,
 						CreatedAt:      rad.Final.CreatedAt,
+					}
+					if idx.JobID == "" {
+						idx.JobID = runData.Run.JobID
+					}
+					if idx.OverallStatus == "" {
+						idx.OverallStatus = "PASS"
 					}
 					_ = s.db.UpsertRenderArtifactIndex(ctx, idx)
 				}

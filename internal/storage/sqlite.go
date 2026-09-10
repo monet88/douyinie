@@ -4861,7 +4861,7 @@ func (s *DB) GetRenderArtifactIndicesByRun(ctx context.Context, runID string) ([
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	query := `SELECT id, asset_id, run_id, target_language, kind, cas_hash, provenance_hash, created_at
+	query := `SELECT id, asset_id, run_id, target_language, kind, output_cas_hash, cas_hash, provenance_hash, created_at
 		FROM render_artifacts WHERE run_id = ? ORDER BY created_at ASC`
 	rows, err := s.db.QueryContext(ctx, query, runID)
 	if err != nil {
@@ -4873,7 +4873,7 @@ func (s *DB) GetRenderArtifactIndicesByRun(ctx context.Context, runID string) ([
 	for rows.Next() {
 		var idx RenderArtifactIndex
 		var createdStr string
-		if err := rows.Scan(&idx.ID, &idx.AssetID, &idx.RunID, &idx.TargetLanguage, &idx.Kind, &idx.CASHash, &idx.ProvenanceHash, &createdStr); err != nil {
+		if err := rows.Scan(&idx.ID, &idx.AssetID, &idx.RunID, &idx.TargetLanguage, &idx.Kind, &idx.OutputCASHash, &idx.CASHash, &idx.ProvenanceHash, &createdStr); err != nil {
 			return nil, fmt.Errorf("scan render artifact index: %w", err)
 		}
 		idx.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
@@ -5353,19 +5353,29 @@ func (s *DB) UpsertRenderArtifactIndex(ctx context.Context, idx RenderArtifactIn
 	defer s.mu.Unlock()
 
 	query := `
-		INSERT INTO render_artifacts (id, asset_id, run_id, target_language, kind, cas_hash, provenance_hash, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO render_artifacts (
+			id, asset_id, run_id, job_id, target_language, kind,
+			plan_provenance, plan_cas_hash, output_cas_hash, cas_hash, provenance_hash,
+			overall_status, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			asset_id = excluded.asset_id,
 			run_id = excluded.run_id,
+			job_id = excluded.job_id,
 			target_language = excluded.target_language,
 			kind = excluded.kind,
+			plan_provenance = excluded.plan_provenance,
+			plan_cas_hash = excluded.plan_cas_hash,
+			output_cas_hash = excluded.output_cas_hash,
 			cas_hash = excluded.cas_hash,
 			provenance_hash = excluded.provenance_hash,
+			overall_status = excluded.overall_status,
 			created_at = excluded.created_at
 	`
 	_, err := s.db.ExecContext(ctx, query,
-		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.Kind, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+		idx.ID, idx.AssetID, idx.RunID, idx.JobID, idx.TargetLanguage, idx.Kind,
+		idx.PlanProvenance, idx.PlanCASHash, idx.OutputCASHash, idx.CASHash, idx.ProvenanceHash,
+		idx.OverallStatus, idx.CreatedAt.Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert render artifact index: %w", err)
