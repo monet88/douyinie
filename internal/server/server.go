@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -226,6 +227,11 @@ func New(cfg Config) *Server {
 // SetExecutor sets or replaces the injected execution seam (e.g. for Seam 1 retry/fallback testing).
 func (s *Server) SetExecutor(exec Executor) {
 	s.executor = exec
+}
+
+// SetCASStore sets or replaces the injected CAS store (e.g. for testing storage failure paths).
+func (s *Server) SetCASStore(store *cas.Store) {
+	s.casStore = store
 }
 
 // SetSpeechService sets or replaces the injected speech understanding pipeline (T08).
@@ -500,6 +506,32 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		targetLang = domain.TargetLanguageVI
 	}
 
+	// Validate run config snapshot and posture fail-closed
+	posture := domain.ReviewPostureAuto
+	run, err := s.db.GetRun(ctx, runID)
+	if err != nil {
+		return s.failRun(ctx, runID, "run_config", fmt.Sprintf("failed to get run %s: %v", runID, err))
+	}
+	if run != nil && strings.TrimSpace(run.ConfigSnapshotJSON) != "" {
+		var cfg struct {
+			Posture       domain.ReviewPosture `json:"posture"`
+			ReviewPosture domain.ReviewPosture `json:"review_posture"`
+		}
+		if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
+			return s.failRun(ctx, runID, "run_config", fmt.Sprintf("malformed run config snapshot JSON: %v", err))
+		}
+		p := cfg.Posture
+		if p == "" {
+			p = cfg.ReviewPosture
+		}
+		if p != "" {
+			if p != domain.ReviewPostureAuto && p != domain.ReviewPostureReview {
+				return s.failRun(ctx, runID, "run_config", fmt.Sprintf("invalid run posture: %q", p))
+			}
+			posture = p
+		}
+	}
+
 	// 1. AudioRolePlan
 	rolePlan, err := s.db.GetAudioRolePlan(ctx, assetID)
 	if err != nil || rolePlan == nil {
@@ -555,10 +587,268 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		return err
 	}
 
-	// Zero-dialogue check: #82 dialogue execution is out of scope for #81.
-	// Fail closed and mark interrupted with a diagnostic StageExecution so the active run slot is released.
+	var dubSegmentsCAS string
 	if domain.IsDubEligible(rolePlan) {
-		return s.failRun(ctx, runID, "dialogue_execution", "zero-dialogue auto-runner encountered dub-eligible dialogue (dialogue auto-run requires #82)")
+		// 2a. Speech Understand (T08)
+		if s.speechSvc == nil {
+			return s.failRun(ctx, runID, "speech_understand", "SpeechService is not configured")
+		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		asset, assetErr := s.db.GetSourceAsset(ctx, assetID)
+		if assetErr != nil {
+			return s.failRun(ctx, runID, "speech_understand", fmt.Sprintf("failed to get source asset: %v", assetErr))
+		}
+		if strings.TrimSpace(asset.CASPath) == "" {
+			return s.failRun(ctx, runID, "speech_understand", "asset has no source media in CAS to process")
+		}
+
+		nowSpeech := time.Now().UTC()
+		seSpeech := domain.StageExecution{
+			ID:        uuid.NewString(),
+			RunID:     runID,
+			Stage:     "speech_understand",
+			Status:    domain.StageStatusRunning,
+			StartedAt: &nowSpeech,
+			CreatedAt: nowSpeech,
+			UpdatedAt: nowSpeech,
+		}
+		if err := s.db.CreateStageExecution(ctx, seSpeech); err != nil {
+			return s.failRun(ctx, runID, "speech_understand", fmt.Sprintf("failed to record stage start: %v", err))
+		}
+
+		transcriptArtifact, speechErr := s.speechSvc.RunPipeline(ctx, domain.SpeechPipelineInput{
+			RunID:         runID,
+			AssetID:       assetID,
+			AudioPath:     asset.CASPath,
+			AudioSHA256:   asset.SHA256,
+			AudioRolePlan: rolePlan,
+		})
+		if speechErr != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+			return s.failStageAndInterrupt(ctx, &seSpeech, speechErr)
+		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		seSpeech.Status = domain.StageStatusSucceeded
+		seSpeech.ArtifactSHA256 = transcriptArtifact.CASHash
+		nowSpeechFin := time.Now().UTC()
+		seSpeech.CompletedAt = &nowSpeechFin
+		seSpeech.UpdatedAt = nowSpeechFin
+		if err := s.db.UpdateStageExecution(ctx, seSpeech); err != nil {
+			return s.failRun(ctx, runID, "speech_understand", fmt.Sprintf("failed to record stage completion: %v", err))
+		}
+
+		// 2b. Translation (T06)
+		if s.translationSvc == nil {
+			return s.failRun(ctx, runID, "translation", "TranslationService is not configured")
+		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		nowTrans := time.Now().UTC()
+		seTrans := domain.StageExecution{
+			ID:        uuid.NewString(),
+			RunID:     runID,
+			Stage:     "translation",
+			Status:    domain.StageStatusRunning,
+			StartedAt: &nowTrans,
+			CreatedAt: nowTrans,
+			UpdatedAt: nowTrans,
+		}
+		if err := s.db.CreateStageExecution(ctx, seTrans); err != nil {
+			return s.failRun(ctx, runID, "translation", fmt.Sprintf("failed to record stage start: %v", err))
+		}
+		// Enforce canonical AudioRolePlan windows: only transcript blocks accepted inside
+		// narration/dialogue windows may flow into translation, dub script, voice assignment and synthesis.
+		// Singing/music-vocal, BGM/instrumental, ambience/SFX and uncertain intervals must never become dub clips.
+		var dialogueSegments []domain.TranslationInputSegment
+		for _, b := range transcriptArtifact.SpeechBlocks {
+			if b.SegmentType != "" && b.SegmentType != domain.SpeechBlockTypeSpeech {
+				continue
+			}
+			if rolePlan != nil && len(rolePlan.Segments) > 0 && !domain.IsInsideDialogueWindow(b.StartMs, b.EndMs, rolePlan) {
+				continue
+			}
+			text := strings.TrimSpace(b.SourceText)
+			if text == "" || domain.IsPathologicalRepetitionNoise(text) {
+				continue
+			}
+			dialogueSegments = append(dialogueSegments, domain.TranslationInputSegment{
+				Index:      b.Index,
+				SourceText: text,
+				SpeakerID:  b.SpeakerID,
+				StartMs:    b.StartMs,
+				EndMs:      b.EndMs,
+			})
+		}
+
+		transVariant, transErr := s.translationSvc.Translate(ctx, domain.TranslationJobInput{
+			RunID:                 runID,
+			AssetID:               assetID,
+			JobID:                 jobID,
+			TargetLanguage:        targetLang,
+			TranscriptArtifactCAS: transcriptArtifact.CASHash,
+			Segments:              dialogueSegments,
+		})
+		if transErr != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+			return s.failStageAndInterrupt(ctx, &seTrans, transErr)
+		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		seTrans.Status = domain.StageStatusSucceeded
+		seTrans.ArtifactSHA256 = transVariant.CASHash
+		nowTransFin := time.Now().UTC()
+		seTrans.CompletedAt = &nowTransFin
+		seTrans.UpdatedAt = nowTransFin
+		if err := s.db.UpdateStageExecution(ctx, seTrans); err != nil {
+			return s.failRun(ctx, runID, "translation", fmt.Sprintf("failed to record stage completion: %v", err))
+		}
+
+		// 2c. Dub Script (T06 / T14)
+		nowDubScript := time.Now().UTC()
+		seDubScript := domain.StageExecution{
+			ID:        uuid.NewString(),
+			RunID:     runID,
+			Stage:     "dub_script",
+			Status:    domain.StageStatusRunning,
+			StartedAt: &nowDubScript,
+			CreatedAt: nowDubScript,
+			UpdatedAt: nowDubScript,
+		}
+		if err := s.db.CreateStageExecution(ctx, seDubScript); err != nil {
+			return s.failRun(ctx, runID, "dub_script", fmt.Sprintf("failed to record stage start: %v", err))
+		}
+
+		dubScriptVariant, dubScriptErr := s.translationSvc.AdaptDubScript(ctx, domain.DubScriptJobInput{
+			RunID:                 runID,
+			AssetID:               assetID,
+			JobID:                 jobID,
+			TargetLanguage:        targetLang,
+			TranslationVariantCAS: transVariant.CASHash,
+		})
+		if dubScriptErr != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+			return s.failStageAndInterrupt(ctx, &seDubScript, dubScriptErr)
+		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		seDubScript.Status = domain.StageStatusSucceeded
+		seDubScript.ArtifactSHA256 = dubScriptVariant.CASHash
+		nowDubScriptFin := time.Now().UTC()
+		seDubScript.CompletedAt = &nowDubScriptFin
+		seDubScript.UpdatedAt = nowDubScriptFin
+		if err := s.db.UpdateStageExecution(ctx, seDubScript); err != nil {
+			return s.failRun(ctx, runID, "dub_script", fmt.Sprintf("failed to record stage completion: %v", err))
+		}
+
+		// 2d. Voice Assignment (T14)
+		if s.dubbingSvc == nil {
+			return s.failRun(ctx, runID, "voice_assignment", "DubbingService is not configured")
+		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		nowVoice := time.Now().UTC()
+		seVoice := domain.StageExecution{
+			ID:        uuid.NewString(),
+			RunID:     runID,
+			Stage:     "voice_assignment",
+			Status:    domain.StageStatusRunning,
+			StartedAt: &nowVoice,
+			CreatedAt: nowVoice,
+			UpdatedAt: nowVoice,
+		}
+		if err := s.db.CreateStageExecution(ctx, seVoice); err != nil {
+			return s.failRun(ctx, runID, "voice_assignment", fmt.Sprintf("failed to record stage start: %v", err))
+		}
+
+		voiceAssignment, voiceErr := s.dubbingSvc.AssignVoices(ctx, domain.VoiceAssignmentInput{
+			RunID:                 runID,
+			AssetID:               assetID,
+			JobID:                 jobID,
+			TargetLanguage:        targetLang,
+			DubScriptVariantCAS:   dubScriptVariant.CASHash,
+			TranscriptArtifactCAS: transcriptArtifact.CASHash,
+		})
+		if voiceErr != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+			return s.failStageAndInterrupt(ctx, &seVoice, voiceErr)
+		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		seVoice.Status = domain.StageStatusSucceeded
+		seVoice.ArtifactSHA256 = voiceAssignment.CASHash
+		nowVoiceFin := time.Now().UTC()
+		seVoice.CompletedAt = &nowVoiceFin
+		seVoice.UpdatedAt = nowVoiceFin
+		if err := s.db.UpdateStageExecution(ctx, seVoice); err != nil {
+			return s.failRun(ctx, runID, "voice_assignment", fmt.Sprintf("failed to record stage completion: %v", err))
+		}
+
+		// 2e. TTS / Dub Synthesis (T14)
+		nowTTS := time.Now().UTC()
+		seTTS := domain.StageExecution{
+			ID:        uuid.NewString(),
+			RunID:     runID,
+			Stage:     "dub_synthesize",
+			Status:    domain.StageStatusRunning,
+			StartedAt: &nowTTS,
+			CreatedAt: nowTTS,
+			UpdatedAt: nowTTS,
+		}
+		if err := s.db.CreateStageExecution(ctx, seTTS); err != nil {
+			return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("failed to record stage start: %v", err))
+		}
+
+		dubSegmentsVariant, ttsErr := s.dubbingSvc.SynthesizeAndFit(ctx, domain.DubbingJobInput{
+			RunID:               runID,
+			AssetID:             assetID,
+			JobID:               jobID,
+			TargetLanguage:      targetLang,
+			DubScriptVariantCAS: dubScriptVariant.CASHash,
+			VoiceAssignmentCAS:  voiceAssignment.CASHash,
+		})
+		if ttsErr != nil {
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+			return s.failStageAndInterrupt(ctx, &seTTS, ttsErr)
+		}
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+
+		dubSegmentsCAS = dubSegmentsVariant.CASHash
+		seTTS.Status = domain.StageStatusSucceeded
+		seTTS.ArtifactSHA256 = dubSegmentsVariant.CASHash
+		nowTTSFin := time.Now().UTC()
+		seTTS.CompletedAt = &nowTTSFin
+		seTTS.UpdatedAt = nowTTSFin
+		if err := s.db.UpdateStageExecution(ctx, seTTS); err != nil {
+			return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("failed to record stage completion: %v", err))
+		}
 	}
 
 	// 2. AudioMix (T15) - separation / passthrough
@@ -589,6 +879,7 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 			AssetID:        assetID,
 			JobID:          jobID,
 			TargetLanguage: targetLang,
+			DubSegmentsCAS: dubSegmentsCAS,
 		})
 		if mixErr != nil {
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
@@ -794,7 +1085,88 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 			return s.failRun(ctx, runID, "render_preview", fmt.Sprintf("failed to record stage completion: %v", err))
 		}
 	}
+	// 5. Automated QC & Review projection / Final render handoff (T16 / T19 / #82)
+	// Posture is validated fail-closed at start of executeRun
+	stageName := "render_final"
+	if posture == domain.ReviewPostureReview {
+		stageName = "final_render_handoff"
+	}
 
+	if s.reviewSvc == nil {
+		return s.failRun(ctx, runID, stageName, "ReviewService is not configured")
+	}
+	if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+		return err
+	}
+
+	nowHandoff := time.Now().UTC()
+	seHandoff := domain.StageExecution{
+		ID:        uuid.NewString(),
+		RunID:     runID,
+		Stage:     stageName,
+		Status:    domain.StageStatusRunning,
+		StartedAt: &nowHandoff,
+		CreatedAt: nowHandoff,
+		UpdatedAt: nowHandoff,
+	}
+	if err := s.db.CreateStageExecution(ctx, seHandoff); err != nil {
+		return s.failRun(ctx, runID, stageName, fmt.Sprintf("failed to record stage start: %v", err))
+	}
+
+	handoffResult, handoffErr := s.reviewSvc.EvaluateFinalRenderHandoff(ctx, domain.FinalRenderHandoffInput{
+		AssetID:        assetID,
+		RunID:          runID,
+		JobID:          jobID,
+		TargetLanguage: targetLang,
+		Posture:        posture,
+	})
+	if handoffErr != nil {
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
+		return s.failStageAndInterrupt(ctx, &seHandoff, handoffErr)
+	}
+	if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+		return err
+	}
+
+	if handoffResult.PendingReviewCount > 0 {
+		_ = s.db.UpdateJobStatus(ctx, jobID, "review_required")
+		return s.failStageAndInterrupt(ctx, &seHandoff, fmt.Errorf("final render handoff blocked: %d pending review exceptions require resolution", handoffResult.PendingReviewCount))
+	}
+
+	if s.casStore == nil {
+		return s.failStageAndInterrupt(ctx, &seHandoff, errors.New("cas store is not configured for handoff artifact persistence"))
+	}
+	handoffBytes, err := json.Marshal(handoffResult)
+	if err != nil {
+		return s.failStageAndInterrupt(ctx, &seHandoff, fmt.Errorf("marshal final render handoff result: %w", err))
+	}
+	obj, err := s.casStore.Put(bytes.NewReader(handoffBytes))
+	if err != nil {
+		return s.failStageAndInterrupt(ctx, &seHandoff, fmt.Errorf("persist final render handoff result to CAS: %w", err))
+	}
+	if obj.SHA256 == "" {
+		return s.failStageAndInterrupt(ctx, &seHandoff, errors.New("persisted final render handoff result produced empty CAS hash"))
+	}
+	handoffCAS := obj.SHA256
+
+	if posture == domain.ReviewPostureAuto {
+		if handoffResult.FinalRenderCAS == "" {
+			return s.failStageAndInterrupt(ctx, &seHandoff, errors.New("auto final render produced empty artifact"))
+		}
+		seHandoff.ArtifactSHA256 = handoffResult.FinalRenderCAS
+	} else {
+		seHandoff.ArtifactSHA256 = handoffCAS
+	}
+
+	seHandoff.Status = domain.StageStatusSucceeded
+	nowHandoffFin := time.Now().UTC()
+	seHandoff.CompletedAt = &nowHandoffFin
+	seHandoff.UpdatedAt = nowHandoffFin
+	if err := s.db.UpdateStageExecution(ctx, seHandoff); err != nil {
+		return s.failRun(ctx, runID, stageName, fmt.Sprintf("failed to record stage completion: %v", err))
+	}
 	// Complete the run atomically with state verification
 	return s.completeRunSafely(ctx, runID)
 }
@@ -1676,12 +2048,14 @@ func (s *Server) handleAssignVoices(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		RunID              string                         `json:"run_id"`
-		JobID              string                         `json:"job_id,omitempty"`
-		TargetLanguage     string                         `json:"target_language"`
-		CustomAssignments  map[string]domain.VoiceProfile `json:"custom_assignments,omitempty"`
-		UseSameVoiceForAll bool                           `json:"use_same_voice_for_all"`
-		ExecutionProfile   domain.ExecutionProfile        `json:"execution_profile,omitempty"`
+		RunID                 string                         `json:"run_id"`
+		JobID                 string                         `json:"job_id,omitempty"`
+		TargetLanguage        string                         `json:"target_language"`
+		CustomAssignments     map[string]domain.VoiceProfile `json:"custom_assignments,omitempty"`
+		UseSameVoiceForAll    bool                           `json:"use_same_voice_for_all"`
+		ExecutionProfile      domain.ExecutionProfile        `json:"execution_profile,omitempty"`
+		DubScriptVariantCAS   string                         `json:"dub_script_variant_cas,omitempty"`
+		TranscriptArtifactCAS string                         `json:"transcript_artifact_cas,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
@@ -1698,13 +2072,15 @@ func (s *Server) handleAssignVoices(w http.ResponseWriter, r *http.Request) {
 	}
 
 	in := domain.VoiceAssignmentInput{
-		RunID:              body.RunID,
-		AssetID:            asset.ID,
-		JobID:              body.JobID,
-		TargetLanguage:     body.TargetLanguage,
-		CustomAssignments:  body.CustomAssignments,
-		UseSameVoiceForAll: body.UseSameVoiceForAll,
-		ExecutionProfile:   body.ExecutionProfile,
+		RunID:                 body.RunID,
+		AssetID:               asset.ID,
+		JobID:                 body.JobID,
+		TargetLanguage:        body.TargetLanguage,
+		CustomAssignments:     body.CustomAssignments,
+		UseSameVoiceForAll:    body.UseSameVoiceForAll,
+		ExecutionProfile:      body.ExecutionProfile,
+		DubScriptVariantCAS:   body.DubScriptVariantCAS,
+		TranscriptArtifactCAS: body.TranscriptArtifactCAS,
 	}
 
 	assignment, err := s.dubbingSvc.AssignVoices(r.Context(), in)
@@ -2096,12 +2472,34 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		ConfigSnapshotJSON string `json:"config_snapshot_json"`
+		ConfigSnapshotJSON string               `json:"config_snapshot_json"`
+		Posture            domain.ReviewPosture `json:"posture"`
+		ReviewPosture      domain.ReviewPosture `json:"review_posture"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
+	if body.Posture == "" {
+		if body.ReviewPosture != "" {
+			body.Posture = body.ReviewPosture
+		} else {
+			body.Posture = domain.ReviewPosture(r.URL.Query().Get("posture"))
+		}
+	}
+
 	if body.ConfigSnapshotJSON == "" {
 		body.ConfigSnapshotJSON = "{}"
+	}
+
+	if body.Posture != "" {
+		var cfg map[string]any
+		_ = json.Unmarshal([]byte(body.ConfigSnapshotJSON), &cfg)
+		if cfg == nil {
+			cfg = make(map[string]any)
+		}
+		cfg["posture"] = body.Posture
+		if b, err := json.Marshal(cfg); err == nil {
+			body.ConfigSnapshotJSON = string(b)
+		}
 	}
 
 	run := domain.LocalizationRun{

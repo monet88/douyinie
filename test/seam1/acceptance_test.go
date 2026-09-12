@@ -201,6 +201,11 @@ func createSyntheticMedia(t *testing.T, dir string, name string) string {
 
 // createSyntheticMediaWithDuration creates a valid MP4 file with the specified duration in seconds.
 func createSyntheticMediaWithDuration(t *testing.T, dir string, name string, durationSec float64) string {
+	return createSyntheticMediaWithDurationAndFrequency(t, dir, name, durationSec, 880)
+}
+
+// createSyntheticMediaWithDurationAndFrequency creates a valid MP4 file with the specified duration and audio frequency.
+func createSyntheticMediaWithDurationAndFrequency(t *testing.T, dir string, name string, durationSec float64, freqHz int) string {
 	t.Helper()
 	targetPath := filepath.Join(dir, name)
 
@@ -208,12 +213,15 @@ func createSyntheticMediaWithDuration(t *testing.T, dir string, name string, dur
 		durationSec = 1.5
 	}
 	durStr := fmt.Sprintf("%.1f", durationSec)
+	if freqHz <= 0 {
+		freqHz = 880
+	}
 
 	if _, err := exec.LookPath("ffmpeg"); err == nil {
 		cmd := exec.Command("ffmpeg",
 			"-y",
 			"-f", "lavfi", "-i", fmt.Sprintf("testsrc=duration=%s:size=640x360:rate=30", durStr),
-			"-f", "lavfi", "-i", fmt.Sprintf("sine=frequency=880:duration=%s", durStr),
+			"-f", "lavfi", "-i", fmt.Sprintf("sine=frequency=%d:duration=%s", freqHz, durStr),
 			"-c:v", "libx264",
 			"-c:a", "aac",
 			targetPath,

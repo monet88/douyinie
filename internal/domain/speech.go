@@ -386,3 +386,30 @@ func IsDubEligible(plan *AudioRolePlan) bool {
 	}
 	return false
 }
+
+// IsInsideDialogueWindow checks whether the timing interval [startMs, endMs] falls within
+// accepted narration/dialogue segments and does not overlap any non-dialogue segments
+// (singing/music-vocal, BGM/instrumental, ambience/SFX, uncertain).
+func IsInsideDialogueWindow(startMs, endMs int64, plan *AudioRolePlan) bool {
+	if plan == nil || len(plan.Segments) == 0 || endMs <= startMs {
+		return false
+	}
+	hasDialogue := false
+	for _, seg := range plan.Segments {
+		overlapStart := startMs
+		if seg.StartMs > overlapStart {
+			overlapStart = seg.StartMs
+		}
+		overlapEnd := endMs
+		if seg.EndMs < overlapEnd {
+			overlapEnd = seg.EndMs
+		}
+		if overlapStart < overlapEnd {
+			if seg.Role != AudioRoleNarrationDialogue {
+				return false
+			}
+			hasDialogue = true
+		}
+	}
+	return hasDialogue
+}

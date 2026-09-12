@@ -534,6 +534,17 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 	// 5. Check Mixer Invariants: Overrun Refusal & Timing Purity
 	if dubSegments != nil {
 		for _, seg := range dubSegments.Segments {
+			// Skip clips outside accepted speech suppression windows (defensively ignored by mixer)
+			insideSuppression := false
+			for _, w := range preservationPlan.SpeechWindows {
+				if w.Action == "suppress_dialogue" && seg.StartMs >= w.StartMs && seg.EndMs <= w.EndMs {
+					insideSuppression = true
+					break
+				}
+			}
+			if !insideSuppression {
+				continue
+			}
 			slotDuration := seg.EndMs - seg.StartMs
 			// Mixer refusal: if measured audio exceeds immutable source window (measured duration > slot duration)
 			if seg.MeasuredDurationMs > slotDuration {
@@ -643,6 +654,17 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 	speechClips := make([]media.DubSpeechClip, 0)
 	if dubSegments != nil {
 		for _, seg := range dubSegments.Segments {
+			// Defensively reject/ignore dub clips outside accepted speech suppression windows
+			insideSuppression := false
+			for _, w := range preservationPlan.SpeechWindows {
+				if w.Action == "suppress_dialogue" && seg.StartMs >= w.StartMs && seg.EndMs <= w.EndMs {
+					insideSuppression = true
+					break
+				}
+			}
+			if !insideSuppression {
+				continue
+			}
 			if seg.AudioSHA256 != "" || seg.AudioCASPath != "" {
 				var r io.ReadCloser
 				var err error

@@ -19,9 +19,9 @@ import (
 
 // helper functions to eliminate boilerplate across autorun tests
 
-func ingestSyntheticAsset(t *testing.T, baseURL, dir, filename string, durationSec float64) string {
+func ingestSyntheticAssetWithFrequency(t *testing.T, baseURL, dir, filename string, durationSec float64, freqHz int) string {
 	t.Helper()
-	mediaPath := createSyntheticMediaWithDuration(t, dir, filename, durationSec)
+	mediaPath := createSyntheticMediaWithDurationAndFrequency(t, dir, filename, durationSec, freqHz)
 	payload := map[string]any{
 		"file_path": mediaPath,
 		"attestation": map[string]any{
@@ -43,6 +43,11 @@ func ingestSyntheticAsset(t *testing.T, baseURL, dir, filename string, durationS
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&res)
 	return res.Asset.ID
+}
+
+func ingestSyntheticAsset(t *testing.T, baseURL, dir, filename string, durationSec float64) string {
+	t.Helper()
+	return ingestSyntheticAssetWithFrequency(t, baseURL, dir, filename, durationSec, 880)
 }
 
 func createJob(t *testing.T, baseURL, assetID, targetLang string) string {
@@ -263,12 +268,15 @@ func TestSeam1_AutoRun_MultiRun_SerialDrain(t *testing.T) {
 	}
 }
 
-// TestSeam1_AutoRun_Dialogue_FailsClosedAndReleasesSlot proves that when a run
-// contains dub-eligible dialogue, the #81 zero-dialogue auto-runner fails closed,
-// records a diagnostic failed stage execution, marks the run interrupted, and
+// TestSeam1_AutoRun_Dialogue_FailsClosedAndReleasesSlot proves that when a dialogue run
+// fails unrecoverably (e.g. speech service unconfigured/failing), it fails closed,
+// records a failed stage execution, marks the run interrupted, and
 // releases the active run slot so subsequent queued runs can proceed.
 func TestSeam1_AutoRun_Dialogue_FailsClosedAndReleasesSlot(t *testing.T) {
 	h := setupAutoRunHarness(t)
+	// Sabotage speech service to force unrecoverable failure in dialogue branch
+	h.srv.SetSpeechService(nil)
+
 	assetID1 := ingestSyntheticAsset(t, h.server.URL, h.dir, "dialogue_test.mp4", 1.5)
 	postAudioRolePlan(t, h.server.URL, assetID1, []domain.AudioSegment{
 		{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue},
@@ -285,15 +293,14 @@ func TestSeam1_AutoRun_Dialogue_FailsClosedAndReleasesSlot(t *testing.T) {
 	stages := getRunStages(t, h.server.URL, runID1)
 	foundDiag := false
 	for _, st := range stages {
-		if st.Stage == "dialogue_execution" && st.Status == domain.StageStatusFailed {
+		if st.Stage == "speech_understand" && st.Status == domain.StageStatusFailed {
 			foundDiag = true
 			break
 		}
 	}
 	if !foundDiag {
-		t.Fatalf("expected failed dialogue_execution diagnostic stage for run 1, got %+v", stages)
+		t.Fatalf("expected failed speech_understand diagnostic stage for run 1, got %+v", stages)
 	}
-
 	// Enqueue Run 2 (no-dub) to prove active run slot was released and not stranded
 	assetID2 := ingestSyntheticAsset(t, h.server.URL, h.dir, "nodub_subsequent.mp4", 1.5)
 	postAudioRolePlan(t, h.server.URL, assetID2, []domain.AudioSegment{

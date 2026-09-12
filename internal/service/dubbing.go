@@ -89,7 +89,7 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 		}
 	}
 	// 1. Resolve distinct speakers from TranscriptArtifact or DubScriptVariant
-	speakers, err := s.resolveSpeakers(ctx, in.AssetID, targetLang)
+	speakers, err := s.resolveSpeakers(ctx, in)
 	if err != nil {
 		return nil, fmt.Errorf("resolve speakers for voice assignment: %w", err)
 	}
@@ -239,18 +239,20 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 	}
 	now := time.Now().UTC()
 	assignment := &domain.VoiceAssignment{
-		ID:                 uuid.NewString(),
-		SchemaVersion:      domain.VoiceAssignmentSchemaVersion,
-		AssetID:            in.AssetID,
-		RunID:              in.RunID,
-		JobID:              in.JobID,
-		TargetLanguage:     targetLang,
-		Assignments:        assignments,
-		UseSameVoiceForAll: in.UseSameVoiceForAll,
-		Distinguishability: distinguishabilityQC,
-		ProvenanceHash:     provenanceHash,
-		FrozenAt:           now,
-		CreatedAt:          now,
+		ID:                    uuid.NewString(),
+		SchemaVersion:         domain.VoiceAssignmentSchemaVersion,
+		AssetID:               in.AssetID,
+		RunID:                 in.RunID,
+		JobID:                 in.JobID,
+		TargetLanguage:        targetLang,
+		Assignments:           assignments,
+		UseSameVoiceForAll:    in.UseSameVoiceForAll,
+		Distinguishability:    distinguishabilityQC,
+		DubScriptVariantCAS:   in.DubScriptVariantCAS,
+		TranscriptArtifactCAS: in.TranscriptArtifactCAS,
+		ProvenanceHash:        provenanceHash,
+		FrozenAt:              now,
+		CreatedAt:             now,
 	}
 	// 5. Commit to CAS and SQLite
 	if s.cas != nil && s.db != nil {
@@ -1644,19 +1646,52 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 }
 
 // resolveSpeakers resolves all distinct speaker IDs from TranscriptArtifact or DubScriptVariant.
-func (s *DubbingService) resolveSpeakers(ctx context.Context, assetID, targetLang string) ([]string, error) {
-	if s.db == nil {
-		return []string{"SPEAKER_00"}, nil
-	}
-
+func (s *DubbingService) resolveSpeakers(ctx context.Context, in domain.VoiceAssignmentInput) ([]string, error) {
 	speakerMap := make(map[string]bool)
 
-	// Check TranscriptArtifact first
-	if tIdx, err := s.db.GetTranscriptArtifactIndex(ctx, assetID); err == nil && tIdx != nil && s.cas != nil {
-		if rc, err := s.cas.Get(tIdx.CASHash); err == nil {
-			defer rc.Close()
-			var transcript domain.TranscriptArtifact
-			if err := json.NewDecoder(rc).Decode(&transcript); err == nil {
+	// 1. Explicit or indexed TranscriptArtifact
+	transCAS := in.TranscriptArtifactCAS
+	if transCAS != "" {
+		if s.cas == nil {
+			return nil, fmt.Errorf("cas store required to read transcript artifact %s", transCAS)
+		}
+		rc, err := s.cas.Get(transCAS)
+		if err != nil {
+			return nil, fmt.Errorf("read transcript artifact %s from CAS: %w", transCAS, err)
+		}
+		var transcript domain.TranscriptArtifact
+		decodeErr := json.NewDecoder(rc).Decode(&transcript)
+		_ = rc.Close()
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode transcript artifact %s: %w", transCAS, decodeErr)
+		}
+		if in.AssetID != "" && transcript.AssetID != "" && transcript.AssetID != in.AssetID {
+			return nil, fmt.Errorf("transcript artifact %s belongs to asset %q, expected %q", transCAS, transcript.AssetID, in.AssetID)
+		}
+		if in.RunID != "" && transcript.RunID != "" && transcript.RunID != in.RunID {
+			return nil, fmt.Errorf("transcript artifact %s belongs to run %q, expected %q", transCAS, transcript.RunID, in.RunID)
+		}
+		for _, b := range transcript.SpeechBlocks {
+			if b.SpeakerID != "" {
+				speakerMap[b.SpeakerID] = true
+			}
+		}
+	} else if s.db != nil && in.AssetID != "" {
+		if tIdx, err := s.db.GetTranscriptArtifactIndex(ctx, in.AssetID); err == nil && tIdx != nil && tIdx.CASHash != "" {
+			if s.cas != nil {
+				rc, err := s.cas.Get(tIdx.CASHash)
+				if err != nil {
+					return nil, fmt.Errorf("read indexed transcript artifact %s from CAS: %w", tIdx.CASHash, err)
+				}
+				var transcript domain.TranscriptArtifact
+				decodeErr := json.NewDecoder(rc).Decode(&transcript)
+				_ = rc.Close()
+				if decodeErr != nil {
+					return nil, fmt.Errorf("decode indexed transcript artifact %s: %w", tIdx.CASHash, decodeErr)
+				}
+				if in.AssetID != "" && transcript.AssetID != "" && transcript.AssetID != in.AssetID {
+					return nil, fmt.Errorf("indexed transcript artifact %s belongs to asset %q, expected %q", tIdx.CASHash, transcript.AssetID, in.AssetID)
+				}
 				for _, b := range transcript.SpeechBlocks {
 					if b.SpeakerID != "" {
 						speakerMap[b.SpeakerID] = true
@@ -1666,13 +1701,53 @@ func (s *DubbingService) resolveSpeakers(ctx context.Context, assetID, targetLan
 		}
 	}
 
-	// Check DubScriptVariant if transcript had no speaker IDs
+	// 2. Explicit or indexed DubScriptVariant if transcript had no speaker IDs
 	if len(speakerMap) == 0 {
-		if dIdx, err := s.db.GetDubScriptVariantIndex(ctx, assetID, targetLang); err == nil && dIdx != nil && s.cas != nil {
-			if rc, err := s.cas.Get(dIdx.CASHash); err == nil {
-				defer rc.Close()
-				var dubScript domain.DubScriptVariant
-				if err := json.NewDecoder(rc).Decode(&dubScript); err == nil {
+		dubScriptCAS := in.DubScriptVariantCAS
+		if dubScriptCAS != "" {
+			if s.cas == nil {
+				return nil, fmt.Errorf("cas store required to read dub script variant %s", dubScriptCAS)
+			}
+			rc, err := s.cas.Get(dubScriptCAS)
+			if err != nil {
+				return nil, fmt.Errorf("read dub script variant %s from CAS: %w", dubScriptCAS, err)
+			}
+			var dubScript domain.DubScriptVariant
+			decodeErr := json.NewDecoder(rc).Decode(&dubScript)
+			_ = rc.Close()
+			if decodeErr != nil {
+				return nil, fmt.Errorf("decode dub script variant %s: %w", dubScriptCAS, decodeErr)
+			}
+			if in.AssetID != "" && dubScript.AssetID != "" && dubScript.AssetID != in.AssetID {
+				return nil, fmt.Errorf("dub script variant %s belongs to asset %q, expected %q", dubScriptCAS, dubScript.AssetID, in.AssetID)
+			}
+			if in.RunID != "" && dubScript.RunID != "" && dubScript.RunID != in.RunID {
+				return nil, fmt.Errorf("dub script variant %s belongs to run %q, expected %q", dubScriptCAS, dubScript.RunID, in.RunID)
+			}
+			if in.TargetLanguage != "" && dubScript.TargetLanguage != "" && !strings.EqualFold(dubScript.TargetLanguage, in.TargetLanguage) {
+				return nil, fmt.Errorf("dub script variant %s target language %q does not match requested %q", dubScriptCAS, dubScript.TargetLanguage, in.TargetLanguage)
+			}
+			for _, seg := range dubScript.Segments {
+				if seg.SpeakerID != "" {
+					speakerMap[seg.SpeakerID] = true
+				}
+			}
+		} else if s.db != nil && in.AssetID != "" {
+			if dIdx, err := s.db.GetDubScriptVariantIndex(ctx, in.AssetID, in.TargetLanguage); err == nil && dIdx != nil && dIdx.CASHash != "" {
+				if s.cas != nil {
+					rc, err := s.cas.Get(dIdx.CASHash)
+					if err != nil {
+						return nil, fmt.Errorf("read indexed dub script variant %s from CAS: %w", dIdx.CASHash, err)
+					}
+					var dubScript domain.DubScriptVariant
+					decodeErr := json.NewDecoder(rc).Decode(&dubScript)
+					_ = rc.Close()
+					if decodeErr != nil {
+						return nil, fmt.Errorf("decode indexed dub script variant %s: %w", dIdx.CASHash, decodeErr)
+					}
+					if in.AssetID != "" && dubScript.AssetID != "" && dubScript.AssetID != in.AssetID {
+						return nil, fmt.Errorf("indexed dub script variant %s belongs to asset %q, expected %q", dIdx.CASHash, dubScript.AssetID, in.AssetID)
+					}
 					for _, seg := range dubScript.Segments {
 						if seg.SpeakerID != "" {
 							speakerMap[seg.SpeakerID] = true
@@ -1786,9 +1861,16 @@ func (s *DubbingService) computeVoiceAssignmentProvenanceHash(in domain.VoiceAss
 		return "", err
 	}
 
+	inputHashes := []string{inputHash}
+	if in.DubScriptVariantCAS != "" {
+		inputHashes = append(inputHashes, in.DubScriptVariantCAS)
+	}
+	if in.TranscriptArtifactCAS != "" {
+		inputHashes = append(inputHashes, in.TranscriptArtifactCAS)
+	}
 	return cas.ComputeStageCacheKey(domain.StageCacheIdentityInput{
 		Stage:       "voice_assignment",
-		InputHashes: []string{inputHash},
+		InputHashes: inputHashes,
 		SemanticConfig: map[string]any{
 			"use_same_voice_for_all": in.UseSameVoiceForAll,
 		},
