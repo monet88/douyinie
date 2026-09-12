@@ -16,6 +16,7 @@ import (
 	"github.com/monet88/douyinie/internal/scheduler"
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
+	"github.com/monet88/douyinie/internal/worker"
 	"io"
 	"log"
 	"net/http"
@@ -207,6 +208,13 @@ func New(cfg Config) *Server {
 
 	// Start background serial queue consumer if enabled.
 	if cfg.AutoRunExecutor {
+		if s.queueSvc != nil {
+			if recovered, err := s.queueSvc.Recover(context.Background()); err != nil {
+				log.Printf("[AutoRun] crash recovery error on startup: %v", err)
+			} else if len(recovered) > 0 {
+				log.Printf("[AutoRun] recovered %d active runs after restart: %v", len(recovered), recovered)
+			}
+		}
 		s.wakeChan = make(chan struct{}, 1)
 		consumerCtx, consumerCancel := context.WithCancel(context.Background())
 		s.consumerCancel = consumerCancel
@@ -384,6 +392,12 @@ func (s *Server) shouldContinueRun(ctx context.Context, runID string) (bool, err
 	}
 	switch entry.Status {
 	case domain.RunStatusRunning:
+		if ctx.Err() != nil {
+			// In-flight run context was cancelled (e.g. host shutdown).
+			// Transition active run and in-flight stages to interrupted cleanly.
+			_ = s.db.UpdateQueueStatus(lookupCtx, runID, domain.RunStatusInterrupted, domain.RunStatusInterrupted)
+			return false, nil
+		}
 		return true, nil
 	case domain.RunStatusPaused, domain.RunStatusCancelled, domain.RunStatusInterrupted:
 		return false, nil
@@ -478,7 +492,11 @@ func (s *Server) failRun(ctx context.Context, runID string, stageName, errMsg st
 }
 
 func (s *Server) failStageAndInterrupt(ctx context.Context, se *domain.StageExecution, cause error) error {
-	se.Status = domain.StageStatusFailed
+	if errors.Is(cause, context.Canceled) || errors.Is(cause, worker.ErrInterrupted) {
+		se.Status = domain.StageStatusInterrupted
+	} else {
+		se.Status = domain.StageStatusFailed
+	}
 	se.ErrorMessage = cause.Error()
 	nowFin := time.Now().UTC()
 	se.CompletedAt = &nowFin
@@ -531,26 +549,66 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 			posture = p
 		}
 	}
+	priorStages, _ := s.db.ListStageExecutions(ctx, runID)
+	latestStageMap := make(map[string]domain.StageExecution)
+	for _, st := range priorStages {
+		latestStageMap[st.Stage] = st
+	}
+
+	canReuse := true
+	isStageReusable := func(stageName string) (bool, string) {
+		if !canReuse {
+			return false, ""
+		}
+		st, ok := latestStageMap[stageName]
+		if !ok || st.Status != domain.StageStatusSucceeded || st.ArtifactSHA256 == "" {
+			return false, ""
+		}
+		if s.casStore != nil && !s.casStore.Exists(st.ArtifactSHA256) {
+			return false, ""
+		}
+		return true, st.ArtifactSHA256
+	}
+
+	startStage := func(stageName string) (*domain.StageExecution, error) {
+		now := time.Now().UTC()
+		if st, ok := latestStageMap[stageName]; ok && st.Status == domain.StageStatusQueued {
+			st.Status = domain.StageStatusRunning
+			st.StartedAt = &now
+			st.UpdatedAt = now
+			if err := s.db.UpdateStageExecution(ctx, st); err != nil {
+				return nil, err
+			}
+			return &st, nil
+		}
+		se := domain.StageExecution{
+			ID:        uuid.NewString(),
+			RunID:     runID,
+			Stage:     stageName,
+			Status:    domain.StageStatusRunning,
+			StartedAt: &now,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if err := s.db.CreateStageExecution(ctx, se); err != nil {
+			return nil, err
+		}
+		return &se, nil
+	}
 
 	// 1. AudioRolePlan
 	rolePlan, err := s.db.GetAudioRolePlan(ctx, assetID)
-	if err != nil || rolePlan == nil {
+	if reusable, _ := isStageReusable("audio_role_plan"); reusable && rolePlan != nil {
+		// Reused audio role plan
+	} else if rolePlan == nil {
+		canReuse = false
 		if s.audioRoleSvc != nil {
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 				return err
 			}
 
-			now := time.Now().UTC()
-			se := domain.StageExecution{
-				ID:        uuid.NewString(),
-				RunID:     runID,
-				Stage:     "audio_role_plan",
-				Status:    domain.StageStatusRunning,
-				StartedAt: &now,
-				CreatedAt: now,
-				UpdatedAt: now,
-			}
-			if err := s.db.CreateStageExecution(ctx, se); err != nil {
+			se, err := startStage("audio_role_plan")
+			if err != nil {
 				return s.failRun(ctx, runID, "audio_role_plan", fmt.Sprintf("failed to record stage start: %v", err))
 			}
 
@@ -563,7 +621,7 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 					return err
 				}
-				return s.failStageAndInterrupt(ctx, &se, genErr)
+				return s.failStageAndInterrupt(ctx, se, genErr)
 			}
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 				return err
@@ -575,7 +633,7 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 			nowFin := time.Now().UTC()
 			se.CompletedAt = &nowFin
 			se.UpdatedAt = nowFin
-			if err := s.db.UpdateStageExecution(ctx, se); err != nil {
+			if err := s.db.UpdateStageExecution(ctx, *se); err != nil {
 				return s.failRun(ctx, runID, "audio_role_plan", fmt.Sprintf("failed to record stage completion: %v", err))
 			}
 		} else {
@@ -590,287 +648,331 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 	var dubSegmentsCAS string
 	if domain.IsDubEligible(rolePlan) {
 		// 2a. Speech Understand (T08)
-		if s.speechSvc == nil {
-			return s.failRun(ctx, runID, "speech_understand", "SpeechService is not configured")
+		var transcriptArtifact *domain.TranscriptArtifact
+		if reusable, casHash := isStageReusable("speech_understand"); reusable {
+			if s.casStore != nil {
+				rc, err := s.casStore.Get(casHash)
+				if err == nil {
+					var ta domain.TranscriptArtifact
+					if err := json.NewDecoder(rc).Decode(&ta); err == nil {
+						ta.CASHash = casHash
+						transcriptArtifact = &ta
+					}
+					rc.Close()
+				}
+			}
+			if transcriptArtifact == nil && s.casStore == nil {
+				transcriptArtifact = &domain.TranscriptArtifact{CASHash: casHash}
+			}
 		}
-		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
-			return err
-		}
-
-		asset, assetErr := s.db.GetSourceAsset(ctx, assetID)
-		if assetErr != nil {
-			return s.failRun(ctx, runID, "speech_understand", fmt.Sprintf("failed to get source asset: %v", assetErr))
-		}
-		if strings.TrimSpace(asset.CASPath) == "" {
-			return s.failRun(ctx, runID, "speech_understand", "asset has no source media in CAS to process")
-		}
-
-		nowSpeech := time.Now().UTC()
-		seSpeech := domain.StageExecution{
-			ID:        uuid.NewString(),
-			RunID:     runID,
-			Stage:     "speech_understand",
-			Status:    domain.StageStatusRunning,
-			StartedAt: &nowSpeech,
-			CreatedAt: nowSpeech,
-			UpdatedAt: nowSpeech,
-		}
-		if err := s.db.CreateStageExecution(ctx, seSpeech); err != nil {
-			return s.failRun(ctx, runID, "speech_understand", fmt.Sprintf("failed to record stage start: %v", err))
-		}
-
-		transcriptArtifact, speechErr := s.speechSvc.RunPipeline(ctx, domain.SpeechPipelineInput{
-			RunID:         runID,
-			AssetID:       assetID,
-			AudioPath:     asset.CASPath,
-			AudioSHA256:   asset.SHA256,
-			AudioRolePlan: rolePlan,
-		})
-		if speechErr != nil {
+		if transcriptArtifact == nil {
+			canReuse = false
+			if s.speechSvc == nil {
+				return s.failRun(ctx, runID, "speech_understand", "SpeechService is not configured")
+			}
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 				return err
 			}
-			return s.failStageAndInterrupt(ctx, &seSpeech, speechErr)
-		}
-		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
-			return err
-		}
 
-		seSpeech.Status = domain.StageStatusSucceeded
-		seSpeech.ArtifactSHA256 = transcriptArtifact.CASHash
-		nowSpeechFin := time.Now().UTC()
-		seSpeech.CompletedAt = &nowSpeechFin
-		seSpeech.UpdatedAt = nowSpeechFin
-		if err := s.db.UpdateStageExecution(ctx, seSpeech); err != nil {
-			return s.failRun(ctx, runID, "speech_understand", fmt.Sprintf("failed to record stage completion: %v", err))
+			asset, assetErr := s.db.GetSourceAsset(ctx, assetID)
+			if assetErr != nil {
+				return s.failRun(ctx, runID, "speech_understand", fmt.Sprintf("failed to get source asset: %v", assetErr))
+			}
+			if strings.TrimSpace(asset.CASPath) == "" {
+				return s.failRun(ctx, runID, "speech_understand", "asset has no source media in CAS to process")
+			}
+
+			seSpeech, err := startStage("speech_understand")
+			if err != nil {
+				return s.failRun(ctx, runID, "speech_understand", fmt.Sprintf("failed to record stage start: %v", err))
+			}
+
+			artifact, speechErr := s.speechSvc.RunPipeline(ctx, domain.SpeechPipelineInput{
+				RunID:         runID,
+				AssetID:       assetID,
+				AudioPath:     asset.CASPath,
+				AudioSHA256:   asset.SHA256,
+				AudioRolePlan: rolePlan,
+			})
+			if speechErr != nil {
+				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+					return err
+				}
+				return s.failStageAndInterrupt(ctx, seSpeech, speechErr)
+			}
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+
+			transcriptArtifact = artifact
+			seSpeech.Status = domain.StageStatusSucceeded
+			seSpeech.ArtifactSHA256 = transcriptArtifact.CASHash
+			nowSpeechFin := time.Now().UTC()
+			seSpeech.CompletedAt = &nowSpeechFin
+			seSpeech.UpdatedAt = nowSpeechFin
+			if err := s.db.UpdateStageExecution(ctx, *seSpeech); err != nil {
+				return s.failRun(ctx, runID, "speech_understand", fmt.Sprintf("failed to record stage completion: %v", err))
+			}
 		}
 
 		// 2b. Translation (T06)
-		if s.translationSvc == nil {
-			return s.failRun(ctx, runID, "translation", "TranslationService is not configured")
-		}
-		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
-			return err
-		}
-
-		nowTrans := time.Now().UTC()
-		seTrans := domain.StageExecution{
-			ID:        uuid.NewString(),
-			RunID:     runID,
-			Stage:     "translation",
-			Status:    domain.StageStatusRunning,
-			StartedAt: &nowTrans,
-			CreatedAt: nowTrans,
-			UpdatedAt: nowTrans,
-		}
-		if err := s.db.CreateStageExecution(ctx, seTrans); err != nil {
-			return s.failRun(ctx, runID, "translation", fmt.Sprintf("failed to record stage start: %v", err))
-		}
-		// Enforce canonical AudioRolePlan windows: only transcript blocks accepted inside
-		// narration/dialogue windows may flow into translation, dub script, voice assignment and synthesis.
-		// Singing/music-vocal, BGM/instrumental, ambience/SFX and uncertain intervals must never become dub clips.
-		var dialogueSegments []domain.TranslationInputSegment
-		for _, b := range transcriptArtifact.SpeechBlocks {
-			if b.SegmentType != "" && b.SegmentType != domain.SpeechBlockTypeSpeech {
-				continue
+		var transVariant *domain.TranslationVariant
+		if reusable, casHash := isStageReusable("translation"); reusable {
+			if s.casStore != nil {
+				rc, err := s.casStore.Get(casHash)
+				if err == nil {
+					var tv domain.TranslationVariant
+					if err := json.NewDecoder(rc).Decode(&tv); err == nil {
+						tv.CASHash = casHash
+						transVariant = &tv
+					}
+					rc.Close()
+				}
 			}
-			if rolePlan != nil && len(rolePlan.Segments) > 0 && !domain.IsInsideDialogueWindow(b.StartMs, b.EndMs, rolePlan) {
-				continue
+			if transVariant == nil && s.casStore == nil {
+				transVariant = &domain.TranslationVariant{CASHash: casHash}
 			}
-			text := strings.TrimSpace(b.SourceText)
-			if text == "" || domain.IsPathologicalRepetitionNoise(text) {
-				continue
-			}
-			dialogueSegments = append(dialogueSegments, domain.TranslationInputSegment{
-				Index:      b.Index,
-				SourceText: text,
-				SpeakerID:  b.SpeakerID,
-				StartMs:    b.StartMs,
-				EndMs:      b.EndMs,
-			})
 		}
-
-		transVariant, transErr := s.translationSvc.Translate(ctx, domain.TranslationJobInput{
-			RunID:                 runID,
-			AssetID:               assetID,
-			JobID:                 jobID,
-			TargetLanguage:        targetLang,
-			TranscriptArtifactCAS: transcriptArtifact.CASHash,
-			Segments:              dialogueSegments,
-		})
-		if transErr != nil {
+		if transVariant == nil {
+			canReuse = false
+			if s.translationSvc == nil {
+				return s.failRun(ctx, runID, "translation", "TranslationService is not configured")
+			}
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 				return err
 			}
-			return s.failStageAndInterrupt(ctx, &seTrans, transErr)
-		}
-		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
-			return err
-		}
 
-		seTrans.Status = domain.StageStatusSucceeded
-		seTrans.ArtifactSHA256 = transVariant.CASHash
-		nowTransFin := time.Now().UTC()
-		seTrans.CompletedAt = &nowTransFin
-		seTrans.UpdatedAt = nowTransFin
-		if err := s.db.UpdateStageExecution(ctx, seTrans); err != nil {
-			return s.failRun(ctx, runID, "translation", fmt.Sprintf("failed to record stage completion: %v", err))
+			seTrans, err := startStage("translation")
+			if err != nil {
+				return s.failRun(ctx, runID, "translation", fmt.Sprintf("failed to record stage start: %v", err))
+			}
+
+			var dialogueSegments []domain.TranslationInputSegment
+			for _, b := range transcriptArtifact.SpeechBlocks {
+				if b.SegmentType != "" && b.SegmentType != domain.SpeechBlockTypeSpeech {
+					continue
+				}
+				if rolePlan != nil && len(rolePlan.Segments) > 0 && !domain.IsInsideDialogueWindow(b.StartMs, b.EndMs, rolePlan) {
+					continue
+				}
+				text := strings.TrimSpace(b.SourceText)
+				if text == "" || domain.IsPathologicalRepetitionNoise(text) {
+					continue
+				}
+				dialogueSegments = append(dialogueSegments, domain.TranslationInputSegment{
+					Index:      b.Index,
+					SourceText: text,
+					SpeakerID:  b.SpeakerID,
+					StartMs:    b.StartMs,
+					EndMs:      b.EndMs,
+				})
+			}
+
+			variant, transErr := s.translationSvc.Translate(ctx, domain.TranslationJobInput{
+				RunID:                 runID,
+				AssetID:               assetID,
+				JobID:                 jobID,
+				TargetLanguage:        targetLang,
+				TranscriptArtifactCAS: transcriptArtifact.CASHash,
+				Segments:              dialogueSegments,
+			})
+			if transErr != nil {
+				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+					return err
+				}
+				return s.failStageAndInterrupt(ctx, seTrans, transErr)
+			}
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+
+			transVariant = variant
+			seTrans.Status = domain.StageStatusSucceeded
+			seTrans.ArtifactSHA256 = transVariant.CASHash
+			nowTransFin := time.Now().UTC()
+			seTrans.CompletedAt = &nowTransFin
+			seTrans.UpdatedAt = nowTransFin
+			if err := s.db.UpdateStageExecution(ctx, *seTrans); err != nil {
+				return s.failRun(ctx, runID, "translation", fmt.Sprintf("failed to record stage completion: %v", err))
+			}
 		}
 
 		// 2c. Dub Script (T06 / T14)
-		nowDubScript := time.Now().UTC()
-		seDubScript := domain.StageExecution{
-			ID:        uuid.NewString(),
-			RunID:     runID,
-			Stage:     "dub_script",
-			Status:    domain.StageStatusRunning,
-			StartedAt: &nowDubScript,
-			CreatedAt: nowDubScript,
-			UpdatedAt: nowDubScript,
+		var dubScriptVariant *domain.DubScriptVariant
+		if reusable, casHash := isStageReusable("dub_script"); reusable {
+			if s.casStore != nil {
+				rc, err := s.casStore.Get(casHash)
+				if err == nil {
+					var dv domain.DubScriptVariant
+					if err := json.NewDecoder(rc).Decode(&dv); err == nil {
+						dv.CASHash = casHash
+						dubScriptVariant = &dv
+					}
+					rc.Close()
+				}
+			}
+			if dubScriptVariant == nil && s.casStore == nil {
+				dubScriptVariant = &domain.DubScriptVariant{CASHash: casHash}
+			}
 		}
-		if err := s.db.CreateStageExecution(ctx, seDubScript); err != nil {
-			return s.failRun(ctx, runID, "dub_script", fmt.Sprintf("failed to record stage start: %v", err))
-		}
-
-		dubScriptVariant, dubScriptErr := s.translationSvc.AdaptDubScript(ctx, domain.DubScriptJobInput{
-			RunID:                 runID,
-			AssetID:               assetID,
-			JobID:                 jobID,
-			TargetLanguage:        targetLang,
-			TranslationVariantCAS: transVariant.CASHash,
-		})
-		if dubScriptErr != nil {
+		if dubScriptVariant == nil {
+			canReuse = false
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 				return err
 			}
-			return s.failStageAndInterrupt(ctx, &seDubScript, dubScriptErr)
-		}
-		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
-			return err
-		}
 
-		seDubScript.Status = domain.StageStatusSucceeded
-		seDubScript.ArtifactSHA256 = dubScriptVariant.CASHash
-		nowDubScriptFin := time.Now().UTC()
-		seDubScript.CompletedAt = &nowDubScriptFin
-		seDubScript.UpdatedAt = nowDubScriptFin
-		if err := s.db.UpdateStageExecution(ctx, seDubScript); err != nil {
-			return s.failRun(ctx, runID, "dub_script", fmt.Sprintf("failed to record stage completion: %v", err))
+			seDubScript, err := startStage("dub_script")
+			if err != nil {
+				return s.failRun(ctx, runID, "dub_script", fmt.Sprintf("failed to record stage start: %v", err))
+			}
+
+			dsv, dubScriptErr := s.translationSvc.AdaptDubScript(ctx, domain.DubScriptJobInput{
+				RunID:                 runID,
+				AssetID:               assetID,
+				JobID:                 jobID,
+				TargetLanguage:        targetLang,
+				TranslationVariantCAS: transVariant.CASHash,
+			})
+			if dubScriptErr != nil {
+				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+					return err
+				}
+				return s.failStageAndInterrupt(ctx, seDubScript, dubScriptErr)
+			}
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+
+			dubScriptVariant = dsv
+			seDubScript.Status = domain.StageStatusSucceeded
+			seDubScript.ArtifactSHA256 = dubScriptVariant.CASHash
+			nowDubScriptFin := time.Now().UTC()
+			seDubScript.CompletedAt = &nowDubScriptFin
+			seDubScript.UpdatedAt = nowDubScriptFin
+			if err := s.db.UpdateStageExecution(ctx, *seDubScript); err != nil {
+				return s.failRun(ctx, runID, "dub_script", fmt.Sprintf("failed to record stage completion: %v", err))
+			}
 		}
 
 		// 2d. Voice Assignment (T14)
-		if s.dubbingSvc == nil {
-			return s.failRun(ctx, runID, "voice_assignment", "DubbingService is not configured")
+		var voiceAssignment *domain.VoiceAssignment
+		if reusable, casHash := isStageReusable("voice_assignment"); reusable {
+			if s.casStore != nil {
+				rc, err := s.casStore.Get(casHash)
+				if err == nil {
+					var va domain.VoiceAssignment
+					if err := json.NewDecoder(rc).Decode(&va); err == nil {
+						va.CASHash = casHash
+						voiceAssignment = &va
+					}
+					rc.Close()
+				}
+			}
+			if voiceAssignment == nil && s.casStore == nil {
+				voiceAssignment = &domain.VoiceAssignment{CASHash: casHash}
+			}
 		}
-		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
-			return err
-		}
-
-		nowVoice := time.Now().UTC()
-		seVoice := domain.StageExecution{
-			ID:        uuid.NewString(),
-			RunID:     runID,
-			Stage:     "voice_assignment",
-			Status:    domain.StageStatusRunning,
-			StartedAt: &nowVoice,
-			CreatedAt: nowVoice,
-			UpdatedAt: nowVoice,
-		}
-		if err := s.db.CreateStageExecution(ctx, seVoice); err != nil {
-			return s.failRun(ctx, runID, "voice_assignment", fmt.Sprintf("failed to record stage start: %v", err))
-		}
-
-		voiceAssignment, voiceErr := s.dubbingSvc.AssignVoices(ctx, domain.VoiceAssignmentInput{
-			RunID:                 runID,
-			AssetID:               assetID,
-			JobID:                 jobID,
-			TargetLanguage:        targetLang,
-			DubScriptVariantCAS:   dubScriptVariant.CASHash,
-			TranscriptArtifactCAS: transcriptArtifact.CASHash,
-		})
-		if voiceErr != nil {
+		if voiceAssignment == nil {
+			canReuse = false
+			if s.dubbingSvc == nil {
+				return s.failRun(ctx, runID, "voice_assignment", "DubbingService is not configured")
+			}
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 				return err
 			}
-			return s.failStageAndInterrupt(ctx, &seVoice, voiceErr)
-		}
-		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
-			return err
-		}
 
-		seVoice.Status = domain.StageStatusSucceeded
-		seVoice.ArtifactSHA256 = voiceAssignment.CASHash
-		nowVoiceFin := time.Now().UTC()
-		seVoice.CompletedAt = &nowVoiceFin
-		seVoice.UpdatedAt = nowVoiceFin
-		if err := s.db.UpdateStageExecution(ctx, seVoice); err != nil {
-			return s.failRun(ctx, runID, "voice_assignment", fmt.Sprintf("failed to record stage completion: %v", err))
+			seVoice, err := startStage("voice_assignment")
+			if err != nil {
+				return s.failRun(ctx, runID, "voice_assignment", fmt.Sprintf("failed to record stage start: %v", err))
+			}
+
+			va, voiceErr := s.dubbingSvc.AssignVoices(ctx, domain.VoiceAssignmentInput{
+				RunID:                 runID,
+				AssetID:               assetID,
+				JobID:                 jobID,
+				TargetLanguage:        targetLang,
+				DubScriptVariantCAS:   dubScriptVariant.CASHash,
+				TranscriptArtifactCAS: transcriptArtifact.CASHash,
+			})
+			if voiceErr != nil {
+				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+					return err
+				}
+				return s.failStageAndInterrupt(ctx, seVoice, voiceErr)
+			}
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+
+			voiceAssignment = va
+			seVoice.Status = domain.StageStatusSucceeded
+			seVoice.ArtifactSHA256 = voiceAssignment.CASHash
+			nowVoiceFin := time.Now().UTC()
+			seVoice.CompletedAt = &nowVoiceFin
+			seVoice.UpdatedAt = nowVoiceFin
+			if err := s.db.UpdateStageExecution(ctx, *seVoice); err != nil {
+				return s.failRun(ctx, runID, "voice_assignment", fmt.Sprintf("failed to record stage completion: %v", err))
+			}
 		}
 
 		// 2e. TTS / Dub Synthesis (T14)
-		nowTTS := time.Now().UTC()
-		seTTS := domain.StageExecution{
-			ID:        uuid.NewString(),
-			RunID:     runID,
-			Stage:     "dub_synthesize",
-			Status:    domain.StageStatusRunning,
-			StartedAt: &nowTTS,
-			CreatedAt: nowTTS,
-			UpdatedAt: nowTTS,
-		}
-		if err := s.db.CreateStageExecution(ctx, seTTS); err != nil {
-			return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("failed to record stage start: %v", err))
-		}
-
-		dubSegmentsVariant, ttsErr := s.dubbingSvc.SynthesizeAndFit(ctx, domain.DubbingJobInput{
-			RunID:               runID,
-			AssetID:             assetID,
-			JobID:               jobID,
-			TargetLanguage:      targetLang,
-			DubScriptVariantCAS: dubScriptVariant.CASHash,
-			VoiceAssignmentCAS:  voiceAssignment.CASHash,
-		})
-		if ttsErr != nil {
+		if reusable, casHash := isStageReusable("dub_synthesize"); reusable {
+			dubSegmentsCAS = casHash
+		} else {
+			canReuse = false
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 				return err
 			}
-			return s.failStageAndInterrupt(ctx, &seTTS, ttsErr)
-		}
-		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
-			return err
-		}
 
-		dubSegmentsCAS = dubSegmentsVariant.CASHash
-		seTTS.Status = domain.StageStatusSucceeded
-		seTTS.ArtifactSHA256 = dubSegmentsVariant.CASHash
-		nowTTSFin := time.Now().UTC()
-		seTTS.CompletedAt = &nowTTSFin
-		seTTS.UpdatedAt = nowTTSFin
-		if err := s.db.UpdateStageExecution(ctx, seTTS); err != nil {
-			return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("failed to record stage completion: %v", err))
+			seTTS, err := startStage("dub_synthesize")
+			if err != nil {
+				return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("failed to record stage start: %v", err))
+			}
+
+			dubSegmentsVariant, ttsErr := s.dubbingSvc.SynthesizeAndFit(ctx, domain.DubbingJobInput{
+				RunID:               runID,
+				AssetID:             assetID,
+				JobID:               jobID,
+				TargetLanguage:      targetLang,
+				DubScriptVariantCAS: dubScriptVariant.CASHash,
+				VoiceAssignmentCAS:  voiceAssignment.CASHash,
+			})
+			if ttsErr != nil {
+				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+					return err
+				}
+				return s.failStageAndInterrupt(ctx, seTTS, ttsErr)
+			}
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+
+			dubSegmentsCAS = dubSegmentsVariant.CASHash
+			seTTS.Status = domain.StageStatusSucceeded
+			seTTS.ArtifactSHA256 = dubSegmentsVariant.CASHash
+			nowTTSFin := time.Now().UTC()
+			seTTS.CompletedAt = &nowTTSFin
+			seTTS.UpdatedAt = nowTTSFin
+			if err := s.db.UpdateStageExecution(ctx, *seTTS); err != nil {
+				return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("failed to record stage completion: %v", err))
+			}
 		}
 	}
 
 	// 2. AudioMix (T15) - separation / passthrough
-	if s.audioMixSvc == nil {
-		return s.failRun(ctx, runID, "audio_mix", "AudioMixService is not configured")
-	}
-	{
+	if reusable, _ := isStageReusable("audio_mix"); reusable {
+		// Reused audio_mix
+	} else {
+		canReuse = false
+		if s.audioMixSvc == nil {
+			return s.failRun(ctx, runID, "audio_mix", "AudioMixService is not configured")
+		}
 		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 			return err
 		}
 
-		now := time.Now().UTC()
-		se := domain.StageExecution{
-			ID:        uuid.NewString(),
-			RunID:     runID,
-			Stage:     "audio_mix",
-			Status:    domain.StageStatusRunning,
-			StartedAt: &now,
-			CreatedAt: now,
-			UpdatedAt: now,
-		}
-		if err := s.db.CreateStageExecution(ctx, se); err != nil {
+		seMix, err := startStage("audio_mix")
+		if err != nil {
 			return s.failRun(ctx, runID, "audio_mix", fmt.Sprintf("failed to record stage start: %v", err))
 		}
 
@@ -885,18 +987,18 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 				return err
 			}
-			return s.failStageAndInterrupt(ctx, &se, mixErr)
+			return s.failStageAndInterrupt(ctx, seMix, mixErr)
 		}
 		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 			return err
 		}
 
-		se.Status = domain.StageStatusSucceeded
-		se.ArtifactSHA256 = dubMix.CASHash
+		seMix.Status = domain.StageStatusSucceeded
+		seMix.ArtifactSHA256 = dubMix.CASHash
 		nowFin := time.Now().UTC()
-		se.CompletedAt = &nowFin
-		se.UpdatedAt = nowFin
-		if err := s.db.UpdateStageExecution(ctx, se); err != nil {
+		seMix.CompletedAt = &nowFin
+		seMix.UpdatedAt = nowFin
+		if err := s.db.UpdateStageExecution(ctx, *seMix); err != nil {
 			return s.failRun(ctx, runID, "audio_mix", fmt.Sprintf("failed to record stage completion: %v", err))
 		}
 	}
@@ -907,89 +1009,84 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		return s.failRun(ctx, runID, "visual_text", "VisualTextService is not configured")
 	}
 	{
-		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
-			return err
-		}
-
-		now := time.Now().UTC()
-		seDetect := domain.StageExecution{
-			ID:        uuid.NewString(),
-			RunID:     runID,
-			Stage:     "text_detection",
-			Status:    domain.StageStatusRunning,
-			StartedAt: &now,
-			CreatedAt: now,
-			UpdatedAt: now,
-		}
-		if err := s.db.CreateStageExecution(ctx, seDetect); err != nil {
-			return s.failRun(ctx, runID, "text_detection", fmt.Sprintf("failed to record stage start: %v", err))
-		}
-
-		textPlan, detErr := s.visualTextSvc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
-			RunID:   runID,
-			AssetID: assetID,
-			JobID:   jobID,
-		})
-		if detErr != nil {
+		if reusable, _ := isStageReusable("text_detection"); reusable {
+			// Reused text_detection
+		} else {
+			canReuse = false
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 				return err
 			}
-			return s.failStageAndInterrupt(ctx, &seDetect, detErr)
-		}
-		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
-			return err
-		}
 
-		seDetect.Status = domain.StageStatusSucceeded
-		seDetect.ArtifactSHA256 = textPlan.CASHash
-		nowFin := time.Now().UTC()
-		seDetect.CompletedAt = &nowFin
-		seDetect.UpdatedAt = nowFin
-		if err := s.db.UpdateStageExecution(ctx, seDetect); err != nil {
-			return s.failRun(ctx, runID, "text_detection", fmt.Sprintf("failed to record stage completion: %v", err))
-		}
+			seDetect, err := startStage("text_detection")
+			if err != nil {
+				return s.failRun(ctx, runID, "text_detection", fmt.Sprintf("failed to record stage start: %v", err))
+			}
 
-		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
-			return err
-		}
-
-		seLoc := domain.StageExecution{
-			ID:        uuid.NewString(),
-			RunID:     runID,
-			Stage:     "visual_text_localize",
-			Status:    domain.StageStatusRunning,
-			StartedAt: &nowFin,
-			CreatedAt: nowFin,
-			UpdatedAt: nowFin,
-		}
-		if err := s.db.CreateStageExecution(ctx, seLoc); err != nil {
-			return s.failRun(ctx, runID, "visual_text_localize", fmt.Sprintf("failed to record stage start: %v", err))
-		}
-
-		visTrack, locErr := s.visualTextSvc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
-			RunID:          runID,
-			AssetID:        assetID,
-			JobID:          jobID,
-			TargetLanguage: targetLang,
-		})
-		if locErr != nil {
+			textPlan, detErr := s.visualTextSvc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+				RunID:   runID,
+				AssetID: assetID,
+				JobID:   jobID,
+			})
+			if detErr != nil {
+				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+					return err
+				}
+				return s.failStageAndInterrupt(ctx, seDetect, detErr)
+			}
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 				return err
 			}
-			return s.failStageAndInterrupt(ctx, &seLoc, locErr)
+
+			seDetect.Status = domain.StageStatusSucceeded
+			seDetect.ArtifactSHA256 = textPlan.CASHash
+			nowFin := time.Now().UTC()
+			seDetect.CompletedAt = &nowFin
+			seDetect.UpdatedAt = nowFin
+			if err := s.db.UpdateStageExecution(ctx, *seDetect); err != nil {
+				return s.failRun(ctx, runID, "text_detection", fmt.Sprintf("failed to record stage completion: %v", err))
+			}
 		}
+
 		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 			return err
 		}
 
-		subtitleTrackCAS = visTrack.SubtitleTrackCAS
-		seLoc.Status = domain.StageStatusSucceeded
-		seLoc.ArtifactSHA256 = visTrack.CASHash
-		nowLocFin := time.Now().UTC()
-		seLoc.CompletedAt = &nowLocFin
-		seLoc.UpdatedAt = nowLocFin
-		if err := s.db.UpdateStageExecution(ctx, seLoc); err != nil {
-			return s.failRun(ctx, runID, "visual_text_localize", fmt.Sprintf("failed to record stage completion: %v", err))
+		if reusable, _ := isStageReusable("visual_text_localize"); reusable {
+			if subIdx, err := s.db.GetLocalizedSubtitleTrackIndexByRun(ctx, runID); err == nil && subIdx != nil {
+				subtitleTrackCAS = subIdx.CASHash
+			}
+		} else {
+			canReuse = false
+			seLoc, err := startStage("visual_text_localize")
+			if err != nil {
+				return s.failRun(ctx, runID, "visual_text_localize", fmt.Sprintf("failed to record stage start: %v", err))
+			}
+
+			visTrack, locErr := s.visualTextSvc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+				RunID:          runID,
+				AssetID:        assetID,
+				JobID:          jobID,
+				TargetLanguage: targetLang,
+			})
+			if locErr != nil {
+				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+					return err
+				}
+				return s.failStageAndInterrupt(ctx, seLoc, locErr)
+			}
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+
+			subtitleTrackCAS = visTrack.SubtitleTrackCAS
+			seLoc.Status = domain.StageStatusSucceeded
+			seLoc.ArtifactSHA256 = visTrack.CASHash
+			nowLocFin := time.Now().UTC()
+			seLoc.CompletedAt = &nowLocFin
+			seLoc.UpdatedAt = nowLocFin
+			if err := s.db.UpdateStageExecution(ctx, *seLoc); err != nil {
+				return s.failRun(ctx, runID, "visual_text_localize", fmt.Sprintf("failed to record stage completion: %v", err))
+			}
 		}
 	}
 
@@ -998,99 +1095,101 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		return s.failRun(ctx, runID, "render_plan", "RenderService is not configured")
 	}
 	{
-		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
-			return err
-		}
-
-		now := time.Now().UTC()
-		sePlan := domain.StageExecution{
-			ID:        uuid.NewString(),
-			RunID:     runID,
-			Stage:     "render_plan",
-			Status:    domain.StageStatusRunning,
-			StartedAt: &now,
-			CreatedAt: now,
-			UpdatedAt: now,
-		}
-		if err := s.db.CreateStageExecution(ctx, sePlan); err != nil {
-			return s.failRun(ctx, runID, "render_plan", fmt.Sprintf("failed to record stage start: %v", err))
-		}
-
-		renderPlan, planErr := s.renderSvc.FreezeRenderPlan(ctx, service.RenderPlanInput{
-			RunID:           runID,
-			JobID:           jobID,
-			AssetID:         assetID,
-			TargetLanguage:  targetLang,
-			SubtitlePlanCAS: subtitleTrackCAS,
-		})
-		if planErr != nil {
+		var planProvenance string
+		if reusable, _ := isStageReusable("render_plan"); reusable {
+			if planIdx, err := s.db.GetRenderPlanIndexByRun(ctx, runID); err == nil && planIdx != nil {
+				planProvenance = planIdx.ProvenanceHash
+			}
+		} else {
+			canReuse = false
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 				return err
 			}
-			return s.failStageAndInterrupt(ctx, &sePlan, planErr)
-		}
-		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
-			return err
-		}
 
-		sePlan.Status = domain.StageStatusSucceeded
-		sePlan.ArtifactSHA256 = renderPlan.CASHash
-		nowFin := time.Now().UTC()
-		sePlan.CompletedAt = &nowFin
-		sePlan.UpdatedAt = nowFin
-		if err := s.db.UpdateStageExecution(ctx, sePlan); err != nil {
-			return s.failRun(ctx, runID, "render_plan", fmt.Sprintf("failed to record stage completion: %v", err))
-		}
+			sePlan, err := startStage("render_plan")
+			if err != nil {
+				return s.failRun(ctx, runID, "render_plan", fmt.Sprintf("failed to record stage start: %v", err))
+			}
 
-		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
-			return err
-		}
-
-		sePrev := domain.StageExecution{
-			ID:        uuid.NewString(),
-			RunID:     runID,
-			Stage:     "render_preview",
-			Status:    domain.StageStatusRunning,
-			StartedAt: &nowFin,
-			CreatedAt: nowFin,
-			UpdatedAt: nowFin,
-		}
-		if err := s.db.CreateStageExecution(ctx, sePrev); err != nil {
-			return s.failRun(ctx, runID, "render_preview", fmt.Sprintf("failed to record stage start: %v", err))
-		}
-
-		prevArtifact, prevErr := s.renderSvc.RenderPreview(ctx, service.RenderExecutionInput{
-			RunID:          runID,
-			JobID:          jobID,
-			AssetID:        assetID,
-			TargetLanguage: targetLang,
-			PlanProvenance: renderPlan.ProvenanceHash,
-		})
-		if prevErr != nil {
+			renderPlan, planErr := s.renderSvc.FreezeRenderPlan(ctx, service.RenderPlanInput{
+				RunID:           runID,
+				JobID:           jobID,
+				AssetID:         assetID,
+				TargetLanguage:  targetLang,
+				SubtitlePlanCAS: subtitleTrackCAS,
+			})
+			if planErr != nil {
+				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+					return err
+				}
+				return s.failStageAndInterrupt(ctx, sePlan, planErr)
+			}
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 				return err
 			}
-			return s.failStageAndInterrupt(ctx, &sePrev, prevErr)
+
+			planProvenance = renderPlan.ProvenanceHash
+			sePlan.Status = domain.StageStatusSucceeded
+			sePlan.ArtifactSHA256 = renderPlan.CASHash
+			nowFin := time.Now().UTC()
+			sePlan.CompletedAt = &nowFin
+			sePlan.UpdatedAt = nowFin
+			if err := s.db.UpdateStageExecution(ctx, *sePlan); err != nil {
+				return s.failRun(ctx, runID, "render_plan", fmt.Sprintf("failed to record stage completion: %v", err))
+			}
 		}
+
 		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 			return err
 		}
 
-		sePrev.Status = domain.StageStatusSucceeded
-		sePrev.ArtifactSHA256 = prevArtifact.CASHash
-		nowPrevFin := time.Now().UTC()
-		sePrev.CompletedAt = &nowPrevFin
-		sePrev.UpdatedAt = nowPrevFin
-		if err := s.db.UpdateStageExecution(ctx, sePrev); err != nil {
-			return s.failRun(ctx, runID, "render_preview", fmt.Sprintf("failed to record stage completion: %v", err))
+		if reusable, _ := isStageReusable("render_preview"); reusable {
+			// Reused render_preview
+		} else {
+			canReuse = false
+			sePrev, err := startStage("render_preview")
+			if err != nil {
+				return s.failRun(ctx, runID, "render_preview", fmt.Sprintf("failed to record stage start: %v", err))
+			}
+
+			prevArtifact, prevErr := s.renderSvc.RenderPreview(ctx, service.RenderExecutionInput{
+				RunID:          runID,
+				JobID:          jobID,
+				AssetID:        assetID,
+				TargetLanguage: targetLang,
+				PlanProvenance: planProvenance,
+			})
+			if prevErr != nil {
+				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+					return err
+				}
+				return s.failStageAndInterrupt(ctx, sePrev, prevErr)
+			}
+			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+				return err
+			}
+
+			sePrev.Status = domain.StageStatusSucceeded
+			sePrev.ArtifactSHA256 = prevArtifact.CASHash
+			nowPrevFin := time.Now().UTC()
+			sePrev.CompletedAt = &nowPrevFin
+			sePrev.UpdatedAt = nowPrevFin
+			if err := s.db.UpdateStageExecution(ctx, *sePrev); err != nil {
+				return s.failRun(ctx, runID, "render_preview", fmt.Sprintf("failed to record stage completion: %v", err))
+			}
 		}
 	}
+
 	// 5. Automated QC & Review projection / Final render handoff (T16 / T19 / #82)
 	// Posture is validated fail-closed at start of executeRun
 	stageName := "render_final"
 	if posture == domain.ReviewPostureReview {
 		stageName = "final_render_handoff"
 	}
+	if reusable, _ := isStageReusable(stageName); reusable {
+		return s.completeRunSafely(ctx, runID)
+	}
+	canReuse = false
 
 	if s.reviewSvc == nil {
 		return s.failRun(ctx, runID, stageName, "ReviewService is not configured")
@@ -1099,17 +1198,8 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		return err
 	}
 
-	nowHandoff := time.Now().UTC()
-	seHandoff := domain.StageExecution{
-		ID:        uuid.NewString(),
-		RunID:     runID,
-		Stage:     stageName,
-		Status:    domain.StageStatusRunning,
-		StartedAt: &nowHandoff,
-		CreatedAt: nowHandoff,
-		UpdatedAt: nowHandoff,
-	}
-	if err := s.db.CreateStageExecution(ctx, seHandoff); err != nil {
+	seHandoff, err := startStage(stageName)
+	if err != nil {
 		return s.failRun(ctx, runID, stageName, fmt.Sprintf("failed to record stage start: %v", err))
 	}
 
@@ -1124,7 +1214,7 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 			return err
 		}
-		return s.failStageAndInterrupt(ctx, &seHandoff, handoffErr)
+		return s.failStageAndInterrupt(ctx, seHandoff, handoffErr)
 	}
 	if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 		return err
@@ -1132,28 +1222,28 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 
 	if handoffResult.PendingReviewCount > 0 {
 		_ = s.db.UpdateJobStatus(ctx, jobID, "review_required")
-		return s.failStageAndInterrupt(ctx, &seHandoff, fmt.Errorf("final render handoff blocked: %d pending review exceptions require resolution", handoffResult.PendingReviewCount))
+		return s.failStageAndInterrupt(ctx, seHandoff, fmt.Errorf("final render handoff blocked: %d pending review exceptions require resolution", handoffResult.PendingReviewCount))
 	}
 
 	if s.casStore == nil {
-		return s.failStageAndInterrupt(ctx, &seHandoff, errors.New("cas store is not configured for handoff artifact persistence"))
+		return s.failStageAndInterrupt(ctx, seHandoff, errors.New("cas store is not configured for handoff artifact persistence"))
 	}
 	handoffBytes, err := json.Marshal(handoffResult)
 	if err != nil {
-		return s.failStageAndInterrupt(ctx, &seHandoff, fmt.Errorf("marshal final render handoff result: %w", err))
+		return s.failStageAndInterrupt(ctx, seHandoff, fmt.Errorf("marshal final render handoff result: %w", err))
 	}
 	obj, err := s.casStore.Put(bytes.NewReader(handoffBytes))
 	if err != nil {
-		return s.failStageAndInterrupt(ctx, &seHandoff, fmt.Errorf("persist final render handoff result to CAS: %w", err))
+		return s.failStageAndInterrupt(ctx, seHandoff, fmt.Errorf("persist final render handoff result to CAS: %w", err))
 	}
 	if obj.SHA256 == "" {
-		return s.failStageAndInterrupt(ctx, &seHandoff, errors.New("persisted final render handoff result produced empty CAS hash"))
+		return s.failStageAndInterrupt(ctx, seHandoff, errors.New("persisted final render handoff result produced empty CAS hash"))
 	}
 	handoffCAS := obj.SHA256
 
 	if posture == domain.ReviewPostureAuto {
 		if handoffResult.FinalRenderCAS == "" {
-			return s.failStageAndInterrupt(ctx, &seHandoff, errors.New("auto final render produced empty artifact"))
+			return s.failStageAndInterrupt(ctx, seHandoff, errors.New("auto final render produced empty artifact"))
 		}
 		seHandoff.ArtifactSHA256 = handoffResult.FinalRenderCAS
 	} else {
@@ -1164,7 +1254,7 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 	nowHandoffFin := time.Now().UTC()
 	seHandoff.CompletedAt = &nowHandoffFin
 	seHandoff.UpdatedAt = nowHandoffFin
-	if err := s.db.UpdateStageExecution(ctx, seHandoff); err != nil {
+	if err := s.db.UpdateStageExecution(ctx, *seHandoff); err != nil {
 		return s.failRun(ctx, runID, stageName, fmt.Sprintf("failed to record stage completion: %v", err))
 	}
 	// Complete the run atomically with state verification

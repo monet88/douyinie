@@ -111,3 +111,100 @@ func TestQueue_UpdateQueueStatus_InterruptedSnapsRunningStages(t *testing.T) {
 		t.Fatalf("expected stage status %s, got %s", domain.StageStatusInterrupted, stages[0].Status)
 	}
 }
+
+func TestQueue_Resume_InterruptedRunGetsPosition(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	db, err := storage.Open(filepath.Join(tmpDir, "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Now().UTC()
+	ra := domain.RightsAttestation{
+		ID:              uuid.NewString(),
+		AttestationType: "OPERATOR_CONFIRMED",
+		DeclaredBy:      "operator",
+		TermsAccepted:   true,
+		Notes:           "test",
+		ConfirmedAt:     now,
+	}
+	if err := db.CreateRightsAttestation(ctx, ra); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+
+	asset := domain.SourceAsset{
+		ID:                  uuid.NewString(),
+		SHA256:              strings.Repeat("a", 64),
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		OriginalFilename:    "resume.mp4",
+		RightsAttestationID: ra.ID,
+		CASPath:             "resume.mp4",
+		CreatedAt:           now,
+	}
+	if err := db.CreateSourceAsset(ctx, asset); err != nil {
+		t.Fatalf("save asset: %v", err)
+	}
+	job := domain.LocalizationJob{
+		ID:             "job-resume-test",
+		SourceAssetID:  asset.ID,
+		TargetLanguage: "vi",
+		Status:         "created",
+		CreatedAt:      now,
+	}
+	if err := db.CreateJob(ctx, job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	run := domain.LocalizationRun{
+		ID:        "run-resume-test",
+		JobID:     job.ID,
+		Status:    "running",
+		CreatedAt: now,
+	}
+	if err := db.CreateRun(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	qSvc := queue.NewService(db)
+	if _, err := qSvc.Enqueue(ctx, run.ID, job.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := qSvc.MarkRunning(ctx, run.ID); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+
+	// Interrupt the run (e.g. crash/unrecoverable worker timeout)
+	if err := db.UpdateQueueStatus(ctx, run.ID, domain.RunStatusInterrupted, domain.RunStatusInterrupted); err != nil {
+		t.Fatalf("update queue status to interrupted: %v", err)
+	}
+
+	entry, err := db.GetQueueEntryByRunID(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("get queue entry: %v", err)
+	}
+	if entry.Status != domain.RunStatusInterrupted {
+		t.Fatalf("expected status %s, got %s", domain.RunStatusInterrupted, entry.Status)
+	}
+	if entry.Position != 0 {
+		t.Fatalf("expected null position (0 in struct), got %d", entry.Position)
+	}
+
+	// Resume interrupted run
+	if err := qSvc.Resume(ctx, run.ID); err != nil {
+		t.Fatalf("resume interrupted run: %v", err)
+	}
+
+	entryResumed, err := db.GetQueueEntryByRunID(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("get resumed queue entry: %v", err)
+	}
+	if entryResumed.Status != domain.RunStatusQueued {
+		t.Fatalf("expected resumed status %s, got %s", domain.RunStatusQueued, entryResumed.Status)
+	}
+	if entryResumed.Position != 1 {
+		t.Fatalf("expected assigned position 1, got %d", entryResumed.Position)
+	}
+}

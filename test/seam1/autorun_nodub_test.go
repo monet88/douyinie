@@ -547,3 +547,157 @@ func TestSeam1_AutoRun_CancelDuringExecutionCannotBecomeCompleted(t *testing.T) 
 		t.Fatalf("expected run status to remain %q, but got %q", domain.RunStatusCancelled, currentRun.Status)
 	}
 }
+
+// TestSeam1_AutoRun_RestartRecoveryInterruptsActiveAndPreservesQueued proves that
+// when RuntimeHost crashes / restarts:
+// 1. The actively running run is recovered to "interrupted", not left "running" or marked "completed".
+// 2. Any already queued runs remain "queued" at their exact positions and survive restart.
+// 3. Explicit resume is required to resume the interrupted run.
+func TestSeam1_AutoRun_RestartRecoveryInterruptsActiveAndPreservesQueued(t *testing.T) {
+	tmpDir := t.TempDir()
+	casStore, err := cas.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("setup CAS: %v", err)
+	}
+	db, err := storage.Open(filepath.Join(tmpDir, "restart_recovery.db"))
+	if err != nil {
+		t.Fatalf("setup SQLite: %v", err)
+	}
+	queueSvc := queue.NewService(db)
+	resScheduler := scheduler.New()
+
+	analyzer := &blockingAudioRoleAnalyzer{
+		startedCh: make(chan struct{}, 1),
+		unblockCh: make(chan struct{}),
+	}
+
+	// Step 1: Start host with AutoRunExecutor and blocking analyzer
+	srv1, _, _ := newRuntimeHostWithOptions(t, db, casStore, queueSvc, resScheduler, harnessOptions{
+		autoRunExecutor:   true,
+		audioRoleAnalyzer: analyzer,
+	})
+	ts1 := httptest.NewServer(srv1.Handler())
+
+	assetID1 := ingestSyntheticAsset(t, ts1.URL, tmpDir, "active_at_crash.mp4", 1.5)
+	jobID1 := createJob(t, ts1.URL, assetID1, domain.TargetLanguageVI)
+	runID1 := enqueueRun(t, ts1.URL, jobID1)
+
+	assetID2 := ingestSyntheticAsset(t, ts1.URL, tmpDir, "queued_at_crash.mp4", 1.5)
+	jobID2 := createJob(t, ts1.URL, assetID2, domain.TargetLanguageVI)
+	runID2 := enqueueRun(t, ts1.URL, jobID2)
+
+	// Wait for run 1 to be active in analyzer
+	select {
+	case <-analyzer.startedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for run 1 to start")
+	}
+
+	// Host crashes abruptly: unblock analyzer so goroutine doesn't hang, shut down server without letting run 1 finish normally
+	close(analyzer.unblockCh)
+	ts1.Close()
+	_ = srv1.Shutdown(context.Background())
+
+	// Step 2: Restart RuntimeHost with new instance over the same DB
+	srv2, _, _ := newRuntimeHostWithOptions(t, db, casStore, queueSvc, resScheduler, harnessOptions{
+		autoRunExecutor: true,
+	})
+	ts2 := httptest.NewServer(srv2.Handler())
+	defer func() {
+		_ = srv2.Shutdown(context.Background())
+		ts2.Close()
+		_ = db.Close()
+	}()
+
+	// Allow startup recovery and consumer to run
+	time.Sleep(300 * time.Millisecond)
+
+	// Run 1 MUST be interrupted by crash recovery
+	run1Check := pollRunStatus(t, ts2.URL, runID1, domain.RunStatusInterrupted, 2*time.Second)
+	if run1Check.Status != domain.RunStatusInterrupted {
+		t.Fatalf("expected run 1 to be %q on restart recovery, got %q", domain.RunStatusInterrupted, run1Check.Status)
+	}
+
+	// Run 2 (which was queued) MUST be drained and eventually complete!
+	run2Check := pollRunStatus(t, ts2.URL, runID2, domain.RunStatusCompleted, 5*time.Second)
+	if run2Check.Status != domain.RunStatusCompleted {
+		t.Fatalf("expected queued run 2 to auto-complete after restart, got %q", run2Check.Status)
+	}
+
+	// Explicit resume of interrupted run 1
+	resumeResp, err := http.Post(fmt.Sprintf("%s/api/v1/runs/%s/resume", ts2.URL, runID1), "application/json", nil)
+	if err != nil {
+		t.Fatalf("resume request failed: %v", err)
+	}
+	defer resumeResp.Body.Close()
+	if resumeResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for resume, got %d", resumeResp.StatusCode)
+	}
+
+	// Run 1 should now drain and reach completed
+	run1Resumed := pollRunStatus(t, ts2.URL, runID1, domain.RunStatusCompleted, 5*time.Second)
+	if run1Resumed.Status != domain.RunStatusCompleted {
+		t.Fatalf("expected resumed run 1 to complete, got %q", run1Resumed.Status)
+	}
+}
+
+// TestSeam1_AutoRun_ResumeReusesCompletedStagesWithoutDuplication proves that
+// when an interrupted or paused run is resumed:
+// 1. Completed stages whose CAS artifacts exist are reused.
+// 2. No duplicate StageExecution entries are created for reused stages.
+// 3. Execution resumes from the first non-reusable stage to completion.
+func TestSeam1_AutoRun_ResumeReusesCompletedStagesWithoutDuplication(t *testing.T) {
+	h := setupAutoRunHarness(t)
+
+	assetID := ingestSyntheticAsset(t, h.server.URL, h.dir, "resume_reuse.mp4", 1.5)
+	// Save role plan upfront so audio_role_plan stage creates an artifact
+	postAudioRolePlan(t, h.server.URL, assetID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleInstrumentalBgm},
+	})
+	jobID := createJob(t, h.server.URL, assetID, domain.TargetLanguageVI)
+	runID := enqueueRun(t, h.server.URL, jobID)
+
+	// Run to completion initially
+	finalRun := pollRunStatus(t, h.server.URL, runID, domain.RunStatusCompleted, 10*time.Second)
+	if finalRun.Status != domain.RunStatusCompleted {
+		t.Fatalf("expected initial run completion, got %q", finalRun.Status)
+	}
+
+	stagesBefore := getRunStages(t, h.server.URL, runID)
+	if len(stagesBefore) == 0 {
+		t.Fatal("expected non-empty stages before resume")
+	}
+	countBefore := len(stagesBefore)
+
+	// Forcibly set queue status back to interrupted to simulate resume after interruption
+	if err := h.db.UpdateQueueStatus(context.Background(), runID, domain.RunStatusInterrupted, domain.RunStatusInterrupted); err != nil {
+		t.Fatalf("failed to set run status to interrupted: %v", err)
+	}
+
+	// Resume the run
+	resumeResp, err := http.Post(fmt.Sprintf("%s/api/v1/runs/%s/resume", h.server.URL, runID), "application/json", nil)
+	if err != nil {
+		t.Fatalf("resume request failed: %v", err)
+	}
+	resumeResp.Body.Close()
+	if resumeResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for resume, got %d", resumeResp.StatusCode)
+	}
+
+	// Run completes again via reuse
+	resumedRun := pollRunStatus(t, h.server.URL, runID, domain.RunStatusCompleted, 5*time.Second)
+	if resumedRun.Status != domain.RunStatusCompleted {
+		t.Fatalf("expected resumed run to complete, got %q", resumedRun.Status)
+	}
+
+	stagesAfter := getRunStages(t, h.server.URL, runID)
+	// Stage executions must NOT have duplicated for successfully reused stages!
+	if len(stagesAfter) != countBefore {
+		t.Fatalf("expected exactly %d stages after reuse, got %d (stages were duplicated!)", countBefore, len(stagesAfter))
+	}
+	for _, st := range stagesAfter {
+		if st.Status != domain.StageStatusSucceeded {
+			t.Errorf("expected stage %s to be succeeded, got %s", st.Stage, st.Status)
+		}
+	}
+}

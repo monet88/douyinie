@@ -106,13 +106,13 @@ func (s *Service) Cancel(ctx context.Context, runID string) error {
 	return nil
 }
 
-// Resume transitions a paused run back to queued.
+// Resume transitions a paused or interrupted run back to queued.
 func (s *Service) Resume(ctx context.Context, runID string) error {
 	e, err := s.db.GetQueueEntryByRunID(ctx, runID)
 	if err != nil {
 		return fmt.Errorf("lookup queue entry: %w", err)
 	}
-	if e.Status != domain.RunStatusPaused {
+	if e.Status != domain.RunStatusPaused && e.Status != domain.RunStatusInterrupted {
 		return fmt.Errorf("%w: status is %s", ErrNotQueued, e.Status)
 	}
 	if err := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusQueued, domain.RunStatusQueued); err != nil {

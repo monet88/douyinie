@@ -2579,7 +2579,7 @@ func (s *DB) UpdateQueueStatus(ctx context.Context, runID, queueStatus, runStatu
 			return fmt.Errorf("update queue_entry status: %w", err)
 		}
 	} else {
-		if _, err := tx.ExecContext(ctx, `UPDATE queue_entries SET status = ?, updated_at = ? WHERE run_id = ?`,
+		if _, err := tx.ExecContext(ctx, `UPDATE queue_entries SET status = ?, position = COALESCE(position, (SELECT COALESCE(MAX(position), 0) + 1 FROM queue_entries WHERE position IS NOT NULL)), updated_at = ? WHERE run_id = ?`,
 			queueStatus, time.Now().UTC().Format(time.RFC3339Nano), runID); err != nil {
 			return fmt.Errorf("update queue_entry status: %w", err)
 		}

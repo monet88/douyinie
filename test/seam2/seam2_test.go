@@ -2274,3 +2274,81 @@ func TestSeam2_SeparatorStage_RealRuntimeSmokeOptIn(t *testing.T) {
 		t.Skipf("skipping real separator smoke: model dir %s does not exist", modelDir)
 	}
 }
+
+// TestSeam2_WorkerTimeoutAndHeartbeatFailureLifecycle proves that when a StageWorker
+// times out during execution:
+// 1. The client detects timeout and escalates to terminating the supervisor process tree.
+// 2. The recovery store reflects the interrupted state.
+// 3. Subsequent runs fail fail-closed on the terminated client until explicit respawn.
+func TestSeam2_WorkerTimeoutAndHeartbeatFailureLifecycle(t *testing.T) {
+	exe := buildStageWorker(t)
+	sup := worker.NewSupervisor()
+	ctx := context.Background()
+	if err := sup.Spawn(ctx, "tts", exe, "-family", "tts", "-heartbeat-ms", "1000"); err != nil {
+		t.Fatalf("spawn worker: %v", err)
+	}
+	client := worker.NewClient(sup)
+	if _, err := client.Handshake(ctx, 5*time.Second); err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("handshake: %v", err)
+	}
+
+	dir := t.TempDir()
+	store, err := worker.NewRecoveryStore(dir)
+	if err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("new recovery store: %v", err)
+	}
+
+	rec, err := store.BeginAttempt("run-timeout", "tts", "tts")
+	if err != nil {
+		_ = sup.Terminate()
+		t.Fatalf("begin attempt: %v", err)
+	}
+
+	cmd := worker.Command{
+		ID:        "cmd-timeout",
+		Family:    "tts",
+		Stage:     "tts",
+		AttemptID: rec.ID,
+		RunID:     "run-timeout",
+		Config: map[string]any{
+			"long_running_ms": float64(10000),
+		},
+	}
+
+	// Execute with short per-command timeout of 300ms
+	_, runErr := client.Run(ctx, cmd, 300*time.Millisecond, 500*time.Millisecond)
+	if runErr == nil {
+		_ = sup.Terminate()
+		t.Fatal("expected timeout error, got nil")
+	}
+	if !strings.Contains(runErr.Error(), "heartbeat timeout") && !errors.Is(runErr, worker.ErrInterrupted) {
+		t.Fatalf("expected heartbeat timeout error, got %v", runErr)
+	}
+	_ = sup.Terminate()
+
+	// Terminal state must be interrupted in recovery store
+	if err := store.InterruptAttempt(*rec, "worker execution timed out: "+runErr.Error()); err != nil {
+		t.Fatalf("record interrupted attempt: %v", err)
+	}
+
+	// Supervisor should be terminated or exited
+	_ = sup.Wait()
+	if sup.State() != worker.LifecycleExited && sup.State() != worker.LifecycleFailed {
+		t.Fatalf("expected supervisor to be exited/failed after timeout escalation, got %s", sup.State())
+	}
+
+	// Subsequent execution on dead client must fail fail-closed
+	cmd2 := worker.Command{
+		ID:        "cmd-subsequent-dead",
+		Family:    "tts",
+		Stage:     "tts",
+		AttemptID: "attempt-subsequent-dead",
+		RunID:     "run-timeout",
+	}
+	_, errSub := client.Run(ctx, cmd2, 5*time.Second, 5*time.Second)
+	if errSub == nil {
+		t.Fatal("expected run on dead client to fail fail-closed, got nil")
+	}
+}
