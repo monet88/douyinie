@@ -87,7 +87,7 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 	// 1. Resolve segments: if none provided, load SpeechBlocks from TranscriptArtifact.
 	// Preserve the transcript CAS hash as a content input to deterministic cache identity.
 	if len(in.Segments) == 0 {
-		segments, transcriptCAS, err := s.loadSegmentsFromTranscript(ctx, in.AssetID)
+		segments, transcriptCAS, err := s.loadSegmentsFromTranscript(ctx, in.AssetID, in.TranscriptArtifactCAS)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load source segments: %w", err)
 		}
@@ -296,25 +296,36 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 }
 
 // loadSegmentsFromTranscript loads SpeechBlocks from TranscriptArtifact in CAS/DB.
-func (s *TranslationService) loadSegmentsFromTranscript(ctx context.Context, assetID string) ([]domain.TranslationInputSegment, string, error) {
-	if s.db == nil || s.cas == nil {
+func (s *TranslationService) loadSegmentsFromTranscript(ctx context.Context, assetID, explicitCAS string) ([]domain.TranslationInputSegment, string, error) {
+	if s.cas == nil {
 		return nil, "", fmt.Errorf("database and CAS required to load transcript")
 	}
 
-	idx, err := s.db.GetTranscriptArtifactIndex(ctx, assetID)
-	if err != nil {
-		return nil, "", fmt.Errorf("transcript artifact not found for asset %s: %w", assetID, err)
+	casHash := explicitCAS
+	if casHash == "" {
+		if s.db == nil {
+			return nil, "", fmt.Errorf("database and CAS required to load transcript")
+		}
+		idx, err := s.db.GetTranscriptArtifactIndex(ctx, assetID)
+		if err != nil {
+			return nil, "", fmt.Errorf("transcript artifact not found for asset %s: %w", assetID, err)
+		}
+		casHash = idx.CASHash
 	}
 
-	rc, err := s.cas.Get(idx.CASHash)
+	rc, err := s.cas.Get(casHash)
 	if err != nil {
-		return nil, "", fmt.Errorf("read transcript artifact from CAS: %w", err)
+		return nil, "", fmt.Errorf("read transcript artifact from CAS (%s): %w", casHash, err)
 	}
 	defer rc.Close()
 
 	var transcript domain.TranscriptArtifact
 	if err := json.NewDecoder(rc).Decode(&transcript); err != nil {
 		return nil, "", fmt.Errorf("decode transcript artifact: %w", err)
+	}
+
+	if transcript.AssetID != "" && transcript.AssetID != assetID {
+		return nil, "", fmt.Errorf("transcript artifact %s belongs to asset %q, not %q", casHash, transcript.AssetID, assetID)
 	}
 
 	var segments []domain.TranslationInputSegment
@@ -334,7 +345,7 @@ func (s *TranslationService) loadSegmentsFromTranscript(ctx context.Context, ass
 			EndMs:      block.EndMs,
 		})
 	}
-	return segments, idx.CASHash, nil
+	return segments, casHash, nil
 }
 
 // computeProvenanceHash computes deterministic cache identity for translation.

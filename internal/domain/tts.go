@@ -61,22 +61,24 @@ type VoiceProfile struct {
 // VoiceAssignment is the frozen, run-scoped mapping of speaker_id -> VoiceProfile.
 // Engine hopping across sentences for a single speaker is strictly prohibited.
 type VoiceAssignment struct {
-	ID                  string                     `json:"id"`
-	SchemaVersion       int                        `json:"schema_version"`
-	AssetID             string                     `json:"asset_id"`
-	RunID               string                     `json:"run_id"`
-	JobID               string                     `json:"job_id,omitempty"`
-	TargetLanguage      string                     `json:"target_language"` // "vi" or "en"
-	Assignments         map[string]VoiceProfile    `json:"assignments"`     // speaker_id -> VoiceProfile
-	UseSameVoiceForAll  bool                       `json:"use_same_voice_for_all"`
-	SupersedesCAS       string                     `json:"supersedes_cas,omitempty"`
-	InvalidatedSpeakers []string                   `json:"invalidated_speakers,omitempty"`
-	InvalidationScope   []string                   `json:"invalidation_scope,omitempty"`
-	Distinguishability  *VoiceDistinguishabilityQC `json:"distinguishability,omitempty"`
-	CASHash             string                     `json:"cas_hash,omitempty"`
-	ProvenanceHash      string                     `json:"provenance_hash,omitempty"`
-	FrozenAt            time.Time                  `json:"frozen_at"`
-	CreatedAt           time.Time                  `json:"created_at"`
+	ID                    string                     `json:"id"`
+	SchemaVersion         int                        `json:"schema_version"`
+	AssetID               string                     `json:"asset_id"`
+	RunID                 string                     `json:"run_id"`
+	JobID                 string                     `json:"job_id,omitempty"`
+	TargetLanguage        string                     `json:"target_language"` // "vi" or "en"
+	Assignments           map[string]VoiceProfile    `json:"assignments"`     // speaker_id -> VoiceProfile
+	UseSameVoiceForAll    bool                       `json:"use_same_voice_for_all"`
+	SupersedesCAS         string                     `json:"supersedes_cas,omitempty"`
+	InvalidatedSpeakers   []string                   `json:"invalidated_speakers,omitempty"`
+	InvalidationScope     []string                   `json:"invalidation_scope,omitempty"`
+	Distinguishability    *VoiceDistinguishabilityQC `json:"distinguishability,omitempty"`
+	CASHash               string                     `json:"cas_hash,omitempty"`
+	ProvenanceHash        string                     `json:"provenance_hash,omitempty"`
+	DubScriptVariantCAS   string                     `json:"dub_script_variant_cas,omitempty"`
+	TranscriptArtifactCAS string                     `json:"transcript_artifact_cas,omitempty"`
+	FrozenAt              time.Time                  `json:"frozen_at"`
+	CreatedAt             time.Time                  `json:"created_at"`
 }
 
 // VoiceDistinguishabilityQC captures quality-control evaluation of multi-speaker voice assignments.
@@ -275,13 +277,15 @@ type DubSegmentsVariant struct {
 
 // VoiceAssignmentInput defines input parameters for generating/freezing a VoiceAssignment.
 type VoiceAssignmentInput struct {
-	RunID              string                  `json:"run_id"`
-	AssetID            string                  `json:"asset_id"`
-	JobID              string                  `json:"job_id,omitempty"`
-	TargetLanguage     string                  `json:"target_language"` // "vi" or "en"
-	CustomAssignments  map[string]VoiceProfile `json:"custom_assignments,omitempty"`
-	UseSameVoiceForAll bool                    `json:"use_same_voice_for_all"`
-	ExecutionProfile   ExecutionProfile        `json:"execution_profile,omitempty"`
+	RunID                 string                  `json:"run_id"`
+	AssetID               string                  `json:"asset_id"`
+	JobID                 string                  `json:"job_id,omitempty"`
+	TargetLanguage        string                  `json:"target_language"` // "vi" or "en"
+	CustomAssignments     map[string]VoiceProfile `json:"custom_assignments,omitempty"`
+	UseSameVoiceForAll    bool                    `json:"use_same_voice_for_all"`
+	ExecutionProfile      ExecutionProfile        `json:"execution_profile,omitempty"`
+	DubScriptVariantCAS   string                  `json:"dub_script_variant_cas,omitempty"`
+	TranscriptArtifactCAS string                  `json:"transcript_artifact_cas,omitempty"`
 }
 
 // VoiceAuditionInput defines input parameters for pre-dub voice audition.
