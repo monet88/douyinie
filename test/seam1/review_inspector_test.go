@@ -875,6 +875,8 @@ func TestSeam1_ManualOverride_StrictPendingValidation_RejectionsAndSuccess(t *te
 	transVar := domain.TranslationVariant{
 		ID:             "trans-strict-seam1",
 		AssetID:        assetID,
+		RunID:          runID,
+		JobID:          jobID,
 		TargetLanguage: "vi",
 		ProvenanceHash: "prov-trans-strict-seam1",
 		Segments: []domain.TranslationSegment{
@@ -893,6 +895,8 @@ func TestSeam1_ManualOverride_StrictPendingValidation_RejectionsAndSuccess(t *te
 	_ = h.db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
 		ID:             transVar.ID,
 		AssetID:        assetID,
+		RunID:          runID,
+		JobID:          jobID,
 		TargetLanguage: "vi",
 		CASHash:        tObj.SHA256,
 		ProvenanceHash: transVar.ProvenanceHash,
@@ -1277,8 +1281,38 @@ func TestSeam1_RegionOverride_Reclassify_Drag_Resize_Relabel_TargetedInvalidatio
 		CreatedAt:      textPlan.CreatedAt,
 	})
 
-	// Setup dub mix via helper
-	_, _, _, _ = setupAssetWithDubMix(t, h)
+	// Setup the DubMix on the selected run itself. Creating it through
+	// setupAssetWithDubMix would mint a second run for the same deduped asset,
+	// which no longer satisfies selected-run correction semantics.
+	rolePayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	roleBody, _ := json.Marshal(rolePayload)
+	roleResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
+	if err != nil {
+		t.Fatalf("setup audio role plan failed: %v", err)
+	}
+	if roleResp.StatusCode != http.StatusCreated {
+		t.Fatalf("setup audio role plan failed: status=%d", roleResp.StatusCode)
+	}
+	_ = roleResp.Body.Close()
+
+	sepResp, stems := runSeparateStems(t, h, assetID, map[string]any{"run_id": runID})
+	if sepResp.StatusCode != http.StatusCreated || stems == nil {
+		t.Fatalf("setup separate stems failed: status=%d", sepResp.StatusCode)
+	}
+	_ = sepResp.Body.Close()
+
+	mixResp, mix := runAudioMix(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": domain.TargetLanguageVI,
+	})
+	if mixResp.StatusCode != http.StatusCreated || mix == nil {
+		t.Fatalf("setup audio mix failed: status=%d", mixResp.StatusCode)
+	}
+	_ = mixResp.Body.Close()
 
 	// 2. Query review items -> 1 pending low confidence / uncertain role item
 	getQueueURL := fmt.Sprintf("%s/api/v1/assets/%s/review-items?target_language=vi", h.server.URL, assetID)

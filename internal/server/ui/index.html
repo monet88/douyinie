@@ -22,15 +22,15 @@
       <nav class="nav-list">
         <button class="nav-item is-active" data-view-target="new" type="button">
           <span class="nav-index">01</span>
-          <span><strong>Job mới</strong><small>Nguồn → VI/EN</small></span>
+          <span><strong>Job mới</strong><small>Nguồn → VI/EN · Posture</small></span>
         </button>
         <button class="nav-item" data-view-target="jobs" type="button">
           <span class="nav-index">02</span>
-          <span><strong>Jobs & Queue</strong><small>Tiến độ pipeline</small></span>
+          <span><strong>Jobs & Queue</strong><small>Tiến độ · 1 active slot</small></span>
         </button>
         <button class="nav-item" data-view-target="inspector" type="button">
           <span class="nav-index">03</span>
-          <span><strong>Inspector</strong><small>Chỉ xử lý exception</small></span>
+          <span><strong>Review Workspace</strong><small>Speaker · Timeline · Review</small></span>
         </button>
         <button class="nav-item" data-view-target="result" type="button">
           <span class="nav-index">04</span>
@@ -53,26 +53,63 @@
           <p class="eyebrow">Local production workspace</p>
           <h1 id="page-title">Tạo localization job</h1>
         </div>
-        <div class="run-context" id="run-context">
-          <span>Run đang chọn</span>
-          <strong>Chưa chọn</strong>
+        <div class="topbar-right">
+          <div class="run-context" id="run-context">
+            <div class="run-context-header">
+              <span>Run đang chọn</span>
+              <span class="status-pill muted" id="topbar-run-status">—</span>
+            </div>
+            <strong id="topbar-run-id">Chưa chọn</strong>
+            <div class="run-context-sub" id="topbar-run-sub">
+              <span id="topbar-run-target">—</span> · <span id="topbar-run-posture">auto</span>
+            </div>
+          </div>
         </div>
       </header>
 
+      <!-- Workflow Stepper driven strictly by persisted RuntimeHost stages -->
+      <nav class="workflow-stepper" id="workflow-stepper" aria-label="Tiến độ pipeline sản xuất">
+        <div class="stepper-step status-waiting" data-step="source">
+          <div class="step-indicator"><span class="step-num">1</span><span class="step-icon" aria-hidden="true"></span></div>
+          <div class="step-meta"><strong>Nguồn</strong><small>Acquisition / Ingest</small></div>
+        </div>
+        <div class="stepper-connector" aria-hidden="true"></div>
+        <div class="stepper-step status-waiting" data-step="analyze">
+          <div class="step-indicator"><span class="step-num">2</span><span class="step-icon" aria-hidden="true"></span></div>
+          <div class="step-meta"><strong>Phân tích</strong><small>Role / ASR / OCR</small></div>
+        </div>
+        <div class="stepper-connector" aria-hidden="true"></div>
+        <div class="stepper-step status-waiting" data-step="translate">
+          <div class="step-indicator"><span class="step-num">3</span><span class="step-icon" aria-hidden="true"></span></div>
+          <div class="step-meta"><strong>Dịch thuật</strong><small>LLM / DubScript</small></div>
+        </div>
+        <div class="stepper-connector" aria-hidden="true"></div>
+        <div class="stepper-step status-waiting" data-step="dub">
+          <div class="step-indicator"><span class="step-num">4</span><span class="step-icon" aria-hidden="true"></span></div>
+          <div class="step-meta"><strong>Lồng tiếng</strong><small>TTS / Audio Mix</small></div>
+        </div>
+        <div class="stepper-connector" aria-hidden="true"></div>
+        <div class="stepper-step status-waiting" data-step="export">
+          <div class="step-indicator"><span class="step-num">5</span><span class="step-icon" aria-hidden="true"></span></div>
+          <div class="step-meta"><strong>Xuất bản</strong><small>Preview / Final</small></div>
+        </div>
+      </nav>
+
       <div class="view-stack">
+        <!-- VIEW 01: NEW JOB -->
         <section class="view is-active" data-view="new" aria-labelledby="new-title">
           <div class="hero-grid">
             <div>
               <p class="section-kicker">Bắt đầu</p>
               <h2 id="new-title">Từ video nguồn đến bản VI/EN</h2>
-              <p class="lead">Dán URL Douyin hoặc chọn video trên máy để tạo job và đưa run vào RuntimeHost queue. Inspector hiển thị các exception do pipeline production tạo ra để operator xử lý đúng điểm cần quyết định.</p>
+              <p class="lead">Dán URL Douyin hoặc chọn video trên máy để tạo job và đưa run vào RuntimeHost queue. Quá trình xử lý chạy tự động theo Phase 1 pipeline, lưu trữ hoàn toàn tại local CAS.</p>
             </div>
             <div class="principle-card">
               <span class="principle-label">Production translation</span>
               <strong>Gemini 3.8 Flash</strong>
               <span class="ladder-arrow">→</span>
               <strong>DeepSeek V4 Flash Vision Exp</strong>
-              <small>Remote-only. Không dùng local LLM làm fallback dịch.</small>
+              <small>Remote-only gateway. Không dùng local LLM làm fallback dịch.</small>
             </div>
           </div>
 
@@ -80,7 +117,7 @@
             <div class="form-section">
               <div class="section-heading">
                 <span>01</span>
-                <div><h3>Nguồn video</h3><p>Chọn một trong hai cách nhập.</p></div>
+                <div><h3>Nguồn video</h3><p>Chọn một trong hai cách nhập media.</p></div>
               </div>
               <div class="segmented-control" role="group" aria-label="Loại nguồn video">
                 <button type="button" class="segment is-active" data-source-mode="douyin_url">Douyin URL</button>
@@ -93,7 +130,7 @@
               </label>
             </div>
 
-            <div class="form-section two-column">
+            <div class="form-section three-column">
               <div>
                 <div class="section-heading compact">
                   <span>02</span>
@@ -104,9 +141,33 @@
                   <label class="language-option"><input type="radio" name="target_language" value="en"><strong>EN</strong><span>English</span></label>
                 </div>
               </div>
+
               <div>
                 <div class="section-heading compact">
                   <span>03</span>
+                  <div><h3>Chế độ review</h3><p>Quy định gate xuất bản.</p></div>
+                </div>
+                <div class="posture-picker" role="radiogroup" aria-label="Chế độ review">
+                  <label class="posture-option is-selected">
+                    <input type="radio" name="review_posture" value="auto" checked>
+                    <div>
+                      <strong>Auto mode</strong>
+                      <span>Tự render final khi review queue sạch (0 pending)</span>
+                    </div>
+                  </label>
+                  <label class="posture-option">
+                    <input type="radio" name="review_posture" value="review">
+                    <div>
+                      <strong>Review mode</strong>
+                      <span>Dừng tại handoff, chờ operator duyệt mới xuất bản</span>
+                    </div>
+                  </label>
+                </div>
+              </div>
+
+              <div>
+                <div class="section-heading compact">
+                  <span>04</span>
                   <div><h3>Người vận hành</h3><p>Ghi vào audit trail.</p></div>
                 </div>
                 <label class="field">
@@ -126,9 +187,14 @@
           </form>
         </section>
 
+        <!-- VIEW 02: JOBS & QUEUE -->
         <section class="view" data-view="jobs" aria-labelledby="jobs-title">
           <div class="section-header-row">
-            <div><p class="section-kicker">Control plane</p><h2 id="jobs-title">Jobs & Queue</h2><p class="lead compact-lead">Theo dõi run hiện tại, stage đang chạy và điều khiển pause / resume / cancel.</p></div>
+            <div>
+              <p class="section-kicker">Control plane</p>
+              <h2 id="jobs-title">Jobs & Queue</h2>
+              <p class="lead compact-lead">Theo dõi run hiện tại, stage đang chạy và điều khiển pause / resume / cancel.</p>
+            </div>
             <button class="secondary-button" id="jobs-refresh" type="button">Refresh</button>
           </div>
 
@@ -138,119 +204,309 @@
             <article class="metric-card"><span>Pending review</span><strong id="metric-review">0</strong><small>cần quyết định</small></article>
           </div>
 
+          <div class="active-run-banner" id="active-run-banner">
+            <div class="banner-badge">Single active run</div>
+            <div class="banner-body">
+              <strong>RuntimeHost Phase 1 xử lý tuần tự 1 active run đồng thời (active_run_slots=1).</strong>
+              <span>Tài nguyên GPU/VRAM được ưu tiên cho các media stage (ASR, alignment, TTS, mix). Các run tiếp theo sẽ giữ vị trí trong queue và tự động thực thi.</span>
+            </div>
+          </div>
+
           <div class="dashboard-grid">
             <article class="panel">
-              <div class="panel-heading"><div><span class="section-kicker">Queue</span><h3>Runs</h3></div><span class="quiet" id="queue-summary">Không có run</span></div>
+              <div class="panel-heading">
+                <div><span class="section-kicker">Queue</span><h3>Runs</h3></div>
+                <span class="quiet" id="queue-summary">Không có run</span>
+              </div>
               <div class="table-wrap">
                 <table>
-                  <thead><tr><th>Run</th><th>Job</th><th>Trạng thái</th><th>Vị trí</th><th></th></tr></thead>
-                  <tbody id="queue-body"><tr><td colspan="5" class="empty-cell">Chưa có dữ liệu queue.</td></tr></tbody>
+                  <thead>
+                    <tr>
+                      <th>Run</th>
+                      <th>Job</th>
+                      <th>Slot / Vị trí</th>
+                      <th>Target</th>
+                      <th>Trạng thái</th>
+                      <th>Thao tác</th>
+                    </tr>
+                  </thead>
+                  <tbody id="queue-body">
+                    <tr><td colspan="6" class="empty-cell">Chưa có dữ liệu queue.</td></tr>
+                  </tbody>
                 </table>
               </div>
             </article>
 
             <article class="panel run-panel">
-              <div class="panel-heading"><div><span class="section-kicker">Selected run</span><h3 id="run-title">Chưa chọn run</h3></div><span class="status-pill muted" id="run-status">—</span></div>
+              <div class="panel-heading">
+                <div><span class="section-kicker">Selected run</span><h3 id="run-title">Chưa chọn run</h3></div>
+                <span class="status-pill muted" id="run-status">—</span>
+              </div>
               <dl class="detail-list" id="run-details">
-                <div><dt>Job</dt><dd>—</dd></div><div><dt>Target</dt><dd>—</dd></div><div><dt>Created</dt><dd>—</dd></div>
+                <div><dt>Job</dt><dd>—</dd></div>
+                <div><dt>Target</dt><dd>—</dd></div>
+                <div><dt>Posture</dt><dd>—</dd></div>
+                <div><dt>Created</dt><dd>—</dd></div>
               </dl>
               <div class="run-actions">
                 <button class="secondary-button" data-run-action="pause" type="button" disabled>Pause</button>
                 <button class="secondary-button" data-run-action="resume" type="button" disabled>Resume</button>
                 <button class="danger-button" data-run-action="cancel" type="button" disabled>Cancel</button>
               </div>
-              <div class="stage-list" id="stage-list"><div class="empty-state"><strong>Chưa có run được chọn.</strong><span>Chọn một run từ bảng bên trái.</span></div></div>
+              <div class="stage-list" id="stage-list">
+                <div class="empty-state"><strong>Chưa có run được chọn.</strong><span>Chọn một run từ bảng bên trái.</span></div>
+              </div>
             </article>
           </div>
 
           <article class="panel jobs-panel">
             <div class="panel-heading"><div><span class="section-kicker">Library</span><h3>Localization jobs</h3></div></div>
-            <div class="job-cards" id="job-cards"><div class="empty-state"><strong>Chưa có job.</strong><span>Tạo job đầu tiên ở màn hình Job mới.</span></div></div>
+            <div class="job-cards" id="job-cards">
+              <div class="empty-state"><strong>Chưa có job.</strong><span>Tạo job đầu tiên ở màn hình Job mới.</span></div>
+            </div>
           </article>
         </section>
 
+        <!-- VIEW 03: REVIEW WORKSPACE (THREE-ZONE INSPECTOR) -->
         <section class="view" data-view="inspector" aria-labelledby="inspector-title">
           <div class="section-header-row">
-            <div><p class="section-kicker">Exception-only review</p><h2 id="inspector-title">Inspector</h2><p class="lead compact-lead">Không chỉnh timeline toàn cục. Chỉ sửa đúng segment, voice hoặc text region bị quality gate đánh dấu.</p></div>
-            <label class="toggle-field"><input id="include-resolved" type="checkbox"><span>Hiện đã xử lý</span></label>
+            <div>
+              <p class="section-kicker">Workspace</p>
+              <h2 id="inspector-title">Review Workspace</h2>
+              <p class="lead compact-lead">Mô hình 3 vùng: Ngữ cảnh speaker · Preview video & Timeline quan sát · Inspector xử lý exception.</p>
+            </div>
+            <div class="header-actions">
+              <span class="status-pill muted" id="inspector-run-pill">—</span>
+              <label class="toggle-field"><input id="include-resolved" type="checkbox"><span>Hiện đã xử lý</span></label>
+            </div>
           </div>
 
-          <div class="inspector-layout">
-            <aside class="panel exception-panel">
-              <div class="panel-heading"><div><span class="section-kicker">Exceptions</span><h3 id="exception-count">0 pending</h3></div></div>
-              <div class="exception-list" id="exception-list"><div class="empty-state"><strong>Chưa có exception.</strong><span>Chọn run để tải review queue.</span></div></div>
+          <div class="review-workspace" id="review-workspace">
+            <!-- ZONE 1: Project & Speaker Context (Left) -->
+            <aside class="panel zone-context" aria-label="Ngữ cảnh dự án và speaker">
+              <div class="panel-heading compact-heading">
+                <div><span class="section-kicker">Zone 1</span><h3>Ngữ cảnh & Speakers</h3></div>
+              </div>
+              <div class="zone-context-content">
+                <div class="project-card" id="project-context-card">
+                  <dl class="context-meta-list">
+                    <div><dt>Asset</dt><dd class="mono" id="context-asset-id">—</dd></div>
+                    <div><dt>Run</dt><dd class="mono" id="context-run-id">—</dd></div>
+                    <div><dt>Target</dt><dd id="context-target-lang">—</dd></div>
+                    <div><dt>Posture</dt><dd><span class="status-pill muted" id="context-posture">—</span></dd></div>
+                    <div><dt>Duration</dt><dd id="context-duration">—</dd></div>
+                  </dl>
+                </div>
+
+                <div class="speaker-section">
+                  <div class="section-subheading">
+                    <h4>Speakers & Voices</h4>
+                    <span class="quiet" id="speaker-count-badge">0 speaker</span>
+                  </div>
+                  <div class="speaker-list" id="speaker-list">
+                    <div class="empty-state"><span>Chưa tải được speaker context.</span></div>
+                  </div>
+                </div>
+              </div>
             </aside>
 
-            <article class="panel inspector-panel">
-              <div id="inspector-empty" class="inspector-empty">
-                <div class="empty-glyph">⌁</div>
-                <strong>Chọn một exception để xử lý</strong>
-                <p>Mỗi thay đổi tạo candidate mới và chỉ rerun descendant stages liên quan.</p>
+            <!-- ZONE 2: Visual Center & Observational Timeline (Center) -->
+            <article class="panel zone-center" aria-label="Video preview và timeline quan sát">
+              <div class="panel-heading compact-heading">
+                <div><span class="section-kicker">Zone 2</span><h3>Video preview & Timeline</h3></div>
+                <div class="video-playback-controls">
+                  <span class="time-readout mono" id="timeline-time-display">00:00.0 / 00:00.0</span>
+                </div>
               </div>
 
-              <div id="inspector-editor" class="hidden">
-                <div class="inspector-header">
-                  <div><span class="status-pill" id="inspect-severity">warning</span><h3 id="inspect-title">Exception</h3><p id="inspect-reason"></p></div>
-                  <span class="mono" id="inspect-id"></span>
+              <div class="preview-media-container" id="preview-media-container">
+                <div class="video-wrapper" id="video-wrapper">
+                  <video id="preview-player" class="render-video" controls playsinline preload="metadata"></video>
+                  <div class="video-overlay-placeholder" id="video-overlay-placeholder">
+                    <div class="media-icon">▶</div>
+                    <strong>Chưa có preview render</strong>
+                    <span id="preview-placeholder-text">Run đang chạy hoặc chưa hoàn tất stage render_preview.</span>
+                  </div>
                 </div>
-                <dl class="detail-list three" id="inspect-meta"></dl>
+              </div>
 
-                <div class="editor-tabs" role="tablist" aria-label="Loại sửa">
-                  <button type="button" class="editor-tab is-active" data-editor-tab="accept">Accept</button>
-                  <button type="button" class="editor-tab" data-editor-tab="text">Sửa text</button>
-                  <button type="button" class="editor-tab" data-editor-tab="voice">Đổi voice</button>
-                  <button type="button" class="editor-tab" data-editor-tab="region">Chỉnh region</button>
+              <div class="observational-timeline-panel" id="observational-timeline-panel">
+                <div class="timeline-header">
+                  <div class="timeline-title-group">
+                    <strong>Timeline quan sát</strong>
+                    <small>Đồng bộ playhead · Nhấp segment để seek video & chọn inspector item</small>
+                  </div>
+                  <div class="timeline-legend">
+                    <span class="legend-item"><span class="legend-dot speech-dot"></span>Thoại (Speech)</span>
+                    <span class="legend-item"><span class="legend-dot visual-dot"></span>Visual text (OCR)</span>
+                    <span class="legend-item"><span class="legend-dot review-dot"></span>Exception</span>
+                  </div>
                 </div>
 
-                <form class="editor-form" data-editor-panel="accept" id="accept-form">
-                  <div class="callout"><strong>Manual override không đổi QA lịch sử thành PASS.</strong><span>Quyết định được ghi append-only với lý do và operator.</span></div>
-                  <label class="field"><span>Lý do chấp nhận</span><textarea id="accept-reason" rows="4" required placeholder="Ví dụ: subtitle hiện tại vẫn đọc rõ và không che nội dung chính…"></textarea></label>
-                  <button class="primary-button" type="submit">Chấp nhận có audit</button>
-                </form>
-
-                <form class="editor-form hidden" data-editor-panel="text" id="text-form">
-                  <div class="form-grid">
-                    <label class="field"><span>Segment index</span><input id="text-segment-index" type="number" min="0" required></label>
-                    <label class="field field-span-2"><span>Target text mới</span><textarea id="text-target" rows="4" required></textarea></label>
-                    <label class="field field-span-2"><span>Lý do</span><input id="text-reason" type="text" value="Operator corrected translation from Inspector"></label>
+                <div class="timeline-viewport" id="timeline-viewport">
+                  <div class="timeline-ruler" id="timeline-ruler"></div>
+                  <div class="timeline-playhead" id="timeline-playhead" style="left: 0%;">
+                    <div class="playhead-handle" title="Kéo hoặc nhấp để chuyển mốc thời gian"></div>
+                    <div class="playhead-line"></div>
                   </div>
-                  <button class="primary-button" type="submit">Lưu & targeted rerun</button>
-                </form>
-
-                <form class="editor-form hidden" data-editor-panel="voice" id="voice-form">
-                  <div class="form-grid">
-                    <label class="field"><span>Speaker ID</span><input id="voice-speaker" type="text" required></label>
-                    <label class="field"><span>Profile ID</span><input id="voice-profile-id" type="text" required placeholder="kokoro_en_female_1"></label>
-                    <label class="field"><span>Provider ID</span><input id="voice-provider-id" type="text" required placeholder="kokoro_tts_en"></label>
-                    <label class="field"><span>Voice ID</span><input id="voice-engine-id" type="text" required placeholder="af_heart"></label>
-                    <label class="field"><span>Tên hiển thị</span><input id="voice-name" type="text" required placeholder="Warm female"></label>
-                    <label class="field"><span>Language</span><select id="voice-language"><option value="vi">vi</option><option value="en">en</option></select></label>
-                    <label class="field field-span-2"><span>Lý do</span><input id="voice-reason" type="text" value="Operator reassigned voice from Inspector"></label>
+                  <div class="timeline-tracks" id="timeline-tracks">
+                    <div class="timeline-track track-dialogue" id="track-dialogue">
+                      <span class="track-label">Speech</span>
+                      <div class="track-lanes" id="lane-dialogue"></div>
+                    </div>
+                    <div class="timeline-track track-visual" id="track-visual">
+                      <span class="track-label">Visual</span>
+                      <div class="track-lanes" id="lane-visual"></div>
+                    </div>
+                    <div class="timeline-track track-review" id="track-review">
+                      <span class="track-label">Review</span>
+                      <div class="track-lanes" id="lane-review"></div>
+                    </div>
                   </div>
-                  <button class="primary-button" type="submit">Đổi voice & targeted rerun</button>
-                </form>
-
-                <form class="editor-form hidden" data-editor-panel="region" id="region-form">
-                  <div class="form-grid region-grid">
-                    <label class="field field-span-2"><span>Region ID</span><input id="region-id" type="text" required></label>
-                    <label class="field"><span>Δ X</span><input id="region-dx" type="number" value="0"></label>
-                    <label class="field"><span>Δ Y</span><input id="region-dy" type="number" value="0"></label>
-                    <label class="field"><span>Δ Width</span><input id="region-dw" type="number" value="0"></label>
-                    <label class="field"><span>Δ Height</span><input id="region-dh" type="number" value="0"></label>
-                    <label class="field field-span-2"><span>Reclassify</span><select id="region-role"><option value="">Giữ nguyên</option><option value="speech_subtitle">speech_subtitle</option><option value="semantic_text">semantic_text</option><option value="instructional_ui_text">instructional_ui_text</option><option value="brand_keep">brand_keep</option><option value="ignore/noise">ignore/noise</option><option value="uncertain">uncertain</option></select></label>
-                    <label class="field field-span-2"><span>Text mới (tùy chọn)</span><input id="region-text" type="text"></label>
-                    <label class="field field-span-2"><span>Lý do</span><input id="region-reason" type="text" value="Operator adjusted text region from Inspector"></label>
-                  </div>
-                  <button class="primary-button" type="submit">Áp dụng & targeted rerun</button>
-                </form>
+                </div>
               </div>
             </article>
+
+            <!-- ZONE 3: Active Inspector & Exception Editor (Right) -->
+            <aside class="panel zone-inspector" aria-label="Inspector và xử lý exception">
+              <div class="panel-heading compact-heading">
+                <div><span class="section-kicker">Zone 3</span><h3>Inspector</h3></div>
+                <span class="status-pill warning" id="inspector-pending-badge">0 pending</span>
+              </div>
+
+              <div class="inspector-tabs" role="tablist" aria-label="Chế độ xem Inspector">
+                <button type="button" class="inspector-tab is-active" data-inspector-tab="exceptions">
+                  Exceptions <span class="tab-badge" id="tab-exceptions-count">0</span>
+                </button>
+                <button type="button" class="inspector-tab" data-inspector-tab="transcript">
+                  Transcript & Dịch
+                </button>
+                <button type="button" class="inspector-tab" data-inspector-tab="regions">
+                  Visual regions
+                </button>
+              </div>
+
+              <div class="inspector-body">
+                <!-- Tab 1: Exceptions list -->
+                <div class="inspector-tab-panel" data-inspector-panel="exceptions" id="panel-exceptions">
+                  <div class="exception-list" id="exception-list">
+                    <div class="empty-state"><strong>Chưa có exception.</strong><span>Chọn run để tải review queue.</span></div>
+                  </div>
+                </div>
+
+                <!-- Tab 2: Transcript segments list -->
+                <div class="inspector-tab-panel hidden" data-inspector-panel="transcript" id="panel-transcript">
+                  <div class="transcript-list" id="transcript-list">
+                    <div class="empty-state"><span>Chưa có dữ liệu transcript.</span></div>
+                  </div>
+                </div>
+
+                <!-- Tab 3: Visual text regions list -->
+                <div class="inspector-tab-panel hidden" data-inspector-panel="regions" id="panel-regions">
+                  <div class="regions-list" id="regions-list">
+                    <div class="empty-state"><span>Chưa có dữ liệu text region.</span></div>
+                  </div>
+                </div>
+
+                <!-- Exception / Correction Editor Drawer -->
+                <div class="editor-drawer" id="inspector-editor-drawer">
+                  <div id="inspector-empty" class="inspector-empty compact-empty">
+                    <div class="empty-glyph">✓</div>
+                    <strong id="inspector-empty-title">Chọn một item để xem chi tiết</strong>
+                    <p id="inspector-empty-desc">Inspector hiển thị exception hoặc cho phép sửa trực tiếp segment thoại, voice gán và text region.</p>
+                  </div>
+
+                  <div id="inspector-editor" class="hidden">
+                    <div class="inspector-header">
+                      <div>
+                        <span class="status-pill" id="inspect-severity">warning</span>
+                        <h4 id="inspect-title">Exception</h4>
+                        <p id="inspect-reason"></p>
+                      </div>
+                      <span class="mono" id="inspect-id"></span>
+                    </div>
+                    <dl class="detail-list three" id="inspect-meta"></dl>
+
+                    <div class="editor-tabs" role="tablist" aria-label="Loại sửa">
+                      <button type="button" class="editor-tab is-active" data-editor-tab="accept">Accept</button>
+                      <button type="button" class="editor-tab" data-editor-tab="text">Sửa text</button>
+                      <button type="button" class="editor-tab" data-editor-tab="voice">Đổi voice</button>
+                      <button type="button" class="editor-tab" data-editor-tab="region">Chỉnh region</button>
+                    </div>
+
+                    <form class="editor-form" data-editor-panel="accept" id="accept-form">
+                      <div class="callout">
+                        <strong>Manual override không đổi QA lịch sử thành PASS.</strong>
+                        <span>Quyết định được ghi append-only vào audit trail với lý do và operator.</span>
+                      </div>
+                      <label class="field">
+                        <span>Lý do chấp nhận</span>
+                        <textarea id="accept-reason" rows="3" required placeholder="Ví dụ: subtitle hiện tại vẫn đọc rõ và không che nội dung chính…"></textarea>
+                      </label>
+                      <button class="primary-button" type="submit">Chấp nhận có audit</button>
+                    </form>
+
+                    <form class="editor-form hidden" data-editor-panel="text" id="text-form">
+                      <div class="form-grid">
+                        <label class="field"><span>Segment index</span><input id="text-segment-index" type="number" min="0" required></label>
+                        <label class="field field-span-2"><span>Target text mới</span><textarea id="text-target" rows="3" required></textarea></label>
+                        <label class="field field-span-2"><span>Lý do</span><input id="text-reason" type="text" value="Operator corrected translation from Inspector"></label>
+                      </div>
+                      <button class="primary-button" type="submit">Lưu & targeted rerun</button>
+                    </form>
+
+                    <form class="editor-form hidden" data-editor-panel="voice" id="voice-form">
+                      <div class="form-grid">
+                        <label class="field"><span>Speaker ID</span><input id="voice-speaker" type="text" required></label>
+                        <label class="field"><span>Profile ID</span><input id="voice-profile-id" type="text" required placeholder="profile_id"></label>
+                        <label class="field"><span>Provider ID</span><input id="voice-provider-id" type="text" required placeholder="provider_id"></label>
+                        <label class="field"><span>Voice ID</span><input id="voice-engine-id" type="text" required placeholder="voice_id"></label>
+                        <label class="field"><span>Tên hiển thị</span><input id="voice-name" type="text" required placeholder="Tên voice"></label>
+                        <label class="field"><span>Language</span><select id="voice-language"><option value="vi">vi</option><option value="en">en</option></select></label>
+                        <label class="field field-span-2"><span>Lý do</span><input id="voice-reason" type="text" value="Operator reassigned voice from Inspector"></label>
+                      </div>
+                      <button class="primary-button" type="submit">Đổi voice & targeted rerun</button>
+                    </form>
+
+                    <form class="editor-form hidden" data-editor-panel="region" id="region-form">
+                      <div class="form-grid region-grid">
+                        <label class="field field-span-2"><span>Region ID</span><input id="region-id" type="text" required></label>
+                        <label class="field"><span>Δ X</span><input id="region-dx" type="number" value="0"></label>
+                        <label class="field"><span>Δ Y</span><input id="region-dy" type="number" value="0"></label>
+                        <label class="field"><span>Δ Width</span><input id="region-dw" type="number" value="0"></label>
+                        <label class="field"><span>Δ Height</span><input id="region-dh" type="number" value="0"></label>
+                        <label class="field field-span-2">
+                          <span>Reclassify</span>
+                          <select id="region-role">
+                            <option value="">Giữ nguyên</option>
+                            <option value="speech_subtitle">speech_subtitle</option>
+                            <option value="semantic_text">semantic_text</option>
+                            <option value="instructional_ui_text">instructional_ui_text</option>
+                            <option value="brand_keep">brand_keep</option>
+                            <option value="ignore/noise">ignore/noise</option>
+                            <option value="uncertain">uncertain</option>
+                          </select>
+                        </label>
+                        <label class="field field-span-2"><span>Text mới (tùy chọn)</span><input id="region-text" type="text"></label>
+                        <label class="field field-span-2"><span>Lý do</span><input id="region-reason" type="text" value="Operator adjusted text region from Inspector"></label>
+                      </div>
+                      <button class="primary-button" type="submit">Áp dụng & targeted rerun</button>
+                    </form>
+                  </div>
+                </div>
+              </div>
+            </aside>
           </div>
         </section>
 
+        <!-- VIEW 04: RESULT (PREVIEW & FINAL) -->
         <section class="view" data-view="result" aria-labelledby="result-title">
           <div class="section-header-row">
-            <div><p class="section-kicker">Render handoff</p><h2 id="result-title">Kết quả</h2><p class="lead compact-lead">Queue phải về zero trước khi final render trong Review mode.</p></div>
+            <div>
+              <p class="section-kicker">Render handoff</p>
+              <h2 id="result-title">Kết quả</h2>
+              <p class="lead compact-lead">Kiểm tra video preview, đánh giá review handoff và xuất bản final video.</p>
+            </div>
             <button class="secondary-button" id="result-refresh" type="button">Refresh result</button>
           </div>
 
@@ -265,8 +521,14 @@
             </article>
 
             <article class="panel result-actions">
-              <div class="panel-heading"><div><span class="section-kicker">Readiness</span><h3>Final render</h3></div><span class="status-pill muted" id="handoff-status">Chưa kiểm tra</span></div>
-              <div class="handoff-box" id="handoff-box"><strong>Chọn run trước.</strong><span>Douyinie sẽ kiểm tra pending review items trước khi cho phép render.</span></div>
+              <div class="panel-heading">
+                <div><span class="section-kicker">Readiness</span><h3>Final render</h3></div>
+                <span class="status-pill muted" id="handoff-status">Chưa kiểm tra</span>
+              </div>
+              <div class="handoff-box" id="handoff-box">
+                <strong>Chọn run trước.</strong>
+                <span>Douyinie sẽ kiểm tra pending review items trước khi cho phép render.</span>
+              </div>
               <button class="primary-button full" id="check-handoff" type="button" disabled>Kiểm tra final-render handoff</button>
               <button class="secondary-button full" id="start-final-render" type="button" disabled>Bắt đầu final render</button>
               <div class="artifact-details" id="final-details"></div>

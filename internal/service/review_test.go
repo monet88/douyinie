@@ -269,6 +269,29 @@ func setupFullReviewHarness(t *testing.T) (*service.ReviewService, *storage.DB, 
 	return reviewSvc, db, casStore, assetID
 }
 
+func bindBaselineDubMixToRun(t *testing.T, db *storage.DB, assetID, targetLang, runID string) string {
+	t.Helper()
+	ctx := context.Background()
+	latest, err := db.GetDubMixArtifactIndex(ctx, assetID, targetLang)
+	if err != nil {
+		t.Fatalf("get baseline dub mix index: %v", err)
+	}
+	createdAt := time.Now().UTC()
+	if err := db.SaveDubMixArtifactIndex(ctx, storage.DubMixArtifactIndex{
+		ID:             "dubmix-" + runID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: targetLang,
+		CASHash:        latest.CASHash,
+		ProvenanceHash: "prov-dubmix-" + runID,
+		OverallStatus:  latest.OverallStatus,
+		CreatedAt:      createdAt,
+	}); err != nil {
+		t.Fatalf("bind baseline dub mix to run %s: %v", runID, err)
+	}
+	return latest.CASHash
+}
+
 func TestReviewService_CleanRun_EmptyReviewItems(t *testing.T) {
 	svc, _, _, assetID := setupReviewTestHarness(t)
 	ctx := context.Background()
@@ -574,6 +597,83 @@ func TestReviewService_ManualOverride_LeavesExceptionQueue(t *testing.T) {
 	}
 	if allItems[0].Status != domain.ReviewItemStatusManualOverride {
 		t.Errorf("expected status manual_override, got %s", allItems[0].Status)
+	}
+}
+
+func TestReviewService_ManualOverride_IsolatedByRunForSharedSourceException(t *testing.T) {
+	svc, db, _, assetID := setupReviewTestHarness(t)
+	ctx := context.Background()
+	const (
+		runA = "run-review-override-a"
+		runB = "run-review-override-b"
+	)
+
+	// Source analysis is intentionally asset-scoped, so both runs see the same
+	// deterministic ReviewItem ID. Resolution, however, is a run-scoped operator
+	// decision and must never bleed from run A into run B.
+	if err := db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{
+		ID:      "role-plan-shared-review",
+		AssetID: assetID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 1200, EndMs: 2400, Role: domain.AudioRoleUncertain},
+		},
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("SaveAudioRolePlan failed: %v", err)
+	}
+
+	itemsA, err := svc.ProjectReviewItemsForRun(ctx, assetID, "vi", runA)
+	if err != nil {
+		t.Fatalf("ProjectReviewItemsForRun A failed: %v", err)
+	}
+	itemsB, err := svc.ProjectReviewItemsForRun(ctx, assetID, "vi", runB)
+	if err != nil {
+		t.Fatalf("ProjectReviewItemsForRun B failed: %v", err)
+	}
+	if len(itemsA) != 1 || len(itemsB) != 1 || itemsA[0].ID != itemsB[0].ID {
+		t.Fatalf("expected one shared source exception in both runs, A=%+v B=%+v", itemsA, itemsB)
+	}
+
+	if _, err := svc.RecordManualOverride(ctx, service.ManualOverrideInput{
+		RunID:          runA,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		ReviewItemID:   itemsA[0].ID,
+		Reason:         "Accepted for run A only",
+		Operator:       "operator-a",
+	}); err != nil {
+		t.Fatalf("RecordManualOverride run A failed: %v", err)
+	}
+
+	pendingA, err := svc.ProjectReviewItemsForRun(ctx, assetID, "vi", runA)
+	if err != nil {
+		t.Fatalf("ProjectReviewItemsForRun A after override failed: %v", err)
+	}
+	if len(pendingA) != 0 {
+		t.Fatalf("run A should have no pending shared exception after override: %+v", pendingA)
+	}
+
+	pendingB, err := svc.ProjectReviewItemsForRun(ctx, assetID, "vi", runB)
+	if err != nil {
+		t.Fatalf("ProjectReviewItemsForRun B after run A override failed: %v", err)
+	}
+	if len(pendingB) != 1 || pendingB[0].ID != itemsB[0].ID || pendingB[0].Status != domain.ReviewItemStatusPending {
+		t.Fatalf("run B shared exception must remain pending, got %+v", pendingB)
+	}
+
+	allA, err := svc.ProjectAllReviewItemsForRun(ctx, assetID, "vi", runA)
+	if err != nil {
+		t.Fatalf("ProjectAllReviewItemsForRun A failed: %v", err)
+	}
+	if len(allA) != 1 || allA[0].Status != domain.ReviewItemStatusManualOverride {
+		t.Fatalf("run A full projection should retain manual_override audit status, got %+v", allA)
+	}
+	allB, err := svc.ProjectAllReviewItemsForRun(ctx, assetID, "vi", runB)
+	if err != nil {
+		t.Fatalf("ProjectAllReviewItemsForRun B failed: %v", err)
+	}
+	if len(allB) != 1 || allB[0].Status != domain.ReviewItemStatusPending {
+		t.Fatalf("run B full projection should remain pending, got %+v", allB)
 	}
 }
 
@@ -1462,6 +1562,42 @@ func TestReviewService_CorrectRegionGeometry_DubMixStorageErrorAndNoDubPreservat
 	svc, db, casStore, assetID := setupFullReviewHarness(t)
 	ctx := context.Background()
 	runID := "run-dubmix-test-01"
+	runACAS := bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
+
+	// Newer run B for the same asset/target must not replace run A's DubMix in
+	// a selected-run correction.
+	runBArtifact := domain.DubMixArtifact{
+		ID:                  "dubmix-run-b-newer",
+		AssetID:             assetID,
+		RunID:               "run-dubmix-test-02",
+		TargetLanguage:      "vi",
+		AudioCASHash:        "audio-run-b",
+		SampleRate:          16000,
+		Channels:            1,
+		Format:              "wav",
+		DurationMs:          1000,
+		DialogueSuppressed:  true,
+		SoundtrackPreserved: true,
+		OverallStatus:       "PASS",
+		CreatedAt:           time.Now().UTC().Add(time.Minute),
+	}
+	runBBytes, _ := json.Marshal(runBArtifact)
+	runBObj, err := casStore.Put(bytes.NewReader(runBBytes))
+	if err != nil {
+		t.Fatalf("put newer run B dub mix metadata: %v", err)
+	}
+	if err := db.SaveDubMixArtifactIndex(ctx, storage.DubMixArtifactIndex{
+		ID:             runBArtifact.ID,
+		AssetID:        assetID,
+		RunID:          runBArtifact.RunID,
+		TargetLanguage: "vi",
+		CASHash:        runBObj.SHA256,
+		ProvenanceHash: "prov-dubmix-run-b-newer",
+		OverallStatus:  "PASS",
+		CreatedAt:      runBArtifact.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save newer run B dub mix index: %v", err)
+	}
 
 	// 1. Setup TextRegionPlan with a valid region
 	tPlan := domain.TextRegionPlan{
@@ -1522,6 +1658,9 @@ func TestReviewService_CorrectRegionGeometry_DubMixStorageErrorAndNoDubPreservat
 	rcPlan.Close()
 	if rPlan.DubMixCASHash == "" {
 		t.Errorf("expected non-empty DubMixCASHash in RenderPlan")
+	}
+	if rPlan.DubMixCASHash != runACAS {
+		t.Fatalf("selected run correction pinned DubMixCASHash=%s, want run A %s (newer run B=%s)", rPlan.DubMixCASHash, runACAS, runBObj.SHA256)
 	}
 
 	// Case B: Storage error on GetDubMixArtifactIndex -> must fail closed and propagate error
@@ -1619,6 +1758,7 @@ func TestReviewService_CorrectRegionGeometry_OverrideMintsNewImmutablePlanIdenti
 	svc, db, casStore, assetID := setupFullReviewHarness(t)
 	ctx := context.Background()
 	runID := "run-lineage-01"
+	bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
 
 	// Setup a source TextRegionPlan with one region to override.
 	origProv := "prov-text-lineage-1"
@@ -1701,6 +1841,7 @@ func TestReviewService_RegionOverride_TruthfulnessAndLowOCRFlags(t *testing.T) {
 	svc, db, casStore, assetID := setupFullReviewHarness(t)
 	ctx := context.Background()
 	runID := "run-truth-01"
+	bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
 
 	// Setup TextRegionPlan with:
 	// 1. "reg-uncertain": uncertain role exception

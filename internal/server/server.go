@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1859,10 +1860,26 @@ func (s *Server) handleRunSpeechUnderstand(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleGetTranscript(w http.ResponseWriter, r *http.Request) {
 	assetID := r.PathValue("id")
-	idx, err := s.db.GetTranscriptArtifactIndex(r.Context(), assetID)
+	runID := r.URL.Query().Get("run_id")
+	if s.db == nil {
+		writeError(w, http.StatusInternalServerError, "database not configured")
+		return
+	}
+
+	var idx *storage.TranscriptArtifactIndex
+	var err error
+	if runID != "" {
+		idx, err = s.db.GetTranscriptArtifactIndexByRun(r.Context(), runID)
+		if err == nil && (idx.AssetID != assetID || idx.RunID != runID) {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("transcript not found for asset %s for run %s", assetID, runID))
+			return
+		}
+	} else {
+		idx, err = s.db.GetTranscriptArtifactIndex(r.Context(), assetID)
+	}
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "transcript not found for asset")
+			writeError(w, http.StatusNotFound, fmt.Sprintf("transcript not found for asset %s", assetID))
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1972,8 +1989,24 @@ func (s *Server) handleGetTranslationVariant(w http.ResponseWriter, r *http.Requ
 	if targetLang == "" {
 		targetLang = "vi" // default target language
 	}
+	runID := r.URL.Query().Get("run_id")
 
-	idx, err := s.db.GetTranslationVariantIndex(r.Context(), assetID, targetLang)
+	if s.db == nil {
+		writeError(w, http.StatusInternalServerError, "database not configured")
+		return
+	}
+
+	var idx *storage.TranslationVariantIndex
+	var err error
+	if runID != "" {
+		idx, err = s.db.GetTranslationVariantIndexByRun(r.Context(), runID)
+		if err == nil && (idx.AssetID != assetID || idx.TargetLanguage != targetLang || idx.RunID != runID) {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("translation variant not found for asset %s in language %s for run %s", assetID, targetLang, runID))
+			return
+		}
+	} else {
+		idx, err = s.db.GetTranslationVariantIndex(r.Context(), assetID, targetLang)
+	}
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("translation variant not found for asset %s in language %s", assetID, targetLang))
@@ -2273,8 +2306,24 @@ func (s *Server) handleGetVoiceAssignment(w http.ResponseWriter, r *http.Request
 	if targetLang == "" {
 		targetLang = "vi" // default target language
 	}
+	runID := r.URL.Query().Get("run_id")
 
-	idx, err := s.db.GetVoiceAssignmentIndex(r.Context(), assetID, targetLang)
+	if s.db == nil {
+		writeError(w, http.StatusInternalServerError, "database not configured")
+		return
+	}
+
+	var idx *storage.VoiceAssignmentIndex
+	var err error
+	if runID != "" {
+		idx, err = s.db.GetVoiceAssignmentIndexByRun(r.Context(), assetID, runID, targetLang)
+		if err == nil && (idx.AssetID != assetID || idx.RunID != runID || idx.TargetLanguage != targetLang) {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("voice assignment not found for asset %s in language %s for run %s", assetID, targetLang, runID))
+			return
+		}
+	} else {
+		idx, err = s.db.GetVoiceAssignmentIndex(r.Context(), assetID, targetLang)
+	}
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("voice assignment not found for asset %s in language %s", assetID, targetLang))
@@ -2363,7 +2412,29 @@ func (s *Server) handleAuditionVoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"audition_result": res})
+	if s.casStore == nil || res.AudioCASHash == "" {
+		writeError(w, http.StatusInternalServerError, "audition audio artifact is unavailable")
+		return
+	}
+	rc, err := s.casStore.Get(res.AudioCASHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "read audition audio from CAS: "+err.Error())
+		return
+	}
+	audioData, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "read audition audio bytes: "+err.Error())
+		return
+	}
+
+	// Browser clients need playable audio, never a machine-local CAS path.
+	res.AudioCASPath = ""
+	audioDataURL := "data:audio/wav;base64," + base64.StdEncoding.EncodeToString(audioData)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"audition_result": res,
+		"audio_data_url":  audioDataURL,
+	})
 }
 
 func (s *Server) handleRunDubSynthesize(w http.ResponseWriter, r *http.Request) {
@@ -4060,9 +4131,9 @@ func (s *Server) handleGetRunReviewItems(w http.ResponseWriter, r *http.Request)
 
 	var items []domain.ReviewItem
 	if includeAll {
-		items, err = s.reviewSvc.ProjectAllReviewItems(r.Context(), job.SourceAssetID, job.TargetLanguage)
+		items, err = s.reviewSvc.ProjectAllReviewItemsForRun(r.Context(), job.SourceAssetID, job.TargetLanguage, runID)
 	} else {
-		items, err = s.reviewSvc.ProjectReviewItems(r.Context(), job.SourceAssetID, job.TargetLanguage)
+		items, err = s.reviewSvc.ProjectReviewItemsForRun(r.Context(), job.SourceAssetID, job.TargetLanguage, runID)
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
