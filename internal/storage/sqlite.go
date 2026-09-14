@@ -3762,6 +3762,25 @@ func (s *DB) SaveTextRegionPlanIndex(ctx context.Context, idx TextRegionPlanInde
 	return nil
 }
 
+// DeleteTextRegionPlanIndex withdraws one plan row for an asset. A correction persists the
+// overridden plan before regenerating its descendants (LocalizeVisualTrack resolves the current
+// plan by index), so a regeneration failure must be able to take that row back out: otherwise a
+// rejected edit stays the asset's latest plan even though the API failed closed.
+func (s *DB) DeleteTextRegionPlanIndex(ctx context.Context, assetID, provenanceHash string) error {
+	if strings.TrimSpace(assetID) == "" || strings.TrimSpace(provenanceHash) == "" {
+		return errors.New("asset_id and provenance_hash are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM text_region_plans WHERE asset_id = ? AND provenance_hash = ?`,
+		assetID, provenanceHash,
+	); err != nil {
+		return fmt.Errorf("delete text_region_plans index: %w", err)
+	}
+	return nil
+}
+
 // GetTextRegionPlanIndex retrieves the latest index row for an asset.
 func (s *DB) GetTextRegionPlanIndex(ctx context.Context, assetID string) (*TextRegionPlanIndex, error) {
 	s.mu.RLock()
@@ -3866,6 +3885,42 @@ func (s *DB) SaveRenderPlanIndex(ctx context.Context, idx RenderPlanIndex) error
 	)
 	if err != nil {
 		return fmt.Errorf("save render_plans index: %w", err)
+	}
+	return nil
+}
+
+// DeleteRenderArtifactIndex withdraws a preview/final render artifact index row.
+// The CAS blob is immutable and stays; the index row is what makes an artifact
+// the latest one a reader resolves, so a rejected correction takes back the row.
+func (s *DB) DeleteRenderArtifactIndex(ctx context.Context, provenanceHash string) error {
+	if strings.TrimSpace(provenanceHash) == "" {
+		return errors.New("provenance_hash is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM render_artifacts WHERE provenance_hash = ?`, provenanceHash,
+	); err != nil {
+		return fmt.Errorf("delete render_artifacts index: %w", err)
+	}
+	return nil
+}
+
+// DeleteRenderPlanIndex withdraws one render plan row by provenance. A region correction
+// regenerates its render plan before recording the operator's audit row, so a failure after that
+// regeneration must be able to take the plan back out: otherwise a correction that reported an
+// error stays the asset's latest render plan. Provenance identifies artifact content and is
+// unique across the table, so this removes exactly the row the failed correction made current.
+func (s *DB) DeleteRenderPlanIndex(ctx context.Context, provenanceHash string) error {
+	if strings.TrimSpace(provenanceHash) == "" {
+		return errors.New("provenance_hash is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM render_plans WHERE provenance_hash = ?`, provenanceHash,
+	); err != nil {
+		return fmt.Errorf("delete render_plans index: %w", err)
 	}
 	return nil
 }
@@ -4115,6 +4170,25 @@ func (s *DB) SaveLocalizedSubtitleTrackIndex(ctx context.Context, idx LocalizedS
 	return nil
 }
 
+// DeleteLocalizedSubtitleTrackIndex withdraws one localized subtitle track row by provenance. A
+// region correction regenerates the subtitle track (and records the operator's audit row) only
+// after the overridden plan is persisted, so a later failure must take this row back out rather
+// than leave a rejected edit as the asset's latest subtitle track. Provenance is unique across the
+// table, so this removes exactly the row the failed correction made current.
+func (s *DB) DeleteLocalizedSubtitleTrackIndex(ctx context.Context, provenanceHash string) error {
+	if strings.TrimSpace(provenanceHash) == "" {
+		return errors.New("provenance_hash is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM localized_subtitle_tracks WHERE provenance_hash = ?`, provenanceHash,
+	); err != nil {
+		return fmt.Errorf("delete localized_subtitle_tracks index: %w", err)
+	}
+	return nil
+}
+
 // GetLocalizedSubtitleTrackIndex retrieves the latest index row for an asset and target language.
 func (s *DB) GetLocalizedSubtitleTrackIndex(ctx context.Context, assetID, targetLang string) (*LocalizedSubtitleTrackIndex, error) {
 	s.mu.RLock()
@@ -4228,6 +4302,25 @@ func (s *DB) SaveLocalizedVisualTrackIndex(ctx context.Context, idx LocalizedVis
 	return nil
 }
 
+// DeleteLocalizedVisualTrackIndex withdraws one localized visual track row by provenance. A region
+// correction regenerates the visual track (and records the operator's audit row) only after the
+// overridden plan is persisted, so a later failure must take this row back out rather than leave a
+// rejected edit as the asset's latest localized track. Provenance is unique across the table, so
+// this removes exactly the row the failed correction made current.
+func (s *DB) DeleteLocalizedVisualTrackIndex(ctx context.Context, provenanceHash string) error {
+	if strings.TrimSpace(provenanceHash) == "" {
+		return errors.New("provenance_hash is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM localized_visual_tracks WHERE provenance_hash = ?`, provenanceHash,
+	); err != nil {
+		return fmt.Errorf("delete localized_visual_tracks index: %w", err)
+	}
+	return nil
+}
+
 // GetLocalizedVisualTrackIndex retrieves the latest index row for an asset and target language.
 func (s *DB) GetLocalizedVisualTrackIndex(ctx context.Context, assetID, targetLang string) (*LocalizedVisualTrackIndex, error) {
 	s.mu.RLock()
@@ -4295,41 +4388,64 @@ func (s *DB) GetLocalizedVisualTrackByProvenance(ctx context.Context, provenance
 
 // SaveReviewOverride records an auditable operator acceptance/override of a flagged exception item.
 func (s *DB) SaveReviewOverride(ctx context.Context, ro domain.ReviewOverride) error {
+	return s.SaveReviewOverrides(ctx, []domain.ReviewOverride{ro})
+}
+
+// SaveReviewOverrides persists a batch of append-only override rows in one
+// transaction. A correction records one row per corrected region and treats that
+// batch as its commit point, so a partially written batch — some regions recorded,
+// others not — must never survive a failed correction: the audit trail would claim
+// part of an edit that was rolled back.
+func (s *DB) SaveReviewOverrides(ctx context.Context, overrides []domain.ReviewOverride) error {
+	if len(overrides) == 0 {
+		return nil
+	}
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if ro.ID == "" {
-		ro.ID = uuid.NewString()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin review_override batch tx: %w", err)
 	}
-	if ro.CreatedAt.IsZero() {
-		ro.CreatedAt = time.Now().UTC()
-	}
-	if ro.Action == "" {
-		ro.Action = "manual_override"
-	}
+	defer tx.Rollback()
 
 	query := `INSERT INTO review_overrides (id, run_id, job_id, asset_id, target_language, review_item_id, item_type, stage, item_index, segment_id, region_id, action, reason, operator, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-
-	_, err := s.db.ExecContext(ctx, query,
-		ro.ID,
-		ro.RunID,
-		ro.JobID,
-		ro.AssetID,
-		ro.TargetLanguage,
-		ro.ReviewItemID,
-		string(ro.ItemType),
-		ro.Stage,
-		ro.ItemIndex,
-		ro.SegmentID,
-		ro.RegionID,
-		ro.Action,
-		ro.Reason,
-		ro.Operator,
-		ro.CreatedAt.Format(time.RFC3339Nano),
-	)
-	if err != nil {
-		return fmt.Errorf("insert review_override: %w", err)
+	for _, ro := range overrides {
+		if ro.ID == "" {
+			ro.ID = uuid.NewString()
+		}
+		if ro.CreatedAt.IsZero() {
+			ro.CreatedAt = time.Now().UTC()
+		}
+		if ro.Action == "" {
+			ro.Action = "manual_override"
+		}
+		if _, err := tx.ExecContext(ctx, query,
+			ro.ID,
+			ro.RunID,
+			ro.JobID,
+			ro.AssetID,
+			ro.TargetLanguage,
+			ro.ReviewItemID,
+			string(ro.ItemType),
+			ro.Stage,
+			ro.ItemIndex,
+			ro.SegmentID,
+			ro.RegionID,
+			ro.Action,
+			ro.Reason,
+			ro.Operator,
+			ro.CreatedAt.Format(time.RFC3339Nano),
+		); err != nil {
+			return fmt.Errorf("insert review_override: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit review_override batch tx: %w", err)
 	}
 	return nil
 }

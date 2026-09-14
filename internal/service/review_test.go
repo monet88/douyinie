@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -68,6 +70,13 @@ func setupReviewTestHarness(t *testing.T) (*service.ReviewService, *storage.DB, 
 }
 
 func setupFullReviewHarness(t *testing.T) (*service.ReviewService, *storage.DB, *cas.Store, string) {
+	reviewSvc, db, casStore, _, assetID := setupFullReviewHarnessWithRender(t)
+	return reviewSvc, db, casStore, assetID
+}
+
+// setupFullReviewHarnessWithRender additionally returns the render service a region
+// correction now drives, so a test can pin the composition backend (or fail inside it).
+func setupFullReviewHarnessWithRender(t *testing.T) (*service.ReviewService, *storage.DB, *cas.Store, *service.RenderService, string) {
 	t.Helper()
 	reviewSvc, db, casStore, assetID := setupReviewTestHarness(t)
 	ctx := context.Background()
@@ -259,6 +268,10 @@ func setupFullReviewHarness(t *testing.T) (*service.ReviewService, *storage.DB, 
 	visSvc := service.NewVisualTextService(db, casStore)
 	visSvc.SetTranslationService(transSvc)
 	renderSvc := service.NewRenderService(db, casStore)
+	// A region correction renders the preview the operator will see. Composition stays
+	// deterministic here (no ffmpeg, no real media) so these tests observe the
+	// correction's own state transitions instead of a renderer.
+	renderSvc.SetCustomComposer(mockPreviewComposer)
 
 	reviewSvc.SetTranslationService(transSvc)
 	reviewSvc.SetDubbingService(dubSvc)
@@ -266,7 +279,22 @@ func setupFullReviewHarness(t *testing.T) (*service.ReviewService, *storage.DB, 
 	reviewSvc.SetVisualTextService(visSvc)
 	reviewSvc.SetRenderService(renderSvc)
 
-	return reviewSvc, db, casStore, assetID
+	return reviewSvc, db, casStore, renderSvc, assetID
+}
+
+// mockPreviewComposer writes a deterministic placeholder instead of invoking a real
+// renderer, mirroring the composition seam the seam-1 tests already use.
+func mockPreviewComposer(_ context.Context, req media.CompositionRequest) (*media.CompositionResult, error) {
+	payload := []byte("MOCK_COMPOSED_PREVIEW_BYTES")
+	if err := os.WriteFile(req.OutputPath, payload, 0o644); err != nil {
+		return nil, err
+	}
+	return &media.CompositionResult{
+		OutputPath: req.OutputPath,
+		ByteSize:   int64(len(payload)),
+		DurationMs: 1000,
+		Renderer:   "mock-preview-composer",
+	}, nil
 }
 
 func bindBaselineDubMixToRun(t *testing.T, db *storage.DB, assetID, targetLang, runID string) string {
@@ -1754,6 +1782,97 @@ func TestReviewService_CorrectRegionGeometry_MissingDubMixFailsClosed(t *testing
 	}
 }
 
+func TestReviewService_CorrectRegionGeometry_ProtectedOcclusionRestoresCurrentPlan(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-occlusion-01"
+	bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
+
+	// A protected brand mark and a semantic region whose overlay can be dragged onto it.
+	brandBox := domain.BoundingBox{X: 50, Y: 60, Width: 120, Height: 40}
+	semBox := domain.BoundingBox{X: 100, Y: 200, Width: 300, Height: 60}
+	srcPlan := domain.TextRegionPlan{
+		ID:             "text-plan-occlusion-1",
+		AssetID:        assetID,
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		ProvenanceHash: "prov-text-occlusion-1",
+		Regions: []domain.TrackedTextRegion{
+			{
+				ID:                "reg-brand",
+				Text:              "SUPOR",
+				Role:              domain.TextRoleBrandKeep,
+				ProtectedMetadata: domain.ProtectedRegionMetadata{IsProtected: true, Reason: "brand_authenticity"},
+				FirstSeenMs:       0,
+				LastSeenMs:        1500,
+				Keyframes:         []domain.RegionKeyframe{{TimestampMs: 0, Box: brandBox, Observed: true, Confidence: 0.98}},
+			},
+			{
+				ID:          "reg-sem",
+				Text:        "关注",
+				Role:        domain.TextRoleSemanticText,
+				FirstSeenMs: 0,
+				LastSeenMs:  1500,
+				Keyframes:   []domain.RegionKeyframe{{TimestampMs: 0, Box: semBox, Observed: true, Confidence: 0.9}},
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	srcBytes, _ := json.Marshal(srcPlan)
+	srcObj, _ := casStore.Put(bytes.NewReader(srcBytes))
+	if err := db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             srcPlan.ID,
+		AssetID:        assetID,
+		CASHash:        srcObj.SHA256,
+		ProvenanceHash: srcPlan.ProvenanceHash,
+		CreatedAt:      srcPlan.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save source plan index: %v", err)
+	}
+
+	// Drag the semantic overlay onto the protected brand mark (-150 canonical px on Y).
+	_, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides: []domain.RegionOverride{
+			{RegionID: "reg-sem", BoxDeltaY: -150},
+		},
+		Reason:   "Drag semantic overlay onto the protected brand mark",
+		Operator: "tester",
+	})
+	if err == nil || !errors.Is(err, domain.ErrSubtitleOverlapsProtectedRegion) {
+		t.Fatalf("expected fail-closed protected-region rejection, got: %v", err)
+	}
+
+	// Fail-closed means the rejected edit must not remain the asset's current plan.
+	current, err := db.GetTextRegionPlanIndex(ctx, assetID)
+	if err != nil {
+		t.Fatalf("get current text region plan index: %v", err)
+	}
+	if current.ProvenanceHash != srcPlan.ProvenanceHash || current.CASHash != srcObj.SHA256 {
+		t.Errorf("rejected edit stayed current: provenance=%s cas=%s, want %s / %s",
+			current.ProvenanceHash, current.CASHash, srcPlan.ProvenanceHash, srcObj.SHA256)
+	}
+
+	// The restored plan is the usable base: a non-occluding reclassification still succeeds.
+	brandRole := domain.TextRoleBrandKeep
+	res, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides: []domain.RegionOverride{
+			{RegionID: "reg-sem", NewRole: &brandRole},
+		},
+		Reason:   "Recover after the rejected drag",
+		Operator: "tester",
+	})
+	if err != nil {
+		t.Fatalf("recovery correction on the restored plan failed: %v", err)
+	}
+	_ = res
+}
+
 func TestReviewService_CorrectRegionGeometry_OverrideMintsNewImmutablePlanIdentity(t *testing.T) {
 	svc, db, casStore, assetID := setupFullReviewHarness(t)
 	ctx := context.Background()
@@ -1834,6 +1953,43 @@ func TestReviewService_CorrectRegionGeometry_OverrideMintsNewImmutablePlanIdenti
 	}
 	if srcIdx == nil || srcIdx.CASHash != srcObj.SHA256 {
 		t.Errorf("source plan index was overwritten: got %+v, want CAS %s", srcIdx, srcObj.SHA256)
+	}
+
+	// The operator's intent is recorded as an append-only audit row bound to the run.
+	audits, err := db.GetReviewOverridesByRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get region correction audit: %v", err)
+	}
+	if len(audits) != 1 {
+		t.Fatalf("expected exactly 1 audit row for the correction, got %d", len(audits))
+	}
+	audit := audits[0]
+	if audit.Action != string(domain.ReviewOverrideActionRegionGeometry) {
+		t.Errorf("expected region geometry audit action, got %q", audit.Action)
+	}
+	if audit.ItemType != domain.ReviewItemTypeRegionGeometry {
+		t.Errorf("expected region geometry item type, got %q", audit.ItemType)
+	}
+	if audit.RegionID != "reg-lineage-1" || audit.ItemIndex != 0 {
+		t.Errorf("audit must name the corrected region and its index, got region=%q index=%d", audit.RegionID, audit.ItemIndex)
+	}
+	if audit.Reason != "Reclassify uncertain region" || audit.Operator != "tester" {
+		t.Errorf("audit must carry operator intent, got reason=%q operator=%q", audit.Reason, audit.Operator)
+	}
+	if audit.AssetID != assetID || audit.TargetLanguage != "vi" {
+		t.Errorf("audit must be bound to the corrected asset/language, got asset=%q lang=%q", audit.AssetID, audit.TargetLanguage)
+	}
+
+	// A region correction is not an acceptance of a projected exception item, so it
+	// must never flip a review item to manual_override.
+	allItems, err := svc.ProjectAllReviewItemsForRun(ctx, assetID, "vi", runID)
+	if err != nil {
+		t.Fatalf("project all review items: %v", err)
+	}
+	for _, it := range allItems {
+		if it.Status == domain.ReviewItemStatusManualOverride {
+			t.Errorf("region correction must not mark review item %q as manual_override", it.ID)
+		}
 	}
 }
 
@@ -2196,4 +2352,709 @@ func assertCorrectionKeepsDubScriptGrounding(
 			visTrack.ProvenanceHash, dubIdx.ProvenanceHash)
 	}
 	return subTrack.RunID
+}
+
+// A region correction must fail closed on geometry the canonical frame cannot hold. The RuntimeHost
+// endpoint's browser preflight is not authoritative, and ApplyRegionOverrides clamps (a clamped box
+// is always in-frame, so the clamp is undetectable afterwards), which would persist a box the
+// operator never placed and report it as success.
+func TestReviewService_CorrectRegionGeometry_RejectsGeometryOutsideCanonicalFrame(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-frame-bounds-01"
+	bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
+
+	srcPlan := domain.TextRegionPlan{
+		ID:             "text-plan-frame-bounds-1",
+		AssetID:        assetID,
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		ProvenanceHash: "prov-text-frame-bounds-1",
+		CreatedAt:      time.Now().UTC(),
+		Regions: []domain.TrackedTextRegion{
+			{
+				ID:          "reg-edge",
+				Text:        "关注",
+				Role:        domain.TextRoleSemanticText,
+				FirstSeenMs: 0,
+				LastSeenMs:  1500,
+				Keyframes: []domain.RegionKeyframe{
+					{TimestampMs: 0, Box: domain.BoundingBox{X: 100, Y: 200, Width: 300, Height: 60}, Observed: true, Confidence: 0.9},
+				},
+			},
+		},
+	}
+	srcBytes, _ := json.Marshal(srcPlan)
+	srcObj, _ := casStore.Put(bytes.NewReader(srcBytes))
+	if err := db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             srcPlan.ID,
+		AssetID:        assetID,
+		CASHash:        srcObj.SHA256,
+		ProvenanceHash: srcPlan.ProvenanceHash,
+		CreatedAt:      srcPlan.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save source plan index: %v", err)
+	}
+
+	for name, delta := range map[string]domain.RegionOverride{
+		"dragged past the left frame edge":    {RegionID: "reg-edge", BoxDeltaX: -400},
+		"resized below the canonical minimum": {RegionID: "reg-edge", BoxDeltaW: -300},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+				RunID:          runID,
+				AssetID:        assetID,
+				TargetLanguage: "vi",
+				Overrides:      []domain.RegionOverride{delta},
+				Reason:         "must fail closed, never clamp",
+				Operator:       "tester",
+			})
+			if !errors.Is(err, domain.ErrRegionOverrideInvalid) {
+				t.Fatalf("expected ErrRegionOverrideInvalid for %s, got: %v", name, err)
+			}
+			current, err := db.GetTextRegionPlanIndex(ctx, assetID)
+			if err != nil {
+				t.Fatalf("get current text region plan index: %v", err)
+			}
+			if current.ProvenanceHash != srcPlan.ProvenanceHash || current.CASHash != srcObj.SHA256 {
+				t.Errorf("clamped geometry became the current plan: provenance=%s cas=%s, want %s / %s",
+					current.ProvenanceHash, current.CASHash, srcPlan.ProvenanceHash, srcObj.SHA256)
+			}
+		})
+	}
+
+	// Control: in-frame geometry still applies, so the guard does not over-reject.
+	if _, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides:      []domain.RegionOverride{{RegionID: "reg-edge", BoxDeltaX: 20}},
+		Reason:         "in-frame drag",
+		Operator:       "tester",
+	}); err != nil {
+		t.Fatalf("in-frame geometry must still apply, got: %v", err)
+	}
+	current, err := db.GetTextRegionPlanIndex(ctx, assetID)
+	if err != nil {
+		t.Fatalf("get current text region plan index after in-frame edit: %v", err)
+	}
+	if current.ProvenanceHash == srcPlan.ProvenanceHash {
+		t.Errorf("an in-frame edit must become the asset's current plan")
+	}
+}
+
+// A correction persists its overridden plan, then regenerates the visual/subtitle tracks and the
+// render plan, then records the operator's audit row. Those steps are not transactional, so a
+// failure after the descendants exist must withdraw every row this correction made current —
+// leaving the pre-correction artifacts as the current ones — instead of reporting an error over a
+// mutated state.
+func TestReviewService_CorrectRegionGeometry_FailedCorrectionRestoresPriorArtifacts(t *testing.T) {
+	svc, db, casStore, _ := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-rollback-01"
+	assetID := "asset-rollback-01"
+
+	srcObj, err := casStore.Put(bytes.NewReader([]byte("rollback source media bytes")))
+	if err != nil {
+		t.Fatalf("put source media: %v", err)
+	}
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		SHA256:              srcObj.SHA256,
+		ByteSize:            int64(len("rollback source media bytes")),
+		MimeType:            "video/mp4",
+		OriginalFilename:    "video.mp4",
+		RightsAttestationID: "att-review-001",
+		CreatedAt:           time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create source asset: %v", err)
+	}
+
+	srcPlan := domain.TextRegionPlan{
+		ID:             "text-plan-rollback-1",
+		AssetID:        assetID,
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		ProvenanceHash: "prov-text-rollback-1",
+		CreatedAt:      time.Now().UTC(),
+		Regions: []domain.TrackedTextRegion{
+			{
+				ID:          "reg-rollback",
+				Text:        "关注",
+				Role:        domain.TextRoleSemanticText,
+				FirstSeenMs: 0,
+				LastSeenMs:  1500,
+				Keyframes: []domain.RegionKeyframe{
+					{TimestampMs: 0, Box: domain.BoundingBox{X: 100, Y: 200, Width: 300, Height: 60}, Observed: true},
+				},
+			},
+		},
+	}
+	srcBytes, _ := json.Marshal(srcPlan)
+	srcPlanObj, _ := casStore.Put(bytes.NewReader(srcBytes))
+	if err := db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             srcPlan.ID,
+		AssetID:        assetID,
+		CASHash:        srcPlanObj.SHA256,
+		ProvenanceHash: srcPlan.ProvenanceHash,
+		CreatedAt:      srcPlan.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save source plan index: %v", err)
+	}
+
+	// The run's pre-correction visual track, older than the correction.
+	priorVisual := storage.LocalizedVisualTrackIndex{
+		ID:                "prior-visual-rollback",
+		AssetID:           assetID,
+		RunID:             runID,
+		TargetLanguage:    "vi",
+		TextRegionPlanCAS: srcPlanObj.SHA256,
+		CASHash:           srcObj.SHA256,
+		ProvenanceHash:    "prov-prior-visual-rollback",
+		CreatedAt:         time.Now().UTC().Add(-time.Hour),
+	}
+	if err := db.SaveLocalizedVisualTrackIndex(ctx, priorVisual); err != nil {
+		t.Fatalf("save prior visual track index: %v", err)
+	}
+
+	// No DubMix index for this asset, so the correction fails after LocalizeVisualTrack has
+	// persisted the run's visual and subtitle tracks and before any render plan is frozen.
+	_, err = svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides:      []domain.RegionOverride{{RegionID: "reg-rollback", BoxDeltaX: 10}},
+		Reason:         "descendant regeneration fails after the plan is persisted",
+		Operator:       "tester",
+	})
+	if err == nil || !strings.Contains(err.Error(), "dub mix") {
+		t.Fatalf("expected the correction to fail on the missing DubMix index, got: %v", err)
+	}
+
+	vis, err := db.GetLocalizedVisualTrackIndexByRun(ctx, runID)
+	if err != nil || vis == nil {
+		t.Fatalf("the prior visual track must still be the run's current one, got idx=%v err=%v", vis, err)
+	}
+	if vis.ID != priorVisual.ID || vis.ProvenanceHash != priorVisual.ProvenanceHash {
+		t.Errorf("failed correction left its own visual track current: id=%s provenance=%s, want %s / %s",
+			vis.ID, vis.ProvenanceHash, priorVisual.ID, priorVisual.ProvenanceHash)
+	}
+	if sub, err := db.GetLocalizedSubtitleTrackIndexByRun(ctx, runID); err == nil && sub != nil {
+		t.Errorf("failed correction left a subtitle track current: %+v", sub)
+	}
+	if rPlan, err := db.GetRenderPlanIndexByRun(ctx, runID); err == nil && rPlan != nil {
+		t.Errorf("failed correction left a render plan current: %+v", rPlan)
+	}
+	if preview, err := db.GetLatestRenderArtifactIndex(ctx, assetID, "vi", domain.RenderKindPreview); err == nil && preview != nil {
+		t.Errorf("failed correction left a preview artifact current: %+v", preview)
+	}
+	current, err := db.GetTextRegionPlanIndex(ctx, assetID)
+	if err != nil {
+		t.Fatalf("get current text region plan index: %v", err)
+	}
+	if current.ProvenanceHash != srcPlan.ProvenanceHash || current.CASHash != srcPlanObj.SHA256 {
+		t.Errorf("failed correction left its own plan current: provenance=%s cas=%s, want %s / %s",
+			current.ProvenanceHash, current.CASHash, srcPlan.ProvenanceHash, srcPlanObj.SHA256)
+	}
+}
+
+// The audit row is the correction's commit point: an unrecorded correction must not be reported as
+// successful, and a failure while recording it must not leave the regenerated artifacts (or the
+// overridden plan) current.
+func TestReviewService_CorrectRegionGeometry_AuditFailureRestoresPriorArtifacts(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-audit-failure-01"
+	bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
+
+	srcPlan := domain.TextRegionPlan{
+		ID:             "text-plan-audit-1",
+		AssetID:        assetID,
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		ProvenanceHash: "prov-text-audit-1",
+		CreatedAt:      time.Now().UTC(),
+		Regions: []domain.TrackedTextRegion{
+			{
+				ID:          "reg-audit",
+				Text:        "关注",
+				Role:        domain.TextRoleSemanticText,
+				FirstSeenMs: 0,
+				LastSeenMs:  1500,
+				Keyframes: []domain.RegionKeyframe{
+					{TimestampMs: 0, Box: domain.BoundingBox{X: 100, Y: 200, Width: 300, Height: 60}, Observed: true},
+				},
+			},
+		},
+	}
+	srcBytes, _ := json.Marshal(srcPlan)
+	srcObj, _ := casStore.Put(bytes.NewReader(srcBytes))
+	if err := db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             srcPlan.ID,
+		AssetID:        assetID,
+		CASHash:        srcObj.SHA256,
+		ProvenanceHash: srcPlan.ProvenanceHash,
+		CreatedAt:      srcPlan.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save source plan index: %v", err)
+	}
+
+	// A first correction succeeds and becomes the state the second one must preserve.
+	newRole := domain.TextRoleBrandKeep
+	if _, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides:      []domain.RegionOverride{{RegionID: "reg-audit", NewRole: &newRole}},
+		Reason:         "first accepted reclassification",
+		Operator:       "tester",
+	}); err != nil {
+		t.Fatalf("first correction must succeed: %v", err)
+	}
+	priorPlan, err := db.GetTextRegionPlanIndex(ctx, assetID)
+	if err != nil {
+		t.Fatalf("get plan after first correction: %v", err)
+	}
+	priorVisual, err := db.GetLocalizedVisualTrackIndexByRun(ctx, runID)
+	if err != nil || priorVisual == nil {
+		t.Fatalf("get visual track after first correction: idx=%v err=%v", priorVisual, err)
+	}
+	priorSubtitle, err := db.GetLocalizedSubtitleTrackIndexByRun(ctx, runID)
+	if err != nil || priorSubtitle == nil {
+		t.Fatalf("get subtitle track after first correction: idx=%v err=%v", priorSubtitle, err)
+	}
+	priorRender, err := db.GetRenderPlanIndexByRun(ctx, runID)
+	if err != nil || priorRender == nil {
+		t.Fatalf("get render plan after first correction: idx=%v err=%v", priorRender, err)
+	}
+	priorPreview, err := db.GetLatestRenderArtifactIndex(ctx, assetID, "vi", domain.RenderKindPreview)
+	if err != nil || priorPreview == nil {
+		t.Fatalf("get preview artifact after first correction: idx=%v err=%v", priorPreview, err)
+	}
+
+	// Remove the audit table so recording the operator's intent fails, without touching the
+	// artifacts the correction regenerates first.
+	_ = db.QueryRow(ctx, "DROP TABLE review_overrides").Scan(new(any))
+
+	semanticRole := domain.TextRoleSemanticText
+	_, err = svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides:      []domain.RegionOverride{{RegionID: "reg-audit", NewRole: &semanticRole, BoxDeltaX: 15}},
+		Reason:         "audit recording fails",
+		Operator:       "tester",
+	})
+	if err == nil || !strings.Contains(err.Error(), "audit") {
+		t.Fatalf("expected the audit failure to surface, got: %v", err)
+	}
+
+	current, err := db.GetTextRegionPlanIndex(ctx, assetID)
+	if err != nil {
+		t.Fatalf("get current plan after the failed correction: %v", err)
+	}
+	if current.ProvenanceHash != priorPlan.ProvenanceHash || current.CASHash != priorPlan.CASHash {
+		t.Errorf("failed correction left its own plan current: provenance=%s cas=%s, want %s / %s",
+			current.ProvenanceHash, current.CASHash, priorPlan.ProvenanceHash, priorPlan.CASHash)
+	}
+	vis, err := db.GetLocalizedVisualTrackIndexByRun(ctx, runID)
+	if err != nil || vis == nil {
+		t.Fatalf("the prior visual track must still be current, got idx=%v err=%v", vis, err)
+	}
+	if vis.ID != priorVisual.ID || vis.ProvenanceHash != priorVisual.ProvenanceHash {
+		t.Errorf("failed correction left its own visual track current: id=%s provenance=%s, want %s / %s",
+			vis.ID, vis.ProvenanceHash, priorVisual.ID, priorVisual.ProvenanceHash)
+	}
+	sub, err := db.GetLocalizedSubtitleTrackIndexByRun(ctx, runID)
+	if err != nil || sub == nil {
+		t.Fatalf("the prior subtitle track must still be current, got idx=%v err=%v", sub, err)
+	}
+	if sub.ID != priorSubtitle.ID || sub.ProvenanceHash != priorSubtitle.ProvenanceHash {
+		t.Errorf("failed correction left its own subtitle track current: id=%s provenance=%s, want %s / %s",
+			sub.ID, sub.ProvenanceHash, priorSubtitle.ID, priorSubtitle.ProvenanceHash)
+	}
+	rPlan, err := db.GetRenderPlanIndexByRun(ctx, runID)
+	if err != nil || rPlan == nil {
+		t.Fatalf("the prior render plan must still be current, got idx=%v err=%v", rPlan, err)
+	}
+	if rPlan.ID != priorRender.ID || rPlan.ProvenanceHash != priorRender.ProvenanceHash {
+		t.Errorf("failed correction left its own render plan current: id=%s provenance=%s, want %s / %s",
+			rPlan.ID, rPlan.ProvenanceHash, priorRender.ID, priorRender.ProvenanceHash)
+	}
+	preview, err := db.GetLatestRenderArtifactIndex(ctx, assetID, "vi", domain.RenderKindPreview)
+	if err != nil {
+		t.Fatalf("get preview artifact after the failed correction: %v", err)
+	}
+	if preview.CASHash != priorPreview.CASHash || preview.ProvenanceHash != priorPreview.ProvenanceHash {
+		t.Errorf("failed correction left its own preview artifact current: cas=%s provenance=%s, want %s / %s",
+			preview.CASHash, preview.ProvenanceHash, priorPreview.CASHash, priorPreview.ProvenanceHash)
+	}
+}
+
+// A descendant snapshot the service cannot read must abort the correction before any state is
+// persisted. Without a trustworthy prior state the rollback cannot tell which rows the correction
+// made current, and a read failure mistaken for "nothing is current" would let a later rollback
+// skip those rows while still reporting the correction as complete.
+func TestReviewService_CorrectRegionGeometry_DescendantSnapshotFailureAbortsBeforePersisting(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-snapshot-failure-01"
+	bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
+
+	srcPlan := domain.TextRegionPlan{
+		ID:             "text-plan-snapshot-1",
+		AssetID:        assetID,
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		ProvenanceHash: "prov-text-snapshot-1",
+		CreatedAt:      time.Now().UTC(),
+		Regions: []domain.TrackedTextRegion{
+			{
+				ID:          "reg-snapshot",
+				Text:        "关注",
+				Role:        domain.TextRoleSemanticText,
+				FirstSeenMs: 0,
+				LastSeenMs:  1500,
+				Keyframes: []domain.RegionKeyframe{
+					{TimestampMs: 0, Box: domain.BoundingBox{X: 100, Y: 200, Width: 300, Height: 60}, Observed: true},
+				},
+			},
+		},
+	}
+	srcBytes, _ := json.Marshal(srcPlan)
+	srcObj, _ := casStore.Put(bytes.NewReader(srcBytes))
+	if err := db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             srcPlan.ID,
+		AssetID:        assetID,
+		CASHash:        srcObj.SHA256,
+		ProvenanceHash: srcPlan.ProvenanceHash,
+		CreatedAt:      srcPlan.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save source plan index: %v", err)
+	}
+
+	// Make the descendant snapshot read fail with a real storage error. QueryRow is the storage
+	// API available here; the statement executes and reports no rows.
+	_ = db.QueryRow(ctx, "DROP TABLE localized_visual_tracks").Scan(new(any))
+
+	_, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides:      []domain.RegionOverride{{RegionID: "reg-snapshot", BoxDeltaX: 10}},
+		Reason:         "snapshot failure must abort before persisting",
+		Operator:       "tester",
+	})
+	if err == nil || !strings.Contains(err.Error(), "snapshot") {
+		t.Fatalf("expected the descendant snapshot failure to abort the correction, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "localized visual track") {
+		t.Errorf("the snapshot failure must name the unreadable artifact, got: %v", err)
+	}
+
+	current, err := db.GetTextRegionPlanIndex(ctx, assetID)
+	if err != nil {
+		t.Fatalf("get current text region plan index: %v", err)
+	}
+	if current.ProvenanceHash != srcPlan.ProvenanceHash || current.CASHash != srcObj.SHA256 {
+		t.Errorf("a failed descendant snapshot mutated the current plan: provenance=%s cas=%s, want %s / %s",
+			current.ProvenanceHash, current.CASHash, srcPlan.ProvenanceHash, srcObj.SHA256)
+	}
+	if sub, err := db.GetLocalizedSubtitleTrackIndexByRun(ctx, runID); err == nil && sub != nil {
+		t.Errorf("a failed descendant snapshot still regenerated descendants: %+v", sub)
+	}
+	if rPlan, err := db.GetRenderPlanIndexByRun(ctx, runID); err == nil && rPlan != nil {
+		t.Errorf("a failed descendant snapshot still froze a render plan: %+v", rPlan)
+	}
+}
+
+// saveRegionCorrectionPlan installs a source TextRegionPlan whose regions carry canonical
+// keyframe geometry, and returns the stored artifact's CAS hash.
+func saveRegionCorrectionPlan(t *testing.T, db *storage.DB, casStore *cas.Store, assetID, provenance string, regions []domain.TrackedTextRegion) string {
+	t.Helper()
+	plan := domain.TextRegionPlan{
+		ID:             "text-plan-" + provenance,
+		AssetID:        assetID,
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		ProvenanceHash: provenance,
+		Regions:        regions,
+		CreatedAt:      time.Now().UTC(),
+	}
+	planBytes, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatalf("marshal source plan: %v", err)
+	}
+	obj, err := casStore.Put(bytes.NewReader(planBytes))
+	if err != nil {
+		t.Fatalf("put source plan: %v", err)
+	}
+	if err := db.SaveTextRegionPlanIndex(context.Background(), storage.TextRegionPlanIndex{
+		ID:             plan.ID,
+		AssetID:        assetID,
+		CASHash:        obj.SHA256,
+		ProvenanceHash: plan.ProvenanceHash,
+		CreatedAt:      plan.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save source plan index: %v", err)
+	}
+	return obj.SHA256
+}
+
+// A request canceled after the overridden plan is persisted must still be withdrawn. The
+// rollback used to run on the request context, so a client that died while the correction
+// was regenerating descendants left the rejected plan (and its descendants) current and
+// returned an error describing state the operator could no longer see.
+func TestReviewService_CorrectRegionGeometry_RollbackSurvivesRequestCancellation(t *testing.T) {
+	svc, db, casStore, renderSvc, assetID := setupFullReviewHarnessWithRender(t)
+	runID := "run-cancelled-rollback-01"
+	bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
+
+	planCAS := saveRegionCorrectionPlan(t, db, casStore, assetID, "prov-text-cancel-1", []domain.TrackedTextRegion{{
+		ID:          "reg-cancel",
+		Text:        "关注",
+		Role:        domain.TextRoleSemanticText,
+		FirstSeenMs: 0,
+		LastSeenMs:  1500,
+		Keyframes: []domain.RegionKeyframe{
+			{TimestampMs: 0, Box: domain.BoundingBox{X: 100, Y: 200, Width: 300, Height: 60}, Observed: true},
+		},
+	}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The client disconnects while the correction is rendering the preview for the plan it
+	// has already persisted: everything up to the audit row is already current state.
+	renderSvc.SetCustomComposer(func(_ context.Context, _ media.CompositionRequest) (*media.CompositionResult, error) {
+		cancel()
+		return nil, errors.New("preview composition interrupted by client disconnect")
+	})
+
+	_, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides:      []domain.RegionOverride{{RegionID: "reg-cancel", BoxDeltaX: 25}},
+		Reason:         "request canceled after the overridden plan was persisted",
+		Operator:       "tester",
+	})
+	if err == nil {
+		t.Fatalf("expected the canceled correction to fail")
+	}
+	if strings.Contains(err.Error(), "could not be withdrawn") {
+		t.Fatalf("the withdrawal ran on the canceled request context: %v", err)
+	}
+
+	// Reads use a live context: the request context this test canceled stays canceled.
+	readCtx := context.Background()
+	current, err := db.GetTextRegionPlanIndex(readCtx, assetID)
+	if err != nil {
+		t.Fatalf("get current plan after the canceled correction: %v", err)
+	}
+	if current.ProvenanceHash != "prov-text-cancel-1" || current.CASHash != planCAS {
+		t.Errorf("a canceled correction left its own plan current: provenance=%s cas=%s, want prov-text-cancel-1 / %s",
+			current.ProvenanceHash, current.CASHash, planCAS)
+	}
+	if vis, err := db.GetLocalizedVisualTrackIndexByRun(readCtx, runID); err == nil && vis != nil {
+		t.Errorf("a canceled correction left a visual track current: %+v", vis)
+	}
+	if sub, err := db.GetLocalizedSubtitleTrackIndexByRun(readCtx, runID); err == nil && sub != nil {
+		t.Errorf("a canceled correction left a subtitle track current: %+v", sub)
+	}
+	if rPlan, err := db.GetRenderPlanIndexByRun(readCtx, runID); err == nil && rPlan != nil {
+		t.Errorf("a canceled correction left a render plan current: %+v", rPlan)
+	}
+	if preview, err := db.GetLatestRenderArtifactIndex(readCtx, assetID, "vi", domain.RenderKindPreview); err == nil && preview != nil {
+		t.Errorf("a canceled correction left a preview artifact current: %+v", preview)
+	}
+}
+
+// The correction's audit rows are its commit point: one row per corrected region, written
+// as a batch, so a failure in the middle of a multi-region correction can never leave an
+// audit trail describing an edit the caller rolled back.
+func TestReviewService_CorrectRegionGeometry_AuditBatchIsAtomic(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-audit-batch-01"
+	bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
+
+	planCAS := saveRegionCorrectionPlan(t, db, casStore, assetID, "prov-text-batch-1", []domain.TrackedTextRegion{
+		{
+			ID:          "reg-batch-one",
+			Text:        "关注",
+			Role:        domain.TextRoleSemanticText,
+			FirstSeenMs: 0,
+			LastSeenMs:  1500,
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 0, Box: domain.BoundingBox{X: 100, Y: 200, Width: 300, Height: 60}, Observed: true},
+			},
+		},
+		{
+			ID:          "reg-batch-two",
+			Text:        "下载",
+			Role:        domain.TextRoleSemanticText,
+			FirstSeenMs: 0,
+			LastSeenMs:  1500,
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 0, Box: domain.BoundingBox{X: 100, Y: 400, Width: 300, Height: 60}, Observed: true},
+			},
+		},
+	})
+
+	// Fail the second row of the batch. The first row is already written by then, so only a
+	// transactional batch keeps it out of the audit trail of a rolled-back correction.
+	_ = db.QueryRow(ctx, `CREATE TRIGGER fail_second_region_audit BEFORE INSERT ON review_overrides
+		WHEN NEW.region_id = 'reg-batch-two'
+		BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END`).Scan(new(any))
+
+	newRole := domain.TextRoleBrandKeep
+	_, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides: []domain.RegionOverride{
+			{RegionID: "reg-batch-one", NewRole: &newRole},
+			{RegionID: "reg-batch-two", NewRole: &newRole},
+		},
+		Reason:   "two-region correction whose audit batch fails on the second row",
+		Operator: "tester",
+	})
+	if err == nil || !strings.Contains(err.Error(), "audit") {
+		t.Fatalf("expected the failed audit batch to surface, got: %v", err)
+	}
+
+	overrides, err := db.GetReviewOverrides(ctx, assetID, "vi")
+	if err != nil {
+		t.Fatalf("get review overrides after the failed batch: %v", err)
+	}
+	if len(overrides) != 0 {
+		t.Errorf("a failed audit batch left %d row(s) behind: %+v", len(overrides), overrides)
+	}
+
+	current, err := db.GetTextRegionPlanIndex(ctx, assetID)
+	if err != nil {
+		t.Fatalf("get current plan after the failed batch: %v", err)
+	}
+	if current.ProvenanceHash != "prov-text-batch-1" || current.CASHash != planCAS {
+		t.Errorf("a failed audit batch left its plan current: provenance=%s cas=%s, want prov-text-batch-1 / %s",
+			current.ProvenanceHash, current.CASHash, planCAS)
+	}
+}
+
+// A region correction is only visible to the operator once the preview the UI reloads has
+// been rendered from the plan it just froze. Freezing a plan without a preview leaves the
+// pre-correction geometry on screen behind a reported success.
+func TestReviewService_CorrectRegionGeometry_RendersPreviewFromCorrectedPlan(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-preview-correction-01"
+	dubMixCAS := bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
+
+	saveRegionCorrectionPlan(t, db, casStore, assetID, "prov-text-preview-1", []domain.TrackedTextRegion{{
+		ID:          "reg-preview",
+		Text:        "关注",
+		Role:        domain.TextRoleSemanticText,
+		FirstSeenMs: 0,
+		LastSeenMs:  1500,
+		Keyframes: []domain.RegionKeyframe{
+			{TimestampMs: 0, Box: domain.BoundingBox{X: 100, Y: 200, Width: 300, Height: 60}, Observed: true},
+		},
+	}})
+
+	first, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides:      []domain.RegionOverride{{RegionID: "reg-preview", BoxDeltaX: 40, BoxDeltaY: 20}},
+		Reason:         "operator dragged the region",
+		Operator:       "tester",
+	})
+	if err != nil {
+		t.Fatalf("first region correction must succeed: %v", err)
+	}
+	if first.PreviewRenderCAS == "" {
+		t.Fatalf("the correction reported no preview render artifact: %+v", first)
+	}
+
+	firstPlan, err := db.GetRenderPlanIndexByRun(ctx, runID)
+	if err != nil || firstPlan == nil {
+		t.Fatalf("get render plan after the first correction: idx=%v err=%v", firstPlan, err)
+	}
+	assertPreviewConsumesPlan(t, db, casStore, assetID, runID, first.PreviewRenderCAS, firstPlan)
+
+	// A second correction must supersede that preview rather than leave the operator
+	// looking at the first one.
+	second, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides:      []domain.RegionOverride{{RegionID: "reg-preview", BoxDeltaX: 10}},
+		Reason:         "operator resized the region again",
+		Operator:       "tester",
+	})
+	if err != nil {
+		t.Fatalf("second region correction must succeed: %v", err)
+	}
+	if second.PreviewRenderCAS == first.PreviewRenderCAS {
+		t.Fatalf("the second correction reused the first preview artifact: %s", second.PreviewRenderCAS)
+	}
+	secondPlan, err := db.GetRenderPlanIndexByRun(ctx, runID)
+	if err != nil || secondPlan == nil {
+		t.Fatalf("get render plan after the second correction: idx=%v err=%v", secondPlan, err)
+	}
+	assertPreviewConsumesPlan(t, db, casStore, assetID, runID, second.PreviewRenderCAS, secondPlan)
+
+	// The correction is a targeted rerun: it reuses the frozen dub mix instead of
+	// re-running speech, translation, TTS or audio stages.
+	afterMix, err := db.GetDubMixArtifactIndexByRun(ctx, runID)
+	if err != nil || afterMix == nil {
+		t.Fatalf("get dub mix after the corrections: idx=%v err=%v", afterMix, err)
+	}
+	if afterMix.CASHash != dubMixCAS {
+		t.Errorf("the correction reran the audio mix: dub mix cas=%s, want %s", afterMix.CASHash, dubMixCAS)
+	}
+}
+
+// assertPreviewConsumesPlan proves a preview artifact is the one the UI's run-scoped render
+// read resolves, and that it was composed from exactly the given render plan.
+func assertPreviewConsumesPlan(t *testing.T, db *storage.DB, casStore *cas.Store, assetID, runID, previewCAS string, plan *storage.RenderPlanIndex) {
+	t.Helper()
+	ctx := context.Background()
+
+	indices, err := db.GetRenderArtifactIndicesByRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get render artifacts by run: %v", err)
+	}
+	latest := ""
+	for _, idx := range indices {
+		if idx.Kind == domain.RenderKindPreview {
+			latest = idx.CASHash
+		}
+	}
+	if latest != previewCAS {
+		t.Fatalf("the run-scoped preview the UI resolves is %q, want %q", latest, previewCAS)
+	}
+
+	rc, err := casStore.Get(previewCAS)
+	if err != nil {
+		t.Fatalf("load preview artifact from CAS: %v", err)
+	}
+	defer rc.Close()
+	var artifact domain.PreviewRenderArtifact
+	if err := json.NewDecoder(rc).Decode(&artifact); err != nil {
+		t.Fatalf("decode preview artifact: %v", err)
+	}
+	if artifact.AssetID != assetID || artifact.RunID != runID {
+		t.Errorf("preview artifact is bound to %s/%s, want %s/%s", artifact.AssetID, artifact.RunID, assetID, runID)
+	}
+	if artifact.ConsumedPlan.PlanProvenanceHash != plan.ProvenanceHash || artifact.ConsumedPlan.PlanCASHash != plan.CASHash {
+		t.Errorf("preview consumed plan %s/%s, want %s/%s",
+			artifact.ConsumedPlan.PlanProvenanceHash, artifact.ConsumedPlan.PlanCASHash, plan.ProvenanceHash, plan.CASHash)
+	}
+	if artifact.OutputCASHash == "" {
+		t.Fatalf("preview artifact has no rendered media: %+v", artifact)
+	}
+	if _, err := casStore.ResolvePath(artifact.OutputCASHash); err != nil {
+		t.Errorf("the preview media the operator plays is not resolvable: %v", err)
+	}
 }

@@ -25,6 +25,33 @@ const TextRegionPlanSchemaVersion = 1
 const LocalizedVisualTrackSchemaVersion = 1
 const LocalizedSubtitleTrackSchemaVersion = 1
 
+// MinTextRegionBoxPx is the smallest canonical box dimension the domain accepts. It is the
+// authoritative floor behind ApplyRegionOverrides' minimum-dimension clamp, so operator surfaces
+// must not enforce a stricter one of their own.
+const MinTextRegionBoxPx = 1
+
+// DefaultTextRegionFrameWidth and DefaultTextRegionFrameHeight are the canonical frame assumed
+// when a plan carries no frame dimensions.
+const (
+	DefaultTextRegionFrameWidth  = 1080
+	DefaultTextRegionFrameHeight = 1920
+)
+
+// FrameBounds returns the canonical frame a plan's boxes live in.
+func (p *TextRegionPlan) FrameBounds() (width, height int) {
+	if p == nil {
+		return DefaultTextRegionFrameWidth, DefaultTextRegionFrameHeight
+	}
+	width, height = p.FrameWidth, p.FrameHeight
+	if width <= 0 {
+		width = DefaultTextRegionFrameWidth
+	}
+	if height <= 0 {
+		height = DefaultTextRegionFrameHeight
+	}
+	return width, height
+}
+
 var (
 	// ErrSubtitleOverlapsProtectedRegion is returned when a subtitle or overlay occludes a protected area.
 	ErrSubtitleOverlapsProtectedRegion = errors.New("subtitle or overlay overlaps protected region")
@@ -157,6 +184,53 @@ type RegionOverride struct {
 	BoxDeltaH   int             `json:"box_delta_h,omitempty"`
 	IsProtected *bool           `json:"is_protected,omitempty"`
 	Notes       string          `json:"notes,omitempty"`
+}
+
+// ValidateRegionOverrideGeometry rejects any override whose requested geometry would leave the
+// canonical frame or collapse a keyframe. It validates the REQUESTED box (the keyframe plus the
+// override deltas), not a clamped result: ApplyRegionOverrides clamps for the callers that need
+// lenient geometry, so a caller that must fail closed (operator corrections) has to check the
+// request itself — a clamped result is always in-frame and therefore indistinguishable from a
+// legitimate edit.
+func ValidateRegionOverrideGeometry(plan *TextRegionPlan, overrides []RegionOverride) error {
+	if plan == nil || len(overrides) == 0 {
+		return nil
+	}
+	frameW, frameH := plan.FrameBounds()
+
+	regions := make(map[string]TrackedTextRegion, len(plan.Regions))
+	for _, reg := range plan.Regions {
+		regions[reg.ID] = reg
+	}
+
+	for _, ov := range overrides {
+		if ov.BoxDeltaX == 0 && ov.BoxDeltaY == 0 && ov.BoxDeltaW == 0 && ov.BoxDeltaH == 0 {
+			continue
+		}
+		reg, found := regions[strings.TrimSpace(ov.RegionID)]
+		if !found {
+			// Unknown region IDs stay ApplyRegionOverrides' concern: it owns the whole override
+			// contract, so this validator only judges geometry of regions it can resolve.
+			continue
+		}
+		for k, kf := range reg.Keyframes {
+			req := BoundingBox{
+				X:      kf.Box.X + ov.BoxDeltaX,
+				Y:      kf.Box.Y + ov.BoxDeltaY,
+				Width:  kf.Box.Width + ov.BoxDeltaW,
+				Height: kf.Box.Height + ov.BoxDeltaH,
+			}
+			if req.Width < MinTextRegionBoxPx || req.Height < MinTextRegionBoxPx {
+				return fmt.Errorf("%w: region %q keyframe %d would collapse to %dx%d px (minimum %d)",
+					ErrRegionOverrideInvalid, reg.ID, k, req.Width, req.Height, MinTextRegionBoxPx)
+			}
+			if req.X < 0 || req.Y < 0 || req.X+req.Width > frameW || req.Y+req.Height > frameH {
+				return fmt.Errorf("%w: region %q keyframe %d would leave the %dx%d frame (requested x=%d y=%d w=%d h=%d)",
+					ErrRegionOverrideInvalid, reg.ID, k, frameW, frameH, req.X, req.Y, req.Width, req.Height)
+			}
+		}
+	}
+	return nil
 }
 
 // LocalizedOverlayItem represents a single in-place localized cover/overlay unit.

@@ -13,6 +13,20 @@ const (
 	ReviewItemTypeDubScriptQA      ReviewItemType = "dub_script_qa"
 	ReviewItemTypeAudioRole        ReviewItemType = "audio_role_uncertain"
 	ReviewItemTypeVisualOcclusion  ReviewItemType = "visual_occlusion"
+	// ReviewItemTypeRegionGeometry audits a direct-manipulation geometry/role
+	// correction of a tracked text region. It is an audit-only type: no
+	// projection emits it, so it never appears as a pending exception.
+	ReviewItemTypeRegionGeometry ReviewItemType = "region_geometry"
+)
+
+// ReviewOverrideAction names the operator action an auditable ReviewOverride records.
+type ReviewOverrideAction string
+
+const (
+	ReviewOverrideActionManualOverride ReviewOverrideAction = "manual_override"
+	// ReviewOverrideActionRegionGeometry records an applied text-region
+	// geometry/role correction (drag, resize, reclassify, relabel).
+	ReviewOverrideActionRegionGeometry ReviewOverrideAction = "region_geometry_correction"
 )
 
 // ReviewItemStatus tracks the resolution lifecycle of a review exception.
@@ -62,7 +76,7 @@ type ReviewOverride struct {
 	ItemIndex      int            `json:"item_index,omitempty"`
 	SegmentID      string         `json:"segment_id,omitempty"`
 	RegionID       string         `json:"region_id,omitempty"`
-	Action         string         `json:"action"`   // "manual_override"
+	Action         string         `json:"action"`   // ReviewOverrideActionManualOverride | ReviewOverrideActionRegionGeometry
 	Reason         string         `json:"reason"`   // Auditable decision note
 	Operator       string         `json:"operator"` // Operator / user ID who confirmed the override
 	CreatedAt      time.Time      `json:"created_at"`

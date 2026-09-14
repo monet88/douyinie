@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/monet88/douyinie/internal/benchmark"
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
@@ -1415,8 +1418,35 @@ func TestSeam1_VoiceReassign_AssetScopedWithoutRunID(t *testing.T) {
 	}
 }
 
+// installPreviewComposer replaces the harness render service with one whose composition
+// backend writes playablePreview to the requested output. A region correction renders the
+// preview the operator reloads, and the seam-1 fixtures are synthetic files no real encoder
+// can read, so composition is pinned here: the bytes written are the bytes the operator plays.
+func installPreviewComposer(t *testing.T, h *testHarness, playablePreview string) *service.RenderService {
+	t.Helper()
+	payload, err := os.ReadFile(playablePreview)
+	if err != nil {
+		t.Fatalf("read preview composition source: %v", err)
+	}
+	renderSvc := service.NewRenderService(h.db, h.casStore)
+	renderSvc.SetCustomComposer(func(_ context.Context, req media.CompositionRequest) (*media.CompositionResult, error) {
+		if err := os.WriteFile(req.OutputPath, payload, 0o644); err != nil {
+			return nil, err
+		}
+		return &media.CompositionResult{
+			OutputPath: req.OutputPath,
+			ByteSize:   int64(len(payload)),
+			DurationMs: 1500,
+			Renderer:   "seam1-preview-composer",
+		}, nil
+	})
+	h.srv.SetRenderService(renderSvc)
+	return renderSvc
+}
+
 // TestSeam1_RegionOverride_Reclassify_Drag_Resize_Relabel_TargetedInvalidation verifies:
-// 1. Region reclassify/drag/resize/relabel via inspector updates TextRegionPlan and regenerates LocalizedVisualTrack + LocalizedSubtitleTrack + RenderPlan.
+// 1. Region reclassify/drag/resize/relabel via inspector updates TextRegionPlan and regenerates
+// LocalizedVisualTrack + LocalizedSubtitleTrack + RenderPlan + the preview the operator reloads.
 // 2. Upstream source audio, ASR, translation, TTS, dub segments, audio stems, and dub mix are strictly preserved and untouched.
 // 3. Uncertain text role exception in review queue auto-resolves after reclassifying to a valid role.
 func TestSeam1_RegionOverride_Reclassify_Drag_Resize_Relabel_TargetedInvalidation(t *testing.T) {
@@ -1426,6 +1456,10 @@ func TestSeam1_RegionOverride_Reclassify_Drag_Resize_Relabel_TargetedInvalidatio
 	jobID, runID := createJobAndRun(t, h)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
+
+	// Region corrections render the preview the operator reloads. Pin composition to the
+	// run's own media so the assertion below observes the bytes the browser would play.
+	installPreviewComposer(t, h, filepath.Join(h.dir, "queue_source.mp4"))
 
 	// 1. Initial TextRegionPlan with an uncertain region that flags a review exception
 	textPlan := domain.TextRegionPlan{
@@ -1497,6 +1531,16 @@ func TestSeam1_RegionOverride_Reclassify_Drag_Resize_Relabel_TargetedInvalidatio
 		t.Fatalf("setup audio mix failed: status=%d", mixResp.StatusCode)
 	}
 	_ = mixResp.Body.Close()
+
+	// Upstream lineage a visual correction must reuse rather than rerun.
+	stemsBefore, err := h.db.GetAudioStemsArtifactIndex(ctx, assetID)
+	if err != nil || stemsBefore == nil {
+		t.Fatalf("capture audio stems before the correction: idx=%v err=%v", stemsBefore, err)
+	}
+	mixBefore, err := h.db.GetDubMixArtifactIndexByRun(ctx, runID)
+	if err != nil || mixBefore == nil {
+		t.Fatalf("capture dub mix before the correction: idx=%v err=%v", mixBefore, err)
+	}
 
 	// 2. Query review items -> 1 pending low confidence / uncertain role item
 	getQueueURL := fmt.Sprintf("%s/api/v1/assets/%s/review-items?target_language=vi", h.server.URL, assetID)
@@ -1595,7 +1639,74 @@ func TestSeam1_RegionOverride_Reclassify_Drag_Resize_Relabel_TargetedInvalidatio
 		t.Errorf("overridden region not found in LocalizedVisualTrack overlays")
 	}
 
-	// 5. Verify that the pending review queue is now clean (0 items)
+	// 5. The preview the operator reloads must be rendered from the plan that was just
+	// frozen: freezing a plan without a new preview leaves the pre-correction geometry on
+	// screen after a reported success.
+	if regRes.Result.PreviewRenderCAS == "" {
+		t.Errorf("expected non-empty PreviewRenderCAS")
+	}
+	rcPlan, err := h.casStore.Get(regRes.Result.RenderPlanCAS)
+	if err != nil {
+		t.Fatalf("load regenerated render plan from CAS: %v", err)
+	}
+	var frozenPlan domain.RenderPlan
+	if err := json.NewDecoder(rcPlan).Decode(&frozenPlan); err != nil {
+		t.Fatalf("decode regenerated render plan: %v", err)
+	}
+	rcPlan.Close()
+
+	prevResp, err := http.Get(fmt.Sprintf("%s/api/v1/assets/%s/render/preview?target_language=vi&run_id=%s", h.server.URL, assetID, runID))
+	if err != nil || prevResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET run preview render failed: status=%d err=%v", prevResp.StatusCode, err)
+	}
+	var prevBody struct {
+		PreviewRender domain.PreviewRenderArtifact `json:"preview_render"`
+	}
+	_ = json.NewDecoder(prevResp.Body).Decode(&prevBody)
+	prevResp.Body.Close()
+	if prevBody.PreviewRender.CASHash != regRes.Result.PreviewRenderCAS {
+		t.Errorf("the run's latest preview artifact is %s, want the correction's %s",
+			prevBody.PreviewRender.CASHash, regRes.Result.PreviewRenderCAS)
+	}
+	if prevBody.PreviewRender.ConsumedPlan.PlanProvenanceHash != frozenPlan.ProvenanceHash {
+		t.Errorf("preview consumed plan provenance %s, want the corrected plan %s",
+			prevBody.PreviewRender.ConsumedPlan.PlanProvenanceHash, frozenPlan.ProvenanceHash)
+	}
+	if prevBody.PreviewRender.ConsumedPlan.PlanCASHash != regRes.Result.RenderPlanCAS {
+		t.Errorf("preview consumed plan cas %s, want %s",
+			prevBody.PreviewRender.ConsumedPlan.PlanCASHash, regRes.Result.RenderPlanCAS)
+	}
+
+	// The media the player fetches is served from that artifact's fresh output.
+	mediaResp, err := http.Get(fmt.Sprintf("%s/api/v1/assets/%s/render/preview/media?target_language=vi&run_id=%s", h.server.URL, assetID, runID))
+	if err != nil || mediaResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET preview media failed: status=%d err=%v", mediaResp.StatusCode, err)
+	}
+	mediaBytes, _ := io.ReadAll(mediaResp.Body)
+	mediaResp.Body.Close()
+	if int64(len(mediaBytes)) != prevBody.PreviewRender.OutputByteSize {
+		t.Errorf("served preview media is %d bytes, want the rendered %d", len(mediaBytes), prevBody.PreviewRender.OutputByteSize)
+	}
+
+	// 7. A visual correction is a targeted rerun: separation, mixing and the dub mix the
+	// preview composes against are reused, never re-derived.
+	stemsAfter, err := h.db.GetAudioStemsArtifactIndex(ctx, assetID)
+	if err != nil || stemsAfter == nil {
+		t.Fatalf("get audio stems after the correction: idx=%v err=%v", stemsAfter, err)
+	}
+	if stemsAfter.CASHash != stemsBefore.CASHash || stemsAfter.ProvenanceHash != stemsBefore.ProvenanceHash {
+		t.Errorf("region correction reran audio separation: cas=%s provenance=%s, want %s / %s",
+			stemsAfter.CASHash, stemsAfter.ProvenanceHash, stemsBefore.CASHash, stemsBefore.ProvenanceHash)
+	}
+	mixAfter, err := h.db.GetDubMixArtifactIndexByRun(ctx, runID)
+	if err != nil || mixAfter == nil {
+		t.Fatalf("get dub mix after the correction: idx=%v err=%v", mixAfter, err)
+	}
+	if mixAfter.CASHash != mixBefore.CASHash {
+		t.Errorf("region correction reran the audio mix: cas=%s, want %s", mixAfter.CASHash, mixBefore.CASHash)
+	}
+
+	// 7. Verify that the pending review queue is now clean (0 items)
 	qResp2, _ := http.Get(getQueueURL)
 	var qBody2 struct {
 		ReviewItems []domain.ReviewItem `json:"review_items"`
@@ -1881,5 +1992,122 @@ func TestSeam1_CorrectRegionGeometry_FailClosedOnPersistenceErrors(t *testing.T)
 	// Expect fail closed (500 or non-200 error since TextRegionPlan is missing from DB/CAS)
 	if ovrResp.StatusCode == http.StatusOK {
 		t.Fatalf("expected fail-closed error response when TextRegionPlan is missing, got 200 OK")
+	}
+}
+
+// TestSeam1_RegionOverride_OutOfFrameFailsClosedWithoutMutatingState proves the RuntimeHost seam
+// rejects geometry the canonical frame cannot hold instead of persisting a clamped result. The
+// Operator UI's own preflight is a convenience, not the authority: a request that reaches the API
+// (stale client, direct call, or a drag the browser could not bound) must fail closed with an
+// actionable 400 and leave the asset's current plan untouched.
+func TestSeam1_RegionOverride_OutOfFrameFailsClosedWithoutMutatingState(t *testing.T) {
+	h := setupHarness(t)
+	ctx := context.Background()
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	textPlan := domain.TextRegionPlan{
+		ID:             "text-plan-region-bounds-seam1",
+		AssetID:        assetID,
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		ProvenanceHash: "prov-text-region-bounds-seam1",
+		Regions: []domain.TrackedTextRegion{
+			{
+				ID:          "region-bounds-101",
+				Role:        domain.TextRoleSemanticText,
+				Text:        "点击下载应用",
+				FirstSeenMs: 0,
+				LastSeenMs:  3000,
+				Keyframes: []domain.RegionKeyframe{
+					{
+						FrameIndex:  0,
+						TimestampMs: 0,
+						Box:         domain.BoundingBox{X: 100, Y: 200, Width: 300, Height: 80},
+						Observed:    true,
+					},
+				},
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(textPlan)
+	tObj, _ := h.casStore.Put(bytes.NewReader(tBytes))
+	if err := h.db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             textPlan.ID,
+		AssetID:        assetID,
+		CASHash:        tObj.SHA256,
+		ProvenanceHash: textPlan.ProvenanceHash,
+		CreatedAt:      textPlan.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save text region plan index: %v", err)
+	}
+
+	rolePayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	roleBody, _ := json.Marshal(rolePayload)
+	roleResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
+	if err != nil {
+		t.Fatalf("setup audio role plan failed: %v", err)
+	}
+	if roleResp.StatusCode != http.StatusCreated {
+		t.Fatalf("setup audio role plan failed: status=%d", roleResp.StatusCode)
+	}
+	_ = roleResp.Body.Close()
+
+	sepResp, stems := runSeparateStems(t, h, assetID, map[string]any{"run_id": runID})
+	if sepResp.StatusCode != http.StatusCreated || stems == nil {
+		t.Fatalf("setup separate stems failed: status=%d", sepResp.StatusCode)
+	}
+	_ = sepResp.Body.Close()
+
+	mixResp, mix := runAudioMix(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": domain.TargetLanguageVI,
+	})
+	if mixResp.StatusCode != http.StatusCreated || mix == nil {
+		t.Fatalf("setup audio mix failed: status=%d", mixResp.StatusCode)
+	}
+	_ = mixResp.Body.Close()
+
+	// Drag the region 400 canonical px left: the requested box starts at x=-300.
+	ovrPayload := map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": "vi",
+		"overrides": []domain.RegionOverride{
+			{RegionID: "region-bounds-101", BoxDeltaX: -400},
+		},
+		"reason":   "Drag out of the canonical frame must be refused, never clamped",
+		"operator": "visual_editor",
+	}
+	ovrBytes, _ := json.Marshal(ovrPayload)
+	ovrResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/inspector/override-region", h.server.URL, assetID), "application/json", bytes.NewReader(ovrBytes))
+	if err != nil {
+		t.Fatalf("POST inspector/override-region failed: %v", err)
+	}
+	body := new(bytes.Buffer)
+	_, _ = body.ReadFrom(ovrResp.Body)
+	_ = ovrResp.Body.Close()
+	if ovrResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("out-of-frame geometry must fail closed with 400, got status=%d body=%s", ovrResp.StatusCode, body.String())
+	}
+	if !strings.Contains(body.String(), "frame") {
+		t.Errorf("the refusal must name the violated frame bounds, got: %s", body.String())
+	}
+
+	// The rejected edit must not become the asset's current plan.
+	current, err := h.db.GetTextRegionPlanIndex(ctx, assetID)
+	if err != nil {
+		t.Fatalf("get current text region plan index: %v", err)
+	}
+	if current.ProvenanceHash != textPlan.ProvenanceHash || current.CASHash != tObj.SHA256 {
+		t.Errorf("rejected out-of-frame edit became the current plan: provenance=%s cas=%s, want %s / %s",
+			current.ProvenanceHash, current.CASHash, textPlan.ProvenanceHash, tObj.SHA256)
 	}
 }
