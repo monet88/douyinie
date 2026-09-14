@@ -2821,3 +2821,175 @@ func TestDubbingService_SynthesizeAndFit_ZeroDurationSlot_FlaggedForReview_Never
 		t.Errorf("expected OverallStatus REVIEW_REQUIRED, got %s", dubSegments.OverallStatus)
 	}
 }
+
+// seedAuditionDubScriptVariant seeds a single-segment [0ms,4000ms] DubScriptVariant for
+// (assetID, runID, lang) carrying spokenText, indexed at createdAt under provenance.
+func seedAuditionDubScriptVariant(t *testing.T, db *storage.DB, casStore *cas.Store, assetID, runID, lang, spokenText, provenance string, createdAt time.Time) {
+	t.Helper()
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: lang,
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SpeakerID:      "SPEAKER_00",
+				StartMs:        0,
+				EndMs:          4000,
+				SlotDurationMs: 4000,
+				SpokenText:     spokenText,
+			},
+		},
+		CreatedAt: createdAt,
+	}
+	payload, err := json.Marshal(dubScript)
+	if err != nil {
+		t.Fatalf("marshal dub script variant: %v", err)
+	}
+	obj, err := casStore.Put(bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("put dub script variant to CAS: %v", err)
+	}
+	if err := db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+		ID:             dubScript.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: lang,
+		CASHash:        obj.SHA256,
+		ProvenanceHash: provenance,
+		CreatedAt:      createdAt,
+	}); err != nil {
+		t.Fatalf("save dub script variant index: %v", err)
+	}
+}
+
+// seedAuditionStems seeds asset-scoped background + vocals stems of durationMs so a
+// contextual audition can mix without failing the source-derived stem requirement.
+func seedAuditionStems(t *testing.T, db *storage.DB, casStore *cas.Store, assetID string, durationMs int64) {
+	t.Helper()
+	bgObj, err := casStore.Put(bytes.NewReader(media.GeneratePCM16WAV(16000, 1, durationMs)))
+	if err != nil {
+		t.Fatalf("put background stem: %v", err)
+	}
+	vocalsObj, err := casStore.Put(bytes.NewReader(media.GeneratePCM16WAV(16000, 1, durationMs)))
+	if err != nil {
+		t.Fatalf("put vocals stem: %v", err)
+	}
+	artifact := domain.AudioStemArtifacts{
+		ID:            uuid.NewString(),
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		ProviderID:    "fake_separator",
+		ModelName:     "uvr_mdx",
+		ModelVersion:  "1.0",
+		Stems: []domain.AudioStem{
+			{Type: domain.StemTypeBackground, AudioCASHash: bgObj.SHA256, SampleRate: 16000, Channels: 1, Format: "wav", DurationMs: durationMs},
+			{Type: domain.StemTypeVocals, AudioCASHash: vocalsObj.SHA256, SampleRate: 16000, Channels: 1, Format: "wav", DurationMs: durationMs},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	payload, err := json.Marshal(artifact)
+	if err != nil {
+		t.Fatalf("marshal stems artifact: %v", err)
+	}
+	obj, err := casStore.Put(bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("put stems artifact to CAS: %v", err)
+	}
+	if err := db.SaveAudioStemsArtifactIndex(context.Background(), storage.AudioStemsArtifactIndex{
+		ID:             artifact.ID,
+		AssetID:        assetID,
+		ProviderID:     artifact.ProviderID,
+		ModelName:      artifact.ModelName,
+		ModelVersion:   artifact.ModelVersion,
+		CASHash:        obj.SHA256,
+		ProvenanceHash: "prov_stems_" + assetID,
+		CreatedAt:      artifact.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save stems artifact index: %v", err)
+	}
+}
+
+// TestDubbingService_AuditionVoice_ContextualRunScopedDubScriptSelection is the cross-run
+// bleed guard: a run-pinned contextual audition must resolve the DubScriptVariant belonging
+// to VoiceAuditionInput.RunID, not the asset/language asset-latest variant. Run B is seeded
+// strictly newer at the same segment position with distinct spoken text, so an asset-latest
+// lookup would synthesize run B's text for a run A request.
+func TestDubbingService_AuditionVoice_ContextualRunScopedDubScriptSelection(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runAID := uuid.NewString()
+	runBID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, assetID, runAID, "vi")
+
+	seedAuditionDubScriptVariant(t, db, casStore, assetID, runAID, "vi", "run A gốc.", "prov_run_a", time.Now().UTC().Add(-2*time.Hour))
+	seedAuditionDubScriptVariant(t, db, casStore, assetID, runBID, "vi", "run B mới nhất.", "prov_run_b", time.Now().UTC().Add(-1*time.Hour))
+	seedAuditionStems(t, db, casStore, assetID, 20000)
+
+	in := domain.VoiceAuditionInput{
+		RunID:          runAID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Voice: domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_f1",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		IsContextual: true,
+		SegmentIndex: 0,
+	}
+
+	res, err := dubSvc.AuditionVoice(context.Background(), in)
+	if err != nil {
+		t.Fatalf("AuditionVoice failed: %v", err)
+	}
+	if res.SampleText != "run A gốc." {
+		t.Errorf("run-pinned audition resolved the wrong run's dub script: got %q, want %q", res.SampleText, "run A gốc.")
+	}
+}
+
+// TestDubbingService_AuditionVoice_ContextualRunScopedMismatchFailsClosed proves a run-pinned
+// audition rejects a run dub script whose target language does not match the request, rather
+// than silently consuming it (or conflating it with a missing variant).
+func TestDubbingService_AuditionVoice_ContextualRunScopedMismatchFailsClosed(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, assetID, runID, "vi")
+
+	// The run's dub script exists, but for target language "en"; the request asks "vi".
+	seedAuditionDubScriptVariant(t, db, casStore, assetID, runID, "en", "run A English.", "prov_run_mismatch", time.Now().UTC())
+	seedAuditionStems(t, db, casStore, assetID, 20000)
+
+	in := domain.VoiceAuditionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Voice: domain.VoiceProfile{
+			ID:         "vieneu_vi_female_1",
+			ProviderID: "fake_vieneu_tts_vi",
+			VoiceID:    "vi_f1",
+			Name:       "VieNeu Nữ",
+			Language:   "vi",
+		},
+		IsContextual: true,
+		SegmentIndex: 0,
+	}
+
+	_, err := dubSvc.AuditionVoice(context.Background(), in)
+	if err == nil {
+		t.Fatalf("expected fail-closed when the run dub script target language mismatches the request")
+	}
+	if errors.Is(err, domain.ErrDubScriptVariantNotFound) {
+		t.Fatalf("expected an explicit run binding mismatch, got dub script not found: %v", err)
+	}
+}

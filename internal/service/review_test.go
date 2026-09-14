@@ -269,6 +269,29 @@ func setupFullReviewHarness(t *testing.T) (*service.ReviewService, *storage.DB, 
 	return reviewSvc, db, casStore, assetID
 }
 
+func bindBaselineDubMixToRun(t *testing.T, db *storage.DB, assetID, targetLang, runID string) string {
+	t.Helper()
+	ctx := context.Background()
+	latest, err := db.GetDubMixArtifactIndex(ctx, assetID, targetLang)
+	if err != nil {
+		t.Fatalf("get baseline dub mix index: %v", err)
+	}
+	createdAt := time.Now().UTC()
+	if err := db.SaveDubMixArtifactIndex(ctx, storage.DubMixArtifactIndex{
+		ID:             "dubmix-" + runID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: targetLang,
+		CASHash:        latest.CASHash,
+		ProvenanceHash: "prov-dubmix-" + runID,
+		OverallStatus:  latest.OverallStatus,
+		CreatedAt:      createdAt,
+	}); err != nil {
+		t.Fatalf("bind baseline dub mix to run %s: %v", runID, err)
+	}
+	return latest.CASHash
+}
+
 func TestReviewService_CleanRun_EmptyReviewItems(t *testing.T) {
 	svc, _, _, assetID := setupReviewTestHarness(t)
 	ctx := context.Background()
@@ -574,6 +597,83 @@ func TestReviewService_ManualOverride_LeavesExceptionQueue(t *testing.T) {
 	}
 	if allItems[0].Status != domain.ReviewItemStatusManualOverride {
 		t.Errorf("expected status manual_override, got %s", allItems[0].Status)
+	}
+}
+
+func TestReviewService_ManualOverride_IsolatedByRunForSharedSourceException(t *testing.T) {
+	svc, db, _, assetID := setupReviewTestHarness(t)
+	ctx := context.Background()
+	const (
+		runA = "run-review-override-a"
+		runB = "run-review-override-b"
+	)
+
+	// Source analysis is intentionally asset-scoped, so both runs see the same
+	// deterministic ReviewItem ID. Resolution, however, is a run-scoped operator
+	// decision and must never bleed from run A into run B.
+	if err := db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{
+		ID:      "role-plan-shared-review",
+		AssetID: assetID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 1200, EndMs: 2400, Role: domain.AudioRoleUncertain},
+		},
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("SaveAudioRolePlan failed: %v", err)
+	}
+
+	itemsA, err := svc.ProjectReviewItemsForRun(ctx, assetID, "vi", runA)
+	if err != nil {
+		t.Fatalf("ProjectReviewItemsForRun A failed: %v", err)
+	}
+	itemsB, err := svc.ProjectReviewItemsForRun(ctx, assetID, "vi", runB)
+	if err != nil {
+		t.Fatalf("ProjectReviewItemsForRun B failed: %v", err)
+	}
+	if len(itemsA) != 1 || len(itemsB) != 1 || itemsA[0].ID != itemsB[0].ID {
+		t.Fatalf("expected one shared source exception in both runs, A=%+v B=%+v", itemsA, itemsB)
+	}
+
+	if _, err := svc.RecordManualOverride(ctx, service.ManualOverrideInput{
+		RunID:          runA,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		ReviewItemID:   itemsA[0].ID,
+		Reason:         "Accepted for run A only",
+		Operator:       "operator-a",
+	}); err != nil {
+		t.Fatalf("RecordManualOverride run A failed: %v", err)
+	}
+
+	pendingA, err := svc.ProjectReviewItemsForRun(ctx, assetID, "vi", runA)
+	if err != nil {
+		t.Fatalf("ProjectReviewItemsForRun A after override failed: %v", err)
+	}
+	if len(pendingA) != 0 {
+		t.Fatalf("run A should have no pending shared exception after override: %+v", pendingA)
+	}
+
+	pendingB, err := svc.ProjectReviewItemsForRun(ctx, assetID, "vi", runB)
+	if err != nil {
+		t.Fatalf("ProjectReviewItemsForRun B after run A override failed: %v", err)
+	}
+	if len(pendingB) != 1 || pendingB[0].ID != itemsB[0].ID || pendingB[0].Status != domain.ReviewItemStatusPending {
+		t.Fatalf("run B shared exception must remain pending, got %+v", pendingB)
+	}
+
+	allA, err := svc.ProjectAllReviewItemsForRun(ctx, assetID, "vi", runA)
+	if err != nil {
+		t.Fatalf("ProjectAllReviewItemsForRun A failed: %v", err)
+	}
+	if len(allA) != 1 || allA[0].Status != domain.ReviewItemStatusManualOverride {
+		t.Fatalf("run A full projection should retain manual_override audit status, got %+v", allA)
+	}
+	allB, err := svc.ProjectAllReviewItemsForRun(ctx, assetID, "vi", runB)
+	if err != nil {
+		t.Fatalf("ProjectAllReviewItemsForRun B failed: %v", err)
+	}
+	if len(allB) != 1 || allB[0].Status != domain.ReviewItemStatusPending {
+		t.Fatalf("run B full projection should remain pending, got %+v", allB)
 	}
 }
 
@@ -1462,6 +1562,42 @@ func TestReviewService_CorrectRegionGeometry_DubMixStorageErrorAndNoDubPreservat
 	svc, db, casStore, assetID := setupFullReviewHarness(t)
 	ctx := context.Background()
 	runID := "run-dubmix-test-01"
+	runACAS := bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
+
+	// Newer run B for the same asset/target must not replace run A's DubMix in
+	// a selected-run correction.
+	runBArtifact := domain.DubMixArtifact{
+		ID:                  "dubmix-run-b-newer",
+		AssetID:             assetID,
+		RunID:               "run-dubmix-test-02",
+		TargetLanguage:      "vi",
+		AudioCASHash:        "audio-run-b",
+		SampleRate:          16000,
+		Channels:            1,
+		Format:              "wav",
+		DurationMs:          1000,
+		DialogueSuppressed:  true,
+		SoundtrackPreserved: true,
+		OverallStatus:       "PASS",
+		CreatedAt:           time.Now().UTC().Add(time.Minute),
+	}
+	runBBytes, _ := json.Marshal(runBArtifact)
+	runBObj, err := casStore.Put(bytes.NewReader(runBBytes))
+	if err != nil {
+		t.Fatalf("put newer run B dub mix metadata: %v", err)
+	}
+	if err := db.SaveDubMixArtifactIndex(ctx, storage.DubMixArtifactIndex{
+		ID:             runBArtifact.ID,
+		AssetID:        assetID,
+		RunID:          runBArtifact.RunID,
+		TargetLanguage: "vi",
+		CASHash:        runBObj.SHA256,
+		ProvenanceHash: "prov-dubmix-run-b-newer",
+		OverallStatus:  "PASS",
+		CreatedAt:      runBArtifact.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save newer run B dub mix index: %v", err)
+	}
 
 	// 1. Setup TextRegionPlan with a valid region
 	tPlan := domain.TextRegionPlan{
@@ -1522,6 +1658,9 @@ func TestReviewService_CorrectRegionGeometry_DubMixStorageErrorAndNoDubPreservat
 	rcPlan.Close()
 	if rPlan.DubMixCASHash == "" {
 		t.Errorf("expected non-empty DubMixCASHash in RenderPlan")
+	}
+	if rPlan.DubMixCASHash != runACAS {
+		t.Fatalf("selected run correction pinned DubMixCASHash=%s, want run A %s (newer run B=%s)", rPlan.DubMixCASHash, runACAS, runBObj.SHA256)
 	}
 
 	// Case B: Storage error on GetDubMixArtifactIndex -> must fail closed and propagate error
@@ -1619,6 +1758,7 @@ func TestReviewService_CorrectRegionGeometry_OverrideMintsNewImmutablePlanIdenti
 	svc, db, casStore, assetID := setupFullReviewHarness(t)
 	ctx := context.Background()
 	runID := "run-lineage-01"
+	bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
 
 	// Setup a source TextRegionPlan with one region to override.
 	origProv := "prov-text-lineage-1"
@@ -1701,6 +1841,7 @@ func TestReviewService_RegionOverride_TruthfulnessAndLowOCRFlags(t *testing.T) {
 	svc, db, casStore, assetID := setupFullReviewHarness(t)
 	ctx := context.Background()
 	runID := "run-truth-01"
+	bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
 
 	// Setup TextRegionPlan with:
 	// 1. "reg-uncertain": uncertain role exception
@@ -1843,4 +1984,216 @@ func TestReviewService_RegionOverride_TruthfulnessAndLowOCRFlags(t *testing.T) {
 	if err != nil || len(itemsAfterStep3) != 0 {
 		t.Fatalf("expected queue zero after OCR text correction, got %d items: %+v", len(itemsAfterStep3), itemsAfterStep3)
 	}
+}
+
+// Legacy asset-scoped CorrectTargetText (empty requested run_id, synthetic correction run
+// generated internally) must keep the regenerated visual track grounded in the
+// DubScriptVariant that this correction just adapted. Regression guard for the run-scoped
+// dub-script lookup wired into VisualTextService.LocalizeVisualTrack: the adapted dub script
+// must remain resolvable for the correction run, otherwise the visual track silently
+// degrades to the translation-only cue branch and drops the dub-script timing/meaning
+// cross-check.
+func TestReviewService_CorrectTargetText_LegacyAssetScopedKeepsDubScriptGrounding(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+
+	baseTarget := "Nhấn vào góc trên bên phải của màn hình"
+	transVar := domain.TranslationVariant{
+		ID:             "trans-legacy-1",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		SourceLanguage: "zh",
+		ProvenanceHash: "prov-trans-legacy",
+		OverallQAScore: 0.5,
+		Segments: []domain.TranslationSegment{
+			{
+				Index:        0,
+				SourceText:   "点击右上角",
+				TargetText:   baseTarget,
+				StartMs:      0,
+				EndMs:        1500,
+				QAConfidence: 0.9,
+				PassedQAGate: true,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(transVar)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             transVar.ID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		CASHash:        tObj.SHA256,
+		ProvenanceHash: transVar.ProvenanceHash,
+		OverallQAScore: transVar.OverallQAScore,
+		CreatedAt:      transVar.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save baseline translation index: %v", err)
+	}
+
+	// Asset-scoped (run-less) baseline dub script, as produced by the legacy pipeline.
+	dubScriptVar := domain.DubScriptVariant{
+		ID:                    "dubscript-legacy-1",
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		SourceLanguage:        "zh",
+		TranslationVariantCAS: tObj.SHA256,
+		ProvenanceHash:        "prov-dubscript-legacy",
+		OverallQAScore:        0.5,
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SourceText:     "点击右上角",
+				MeaningText:    baseTarget,
+				SpokenText:     baseTarget,
+				StartMs:        0,
+				EndMs:          1500,
+				SlotDurationMs: 1500,
+				PassedQAGate:   true,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dsBytes, _ := json.Marshal(dubScriptVar)
+	dsObj, _ := casStore.Put(bytes.NewReader(dsBytes))
+	if err := db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID:             dubScriptVar.ID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		CASHash:        dsObj.SHA256,
+		ProvenanceHash: dubScriptVar.ProvenanceHash,
+		OverallQAScore: dubScriptVar.OverallQAScore,
+		CreatedAt:      dubScriptVar.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save baseline dub script index: %v", err)
+	}
+
+	// Legacy caller: asset-scoped correction, no run_id and no spoken override.
+	res, err := svc.CorrectTargetText(ctx, service.TargetTextCorrectionInput{
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		SegmentIndex:   0,
+		NewTargetText:  "Nhấn góc trên",
+		Reason:         "legacy asset-scoped correction",
+		Operator:       "editor_monet",
+	})
+	if err != nil {
+		t.Fatalf("legacy asset-scoped CorrectTargetText failed: %v", err)
+	}
+	run1 := assertCorrectionKeepsDubScriptGrounding(t, db, casStore, assetID, "Nhấn góc trên", res)
+
+	// Repeating the identical legacy correction exercises the provenance-cache path:
+	// a cache hit must still leave the correction run with a resolvable dub script.
+	res2, err := svc.CorrectTargetText(ctx, service.TargetTextCorrectionInput{
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		SegmentIndex:   0,
+		NewTargetText:  "Nhấn góc trên",
+		Reason:         "legacy asset-scoped correction repeat",
+		Operator:       "editor_monet",
+	})
+	if err != nil {
+		t.Fatalf("repeated legacy asset-scoped CorrectTargetText failed: %v", err)
+	}
+	run2 := assertCorrectionKeepsDubScriptGrounding(t, db, casStore, assetID, "Nhấn góc trên", res2)
+	if run1 == run2 {
+		t.Fatalf("expected each legacy correction to run under a fresh correction run, got %q twice", run1)
+	}
+}
+
+// assertCorrectionKeepsDubScriptGrounding verifies that a legacy asset-scoped correction
+// regenerated its visual track from the dub script adapted for that correction's own run,
+// rather than silently falling back to translation-only cues. It returns the correction run.
+func assertCorrectionKeepsDubScriptGrounding(
+	t *testing.T,
+	db *storage.DB,
+	casStore *cas.Store,
+	assetID, expectedCueText string,
+	res *service.TargetTextCorrectionResult,
+) string {
+	t.Helper()
+	ctx := context.Background()
+	if res.DubScriptVariantCAS == "" || res.LocalizedSubtitleCAS == "" {
+		t.Fatalf("expected regenerated dub script and subtitle artifacts: %+v", res)
+	}
+
+	subRC, err := casStore.Get(res.LocalizedSubtitleCAS)
+	if err != nil {
+		t.Fatalf("load regenerated subtitle track: %v", err)
+	}
+	defer subRC.Close()
+	var subTrack domain.LocalizedSubtitleTrack
+	if err := json.NewDecoder(subRC).Decode(&subTrack); err != nil {
+		t.Fatalf("decode regenerated subtitle track: %v", err)
+	}
+	if subTrack.RunID == "" {
+		t.Fatal("expected the correction to produce a run-scoped subtitle track")
+	}
+	if len(subTrack.Cues) != 1 || subTrack.Cues[0].Text != expectedCueText {
+		t.Fatalf("subtitle cues are not grounded in the corrected translation: %+v", subTrack.Cues)
+	}
+
+	// The dub script adapted by this correction must be resolvable for the correction run.
+	dubIdx, err := db.GetDubScriptVariantIndexByRun(ctx, subTrack.RunID)
+	if err != nil {
+		t.Fatalf("adapted dub script is not indexed for correction run %q: %v", subTrack.RunID, err)
+	}
+	if dubIdx.CASHash != res.DubScriptVariantCAS {
+		t.Fatalf("correction run dub script CAS %s != regenerated dub script CAS %s", dubIdx.CASHash, res.DubScriptVariantCAS)
+	}
+	if dubIdx.ProvenanceHash == "" {
+		t.Fatalf("correction run dub script %q has no provenance identity", subTrack.RunID)
+	}
+
+	dsRC, err := casStore.Get(res.DubScriptVariantCAS)
+	if err != nil {
+		t.Fatalf("load regenerated dub script: %v", err)
+	}
+	defer dsRC.Close()
+	var dubVar domain.DubScriptVariant
+	if err := json.NewDecoder(dsRC).Decode(&dubVar); err != nil {
+		t.Fatalf("decode regenerated dub script: %v", err)
+	}
+	if dubVar.TranslationVariantCAS != res.TranslationVariantCAS {
+		t.Fatalf("regenerated dub script is not grounded in the corrected translation: %s != %s",
+			dubVar.TranslationVariantCAS, res.TranslationVariantCAS)
+	}
+
+	// The visual track must carry that dub script's provenance rather than the
+	// translation-only fallback prov (which would mean dub-script grounding was dropped).
+	visIdx, err := db.GetLocalizedVisualTrackIndexByRun(ctx, subTrack.RunID)
+	if err != nil {
+		t.Fatalf("regenerated visual track is not indexed for correction run %q: %v", subTrack.RunID, err)
+	}
+	visRC, err := casStore.Get(visIdx.CASHash)
+	if err != nil {
+		t.Fatalf("load regenerated visual track: %v", err)
+	}
+	defer visRC.Close()
+	var visTrack domain.LocalizedVisualTrack
+	if err := json.NewDecoder(visRC).Decode(&visTrack); err != nil {
+		t.Fatalf("decode regenerated visual track: %v", err)
+	}
+
+	groundedProv, err := domain.ComputeLocalizedVisualTrackProvenanceHash(
+		assetID, "vi", visTrack.TextRegionPlanProv, dubIdx.ProvenanceHash,
+		visTrack.Overlays, visTrack.SubtitleCues, []domain.SceneProtectedRegion(nil))
+	if err != nil {
+		t.Fatalf("compute dub-script-grounded visual track provenance: %v", err)
+	}
+	fallbackProv, err := domain.ComputeLocalizedVisualTrackProvenanceHash(
+		assetID, "vi", visTrack.TextRegionPlanProv, "",
+		visTrack.Overlays, visTrack.SubtitleCues, []domain.SceneProtectedRegion(nil))
+	if err != nil {
+		t.Fatalf("compute translation-only visual track provenance: %v", err)
+	}
+	if visTrack.ProvenanceHash == fallbackProv {
+		t.Fatalf("regenerated visual track lost dub-script grounding (provenance %s matches the translation-only fallback)", visTrack.ProvenanceHash)
+	}
+	if visTrack.ProvenanceHash != groundedProv {
+		t.Fatalf("regenerated visual track provenance %s is not grounded in the correction run dub script %s",
+			visTrack.ProvenanceHash, dubIdx.ProvenanceHash)
+	}
+	return subTrack.RunID
 }

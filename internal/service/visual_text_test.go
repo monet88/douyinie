@@ -873,7 +873,75 @@ func TestVisualTextService_LocalizeVisualTrack_CanonicalTranslationGrounding_Suc
 		t.Fatalf("save dub script index: %v", err)
 	}
 
-	// 4. LocalizeVisualTrack must render canonical TranslationVariant text, NEVER spokenText
+	// Seed a newer run for the same asset/target. Selected-run localization must
+	// not drift to these newer artifacts merely because they are latest.
+	newerMeaningText := "SAI: nội dung từ run mới hơn"
+	newerTranslation := domain.TranslationVariant{
+		ID:             "trans-canon-newer-run",
+		AssetID:        assetID,
+		RunID:          "run-grounding-newer",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{{
+			Index:      0,
+			SourceText: "第一步：准备好所有新鲜食材。",
+			TargetText: newerMeaningText,
+			StartMs:    0,
+			EndMs:      3000,
+		}},
+		CreatedAt: transVariant.CreatedAt.Add(time.Minute),
+	}
+	newerTransBytes, _ := json.Marshal(newerTranslation)
+	newerTransObj, err := casStore.Put(bytes.NewReader(newerTransBytes))
+	if err != nil {
+		t.Fatalf("put newer-run translation in CAS: %v", err)
+	}
+	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             newerTranslation.ID,
+		AssetID:        assetID,
+		RunID:          newerTranslation.RunID,
+		TargetLanguage: "vi",
+		CASHash:        newerTransObj.SHA256,
+		ProvenanceHash: "prov-trans-grounding-newer",
+		CreatedAt:      newerTranslation.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save newer-run translation index: %v", err)
+	}
+
+	newerDub := domain.DubScriptVariant{
+		ID:                    "dub-canon-newer-run",
+		AssetID:               assetID,
+		RunID:                 newerTranslation.RunID,
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: newerTransObj.SHA256,
+		Segments: []domain.DubScriptSegment{{
+			Index:       0,
+			SourceText:  "第一步：准备好所有新鲜食材。",
+			MeaningText: newerMeaningText,
+			SpokenText:  newerMeaningText,
+			StartMs:     0,
+			EndMs:       3000,
+		}},
+		CreatedAt: newerTranslation.CreatedAt,
+	}
+	newerDubBytes, _ := json.Marshal(newerDub)
+	newerDubObj, err := casStore.Put(bytes.NewReader(newerDubBytes))
+	if err != nil {
+		t.Fatalf("put newer-run dub script in CAS: %v", err)
+	}
+	if err := db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID:             newerDub.ID,
+		AssetID:        assetID,
+		RunID:          newerDub.RunID,
+		TargetLanguage: "vi",
+		CASHash:        newerDubObj.SHA256,
+		ProvenanceHash: "prov-dub-grounding-newer",
+		CreatedAt:      newerDub.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save newer-run dub script index: %v", err)
+	}
+
+	// 4. LocalizeVisualTrack must render the selected run's canonical
+	// TranslationVariant text, never spokenText or the newer run's text.
 	visTrack, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
 		RunID:          "run-grounding",
 		AssetID:        assetID,
@@ -889,6 +957,9 @@ func TestVisualTextService_LocalizeVisualTrack_CanonicalTranslationGrounding_Suc
 	if visTrack.SubtitleCues[0].Text != canonicalMeaningText {
 		t.Errorf("subtitle text %q != canonical TranslationVariant target text %q (must not use spokenText %q)",
 			visTrack.SubtitleCues[0].Text, canonicalMeaningText, shortenedSpokenText)
+	}
+	if visTrack.SubtitleCues[0].Text == newerMeaningText {
+		t.Fatalf("selected run localized using newer run artifact: %q", visTrack.SubtitleCues[0].Text)
 	}
 }
 

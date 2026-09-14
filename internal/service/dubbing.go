@@ -487,6 +487,12 @@ func isSpeechIntervalCoveredBySuppression(speechStartMs, speechEndMs int64, segm
 	return currStart <= speechStartMs && currEnd >= speechEndMs
 }
 
+// MaxAuditionAudioBytes bounds the audition audio artifact handed back to callers.
+// Audition clips are seconds long (~10s of 48kHz stereo PCM16 is ~2MB), so a larger
+// artifact is corrupt or hostile and must fail closed rather than being buffered and
+// base64-encoded into an HTTP response.
+const MaxAuditionAudioBytes int64 = 8 << 20
+
 // AuditionVoice generates a short ~5s standalone or ~10s contextual audio clip to audition a voice profile.
 // For contextual audition (IsContextual=true):
 // - Uses actual translated segment text from DubScriptVariant.
@@ -552,10 +558,28 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 		if rolePlan == nil {
 			return nil, fmt.Errorf("%w: audio role plan required to prove dialogue suppression", domain.ErrAudioRolePlanRequired)
 		}
-		// Resolve actual translated segment from current DubScriptVariant (fail closed if not found)
-		dIdx, err := s.db.GetDubScriptVariantIndex(ctx, in.AssetID, targetLang)
-		if err != nil || dIdx == nil || dIdx.CASHash == "" {
-			return nil, fmt.Errorf("%w: dub script variant not found for asset %s (%s)", domain.ErrDubScriptVariantNotFound, in.AssetID, targetLang)
+		// Resolve the translated segment from the DubScriptVariant this audition targets.
+		// A run-pinned caller (RunID set) must read that run's variant; only a legacy
+		// asset-scoped caller with no run_id falls back to the latest variant for the
+		// asset/language. An asset-scoped lookup for a run-pinned request would let a
+		// newer variant from another run bleed its segment text into this audition, and
+		// SegmentIndex is positional into the run's own segment list.
+		var dIdx *storage.DubScriptVariantIndex
+		if runID := strings.TrimSpace(in.RunID); runID != "" {
+			runIdx, loadErr := s.db.GetDubScriptVariantIndexByRun(ctx, runID)
+			if loadErr != nil || runIdx == nil || runIdx.CASHash == "" {
+				return nil, fmt.Errorf("%w: dub script variant not found for run %s", domain.ErrDubScriptVariantNotFound, runID)
+			}
+			if runIdx.AssetID != in.AssetID || !strings.EqualFold(runIdx.TargetLanguage, targetLang) {
+				return nil, fmt.Errorf("dub script variant run binding mismatch for run %s", runID)
+			}
+			dIdx = runIdx
+		} else {
+			assetIdx, loadErr := s.db.GetDubScriptVariantIndex(ctx, in.AssetID, targetLang)
+			if loadErr != nil || assetIdx == nil || assetIdx.CASHash == "" {
+				return nil, fmt.Errorf("%w: dub script variant not found for asset %s (%s)", domain.ErrDubScriptVariantNotFound, in.AssetID, targetLang)
+			}
+			dIdx = assetIdx
 		}
 		rc, err := s.cas.Get(dIdx.CASHash)
 		if err != nil {
@@ -886,14 +910,19 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 	if probedMs <= 0 {
 		return nil, fmt.Errorf("invalid probed duration %dms for audition audio", probedMs)
 	}
-	var casHash, casPath string
-	if s.cas != nil {
-		casObj, err := s.cas.Put(bytes.NewReader(finalAudioData))
-		if err == nil {
-			casHash = casObj.SHA256
-			casPath = casObj.Path
-		}
+	if s.cas == nil {
+		return nil, fmt.Errorf("CAS store is required to persist audition audio")
 	}
+	// Oversize artifacts fail closed before they reach CAS or a transport that
+	// would buffer and base64-encode them unbounded.
+	if int64(len(finalAudioData)) > MaxAuditionAudioBytes {
+		return nil, fmt.Errorf("audition audio artifact is %d bytes and exceeds the %d byte limit", len(finalAudioData), MaxAuditionAudioBytes)
+	}
+	casObj, err := s.cas.Put(bytes.NewReader(finalAudioData))
+	if err != nil {
+		return nil, fmt.Errorf("put audition audio in CAS: %w", err)
+	}
+	casHash, casPath := casObj.SHA256, casObj.Path
 
 	var providerID, modelName, modelVersion string
 	if synthRes != nil {
@@ -909,6 +938,7 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 		Voice:              in.Voice,
 		AudioCASHash:       casHash,
 		AudioCASPath:       casPath,
+		AudioBytes:         finalAudioData,
 		MeasuredDurationMs: probedMs,
 		IsContextual:       in.IsContextual,
 		ContextualMixed:    contextualMixed,

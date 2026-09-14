@@ -875,6 +875,8 @@ func TestSeam1_ManualOverride_StrictPendingValidation_RejectionsAndSuccess(t *te
 	transVar := domain.TranslationVariant{
 		ID:             "trans-strict-seam1",
 		AssetID:        assetID,
+		RunID:          runID,
+		JobID:          jobID,
 		TargetLanguage: "vi",
 		ProvenanceHash: "prov-trans-strict-seam1",
 		Segments: []domain.TranslationSegment{
@@ -893,6 +895,8 @@ func TestSeam1_ManualOverride_StrictPendingValidation_RejectionsAndSuccess(t *te
 	_ = h.db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
 		ID:             transVar.ID,
 		AssetID:        assetID,
+		RunID:          runID,
+		JobID:          jobID,
 		TargetLanguage: "vi",
 		CASHash:        tObj.SHA256,
 		ProvenanceHash: transVar.ProvenanceHash,
@@ -1227,6 +1231,190 @@ func TestSeam1_VoiceReassign_TargetedInvalidation_And_DownstreamRerun(t *testing
 	}
 }
 
+// TestSeam1_VoiceReassign_AssetScopedWithoutRunID verifies that the legacy
+// asset-scoped inspector route (POST /api/v1/assets/{id}/inspector/reassign-voice)
+// keeps working for callers that predate run-scoped plumbing and therefore send
+// no run_id: the reassignment resolves the run from the asset's latest dub script
+// variant and still regenerates the run's TTS -> DubMix -> RenderPlan lineage.
+func TestSeam1_VoiceReassign_AssetScopedWithoutRunID(t *testing.T) {
+	h := setupHarness(t)
+	ctx := context.Background()
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	segments := []domain.TranslationInputSegment{
+		{Index: 0, SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 2000, SourceText: "今天天气很好。"},
+		{Index: 1, SpeakerID: "SPEAKER_01", StartMs: 2200, EndMs: 4200, SourceText: "测试语音输入"},
+	}
+	_, dubVariant := setupDubScriptForSeam1(t, h, runID, assetID, segments)
+
+	respAssign, assign1 := runAssignVoices(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	})
+	if respAssign.StatusCode != http.StatusCreated || assign1 == nil {
+		t.Fatalf("initial assign voices failed: %d", respAssign.StatusCode)
+	}
+
+	respSynth, variant1 := runDubSynthesize(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": dubVariant.CASHash,
+		"voice_assignment_cas":   assign1.CASHash,
+	})
+	if respSynth.StatusCode != http.StatusCreated || variant1 == nil {
+		t.Fatalf("initial synthesis failed: %d", respSynth.StatusCode)
+	}
+
+	sepResp, _ := runSeparateStems(t, h, assetID, map[string]any{"run_id": runID})
+	if sepResp.StatusCode != http.StatusCreated {
+		t.Fatalf("separate stems failed: %d", sepResp.StatusCode)
+	}
+	_ = sepResp.Body.Close()
+
+	mixResp, mix1 := runAudioMix(t, h, assetID, map[string]any{"run_id": runID, "target_language": "vi"})
+	if mix1 == nil {
+		t.Fatalf("initial audio mix failed: %d", mixResp.StatusCode)
+	}
+	_ = mixResp.Body.Close()
+
+	// Seed two same-asset/same-language LocalizedVisualTrack rows: run A's own
+	// track first, then a NEWER track belonging to a different run (run B) with
+	// distinct subtitle cues. The legacy reassign adopts run A from the latest
+	// dub script variant, so the regenerated render plan must freeze run A's cues.
+	seedVisualTrack := func(trackRunID, id, cueText string, createdAt time.Time) {
+		t.Helper()
+		track := domain.LocalizedVisualTrack{
+			ID:             id,
+			AssetID:        assetID,
+			RunID:          trackRunID,
+			TargetLanguage: "vi",
+			SubtitleCues: []domain.SubtitleCue{
+				{ID: id + "-cue", StartMs: 0, EndMs: 2000, Text: cueText, FontSizePx: 48},
+			},
+			CreatedAt: createdAt,
+		}
+		raw, _ := json.Marshal(track)
+		obj, err := h.casStore.Put(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("seed visual track %s: %v", id, err)
+		}
+		if err := h.db.SaveLocalizedVisualTrackIndex(ctx, storage.LocalizedVisualTrackIndex{
+			ID:                id,
+			AssetID:           assetID,
+			RunID:             trackRunID,
+			JobID:             "job-" + trackRunID,
+			TargetLanguage:    "vi",
+			TextRegionPlanCAS: "seed-trp-" + id,
+			CASHash:           obj.SHA256,
+			ProvenanceHash:    "prov-" + id,
+			CreatedAt:         createdAt,
+		}); err != nil {
+			t.Fatalf("seed visual track index %s: %v", id, err)
+		}
+	}
+	seedBase := time.Now().UTC()
+	seedVisualTrack(runID, "vt-run-a", "run A subtitle", seedBase)
+	seedVisualTrack("run-b-visual-only", "vt-run-b", "run B subtitle", seedBase.Add(time.Hour))
+
+	// Register CosyVoice3 provider & license for the replacement voice.
+	fakeCosy := provider.NewFakeTTSProvider("fake_cosyvoice3_tts", 1350)
+	fakeCosy.SpeedFitEnabled = true
+	_ = h.registry.Register(fakeCosy)
+
+	licBody, _ := json.Marshal(domain.LicenseManifestEntry{
+		DependencyName: "fake_cosyvoice3_tts",
+		Version:        "1.0.0",
+		SHA256:         "sha256_mock_fake_cosyvoice3_tts",
+		SourceRepo:     "github.com/monet88/douyinie/models/fake_cosyvoice3_tts",
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Standard",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	})
+	licResp, err := http.Post(h.server.URL+"/api/v1/licenses", "application/json", bytes.NewReader(licBody))
+	if err != nil {
+		t.Fatalf("register license failed: %v", err)
+	}
+	_ = licResp.Body.Close()
+
+	// Legacy payload: asset + target language only, no run_id and no job_id.
+	legacyPayload := map[string]any{
+		"target_language": "vi",
+		"custom_assignments": map[string]domain.VoiceProfile{
+			"SPEAKER_00": fakeCosy.VoiceCatalog()[0],
+		},
+		"reason":   "Operator prefers warmer tone for SPEAKER_00",
+		"operator": "lead_audio_editor",
+	}
+	legacyBytes, _ := json.Marshal(legacyPayload)
+	legacyURL := fmt.Sprintf("%s/api/v1/assets/%s/inspector/reassign-voice", h.server.URL, assetID)
+	legacyResp, err := http.Post(legacyURL, "application/json", bytes.NewReader(legacyBytes))
+	if err != nil {
+		t.Fatalf("POST legacy inspector/reassign-voice failed: %v", err)
+	}
+	buf := new(bytes.Buffer)
+	_, _ = buf.ReadFrom(legacyResp.Body)
+	_ = legacyResp.Body.Close()
+	if legacyResp.StatusCode != http.StatusOK {
+		t.Fatalf("legacy asset-scoped reassign without run_id: status=%d body=%s", legacyResp.StatusCode, buf.String())
+	}
+
+	var decoded struct {
+		Result service.VoiceReassignCorrectionResult `json:"result"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode reassign result: %v", err)
+	}
+	res := decoded.Result
+	if res.VoiceAssignmentCAS == "" || res.VoiceAssignmentCAS == assign1.CASHash {
+		t.Errorf("expected new VoiceAssignment CAS, got %s", res.VoiceAssignmentCAS)
+	}
+	if len(res.InvalidatedSpeakers) != 1 || res.InvalidatedSpeakers[0] != "SPEAKER_00" {
+		t.Errorf("expected InvalidatedSpeakers=[SPEAKER_00], got %v", res.InvalidatedSpeakers)
+	}
+	if res.DubSegmentsVariantCAS == "" || res.DubSegmentsVariantCAS == variant1.CASHash {
+		t.Errorf("expected new DubSegmentsVariant CAS, got %s", res.DubSegmentsVariantCAS)
+	}
+	if res.DubMixCAS == "" || res.DubMixCAS == mix1.CASHash {
+		t.Errorf("expected new DubMix CAS, got %s", res.DubMixCAS)
+	}
+	if res.RenderPlanCAS == "" {
+		t.Errorf("expected new RenderPlan CAS, got empty")
+	}
+
+	// The legacy call must still land on the run the resolved variant belongs to:
+	// the regenerated dub mix has to be run-bound so run-scoped reads still see it.
+	runMixIdx, err := h.db.GetDubMixArtifactIndexByRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("run-scoped dub mix index missing after legacy reassign: %v", err)
+	}
+	if runMixIdx.CASHash != res.DubMixCAS {
+		t.Errorf("legacy reassign dub mix bound to CAS %s, want run %s mix %s", runMixIdx.CASHash, runID, res.DubMixCAS)
+	}
+
+	// The regenerated render plan must freeze the adopted run's subtitle cues.
+	// A newer same-asset/same-language visual track from a different run must
+	// never bleed its cues in.
+	rcPlan, err := h.casStore.Get(res.RenderPlanCAS)
+	if err != nil {
+		t.Fatalf("load regenerated render plan from CAS: %v", err)
+	}
+	var newPlan domain.RenderPlan
+	decErr := json.NewDecoder(rcPlan).Decode(&newPlan)
+	rcPlan.Close()
+	if decErr != nil {
+		t.Fatalf("decode regenerated render plan: %v", decErr)
+	}
+	if len(newPlan.SubtitleCues) != 1 || newPlan.SubtitleCues[0].Text != "run A subtitle" {
+		t.Errorf("legacy reassign froze subtitle cues from another run: got %+v, want run A subtitle", newPlan.SubtitleCues)
+	}
+}
+
 // TestSeam1_RegionOverride_Reclassify_Drag_Resize_Relabel_TargetedInvalidation verifies:
 // 1. Region reclassify/drag/resize/relabel via inspector updates TextRegionPlan and regenerates LocalizedVisualTrack + LocalizedSubtitleTrack + RenderPlan.
 // 2. Upstream source audio, ASR, translation, TTS, dub segments, audio stems, and dub mix are strictly preserved and untouched.
@@ -1277,8 +1465,38 @@ func TestSeam1_RegionOverride_Reclassify_Drag_Resize_Relabel_TargetedInvalidatio
 		CreatedAt:      textPlan.CreatedAt,
 	})
 
-	// Setup dub mix via helper
-	_, _, _, _ = setupAssetWithDubMix(t, h)
+	// Setup the DubMix on the selected run itself. Creating it through
+	// setupAssetWithDubMix would mint a second run for the same deduped asset,
+	// which no longer satisfies selected-run correction semantics.
+	rolePayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	roleBody, _ := json.Marshal(rolePayload)
+	roleResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
+	if err != nil {
+		t.Fatalf("setup audio role plan failed: %v", err)
+	}
+	if roleResp.StatusCode != http.StatusCreated {
+		t.Fatalf("setup audio role plan failed: status=%d", roleResp.StatusCode)
+	}
+	_ = roleResp.Body.Close()
+
+	sepResp, stems := runSeparateStems(t, h, assetID, map[string]any{"run_id": runID})
+	if sepResp.StatusCode != http.StatusCreated || stems == nil {
+		t.Fatalf("setup separate stems failed: status=%d", sepResp.StatusCode)
+	}
+	_ = sepResp.Body.Close()
+
+	mixResp, mix := runAudioMix(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": domain.TargetLanguageVI,
+	})
+	if mixResp.StatusCode != http.StatusCreated || mix == nil {
+		t.Fatalf("setup audio mix failed: status=%d", mixResp.StatusCode)
+	}
+	_ = mixResp.Body.Close()
 
 	// 2. Query review items -> 1 pending low confidence / uncertain role item
 	getQueueURL := fmt.Sprintf("%s/api/v1/assets/%s/review-items?target_language=vi", h.server.URL, assetID)

@@ -100,8 +100,16 @@ func (s *ReviewService) RecordManualOverride(ctx context.Context, in ManualOverr
 		in.Operator = "operator"
 	}
 
-	// 1. Verify that the requested review item is currently pending for the specified asset and target language.
-	pendingItems, err := s.ProjectReviewItems(ctx, in.AssetID, in.TargetLanguage)
+	// 1. Verify that the requested review item is currently pending for the
+	// requested run when available. This prevents a same-asset newer run from
+	// satisfying an override submitted from an older run's inspector.
+	var pendingItems []domain.ReviewItem
+	var err error
+	if strings.TrimSpace(in.RunID) != "" {
+		pendingItems, err = s.ProjectReviewItemsForRun(ctx, in.AssetID, in.TargetLanguage, in.RunID)
+	} else {
+		pendingItems, err = s.ProjectReviewItems(ctx, in.AssetID, in.TargetLanguage)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("project review items: %w", err)
 	}
@@ -245,7 +253,8 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 	if in.TargetLanguage == "" {
 		in.TargetLanguage = "vi"
 	}
-	if in.RunID == "" {
+	requestedRunID := strings.TrimSpace(in.RunID)
+	if requestedRunID == "" {
 		in.RunID = fmt.Sprintf("corr-run-%d", time.Now().UnixNano())
 	}
 
@@ -274,7 +283,16 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 	}
 
 	// 1. Update TranslationVariant with honest QA validation (never hardcoding 1.0/PASS)
-	transIdx, err := s.db.GetTranslationVariantIndex(ctx, in.AssetID, in.TargetLanguage)
+	var transIdx *storage.TranslationVariantIndex
+	var err error
+	if requestedRunID != "" {
+		transIdx, err = s.db.GetTranslationVariantIndexByRun(ctx, requestedRunID)
+		if err == nil && transIdx != nil && (transIdx.AssetID != in.AssetID || !strings.EqualFold(transIdx.TargetLanguage, in.TargetLanguage)) {
+			return nil, fmt.Errorf("translation variant run binding mismatch for run %s", requestedRunID)
+		}
+	} else {
+		transIdx, err = s.db.GetTranslationVariantIndex(ctx, in.AssetID, in.TargetLanguage)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("load translation variant index: %w", err)
 	}
@@ -416,9 +434,16 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 
 	// 3. Rerun TTS & DubSegments synthesis
 	voiceAssignCAS := ""
-	vaIdx, err := s.db.GetVoiceAssignmentIndex(ctx, in.AssetID, in.TargetLanguage)
+	var vaIdx *storage.VoiceAssignmentIndex
+	if requestedRunID != "" {
+		vaIdx, err = s.db.GetVoiceAssignmentIndexByRun(ctx, in.AssetID, requestedRunID, in.TargetLanguage)
+	} else {
+		vaIdx, err = s.db.GetVoiceAssignmentIndex(ctx, in.AssetID, in.TargetLanguage)
+	}
 	if err == nil && vaIdx != nil {
 		voiceAssignCAS = vaIdx.CASHash
+	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return nil, fmt.Errorf("load voice assignment index: %w", err)
 	}
 
 	dubbingJobIn := domain.DubbingJobInput{
@@ -462,10 +487,11 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 
 	// 5. Rerun Visual Text Localized Subtitle / Visual Track
 	visIn := LocalizeVisualTrackInput{
-		RunID:          in.RunID,
-		JobID:          in.JobID,
-		AssetID:        in.AssetID,
-		TargetLanguage: in.TargetLanguage,
+		RunID:                 in.RunID,
+		JobID:                 in.JobID,
+		AssetID:               in.AssetID,
+		TargetLanguage:        in.TargetLanguage,
+		TranslationVariantCAS: tObj.SHA256,
 	}
 	visTrack, err := s.visualTextSvc.LocalizeVisualTrack(ctx, visIn)
 	if err != nil {
@@ -546,13 +572,13 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 // ReassignVoice explicitly changes one or more speakers' frozen voices for a run,
 // regenerating exactly that speaker's affected downstream scope (TTS -> DubSegment -> DubMix -> RenderPlan)
 // while strictly preserving source-derived extractions (source media, audio stems, transcript alignment, text regions).
+// Run-pinned callers stay strictly run-bound; legacy asset-scoped callers that send no
+// run_id resolve the run from the asset's latest dub script variant for the target language.
 func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorrectionInput) (*VoiceReassignCorrectionResult, error) {
 	if strings.TrimSpace(in.AssetID) == "" {
 		return nil, errors.New("asset_id is required")
 	}
-	if strings.TrimSpace(in.RunID) == "" {
-		return nil, errors.New("run_id is required")
-	}
+	pinnedRunID := strings.TrimSpace(in.RunID)
 	targetLang := strings.ToLower(strings.TrimSpace(in.TargetLanguage))
 	if targetLang == "" {
 		targetLang = "vi"
@@ -572,7 +598,33 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 		return nil, errors.New("render service is required for voice reassign rerun")
 	}
 
-	// 1. Reassign voice profile(s) for the run
+	// 1. Resolve the dub script variant the reassignment regenerates against. A
+	// run-pinned caller stays strictly run-bound. The legacy asset-scoped route
+	// (POST /api/v1/assets/{id}/inspector/reassign-voice) sends no run_id and keeps
+	// the latest-variant-for-asset/language resolution, adopting the run that variant
+	// was produced for so the regeneration below still writes run-bound artifacts.
+	var dubScriptIdx *storage.DubScriptVariantIndex
+	var err error
+	if pinnedRunID != "" {
+		dubScriptIdx, err = s.db.GetDubScriptVariantIndexByRun(ctx, pinnedRunID)
+		if err != nil {
+			return nil, fmt.Errorf("load run dub script variant: %w", err)
+		}
+		if dubScriptIdx == nil || dubScriptIdx.AssetID != in.AssetID || !strings.EqualFold(dubScriptIdx.TargetLanguage, in.TargetLanguage) {
+			return nil, fmt.Errorf("dub script variant run binding mismatch for run %s", pinnedRunID)
+		}
+	} else {
+		dubScriptIdx, err = s.db.GetDubScriptVariantIndex(ctx, in.AssetID, in.TargetLanguage)
+		if err != nil {
+			return nil, fmt.Errorf("load latest dub script variant: %w", err)
+		}
+		if dubScriptIdx == nil || strings.TrimSpace(dubScriptIdx.RunID) == "" {
+			return nil, fmt.Errorf("run_id is required: no run-bound dub script variant for asset %s (%s)", in.AssetID, in.TargetLanguage)
+		}
+		in.RunID = dubScriptIdx.RunID
+	}
+
+	// 2. Reassign voice profile(s) for the run
 	assignIn := domain.VoiceAssignmentInput{
 		RunID:              in.RunID,
 		AssetID:            in.AssetID,
@@ -592,12 +644,7 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 		InvalidatedSpeakers: newAssign.InvalidatedSpeakers,
 	}
 
-	// 2. Synthesize dub segments (reuses unchanged speakers, regenerates changed speakers)
-	dubScriptIdx, err := s.db.GetDubScriptVariantIndex(ctx, in.AssetID, in.TargetLanguage)
-	if err != nil {
-		return nil, fmt.Errorf("load latest dub script variant: %w", err)
-	}
-
+	// 3. Synthesize dub segments (reuses unchanged speakers, regenerates changed speakers)
 	synthIn := domain.DubbingJobInput{
 		RunID:                 in.RunID,
 		JobID:                 in.JobID,
@@ -614,7 +661,7 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 	}
 	result.DubSegmentsVariantCAS = dubSegsVar.CASHash
 
-	// 3. Audio stem mixing
+	// 4. Audio stem mixing
 	mixIn := AudioMixInput{
 		RunID:                 in.RunID,
 		JobID:                 in.JobID,
@@ -630,11 +677,18 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 	}
 	result.DubMixCAS = dubMix.CASHash
 
-	// 4. Refreeze RenderPlan
+	// 5. Refreeze RenderPlan. in.RunID is guaranteed populated by step 1 (the
+	// legacy route adopts the resolved variant's run), so the visual track must
+	// always resolve run-bound: an asset-scoped lookup here would let a newer
+	// track from another run bleed its cues into the regenerated plan.
 	var cues []domain.SubtitleCue
-	visIdx, err := s.db.GetLocalizedVisualTrackIndex(ctx, in.AssetID, in.TargetLanguage)
+	var visIdx *storage.LocalizedVisualTrackIndex
+	visIdx, err = s.db.GetLocalizedVisualTrackIndexByRun(ctx, in.RunID)
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return nil, fmt.Errorf("get localized visual track index: %w", err)
+		return nil, fmt.Errorf("get run localized visual track index: %w", err)
+	}
+	if visIdx != nil && (visIdx.AssetID != in.AssetID || !strings.EqualFold(visIdx.TargetLanguage, in.TargetLanguage)) {
+		return nil, fmt.Errorf("localized visual track run binding mismatch for run %s", in.RunID)
 	}
 	if visIdx != nil {
 		rc, err := s.cas.Get(visIdx.CASHash)
@@ -663,7 +717,7 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 	}
 	result.RenderPlanCAS = rPlan.CASHash
 
-	// 5. Evaluate auto-resolution status
+	// 6. Evaluate auto-resolution status
 	isResolved := dubSegsVar.OverallStatus == "PASS" && len(dubSegsVar.ReviewSegments) == 0 &&
 		result.DubMixCAS != "" && result.RenderPlanCAS != ""
 	if isResolved {
@@ -792,7 +846,15 @@ func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeom
 	// DubMixArtifact. Therefore a missing DubMix index during region correction is an
 	// incomplete/invalid review state and must fail closed explicitly, not be treated as a
 	// legitimate no-dub success.
-	dubMixIdx, err := s.db.GetDubMixArtifactIndex(ctx, in.AssetID, in.TargetLanguage)
+	var dubMixIdx *storage.DubMixArtifactIndex
+	if strings.TrimSpace(in.RunID) != "" {
+		dubMixIdx, err = s.db.GetDubMixArtifactIndexByRun(ctx, in.RunID)
+		if err == nil && dubMixIdx != nil && (dubMixIdx.AssetID != in.AssetID || !strings.EqualFold(dubMixIdx.TargetLanguage, in.TargetLanguage)) {
+			return nil, fmt.Errorf("dub mix artifact run binding mismatch for run %s", in.RunID)
+		}
+	} else {
+		dubMixIdx, err = s.db.GetDubMixArtifactIndex(ctx, in.AssetID, in.TargetLanguage)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("get dub mix artifact index: %w", err)
 	}
@@ -870,8 +932,16 @@ func (s *ReviewService) EvaluateFinalRenderHandoff(ctx context.Context, in domai
 	}
 	in.Posture = posture
 
-	// 1. Check pending review exceptions
-	pendingItems, err := s.ProjectReviewItems(ctx, in.AssetID, in.TargetLanguage)
+	// 1. Check pending review exceptions for the concrete run when RuntimeHost
+	// supplied one. The legacy asset-level projection remains for callers that
+	// predate run-aware handoff.
+	var pendingItems []domain.ReviewItem
+	var err error
+	if strings.TrimSpace(in.RunID) != "" {
+		pendingItems, err = s.ProjectReviewItemsForRun(ctx, in.AssetID, in.TargetLanguage, in.RunID)
+	} else {
+		pendingItems, err = s.ProjectReviewItems(ctx, in.AssetID, in.TargetLanguage)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("query review items for final render handoff: %w", err)
 	}
@@ -937,7 +1007,21 @@ func (s *ReviewService) EvaluateFinalRenderHandoff(ctx context.Context, in domai
 // ProjectReviewItems collects and projects all actionable review exceptions for a given asset and target language.
 // Invariant: Exception-only review — passing, auto-resolved, or manually-overridden items do not surface in the pending review queue.
 func (s *ReviewService) ProjectReviewItems(ctx context.Context, assetID, targetLang string) ([]domain.ReviewItem, error) {
-	allItems, err := s.ProjectAllReviewItems(ctx, assetID, targetLang)
+	return s.projectReviewItems(ctx, assetID, targetLang, "")
+}
+
+// ProjectReviewItemsForRun projects actionable exceptions against the artifacts
+// frozen for one concrete run. Asset-scoped source analysis (audio roles/text
+// regions) remains shared, while run-produced artifacts are resolved by run ID.
+func (s *ReviewService) ProjectReviewItemsForRun(ctx context.Context, assetID, targetLang, runID string) ([]domain.ReviewItem, error) {
+	if strings.TrimSpace(runID) == "" {
+		return nil, errors.New("run_id is required")
+	}
+	return s.projectReviewItems(ctx, assetID, targetLang, runID)
+}
+
+func (s *ReviewService) projectReviewItems(ctx context.Context, assetID, targetLang, runID string) ([]domain.ReviewItem, error) {
+	allItems, err := s.projectAllReviewItems(ctx, assetID, targetLang, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -953,6 +1037,18 @@ func (s *ReviewService) ProjectReviewItems(ctx context.Context, assetID, targetL
 
 // ProjectAllReviewItems collects all review exceptions along with their resolution status (pending, auto_pass, auto_resolved, manual_override).
 func (s *ReviewService) ProjectAllReviewItems(ctx context.Context, assetID, targetLang string) ([]domain.ReviewItem, error) {
+	return s.projectAllReviewItems(ctx, assetID, targetLang, "")
+}
+
+// ProjectAllReviewItemsForRun is the audit-inclusive run-scoped projection.
+func (s *ReviewService) ProjectAllReviewItemsForRun(ctx context.Context, assetID, targetLang, runID string) ([]domain.ReviewItem, error) {
+	if strings.TrimSpace(runID) == "" {
+		return nil, errors.New("run_id is required")
+	}
+	return s.projectAllReviewItems(ctx, assetID, targetLang, runID)
+}
+
+func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targetLang, runID string) ([]domain.ReviewItem, error) {
 	if strings.TrimSpace(assetID) == "" {
 		return nil, errors.New("asset_id is required")
 	}
@@ -1045,7 +1141,15 @@ func (s *ReviewService) ProjectAllReviewItems(ctx context.Context, assetID, targ
 	}
 
 	// 3. Check TranslationVariant for meaning QA failures
-	transIdx, err := s.db.GetTranslationVariantIndex(ctx, assetID, targetLang)
+	var transIdx *storage.TranslationVariantIndex
+	if runID != "" {
+		transIdx, err = s.db.GetTranslationVariantIndexByRun(ctx, runID)
+		if err == nil && (transIdx.AssetID != assetID || !strings.EqualFold(transIdx.TargetLanguage, targetLang)) {
+			return nil, fmt.Errorf("translation variant run binding mismatch for run %s", runID)
+		}
+	} else {
+		transIdx, err = s.db.GetTranslationVariantIndex(ctx, assetID, targetLang)
+	}
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return nil, fmt.Errorf("query translation variant index: %w", err)
 	}
@@ -1096,7 +1200,15 @@ func (s *ReviewService) ProjectAllReviewItems(ctx context.Context, assetID, targ
 
 	// 4. Check DubSegmentsVariant for TTS overruns / unselected review items
 	var hasDubSegments bool
-	dubSegIdx, err := s.db.GetDubSegmentsVariantIndex(ctx, assetID, targetLang)
+	var dubSegIdx *storage.DubSegmentsVariantIndex
+	if runID != "" {
+		dubSegIdx, err = s.db.GetDubSegmentsVariantIndexByRun(ctx, runID)
+		if err == nil && (dubSegIdx.AssetID != assetID || !strings.EqualFold(dubSegIdx.TargetLanguage, targetLang)) {
+			return nil, fmt.Errorf("dub segments variant run binding mismatch for run %s", runID)
+		}
+	} else {
+		dubSegIdx, err = s.db.GetDubSegmentsVariantIndex(ctx, assetID, targetLang)
+	}
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return nil, fmt.Errorf("query dub segments variant index: %w", err)
 	}
@@ -1183,7 +1295,15 @@ func (s *ReviewService) ProjectAllReviewItems(ctx context.Context, assetID, targ
 	}
 
 	// 5. Check DubScriptVariant for spoken adaptation QA failures or unresolved timing flags
-	dubScriptIdx, err := s.db.GetDubScriptVariantIndex(ctx, assetID, targetLang)
+	var dubScriptIdx *storage.DubScriptVariantIndex
+	if runID != "" {
+		dubScriptIdx, err = s.db.GetDubScriptVariantIndexByRun(ctx, runID)
+		if err == nil && (dubScriptIdx.AssetID != assetID || !strings.EqualFold(dubScriptIdx.TargetLanguage, targetLang)) {
+			return nil, fmt.Errorf("dub script variant run binding mismatch for run %s", runID)
+		}
+	} else {
+		dubScriptIdx, err = s.db.GetDubScriptVariantIndex(ctx, assetID, targetLang)
+	}
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return nil, fmt.Errorf("query dub script variant index: %w", err)
 	}
@@ -1238,9 +1358,19 @@ func (s *ReviewService) ProjectAllReviewItems(ctx context.Context, assetID, targ
 	}
 
 	// 6. Check QualityResults for multimodal QC records (both auto_pass records and flagged issues)
-	qualityResults, err := s.db.GetQualityResults(ctx, assetID, targetLang, "")
+	var qualityResults []domain.QualityResult
+	if runID != "" {
+		qualityResults, err = s.db.GetQualityResultsByRun(ctx, runID)
+	} else {
+		qualityResults, err = s.db.GetQualityResults(ctx, assetID, targetLang, "")
+	}
 	if err == nil {
 		for _, qr := range qualityResults {
+			if runID != "" {
+				if qr.RunID != runID || qr.AssetID != assetID || (qr.TargetLanguage != "" && !strings.EqualFold(qr.TargetLanguage, targetLang)) {
+					return nil, fmt.Errorf("quality result run binding mismatch for run %s", runID)
+				}
+			}
 			if qr.OverallStatus == domain.QualityStatusPass {
 				items = append(items, domain.ReviewItem{
 					ID:             fmt.Sprintf("rev-quality-pass-%s", qr.ID),
@@ -1266,6 +1396,12 @@ func (s *ReviewService) ProjectAllReviewItems(ctx context.Context, assetID, targ
 					if iss.TargetLanguage == "" {
 						iss.TargetLanguage = targetLang
 					}
+					if iss.RunID == "" {
+						iss.RunID = qr.RunID
+					}
+					if iss.JobID == "" {
+						iss.JobID = qr.JobID
+					}
 					if iss.Status == "" {
 						iss.Status = domain.ReviewItemStatusPending
 					}
@@ -1279,7 +1415,19 @@ func (s *ReviewService) ProjectAllReviewItems(ctx context.Context, assetID, targ
 	}
 
 	// 7. Apply recorded manual overrides
-	overrides, err := s.db.GetReviewOverrides(ctx, assetID, targetLang)
+	var overrides []domain.ReviewOverride
+	if runID != "" {
+		overrides, err = s.db.GetReviewOverridesByRun(ctx, runID)
+		if err == nil {
+			for _, ro := range overrides {
+				if ro.RunID != runID || ro.AssetID != assetID || !strings.EqualFold(ro.TargetLanguage, targetLang) {
+					return nil, fmt.Errorf("review override run binding mismatch for run %s", runID)
+				}
+			}
+		}
+	} else {
+		overrides, err = s.db.GetReviewOverrides(ctx, assetID, targetLang)
+	}
 	if err == nil && len(overrides) > 0 {
 		for i := range items {
 			if matchOverride(items[i], overrides) != nil {

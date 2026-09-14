@@ -678,7 +678,14 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 	var transIdx *storage.TranslationVariantIndex
 	if canonicalTransCAS == "" {
 		var err error
-		transIdx, err = s.db.GetTranslationVariantIndex(ctx, in.AssetID, in.TargetLanguage)
+		if strings.TrimSpace(in.RunID) != "" {
+			transIdx, err = s.db.GetTranslationVariantIndexByRun(ctx, in.RunID)
+			if err == nil && transIdx != nil && (transIdx.AssetID != in.AssetID || !strings.EqualFold(transIdx.TargetLanguage, in.TargetLanguage)) {
+				return nil, fmt.Errorf("translation variant run binding mismatch for run %s", in.RunID)
+			}
+		} else {
+			transIdx, err = s.db.GetTranslationVariantIndex(ctx, in.AssetID, in.TargetLanguage)
+		}
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
 			return nil, fmt.Errorf("query translation variant index: %w", err)
 		}
@@ -906,7 +913,15 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 		selector = s.SubtitlePlacementSelector
 	}
 
-	dubScriptIdx, err := s.db.GetDubScriptVariantIndex(ctx, in.AssetID, in.TargetLanguage)
+	var dubScriptIdx *storage.DubScriptVariantIndex
+	if strings.TrimSpace(in.RunID) != "" {
+		dubScriptIdx, err = s.db.GetDubScriptVariantIndexByRun(ctx, in.RunID)
+		if err == nil && dubScriptIdx != nil && (dubScriptIdx.AssetID != in.AssetID || !strings.EqualFold(dubScriptIdx.TargetLanguage, in.TargetLanguage)) {
+			return nil, fmt.Errorf("dub script variant run binding mismatch for run %s", in.RunID)
+		}
+	} else {
+		dubScriptIdx, err = s.db.GetDubScriptVariantIndex(ctx, in.AssetID, in.TargetLanguage)
+	}
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return nil, fmt.Errorf("query dub script variant index: %w", err)
 	}
