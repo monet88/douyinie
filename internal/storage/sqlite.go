@@ -3889,6 +3889,25 @@ func (s *DB) SaveRenderPlanIndex(ctx context.Context, idx RenderPlanIndex) error
 	return nil
 }
 
+// DeleteRenderPlanIndex withdraws one render plan row by provenance. A region correction
+// regenerates its render plan before recording the operator's audit row, so a failure after that
+// regeneration must be able to take the plan back out: otherwise a correction that reported an
+// error stays the asset's latest render plan. Provenance identifies artifact content and is
+// unique across the table, so this removes exactly the row the failed correction made current.
+func (s *DB) DeleteRenderPlanIndex(ctx context.Context, provenanceHash string) error {
+	if strings.TrimSpace(provenanceHash) == "" {
+		return errors.New("provenance_hash is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM render_plans WHERE provenance_hash = ?`, provenanceHash,
+	); err != nil {
+		return fmt.Errorf("delete render_plans index: %w", err)
+	}
+	return nil
+}
+
 // GetRenderPlanIndex retrieves the latest index row for an asset and target language.
 func (s *DB) GetRenderPlanIndex(ctx context.Context, assetID string, targetLang string) (*RenderPlanIndex, error) {
 	s.mu.RLock()
@@ -4134,6 +4153,25 @@ func (s *DB) SaveLocalizedSubtitleTrackIndex(ctx context.Context, idx LocalizedS
 	return nil
 }
 
+// DeleteLocalizedSubtitleTrackIndex withdraws one localized subtitle track row by provenance. A
+// region correction regenerates the subtitle track (and records the operator's audit row) only
+// after the overridden plan is persisted, so a later failure must take this row back out rather
+// than leave a rejected edit as the asset's latest subtitle track. Provenance is unique across the
+// table, so this removes exactly the row the failed correction made current.
+func (s *DB) DeleteLocalizedSubtitleTrackIndex(ctx context.Context, provenanceHash string) error {
+	if strings.TrimSpace(provenanceHash) == "" {
+		return errors.New("provenance_hash is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM localized_subtitle_tracks WHERE provenance_hash = ?`, provenanceHash,
+	); err != nil {
+		return fmt.Errorf("delete localized_subtitle_tracks index: %w", err)
+	}
+	return nil
+}
+
 // GetLocalizedSubtitleTrackIndex retrieves the latest index row for an asset and target language.
 func (s *DB) GetLocalizedSubtitleTrackIndex(ctx context.Context, assetID, targetLang string) (*LocalizedSubtitleTrackIndex, error) {
 	s.mu.RLock()
@@ -4243,6 +4281,25 @@ func (s *DB) SaveLocalizedVisualTrackIndex(ctx context.Context, idx LocalizedVis
 	)
 	if err != nil {
 		return fmt.Errorf("save localized_visual_tracks index: %w", err)
+	}
+	return nil
+}
+
+// DeleteLocalizedVisualTrackIndex withdraws one localized visual track row by provenance. A region
+// correction regenerates the visual track (and records the operator's audit row) only after the
+// overridden plan is persisted, so a later failure must take this row back out rather than leave a
+// rejected edit as the asset's latest localized track. Provenance is unique across the table, so
+// this removes exactly the row the failed correction made current.
+func (s *DB) DeleteLocalizedVisualTrackIndex(ctx context.Context, provenanceHash string) error {
+	if strings.TrimSpace(provenanceHash) == "" {
+		return errors.New("provenance_hash is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM localized_visual_tracks WHERE provenance_hash = ?`, provenanceHash,
+	); err != nil {
+		return fmt.Errorf("delete localized_visual_tracks index: %w", err)
 	}
 	return nil
 }

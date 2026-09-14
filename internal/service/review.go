@@ -756,6 +756,15 @@ func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeom
 		return nil, errors.New("render service is required for region correction rerun")
 	}
 
+	// Snapshot every descendant artifact this correction is able to regenerate BEFORE any state is
+	// persisted: the rollback can only withdraw the rows this correction makes current itself if it
+	// knows what was current beforehand, and a snapshot failure must therefore abort while the asset
+	// is still untouched.
+	priorDescendants, err := s.currentDescendantArtifacts(ctx, in)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot current region correction descendants: %w", err)
+	}
+
 	// 1. Update and persist TextRegionPlan in CAS and SQLite
 	planIdx, err := s.db.GetTextRegionPlanIndex(ctx, in.AssetID)
 	if err != nil {
@@ -776,6 +785,14 @@ func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeom
 	}
 	origPlan.CASHash = planIdx.CASHash
 	origPlan.ProvenanceHash = planIdx.ProvenanceHash
+
+	// Fail closed on geometry the operator asked for but the frame cannot hold. ApplyRegionOverrides
+	// clamps (a clamped box is always in-frame and valid, so a clamp cannot be detected afterwards),
+	// which is right for the lenient callers it also serves but wrong here: a correction that
+	// silently moved the box somewhere else must be an actionable error, not a persisted surprise.
+	if err := domain.ValidateRegionOverrideGeometry(&origPlan, in.Overrides); err != nil {
+		return nil, err
+	}
 
 	updatedPlan, err := ApplyRegionOverrides(&origPlan, in.Overrides)
 	if err != nil {
@@ -822,19 +839,23 @@ func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeom
 		return nil, fmt.Errorf("save updated text region plan index: %w", err)
 	}
 
-	// Fail-closed: the overridden plan becomes the asset's current plan only once
-	// its declared descendants actually regenerate. Persisting it first is required
-	// (LocalizeVisualTrack resolves the current plan by index) but a rejected edit
-	// must not stay silently accepted as the current plan, so any regeneration
-	// failure withdraws the row this correction just made current, leaving the
-	// pre-override plan latest again.
-	descendantsRegenerated := false
+	// Fail-closed: the overridden plan becomes the asset's current plan only once its declared
+	// descendants regenerate and the operator's audit row is recorded. Persisting it first is
+	// required (LocalizeVisualTrack resolves the current plan by index) but a rejected edit must
+	// not stay silently accepted as the current plan, so any failure after this point withdraws
+	// every row this correction made current — the plan and the visual/subtitle/render artifacts
+	// its regeneration persisted — leaving the pre-correction state current again.
 	defer func() {
-		if err == nil || descendantsRegenerated {
+		if err == nil {
 			return
 		}
-		if derr := s.db.DeleteTextRegionPlanIndex(ctx, in.AssetID, updatedPlan.ProvenanceHash); derr != nil {
-			err = fmt.Errorf("%w (and the rejected plan could not be withdrawn: %v)", err, derr)
+		if updatedPlan.ProvenanceHash != planIdx.ProvenanceHash {
+			if derr := s.db.DeleteTextRegionPlanIndex(ctx, in.AssetID, updatedPlan.ProvenanceHash); derr != nil {
+				err = fmt.Errorf("%w (and the rejected plan could not be withdrawn: %v)", err, derr)
+			}
+		}
+		if derr := s.withdrawCorrectionDescendants(ctx, in, priorDescendants); derr != nil {
+			err = fmt.Errorf("%w (and the rejected descendants could not be withdrawn: %v)", err, derr)
 		}
 	}()
 
@@ -892,7 +913,6 @@ func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeom
 		return nil, fmt.Errorf("freeze render plan rerun failed: %w", err)
 	}
 	result.RenderPlanCAS = rPlan.CASHash
-	descendantsRegenerated = true
 
 	// 3. Record the operator's direct-manipulation intent as an append-only audit
 	// row, one per corrected region. The before/after geometry and role are fully
@@ -927,6 +947,106 @@ func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeom
 		result.Message = "Region updated but candidate still requires review"
 	}
 	return result, nil
+}
+
+// regionCorrectionDescendants names the artifact a region correction is about to regenerate, by the
+// provenance hash that is currently latest for it. Empty means nothing is current yet.
+type regionCorrectionDescendants struct {
+	visual   string
+	subtitle string
+	render   string
+}
+
+// currentDescendantArtifacts resolves the visual/subtitle/render artifacts current for the scope a
+// region correction regenerates: run-scoped when the caller supplied a run, asset-latest for the
+// legacy asset-scoped route, mirroring how the correction's descendants resolve it themselves.
+//
+// A missing artifact is a valid empty snapshot. Every other storage error is returned: a read
+// failure silently treated as "nothing is current" would skip part of a rollback (or let a
+// correction proceed on state it could not describe), which is the opposite of failing closed.
+func (s *ReviewService) currentDescendantArtifacts(ctx context.Context, in RegionGeometryCorrectionInput) (regionCorrectionDescendants, error) {
+	var snap regionCorrectionDescendants
+	if runID := strings.TrimSpace(in.RunID); runID != "" {
+		visual, err := s.db.GetLocalizedVisualTrackIndexByRun(ctx, runID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return snap, fmt.Errorf("read current localized visual track: %w", err)
+		}
+		if visual != nil {
+			snap.visual = visual.ProvenanceHash
+		}
+		subtitle, err := s.db.GetLocalizedSubtitleTrackIndexByRun(ctx, runID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return snap, fmt.Errorf("read current localized subtitle track: %w", err)
+		}
+		if subtitle != nil {
+			snap.subtitle = subtitle.ProvenanceHash
+		}
+		render, err := s.db.GetRenderPlanIndexByRun(ctx, runID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return snap, fmt.Errorf("read current render plan: %w", err)
+		}
+		if render != nil {
+			snap.render = render.ProvenanceHash
+		}
+		return snap, nil
+	}
+
+	visual, err := s.db.GetLocalizedVisualTrackIndex(ctx, in.AssetID, in.TargetLanguage)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return snap, fmt.Errorf("read current localized visual track: %w", err)
+	}
+	if visual != nil {
+		snap.visual = visual.ProvenanceHash
+	}
+	subtitle, err := s.db.GetLocalizedSubtitleTrackIndex(ctx, in.AssetID, in.TargetLanguage)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return snap, fmt.Errorf("read current localized subtitle track: %w", err)
+	}
+	if subtitle != nil {
+		snap.subtitle = subtitle.ProvenanceHash
+	}
+	render, err := s.db.GetRenderPlanIndex(ctx, in.AssetID, in.TargetLanguage)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return snap, fmt.Errorf("read current render plan: %w", err)
+	}
+	if render != nil {
+		snap.render = render.ProvenanceHash
+	}
+	return snap, nil
+}
+
+// withdrawCorrectionDescendants takes back the descendant rows a failed region correction made
+// current. A changed provenance means this correction inserted that row (regeneration derives
+// provenance from the overridden plan, so it cannot collide with the artifact it replaced); an
+// unchanged provenance means the correction upserted a row that already existed, whose content and
+// position must survive the failure untouched.
+func (s *ReviewService) withdrawCorrectionDescendants(ctx context.Context, in RegionGeometryCorrectionInput, prior regionCorrectionDescendants) error {
+	now, err := s.currentDescendantArtifacts(ctx, in)
+	if err != nil {
+		// Without a trustworthy read the rollback cannot tell which rows this correction made
+		// current, so it must report that instead of silently leaving them in place.
+		return fmt.Errorf("read current descendants for rollback: %w", err)
+	}
+	var failures []string
+	if now.visual != "" && now.visual != prior.visual {
+		if err := s.db.DeleteLocalizedVisualTrackIndex(ctx, now.visual); err != nil {
+			failures = append(failures, err.Error())
+		}
+	}
+	if now.subtitle != "" && now.subtitle != prior.subtitle {
+		if err := s.db.DeleteLocalizedSubtitleTrackIndex(ctx, now.subtitle); err != nil {
+			failures = append(failures, err.Error())
+		}
+	}
+	if now.render != "" && now.render != prior.render {
+		if err := s.db.DeleteRenderPlanIndex(ctx, now.render); err != nil {
+			failures = append(failures, err.Error())
+		}
+	}
+	if len(failures) > 0 {
+		return errors.New(strings.Join(failures, "; "))
+	}
+	return nil
 }
 
 // recordRegionCorrectionAudit persists one append-only ReviewOverride row per applied

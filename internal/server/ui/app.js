@@ -988,7 +988,10 @@ function syncEditorToSelection() {
 let lastSyncedRegionId = null;
 let regionDrag = null;
 
-const REGION_MIN_CANONICAL_PX = 8;
+// The smallest canonical box the backend accepts: domain.MinTextRegionBoxPx, the floor behind
+// ApplyRegionOverrides' minimum-dimension clamp. A stricter UI-only floor would reject edits the
+// runtime accepts (a role-only edit on a small region) and disagree with the operator's own drag.
+const REGION_MIN_CANONICAL_PX = 1;
 
 function currentPlayheadMs() {
   const player = $("#preview-player");

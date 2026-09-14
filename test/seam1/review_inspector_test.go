@@ -1883,3 +1883,120 @@ func TestSeam1_CorrectRegionGeometry_FailClosedOnPersistenceErrors(t *testing.T)
 		t.Fatalf("expected fail-closed error response when TextRegionPlan is missing, got 200 OK")
 	}
 }
+
+// TestSeam1_RegionOverride_OutOfFrameFailsClosedWithoutMutatingState proves the RuntimeHost seam
+// rejects geometry the canonical frame cannot hold instead of persisting a clamped result. The
+// Operator UI's own preflight is a convenience, not the authority: a request that reaches the API
+// (stale client, direct call, or a drag the browser could not bound) must fail closed with an
+// actionable 400 and leave the asset's current plan untouched.
+func TestSeam1_RegionOverride_OutOfFrameFailsClosedWithoutMutatingState(t *testing.T) {
+	h := setupHarness(t)
+	ctx := context.Background()
+
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	textPlan := domain.TextRegionPlan{
+		ID:             "text-plan-region-bounds-seam1",
+		AssetID:        assetID,
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		ProvenanceHash: "prov-text-region-bounds-seam1",
+		Regions: []domain.TrackedTextRegion{
+			{
+				ID:          "region-bounds-101",
+				Role:        domain.TextRoleSemanticText,
+				Text:        "点击下载应用",
+				FirstSeenMs: 0,
+				LastSeenMs:  3000,
+				Keyframes: []domain.RegionKeyframe{
+					{
+						FrameIndex:  0,
+						TimestampMs: 0,
+						Box:         domain.BoundingBox{X: 100, Y: 200, Width: 300, Height: 80},
+						Observed:    true,
+					},
+				},
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(textPlan)
+	tObj, _ := h.casStore.Put(bytes.NewReader(tBytes))
+	if err := h.db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             textPlan.ID,
+		AssetID:        assetID,
+		CASHash:        tObj.SHA256,
+		ProvenanceHash: textPlan.ProvenanceHash,
+		CreatedAt:      textPlan.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save text region plan index: %v", err)
+	}
+
+	rolePayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	roleBody, _ := json.Marshal(rolePayload)
+	roleResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
+	if err != nil {
+		t.Fatalf("setup audio role plan failed: %v", err)
+	}
+	if roleResp.StatusCode != http.StatusCreated {
+		t.Fatalf("setup audio role plan failed: status=%d", roleResp.StatusCode)
+	}
+	_ = roleResp.Body.Close()
+
+	sepResp, stems := runSeparateStems(t, h, assetID, map[string]any{"run_id": runID})
+	if sepResp.StatusCode != http.StatusCreated || stems == nil {
+		t.Fatalf("setup separate stems failed: status=%d", sepResp.StatusCode)
+	}
+	_ = sepResp.Body.Close()
+
+	mixResp, mix := runAudioMix(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": domain.TargetLanguageVI,
+	})
+	if mixResp.StatusCode != http.StatusCreated || mix == nil {
+		t.Fatalf("setup audio mix failed: status=%d", mixResp.StatusCode)
+	}
+	_ = mixResp.Body.Close()
+
+	// Drag the region 400 canonical px left: the requested box starts at x=-300.
+	ovrPayload := map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": "vi",
+		"overrides": []domain.RegionOverride{
+			{RegionID: "region-bounds-101", BoxDeltaX: -400},
+		},
+		"reason":   "Drag out of the canonical frame must be refused, never clamped",
+		"operator": "visual_editor",
+	}
+	ovrBytes, _ := json.Marshal(ovrPayload)
+	ovrResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/inspector/override-region", h.server.URL, assetID), "application/json", bytes.NewReader(ovrBytes))
+	if err != nil {
+		t.Fatalf("POST inspector/override-region failed: %v", err)
+	}
+	body := new(bytes.Buffer)
+	_, _ = body.ReadFrom(ovrResp.Body)
+	_ = ovrResp.Body.Close()
+	if ovrResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("out-of-frame geometry must fail closed with 400, got status=%d body=%s", ovrResp.StatusCode, body.String())
+	}
+	if !strings.Contains(body.String(), "frame") {
+		t.Errorf("the refusal must name the violated frame bounds, got: %s", body.String())
+	}
+
+	// The rejected edit must not become the asset's current plan.
+	current, err := h.db.GetTextRegionPlanIndex(ctx, assetID)
+	if err != nil {
+		t.Fatalf("get current text region plan index: %v", err)
+	}
+	if current.ProvenanceHash != textPlan.ProvenanceHash || current.CASHash != tObj.SHA256 {
+		t.Errorf("rejected out-of-frame edit became the current plan: provenance=%s cas=%s, want %s / %s",
+			current.ProvenanceHash, current.CASHash, textPlan.ProvenanceHash, tObj.SHA256)
+	}
+}

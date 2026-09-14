@@ -737,6 +737,48 @@ test("an out-of-frame typed delta fails closed with an actionable inspector erro
   assert.match(h.els.regionError.textContent, /reg-box|keyframe/, "the error must be actionable for the edited region");
 });
 
+test("a role-only edit on a small canonical region is accepted, not refused by a UI-only minimum", async () => {
+  const h = createHarness();
+  await h.ready();
+  stageRegionOverlay(h);
+  h.evalIn(`
+state.selectedRunId = "run-1";
+state.selectedRun = { id: "run-1", job_id: "job-1", status: "running", config_snapshot_json: "" };
+state.selectedJob = { id: "job-1", source_asset_id: "asset-1", target_language: "vi" };
+state.preview = { cas_hash: "preview-cas" };
+state.textRegionPlan = {
+  frame_width: 1080,
+  frame_height: 1920,
+  regions: [
+    { id: "reg-tiny", role: "uncertain", text: "i", first_seen_ms: 1000, last_seen_ms: 3000,
+      keyframes: [
+        { frame_index: 0, timestamp_ms: 1000, box: { x: 10, y: 10, width: 40, height: 4 }, observed: true }
+      ] }
+  ]
+};
+state.reviewItems = [];
+state.selectedSegmentIndex = null;
+state.selectedRegionId = null;
+state.selectedReviewItem = null;
+renderInspector();
+`);
+  h.setResponder(() => ({
+    status: 200,
+    payload: {
+      result: { status: "auto_resolved", message: "ok", localized_visual_track_cas: "v", localized_subtitle_cas: "s", render_plan_cas: "r" },
+    },
+  }));
+  selectRegionRow(h, "reg-tiny", "1000");
+  h.els.regionRole.value = "semantic_text";
+  h.submit(h.els.regionForm);
+  await h.settle();
+
+  // 4 canonical px tall is legal: the runtime floor is 1px, so a stricter UI-only
+  // floor refused an edit the backend accepts.
+  assert.equal(overrideRequests(h).length, 1, "a role-only edit on a 4px-tall region must reach RuntimeHost");
+  assert.equal(h.els.regionError.classList.contains("hidden"), true, "the accepted edit must not be refused as too small");
+});
+
 test("a RuntimeHost region rejection is surfaced and keeps the pending edit", async () => {
   const h = createHarness();
   await h.ready();

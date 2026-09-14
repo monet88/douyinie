@@ -527,14 +527,7 @@ func ApplyRegionOverrides(plan *domain.TextRegionPlan, overrides []domain.Region
 		return plan, nil
 	}
 
-	frameW := plan.FrameWidth
-	if frameW <= 0 {
-		frameW = 1080
-	}
-	frameH := plan.FrameHeight
-	if frameH <= 0 {
-		frameH = 1920
-	}
+	frameW, frameH := plan.FrameBounds()
 
 	// Build map of existing region IDs to validate overrides
 	existingRegionIDs := make(map[string]bool, len(plan.Regions))
@@ -618,12 +611,12 @@ func ApplyRegionOverrides(plan *domain.TextRegionPlan, overrides []domain.Region
 				b.Width += ov.BoxDeltaW
 				b.Height += ov.BoxDeltaH
 
-				// Enforce minimum dimension
-				if b.Width < 1 {
-					b.Width = 1
+				// Enforce the domain's minimum dimension
+				if b.Width < domain.MinTextRegionBoxPx {
+					b.Width = domain.MinTextRegionBoxPx
 				}
-				if b.Height < 1 {
-					b.Height = 1
+				if b.Height < domain.MinTextRegionBoxPx {
+					b.Height = domain.MinTextRegionBoxPx
 				}
 
 				// Clamp position and size within [0, frameW] and [0, frameH]
