@@ -644,6 +644,10 @@ function renderSpeakers() {
   const speakers = [...speakersMap.values()];
   if (badge) badge.textContent = `${speakers.length} speaker`;
 
+  // Contextual audition reads the real translated segment + preserved stems of
+  // the selected target, so it stays unavailable until an operator picks one.
+  const contextualSegmentIndex = Number.isInteger(state.selectedSegmentIndex) ? state.selectedSegmentIndex : null;
+
   if (!speakers.length) {
     list.innerHTML = '<div class="empty-state"><span>Chưa có speaker nào được phát hiện trong run này.</span></div>';
     return;
@@ -683,6 +687,15 @@ function renderSpeakers() {
                   data-name="${esc(isAssigned ? spk.name : "")}"
                   ${isAssigned ? "" : "disabled title=\"Chưa có voice profile để nghe thử\""}>
             Nghe thử
+          </button>
+          <button class="speaker-action-btn secondary" type="button"
+                  data-speaker-action="audition-contextual"
+                  data-speaker="${esc(spk.id)}"
+                  data-voice="${esc(spk.voiceId)}"
+                  data-provider="${esc(spk.providerId)}"
+                  data-name="${esc(isAssigned ? spk.name : "")}"
+                  ${isAssigned && contextualSegmentIndex != null ? `title="Audition ~10s cùng BGM/SFX thật của segment ${contextualSegmentIndex}"` : "disabled title=\"Chọn một segment trong timeline hoặc tab 'Transcript & Dịch' để nghe thử trong ngữ cảnh run\""}>
+            Nghe + BGM
           </button>
         </div>
       </div>`;
@@ -887,6 +900,95 @@ function renderObservationalTimeline() {
 let lastActiveSegIndex = null;
 let lastActiveRegionId = null;
 let lastActiveReviewId = null;
+let lastOptionalReadFailureKey = "";
+
+function speechSegments() {
+  return state.translation?.segments || state.transcript?.speech_blocks || [];
+}
+
+function segmentByIndex(segmentIndex) {
+  const segments = speechSegments();
+  const pos = segments.findIndex((seg, idx) => (seg.index ?? idx) === segmentIndex);
+  return pos < 0 ? null : segments[pos];
+}
+
+function regionById(regionId) {
+  return (state.textRegionPlan?.regions || []).find((region) => region.id === regionId) || null;
+}
+
+function startMsOf(value) {
+  const startMs = Number(value?.start_ms);
+  return Number.isFinite(startMs) ? startMs : null;
+}
+
+function inspectorTabForSelection() {
+  if (state.selectedSegmentIndex != null) return "transcript";
+  if (state.selectedRegionId) return "regions";
+  return "exceptions";
+}
+
+function scrollSelectionIntoView(tab) {
+  let node = null;
+  if (tab === "transcript" && state.selectedSegmentIndex != null) {
+    node = $(`[data-segment-index="${state.selectedSegmentIndex}"]`, $("#transcript-list"));
+  } else if (tab === "regions" && state.selectedRegionId) {
+    node = $(`[data-region-id="${CSS.escape(state.selectedRegionId)}"]`, $("#regions-list"));
+  } else if (tab === "exceptions" && state.selectedReviewItem) {
+    node = $(`[data-review-id="${CSS.escape(state.selectedReviewItem.id)}"]`, $("#exception-list"));
+  }
+  if (node) node.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+// An open editor drawer must always describe the current selection, never the
+// previous target. Prefill is intentionally driven by user selection only, so
+// background polling cannot overwrite in-progress operator input.
+function syncEditorToSelection() {
+  const editorBox = $("#inspector-editor");
+  if (!editorBox || editorBox.classList.contains("hidden")) return;
+
+  if (state.selectedSegmentIndex != null) {
+    const segment = segmentByIndex(state.selectedSegmentIndex);
+    const indexInput = $("#text-segment-index");
+    if (indexInput) indexInput.value = String(state.selectedSegmentIndex);
+    const targetInput = $("#text-target");
+    if (targetInput) targetInput.value = segment?.target_text || "";
+  }
+  if (state.selectedRegionId) {
+    const region = regionById(state.selectedRegionId);
+    const idInput = $("#region-id");
+    if (idInput) idInput.value = state.selectedRegionId;
+    const roleInput = $("#region-role");
+    if (roleInput && region?.role) roleInput.value = region.role;
+    const textInput = $("#region-text");
+    if (textInput && region?.text) textInput.value = region.text;
+  }
+}
+
+// Single entry point for transcript / region / review selection so video seek,
+// selection state, inspector tab, highlight and editor content always move
+// together and exactly one target stays selected.
+function selectTimelineTarget({ segmentIndex = null, regionId = null, reviewId = null } = {}) {
+  state.selectedSegmentIndex = segmentIndex == null ? null : Number(segmentIndex);
+  state.selectedRegionId = regionId || null;
+  state.selectedReviewItem = reviewId ? state.reviewItems.find((item) => item.id === reviewId) || null : null;
+
+  const tab = inspectorTabForSelection();
+  let startMs = null;
+  if (tab === "transcript") startMs = startMsOf(segmentByIndex(state.selectedSegmentIndex));
+  else if (tab === "regions") startMs = startMsOf(regionById(state.selectedRegionId));
+  else startMs = startMsOf(state.selectedReviewItem);
+
+  setInspectorTab(tab);
+  // A selected target opens the drawer on the form that describes it, so the
+  // visible editor and the active selection never disagree.
+  if (tab === "transcript") setEditorTab("text");
+  else if (tab === "regions") setEditorTab("region");
+  renderSpeakers();
+  renderZoneInspector();
+  syncEditorToSelection();
+  scrollSelectionIntoView(tab);
+  if (startMs != null) seekVideoTo(startMs);
+}
 
 function updatePlayhead() {
   const player = $("#preview-player");
@@ -1084,7 +1186,7 @@ function renderInspectorTranscript() {
         <div class="transcript-meta">
           <span class="speaker-tag" style="--spk-color: ${color};">${esc(spk)}</span>
           <span class="mono quiet-time">${formatMs(startMs)}–${formatMs(endMs)}</span>
-          <button class="small-text-btn" type="button" data-edit-segment="${seg.index ?? idx}" data-target-text="${esc(seg.target_text || "")}">Sửa</button>
+          <button class="small-text-btn" type="button" data-edit-segment="${seg.index ?? idx}">Sửa</button>
         </div>
         ${seg.source_text ? `<p class="source-quote">${esc(seg.source_text)}</p>` : ""}
         <p class="target-text"><strong>${esc(seg.target_text || seg.source_text || "")}</strong></p>
@@ -1115,7 +1217,7 @@ function renderInspectorRegions() {
         <div class="region-meta">
           <span class="status-pill info">${esc(reg.role || "region")}</span>
           <span class="mono quiet-time">${formatMs(startMs)}–${formatMs(endMs)}</span>
-          <button class="small-text-btn" type="button" data-edit-region="${esc(reg.id)}" data-region-role="${esc(reg.role || "")}">Chỉnh</button>
+          <button class="small-text-btn" type="button" data-edit-region="${esc(reg.id)}">Chỉnh</button>
         </div>
         <p class="region-text">${esc(reg.text || "—")}</p>
       </div>`;
@@ -1308,8 +1410,23 @@ async function loadBaseData() {
   renderMetrics();
 }
 
+// 404 already means "artifact not written yet" and stays silent. Everything
+// else is a real RuntimeHost failure: tell the operator once per distinct
+// failure set so the 3.5s poll loop cannot spam a persistent error.
+function reportOptionalReadFailures(failures) {
+  if (!failures.length) {
+    lastOptionalReadFailureKey = "";
+    return;
+  }
+  const key = failures.join(" | ");
+  if (key === lastOptionalReadFailureKey) return;
+  lastOptionalReadFailureKey = key;
+  toast("Không tải được một phần artifact của run", failures.join("; "), "error");
+}
+
 async function loadSelectedRun() {
   if (!state.selectedRunId) {
+    lastOptionalReadFailureKey = "";
     state.selectedRun = null;
     state.selectedJob = null;
     state.stages = [];
@@ -1353,21 +1470,67 @@ async function loadSelectedRun() {
   state.selectedReviewItem = null;
   await loadReviewItems();
 
-  const [transcriptRes, transRes, voiceRes, textRes, prevRes, finalRes] = await Promise.allSettled([
-    assetID ? apiOptional(`/api/v1/assets/${encodeURIComponent(assetID)}/transcript?run_id=${encodeURIComponent(runID)}`) : Promise.resolve(null),
-    assetID ? apiOptional(`/api/v1/assets/${encodeURIComponent(assetID)}/translation-variant?target_language=${target}&run_id=${encodeURIComponent(runID)}`) : Promise.resolve(null),
-    assetID ? apiOptional(`/api/v1/assets/${encodeURIComponent(assetID)}/voice-assignment?target_language=${target}&run_id=${encodeURIComponent(runID)}`) : Promise.resolve(null),
-    assetID ? apiOptional(`/api/v1/assets/${encodeURIComponent(assetID)}/text-region-plan`) : Promise.resolve(null),
-    assetID ? apiOptional(`/api/v1/assets/${encodeURIComponent(assetID)}/render/preview?target_language=${target}&run_id=${encodeURIComponent(runID)}`) : Promise.resolve(null),
-    assetID ? apiOptional(`/api/v1/assets/${encodeURIComponent(assetID)}/render/final?target_language=${target}&run_id=${encodeURIComponent(runID)}`) : Promise.resolve(null),
-  ]);
+  // Each artifact read is independent: a missing artifact (404) is a normal
+  // empty panel, but any other RuntimeHost failure must reach the operator
+  // instead of being flattened into "no data" alongside the panels that did
+  // load.
+  const optionalReads = [
+    {
+      label: "transcript",
+      url: assetID ? `/api/v1/assets/${encodeURIComponent(assetID)}/transcript?run_id=${encodeURIComponent(runID)}` : "",
+      apply: (value) => {
+        state.transcript = value?.transcript_artifact || null;
+      },
+    },
+    {
+      label: "translation variant",
+      url: assetID ? `/api/v1/assets/${encodeURIComponent(assetID)}/translation-variant?target_language=${target}&run_id=${encodeURIComponent(runID)}` : "",
+      apply: (value) => {
+        state.translation = value?.translation_variant || null;
+      },
+    },
+    {
+      label: "voice assignment",
+      url: assetID ? `/api/v1/assets/${encodeURIComponent(assetID)}/voice-assignment?target_language=${target}&run_id=${encodeURIComponent(runID)}` : "",
+      apply: (value) => {
+        state.voiceAssignment = value?.voice_assignment || null;
+      },
+    },
+    {
+      label: "text region plan",
+      url: assetID ? `/api/v1/assets/${encodeURIComponent(assetID)}/text-region-plan` : "",
+      apply: (value) => {
+        state.textRegionPlan = value?.text_region_plan || null;
+      },
+    },
+    {
+      label: "preview render",
+      url: assetID ? `/api/v1/assets/${encodeURIComponent(assetID)}/render/preview?target_language=${target}&run_id=${encodeURIComponent(runID)}` : "",
+      apply: (value) => {
+        state.preview = value?.preview_render || null;
+      },
+    },
+    {
+      label: "final render",
+      url: assetID ? `/api/v1/assets/${encodeURIComponent(assetID)}/render/final?target_language=${target}&run_id=${encodeURIComponent(runID)}` : "",
+      apply: (value) => {
+        state.final = value?.final_render || null;
+      },
+    },
+  ];
 
-  state.transcript = transcriptRes.status === "fulfilled" ? transcriptRes.value?.transcript_artifact || null : null;
-  state.translation = transRes.status === "fulfilled" ? transRes.value?.translation_variant || null : null;
-  state.voiceAssignment = voiceRes.status === "fulfilled" ? voiceRes.value?.voice_assignment || null : null;
-  state.textRegionPlan = textRes.status === "fulfilled" ? textRes.value?.text_region_plan || null : null;
-  state.preview = prevRes.status === "fulfilled" ? prevRes.value?.preview_render || null : null;
-  state.final = finalRes.status === "fulfilled" ? finalRes.value?.final_render || null : null;
+  const settled = await Promise.allSettled(optionalReads.map((read) => (read.url ? apiOptional(read.url) : Promise.resolve(null))));
+  const failedReads = [];
+  settled.forEach((result, index) => {
+    const read = optionalReads[index];
+    if (result.status === "fulfilled") {
+      read.apply(result.value);
+      return;
+    }
+    read.apply(null);
+    failedReads.push(`${read.label}: ${result.reason?.message || result.reason}`);
+  });
+  reportOptionalReadFailures(failedReads);
 
   renderSelectedRun();
   renderInspector();
@@ -1670,18 +1833,34 @@ async function submitRegionCorrection(event) {
   }
 }
 
-async function auditionVoice(speakerId, voiceProfile) {
+async function auditionVoice(speakerId, voiceProfile, { contextual = false } = {}) {
   if (!state.selectedJob) return;
-  toast("Đang audition voice", `Đang gửi yêu cầu mẫu voice cho ${speakerId}…`);
+
+  // Contextual audition must be bound to a real selected segment: the artifact
+  // is rendered from that segment's translated text plus the run's preserved
+  // stems, never from an implicit default segment.
+  const segmentIndex = contextual ? state.selectedSegmentIndex : null;
+  if (contextual && !Number.isInteger(segmentIndex)) {
+    toast("Chưa chọn segment", "Chọn một segment trong timeline hoặc tab 'Transcript & Dịch' trước khi nghe thử cùng BGM/SFX.", "error");
+    return;
+  }
+
+  toast(
+    contextual ? "Đang audition trong ngữ cảnh" : "Đang audition voice",
+    contextual ? `Đang dựng mẫu ~10s cùng BGM/SFX cho ${speakerId} ở segment ${segmentIndex}…` : `Đang gửi yêu cầu mẫu voice cho ${speakerId}…`
+  );
   try {
+    const body = {
+      run_id: state.selectedRun?.id || "",
+      target_language: state.selectedJob.target_language,
+      voice: voiceProfile,
+      is_contextual: contextual,
+    };
+    if (contextual) body.segment_index = segmentIndex;
+
     const res = await api(`/api/v1/assets/${encodeURIComponent(state.selectedJob.source_asset_id)}/voice-audition`, {
       method: "POST",
-      body: jsonBody({
-        run_id: state.selectedRun?.id || "",
-        target_language: state.selectedJob.target_language,
-        voice: voiceProfile,
-        is_contextual: false,
-      }),
+      body: jsonBody(body),
     });
     if (!res.audio_data_url) throw new Error("RuntimeHost không trả audition audio có thể phát trong browser.");
     if (state.auditionAudio) {
@@ -1699,7 +1878,8 @@ async function auditionVoice(speakerId, voiceProfile) {
     );
     await audio.play();
     const durationSeconds = (Number(res.audition_result?.measured_duration_ms) || 0) / 1000;
-    toast("Đang phát audition", `${speakerId} · ${durationSeconds.toFixed(1)}s`, "success");
+    const suffix = contextual ? ` · segment ${segmentIndex} · có BGM/SFX` : "";
+    toast(contextual ? "Đang phát audition ngữ cảnh" : "Đang phát audition", `${speakerId} · ${durationSeconds.toFixed(1)}s${suffix}`, "success");
   } catch (error) {
     showError(error);
   }
@@ -1886,33 +2066,20 @@ function bindEvents() {
   $("#exception-list")?.addEventListener("click", (event) => {
     const button = event.target.closest("[data-review-id]");
     if (!button) return;
-    state.selectedReviewItem = state.reviewItems.find((item) => item.id === button.dataset.reviewId) || null;
-    if (state.selectedReviewItem?.start_ms != null) {
-      seekVideoTo(state.selectedReviewItem.start_ms);
-    }
-    renderInspector();
+    selectTimelineTarget({ reviewId: button.dataset.reviewId });
   });
 
   // Transcript row click & edit
   $("#transcript-list")?.addEventListener("click", (event) => {
     const row = event.target.closest("[data-transcript-seek]");
     if (row) {
-      const seekMs = Number(row.dataset.transcriptSeek);
-      seekVideoTo(seekMs);
-      state.selectedSegmentIndex = Number(row.dataset.segmentIndex);
-      $$(".transcript-row").forEach((r) => r.classList.toggle("is-selected", r === row));
+      selectTimelineTarget({ segmentIndex: Number(row.dataset.segmentIndex) });
     }
     const editBtn = event.target.closest("[data-edit-segment]");
     if (editBtn) {
-      const idx = Number(editBtn.dataset.editSegment);
-      const text = editBtn.dataset.targetText || "";
-      $("#text-segment-index").value = idx;
-      $("#text-target").value = text;
-      setEditorTab("text");
-      const emptyBox = $("#inspector-empty");
-      const editorBox = $("#inspector-editor");
-      if (emptyBox) emptyBox.classList.add("hidden");
-      if (editorBox) editorBox.classList.remove("hidden");
+      // Row-scoped edit shortcut: select the row's target and let the shared
+      // selector open the text form with that segment's content.
+      selectTimelineTarget({ segmentIndex: Number(editBtn.dataset.editSegment) });
     }
   });
 
@@ -1920,22 +2087,11 @@ function bindEvents() {
   $("#regions-list")?.addEventListener("click", (event) => {
     const row = event.target.closest("[data-region-seek]");
     if (row) {
-      const seekMs = Number(row.dataset.regionSeek);
-      seekVideoTo(seekMs);
-      state.selectedRegionId = row.dataset.regionId;
-      $$(".region-row").forEach((r) => r.classList.toggle("is-selected", r === row));
+      selectTimelineTarget({ regionId: row.dataset.regionId });
     }
     const editBtn = event.target.closest("[data-edit-region]");
     if (editBtn) {
-      const regId = editBtn.dataset.editRegion;
-      const role = editBtn.dataset.regionRole || "";
-      $("#region-id").value = regId;
-      if (role) $("#region-role").value = role;
-      setEditorTab("region");
-      const emptyBox = $("#inspector-empty");
-      const editorBox = $("#inspector-editor");
-      if (emptyBox) emptyBox.classList.add("hidden");
-      if (editorBox) editorBox.classList.remove("hidden");
+      selectTimelineTarget({ regionId: editBtn.dataset.editRegion });
     }
   });
 
@@ -1960,14 +2116,18 @@ function bindEvents() {
       const editorBox = $("#inspector-editor");
       if (emptyBox) emptyBox.classList.add("hidden");
       if (editorBox) editorBox.classList.remove("hidden");
-    } else if (action === "audition") {
-      auditionVoice(speakerId, {
-        id: voiceId,
-        voice_id: voiceId,
-        provider_id: providerId,
-        name: name,
-        language: state.selectedJob?.target_language || "vi",
-      });
+    } else if (action === "audition" || action === "audition-contextual") {
+      auditionVoice(
+        speakerId,
+        {
+          id: voiceId,
+          voice_id: voiceId,
+          provider_id: providerId,
+          name: name,
+          language: state.selectedJob?.target_language || "vi",
+        },
+        { contextual: action === "audition-contextual" }
+      );
     }
   });
 
@@ -1975,37 +2135,14 @@ function bindEvents() {
   $("#timeline-viewport")?.addEventListener("click", (event) => {
     const seekEl = event.target.closest("[data-timeline-seek]");
     if (seekEl) {
-      const seekMs = Number(seekEl.dataset.timelineSeek);
-      seekVideoTo(seekMs);
       if (seekEl.dataset.segIndex != null) {
-        state.selectedRegionId = null;
-        state.selectedReviewItem = null;
-        state.selectedSegmentIndex = Number(seekEl.dataset.segIndex);
-        setInspectorTab("transcript");
-        renderZoneInspector();
-        const row = $(`[data-segment-index="${state.selectedSegmentIndex}"]`, $("#transcript-list"));
-        if (row) {
-          row.scrollIntoView({ behavior: "smooth", block: "nearest" });
-          $$(".transcript-row").forEach((r) => r.classList.toggle("is-selected", r === row));
-        }
-      }
-      if (seekEl.dataset.regionId) {
-        state.selectedSegmentIndex = null;
-        state.selectedReviewItem = null;
-        state.selectedRegionId = seekEl.dataset.regionId;
-        setInspectorTab("regions");
-        renderZoneInspector();
-        const row = $(`[data-region-id="${CSS.escape(state.selectedRegionId)}"]`, $("#regions-list"));
-        if (row) row.scrollIntoView({ behavior: "smooth", block: "nearest" });
-      }
-      if (seekEl.dataset.reviewMarker) {
-        state.selectedSegmentIndex = null;
-        state.selectedRegionId = null;
-        state.selectedReviewItem = state.reviewItems.find((i) => i.id === seekEl.dataset.reviewMarker) || null;
-        setInspectorTab("exceptions");
-        renderZoneInspector();
-        const row = $(`[data-review-id="${CSS.escape(seekEl.dataset.reviewMarker)}"]`, $("#exception-list"));
-        if (row) row.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        selectTimelineTarget({ segmentIndex: Number(seekEl.dataset.segIndex) });
+      } else if (seekEl.dataset.regionId) {
+        selectTimelineTarget({ regionId: seekEl.dataset.regionId });
+      } else if (seekEl.dataset.reviewMarker) {
+        selectTimelineTarget({ reviewId: seekEl.dataset.reviewMarker });
+      } else {
+        seekVideoTo(Number(seekEl.dataset.timelineSeek));
       }
       return;
     }

@@ -125,15 +125,17 @@ func TestOperatorUIShellRoutes(t *testing.T) {
 	}
 }
 
-func TestVoiceAuditionReturnsBrowserPlayableAudioWithoutLocalPath(t *testing.T) {
-	t.Parallel()
+// newAuditionTestServer builds a Server whose fake TTS returns synthWAV, returning
+// the server, the audition asset ID and the harness root for path-leak assertions.
+func newAuditionTestServer(t *testing.T, synthWAV []byte) (*Server, string, string) {
+	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
 	db, err := storage.Open(filepath.Join(root, "audition.db"))
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
-	defer db.Close()
+	t.Cleanup(func() { _ = db.Close() })
 	casStore, err := cas.NewStore(filepath.Join(root, "cas"))
 	if err != nil {
 		t.Fatalf("open cas: %v", err)
@@ -153,11 +155,51 @@ func TestVoiceAuditionReturnsBrowserPlayableAudioWithoutLocalPath(t *testing.T) 
 	}
 
 	dubbingSvc := service.NewDubbingService(db, casStore)
-	wav := media.GeneratePCM16WAV(16000, 1, 500)
 	dubbingSvc.TTSInvoke = func(context.Context, provider.Provider, provider.TTSSynthesisRequest) (*provider.TTSSynthesisResult, error) {
-		return &provider.TTSSynthesisResult{AudioData: wav, Format: "wav", SampleRate: 16000, Channels: 1, MeasuredDurationMs: 500, ProviderID: "fake-tts", ModelName: "fake-model", ModelVersion: "1"}, nil
+		return &provider.TTSSynthesisResult{AudioData: synthWAV, Format: "wav", SampleRate: 16000, Channels: 1, MeasuredDurationMs: 500, ProviderID: "fake-tts", ModelName: "fake-model", ModelVersion: "1"}, nil
 	}
-	s := New(Config{Addr: "127.0.0.1:0", DB: db, CASStore: casStore, DubbingSvc: dubbingSvc})
+	return New(Config{Addr: "127.0.0.1:0", DB: db, CASStore: casStore, DubbingSvc: dubbingSvc}), asset.ID, root
+}
+
+func TestVoiceAuditionRejectsOversizeArtifactFailClosed(t *testing.T) {
+	t.Parallel()
+	// Valid, probeable WAV padded to exactly one byte past the audition artifact
+	// limit: the request must fail closed instead of buffering and base64-encoding
+	// an unbounded artifact into the HTTP response.
+	oversize := media.GeneratePCM16WAV(16000, 1, 1000)
+	oversize = append(oversize, make([]byte, int(service.MaxAuditionAudioBytes)+1-len(oversize))...)
+	s, assetID, root := newAuditionTestServer(t, oversize)
+
+	body, err := json.Marshal(map[string]any{
+		"run_id": "run-audition-oversize", "target_language": "vi", "sample_text": "Xin chao",
+		"voice": domain.VoiceProfile{ID: "voice-audition", ProviderID: "fake-tts", VoiceID: "voice-1", Name: "Voice 1", Language: "vi"},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/assets/"+assetID+"/voice-audition", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("oversize audition status=%d, want %d; body=%s", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "audio_data_url") {
+		t.Fatalf("oversize audition must not return a partial audio payload: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "exceeds") {
+		t.Fatalf("oversize audition error must name the artifact limit: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), root) {
+		t.Fatalf("response leaked a machine-local filesystem path: %s", rec.Body.String())
+	}
+}
+
+func TestVoiceAuditionReturnsBrowserPlayableAudioWithoutLocalPath(t *testing.T) {
+	t.Parallel()
+	wav := media.GeneratePCM16WAV(16000, 1, 500)
+	s, assetID, root := newAuditionTestServer(t, wav)
 
 	body, err := json.Marshal(map[string]any{
 		"run_id": "run-audition", "target_language": "vi", "sample_text": "Xin chao",
@@ -166,7 +208,7 @@ func TestVoiceAuditionReturnsBrowserPlayableAudioWithoutLocalPath(t *testing.T) 
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/assets/"+asset.ID+"/voice-audition", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/assets/"+assetID+"/voice-audition", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)

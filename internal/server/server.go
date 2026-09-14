@@ -2412,25 +2412,14 @@ func (s *Server) handleAuditionVoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.casStore == nil || res.AudioCASHash == "" {
+	if len(res.AudioBytes) == 0 {
 		writeError(w, http.StatusInternalServerError, "audition audio artifact is unavailable")
-		return
-	}
-	rc, err := s.casStore.Get(res.AudioCASHash)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "read audition audio from CAS: "+err.Error())
-		return
-	}
-	audioData, err := io.ReadAll(rc)
-	_ = rc.Close()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "read audition audio bytes: "+err.Error())
 		return
 	}
 
 	// Browser clients need playable audio, never a machine-local CAS path.
 	res.AudioCASPath = ""
-	audioDataURL := "data:audio/wav;base64," + base64.StdEncoding.EncodeToString(audioData)
+	audioDataURL := "data:audio/wav;base64," + base64.StdEncoding.EncodeToString(res.AudioBytes)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"audition_result": res,
 		"audio_data_url":  audioDataURL,

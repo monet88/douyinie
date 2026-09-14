@@ -572,13 +572,13 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 // ReassignVoice explicitly changes one or more speakers' frozen voices for a run,
 // regenerating exactly that speaker's affected downstream scope (TTS -> DubSegment -> DubMix -> RenderPlan)
 // while strictly preserving source-derived extractions (source media, audio stems, transcript alignment, text regions).
+// Run-pinned callers stay strictly run-bound; legacy asset-scoped callers that send no
+// run_id resolve the run from the asset's latest dub script variant for the target language.
 func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorrectionInput) (*VoiceReassignCorrectionResult, error) {
 	if strings.TrimSpace(in.AssetID) == "" {
 		return nil, errors.New("asset_id is required")
 	}
-	if strings.TrimSpace(in.RunID) == "" {
-		return nil, errors.New("run_id is required")
-	}
+	pinnedRunID := strings.TrimSpace(in.RunID)
 	targetLang := strings.ToLower(strings.TrimSpace(in.TargetLanguage))
 	if targetLang == "" {
 		targetLang = "vi"
@@ -598,7 +598,33 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 		return nil, errors.New("render service is required for voice reassign rerun")
 	}
 
-	// 1. Reassign voice profile(s) for the run
+	// 1. Resolve the dub script variant the reassignment regenerates against. A
+	// run-pinned caller stays strictly run-bound. The legacy asset-scoped route
+	// (POST /api/v1/assets/{id}/inspector/reassign-voice) sends no run_id and keeps
+	// the latest-variant-for-asset/language resolution, adopting the run that variant
+	// was produced for so the regeneration below still writes run-bound artifacts.
+	var dubScriptIdx *storage.DubScriptVariantIndex
+	var err error
+	if pinnedRunID != "" {
+		dubScriptIdx, err = s.db.GetDubScriptVariantIndexByRun(ctx, pinnedRunID)
+		if err != nil {
+			return nil, fmt.Errorf("load run dub script variant: %w", err)
+		}
+		if dubScriptIdx == nil || dubScriptIdx.AssetID != in.AssetID || !strings.EqualFold(dubScriptIdx.TargetLanguage, in.TargetLanguage) {
+			return nil, fmt.Errorf("dub script variant run binding mismatch for run %s", pinnedRunID)
+		}
+	} else {
+		dubScriptIdx, err = s.db.GetDubScriptVariantIndex(ctx, in.AssetID, in.TargetLanguage)
+		if err != nil {
+			return nil, fmt.Errorf("load latest dub script variant: %w", err)
+		}
+		if dubScriptIdx == nil || strings.TrimSpace(dubScriptIdx.RunID) == "" {
+			return nil, fmt.Errorf("run_id is required: no run-bound dub script variant for asset %s (%s)", in.AssetID, in.TargetLanguage)
+		}
+		in.RunID = dubScriptIdx.RunID
+	}
+
+	// 2. Reassign voice profile(s) for the run
 	assignIn := domain.VoiceAssignmentInput{
 		RunID:              in.RunID,
 		AssetID:            in.AssetID,
@@ -618,15 +644,7 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 		InvalidatedSpeakers: newAssign.InvalidatedSpeakers,
 	}
 
-	// 2. Synthesize dub segments (reuses unchanged speakers, regenerates changed speakers)
-	dubScriptIdx, err := s.db.GetDubScriptVariantIndexByRun(ctx, in.RunID)
-	if err != nil {
-		return nil, fmt.Errorf("load run dub script variant: %w", err)
-	}
-	if dubScriptIdx == nil || dubScriptIdx.AssetID != in.AssetID || !strings.EqualFold(dubScriptIdx.TargetLanguage, in.TargetLanguage) {
-		return nil, fmt.Errorf("dub script variant run binding mismatch for run %s", in.RunID)
-	}
-
+	// 3. Synthesize dub segments (reuses unchanged speakers, regenerates changed speakers)
 	synthIn := domain.DubbingJobInput{
 		RunID:                 in.RunID,
 		JobID:                 in.JobID,
@@ -643,7 +661,7 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 	}
 	result.DubSegmentsVariantCAS = dubSegsVar.CASHash
 
-	// 3. Audio stem mixing
+	// 4. Audio stem mixing
 	mixIn := AudioMixInput{
 		RunID:                 in.RunID,
 		JobID:                 in.JobID,
@@ -659,16 +677,20 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 	}
 	result.DubMixCAS = dubMix.CASHash
 
-	// 4. Refreeze RenderPlan
+	// 5. Refreeze RenderPlan. in.RunID is guaranteed populated by step 1 (the
+	// legacy route adopts the resolved variant's run), so the visual track must
+	// always resolve run-bound: an asset-scoped lookup here would let a newer
+	// track from another run bleed its cues into the regenerated plan.
 	var cues []domain.SubtitleCue
-	visIdx, err := s.db.GetLocalizedVisualTrackIndexByRun(ctx, in.RunID)
+	var visIdx *storage.LocalizedVisualTrackIndex
+	visIdx, err = s.db.GetLocalizedVisualTrackIndexByRun(ctx, in.RunID)
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return nil, fmt.Errorf("get run localized visual track index: %w", err)
 	}
+	if visIdx != nil && (visIdx.AssetID != in.AssetID || !strings.EqualFold(visIdx.TargetLanguage, in.TargetLanguage)) {
+		return nil, fmt.Errorf("localized visual track run binding mismatch for run %s", in.RunID)
+	}
 	if visIdx != nil {
-		if visIdx.AssetID != in.AssetID || !strings.EqualFold(visIdx.TargetLanguage, in.TargetLanguage) {
-			return nil, fmt.Errorf("localized visual track run binding mismatch for run %s", in.RunID)
-		}
 		rc, err := s.cas.Get(visIdx.CASHash)
 		if err != nil {
 			return nil, fmt.Errorf("load localized visual track from CAS (%s): %w", visIdx.CASHash, err)
@@ -695,7 +717,7 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 	}
 	result.RenderPlanCAS = rPlan.CASHash
 
-	// 5. Evaluate auto-resolution status
+	// 6. Evaluate auto-resolution status
 	isResolved := dubSegsVar.OverallStatus == "PASS" && len(dubSegsVar.ReviewSegments) == 0 &&
 		result.DubMixCAS != "" && result.RenderPlanCAS != ""
 	if isResolved {

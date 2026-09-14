@@ -311,6 +311,10 @@ type VoiceAuditionResult struct {
 	ProviderID         string       `json:"provider_id,omitempty"`
 	ModelName          string       `json:"model_name,omitempty"`
 	ModelVersion       string       `json:"model_version,omitempty"`
+	// AudioBytes carries the bounded audition artifact for transport serialization.
+	// It is never part of the JSON contract; transports encode it into a playable
+	// data URL and browser clients never receive a CAS/local path.
+	AudioBytes []byte `json:"-"`
 }
 
 // DubbingJobInput defines the inputs required to run the TTS synthesis & fit controller pipeline.

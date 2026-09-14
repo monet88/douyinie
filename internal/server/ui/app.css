@@ -255,9 +255,10 @@ tr.is-selected-row td { background: rgba(231,255,87,.03); }
 .speaker-meta { display: grid; gap: 2px; min-width: 0; }
 .speaker-meta strong { font-size: 11px; }
 .speaker-meta small { color: var(--text-dim); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.speaker-actions { display: flex; gap: 6px; }
-.speaker-action-btn { flex: 1; border: 1px solid var(--border); background: var(--surface-raised); border-radius: 6px; padding: 4px 8px; font-size: 10px; font-weight: 600; cursor: pointer; text-align: center; }
-.speaker-action-btn:hover { border-color: var(--border-strong); color: var(--text); }
+.speaker-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.speaker-action-btn { flex: 1 1 auto; min-width: 84px; border: 1px solid var(--border); background: var(--surface-raised); border-radius: 6px; padding: 4px 8px; font-size: 10px; font-weight: 600; cursor: pointer; text-align: center; }
+.speaker-action-btn:hover:not(:disabled) { border-color: var(--border-strong); color: var(--text); }
+.speaker-action-btn:disabled { opacity: .5; cursor: not-allowed; }
 .speaker-action-btn.secondary { background: transparent; color: var(--text-dim); }
 .speaker-card.is-unassigned { border-style: dashed; }
 .unassigned-badge { color: var(--warning); font-size: 10px; font-weight: 500; }

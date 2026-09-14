@@ -1985,3 +1985,215 @@ func TestReviewService_RegionOverride_TruthfulnessAndLowOCRFlags(t *testing.T) {
 		t.Fatalf("expected queue zero after OCR text correction, got %d items: %+v", len(itemsAfterStep3), itemsAfterStep3)
 	}
 }
+
+// Legacy asset-scoped CorrectTargetText (empty requested run_id, synthetic correction run
+// generated internally) must keep the regenerated visual track grounded in the
+// DubScriptVariant that this correction just adapted. Regression guard for the run-scoped
+// dub-script lookup wired into VisualTextService.LocalizeVisualTrack: the adapted dub script
+// must remain resolvable for the correction run, otherwise the visual track silently
+// degrades to the translation-only cue branch and drops the dub-script timing/meaning
+// cross-check.
+func TestReviewService_CorrectTargetText_LegacyAssetScopedKeepsDubScriptGrounding(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+
+	baseTarget := "Nhấn vào góc trên bên phải của màn hình"
+	transVar := domain.TranslationVariant{
+		ID:             "trans-legacy-1",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		SourceLanguage: "zh",
+		ProvenanceHash: "prov-trans-legacy",
+		OverallQAScore: 0.5,
+		Segments: []domain.TranslationSegment{
+			{
+				Index:        0,
+				SourceText:   "点击右上角",
+				TargetText:   baseTarget,
+				StartMs:      0,
+				EndMs:        1500,
+				QAConfidence: 0.9,
+				PassedQAGate: true,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(transVar)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             transVar.ID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		CASHash:        tObj.SHA256,
+		ProvenanceHash: transVar.ProvenanceHash,
+		OverallQAScore: transVar.OverallQAScore,
+		CreatedAt:      transVar.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save baseline translation index: %v", err)
+	}
+
+	// Asset-scoped (run-less) baseline dub script, as produced by the legacy pipeline.
+	dubScriptVar := domain.DubScriptVariant{
+		ID:                    "dubscript-legacy-1",
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		SourceLanguage:        "zh",
+		TranslationVariantCAS: tObj.SHA256,
+		ProvenanceHash:        "prov-dubscript-legacy",
+		OverallQAScore:        0.5,
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SourceText:     "点击右上角",
+				MeaningText:    baseTarget,
+				SpokenText:     baseTarget,
+				StartMs:        0,
+				EndMs:          1500,
+				SlotDurationMs: 1500,
+				PassedQAGate:   true,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dsBytes, _ := json.Marshal(dubScriptVar)
+	dsObj, _ := casStore.Put(bytes.NewReader(dsBytes))
+	if err := db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID:             dubScriptVar.ID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		CASHash:        dsObj.SHA256,
+		ProvenanceHash: dubScriptVar.ProvenanceHash,
+		OverallQAScore: dubScriptVar.OverallQAScore,
+		CreatedAt:      dubScriptVar.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save baseline dub script index: %v", err)
+	}
+
+	// Legacy caller: asset-scoped correction, no run_id and no spoken override.
+	res, err := svc.CorrectTargetText(ctx, service.TargetTextCorrectionInput{
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		SegmentIndex:   0,
+		NewTargetText:  "Nhấn góc trên",
+		Reason:         "legacy asset-scoped correction",
+		Operator:       "editor_monet",
+	})
+	if err != nil {
+		t.Fatalf("legacy asset-scoped CorrectTargetText failed: %v", err)
+	}
+	run1 := assertCorrectionKeepsDubScriptGrounding(t, db, casStore, assetID, "Nhấn góc trên", res)
+
+	// Repeating the identical legacy correction exercises the provenance-cache path:
+	// a cache hit must still leave the correction run with a resolvable dub script.
+	res2, err := svc.CorrectTargetText(ctx, service.TargetTextCorrectionInput{
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		SegmentIndex:   0,
+		NewTargetText:  "Nhấn góc trên",
+		Reason:         "legacy asset-scoped correction repeat",
+		Operator:       "editor_monet",
+	})
+	if err != nil {
+		t.Fatalf("repeated legacy asset-scoped CorrectTargetText failed: %v", err)
+	}
+	run2 := assertCorrectionKeepsDubScriptGrounding(t, db, casStore, assetID, "Nhấn góc trên", res2)
+	if run1 == run2 {
+		t.Fatalf("expected each legacy correction to run under a fresh correction run, got %q twice", run1)
+	}
+}
+
+// assertCorrectionKeepsDubScriptGrounding verifies that a legacy asset-scoped correction
+// regenerated its visual track from the dub script adapted for that correction's own run,
+// rather than silently falling back to translation-only cues. It returns the correction run.
+func assertCorrectionKeepsDubScriptGrounding(
+	t *testing.T,
+	db *storage.DB,
+	casStore *cas.Store,
+	assetID, expectedCueText string,
+	res *service.TargetTextCorrectionResult,
+) string {
+	t.Helper()
+	ctx := context.Background()
+	if res.DubScriptVariantCAS == "" || res.LocalizedSubtitleCAS == "" {
+		t.Fatalf("expected regenerated dub script and subtitle artifacts: %+v", res)
+	}
+
+	subRC, err := casStore.Get(res.LocalizedSubtitleCAS)
+	if err != nil {
+		t.Fatalf("load regenerated subtitle track: %v", err)
+	}
+	defer subRC.Close()
+	var subTrack domain.LocalizedSubtitleTrack
+	if err := json.NewDecoder(subRC).Decode(&subTrack); err != nil {
+		t.Fatalf("decode regenerated subtitle track: %v", err)
+	}
+	if subTrack.RunID == "" {
+		t.Fatal("expected the correction to produce a run-scoped subtitle track")
+	}
+	if len(subTrack.Cues) != 1 || subTrack.Cues[0].Text != expectedCueText {
+		t.Fatalf("subtitle cues are not grounded in the corrected translation: %+v", subTrack.Cues)
+	}
+
+	// The dub script adapted by this correction must be resolvable for the correction run.
+	dubIdx, err := db.GetDubScriptVariantIndexByRun(ctx, subTrack.RunID)
+	if err != nil {
+		t.Fatalf("adapted dub script is not indexed for correction run %q: %v", subTrack.RunID, err)
+	}
+	if dubIdx.CASHash != res.DubScriptVariantCAS {
+		t.Fatalf("correction run dub script CAS %s != regenerated dub script CAS %s", dubIdx.CASHash, res.DubScriptVariantCAS)
+	}
+	if dubIdx.ProvenanceHash == "" {
+		t.Fatalf("correction run dub script %q has no provenance identity", subTrack.RunID)
+	}
+
+	dsRC, err := casStore.Get(res.DubScriptVariantCAS)
+	if err != nil {
+		t.Fatalf("load regenerated dub script: %v", err)
+	}
+	defer dsRC.Close()
+	var dubVar domain.DubScriptVariant
+	if err := json.NewDecoder(dsRC).Decode(&dubVar); err != nil {
+		t.Fatalf("decode regenerated dub script: %v", err)
+	}
+	if dubVar.TranslationVariantCAS != res.TranslationVariantCAS {
+		t.Fatalf("regenerated dub script is not grounded in the corrected translation: %s != %s",
+			dubVar.TranslationVariantCAS, res.TranslationVariantCAS)
+	}
+
+	// The visual track must carry that dub script's provenance rather than the
+	// translation-only fallback prov (which would mean dub-script grounding was dropped).
+	visIdx, err := db.GetLocalizedVisualTrackIndexByRun(ctx, subTrack.RunID)
+	if err != nil {
+		t.Fatalf("regenerated visual track is not indexed for correction run %q: %v", subTrack.RunID, err)
+	}
+	visRC, err := casStore.Get(visIdx.CASHash)
+	if err != nil {
+		t.Fatalf("load regenerated visual track: %v", err)
+	}
+	defer visRC.Close()
+	var visTrack domain.LocalizedVisualTrack
+	if err := json.NewDecoder(visRC).Decode(&visTrack); err != nil {
+		t.Fatalf("decode regenerated visual track: %v", err)
+	}
+
+	groundedProv, err := domain.ComputeLocalizedVisualTrackProvenanceHash(
+		assetID, "vi", visTrack.TextRegionPlanProv, dubIdx.ProvenanceHash,
+		visTrack.Overlays, visTrack.SubtitleCues, []domain.SceneProtectedRegion(nil))
+	if err != nil {
+		t.Fatalf("compute dub-script-grounded visual track provenance: %v", err)
+	}
+	fallbackProv, err := domain.ComputeLocalizedVisualTrackProvenanceHash(
+		assetID, "vi", visTrack.TextRegionPlanProv, "",
+		visTrack.Overlays, visTrack.SubtitleCues, []domain.SceneProtectedRegion(nil))
+	if err != nil {
+		t.Fatalf("compute translation-only visual track provenance: %v", err)
+	}
+	if visTrack.ProvenanceHash == fallbackProv {
+		t.Fatalf("regenerated visual track lost dub-script grounding (provenance %s matches the translation-only fallback)", visTrack.ProvenanceHash)
+	}
+	if visTrack.ProvenanceHash != groundedProv {
+		t.Fatalf("regenerated visual track provenance %s is not grounded in the correction run dub script %s",
+			visTrack.ProvenanceHash, dubIdx.ProvenanceHash)
+	}
+	return subTrack.RunID
+}
