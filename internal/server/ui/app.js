@@ -737,6 +737,9 @@ function renderZoneCenter() {
   }
 
   renderObservationalTimeline();
+  // The timeline short-circuits when no duration is known, so the overlay is
+  // refreshed explicitly to stay correct when the preview media disappears.
+  renderRegionOverlay();
 }
 
 function calculateTotalDuration() {
@@ -753,8 +756,8 @@ function calculateTotalDuration() {
       ...(state.reviewItems || []),
     ];
     for (const item of timedItems) {
-      const endMs = Number(item.end_ms);
-      const startMs = Number(item.start_ms);
+      const endMs = Number(item.end_ms ?? item.last_seen_ms);
+      const startMs = Number(item.start_ms ?? item.first_seen_ms);
       if (Number.isFinite(endMs) && endMs > dur) dur = endMs;
       if (Number.isFinite(startMs) && startMs > dur) dur = startMs;
     }
@@ -842,8 +845,9 @@ function renderObservationalTimeline() {
     } else {
       laneVisual.innerHTML = regions
         .map((reg) => {
-          const startMs = Number.isFinite(Number(reg.start_ms)) ? Number(reg.start_ms) : 0;
-          const persistedEndMs = Number(reg.end_ms);
+          const startMs = Number.isFinite(Number(reg.start_ms)) ? Number(reg.start_ms) : Number.isFinite(Number(reg.first_seen_ms)) ? Number(reg.first_seen_ms) : 0;
+          const rawEndMs = Number(reg.end_ms);
+          const persistedEndMs = Number.isFinite(rawEndMs) ? rawEndMs : Number(reg.last_seen_ms);
           const endMs = Number.isFinite(persistedEndMs) && persistedEndMs >= startMs ? persistedEndMs : startMs;
           const leftPct = Math.max(0, Math.min(100, (startMs / totalMs) * 100));
           const widthPct = Math.min(100 - leftPct, Math.max(0.75, ((endMs - startMs) / totalMs) * 100));
@@ -917,7 +921,9 @@ function regionById(regionId) {
 }
 
 function startMsOf(value) {
-  const startMs = Number(value?.start_ms);
+  // TextRegionPlan regions carry source-truth timing as first_seen_ms/last_seen_ms;
+  // speech segments and review items carry start_ms/end_ms.
+  const startMs = Number(value?.start_ms ?? value?.first_seen_ms);
   return Number.isFinite(startMs) ? startMs : null;
 }
 
@@ -961,7 +967,486 @@ function syncEditorToSelection() {
     if (roleInput && region?.role) roleInput.value = region.role;
     const textInput = $("#region-text");
     if (textInput && region?.text) textInput.value = region.text;
+    // A pending rectangle edit belongs to exactly one region: switching the
+    // active region must not carry the previous region's deltas onto it.
+    if (lastSyncedRegionId !== state.selectedRegionId) {
+      lastSyncedRegionId = state.selectedRegionId;
+      resetRegionDeltaInputs();
+      setRegionError("");
+      renderRegionApplyResult(null);
+    }
   }
+}
+
+// --- Direct manipulation of TextRegionPlan geometry over the video ----------
+//
+// Single source of truth: the existing Inspector region form. Pointer gestures
+// write canonical-pixel deltas into the same Δ fields the form already submits,
+// so the overlay never becomes a second geometry model. Canonical media
+// coordinates are the only persisted truth; display pixels are derived.
+
+let lastSyncedRegionId = null;
+let regionDrag = null;
+
+const REGION_MIN_CANONICAL_PX = 8;
+
+function currentPlayheadMs() {
+  const player = $("#preview-player");
+  const seconds = Number(player?.currentTime);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 0;
+}
+
+// Intrinsic media size of the canonical TextRegionPlan, falling back to the
+// decoded preview only when the plan does not carry frame dimensions.
+function regionFrameSize() {
+  const plan = state.textRegionPlan;
+  const player = $("#preview-player");
+  return {
+    frameWidth: Number(plan?.frame_width) || Number(player?.videoWidth) || 0,
+    frameHeight: Number(plan?.frame_height) || Number(player?.videoHeight) || 0,
+  };
+}
+
+// Maps the rendered video content rect (object-fit: contain, so letterboxed) into
+// coordinates relative to the overlay host. One scale factor converts canonical
+// media pixels to rendered pixels and back, so letterbox offsets are structural
+// rather than duplicated per box.
+function computeRegionViewport(playerRect, hostRect, frameWidth, frameHeight) {
+  const fw = Number(frameWidth) || 0;
+  const fh = Number(frameHeight) || 0;
+  const pw = Number(playerRect?.width) || 0;
+  const ph = Number(playerRect?.height) || 0;
+  if (!(fw > 0) || !(fh > 0) || !(pw > 0) || !(ph > 0) || !hostRect) return null;
+  const scale = Math.min(pw / fw, ph / fh);
+  const width = fw * scale;
+  const height = fh * scale;
+  return {
+    frameWidth: fw,
+    frameHeight: fh,
+    scale,
+    width,
+    height,
+    left: playerRect.left + (pw - width) / 2 - hostRect.left,
+    top: playerRect.top + (ph - height) / 2 - hostRect.top,
+  };
+}
+
+function regionViewport() {
+  const player = $("#preview-player");
+  const host = $("#video-wrapper");
+  if (!player || !host || typeof player.getBoundingClientRect !== "function" || typeof host.getBoundingClientRect !== "function") {
+    return null;
+  }
+  const { frameWidth, frameHeight } = regionFrameSize();
+  return computeRegionViewport(player.getBoundingClientRect(), host.getBoundingClientRect(), frameWidth, frameHeight);
+}
+
+// Canonical geometry of a tracked region at a playhead position. Uses the last
+// sampled keyframe at or before the playhead and never invents coordinates: a
+// region without keyframes has no canonical geometry to project.
+function regionBoxAt(region, timeMs) {
+  const frames = (region?.keyframes || []).filter((frame) => frame?.box);
+  if (!frames.length) return null;
+  const t = Number(timeMs) || 0;
+  let before = null;
+  let earliest = frames[0];
+  for (const frame of frames) {
+    const ts = Number(frame.timestamp_ms);
+    if (Number.isFinite(ts) && ts < Number(earliest?.timestamp_ms ?? ts)) earliest = frame;
+    if (!Number.isFinite(ts) || ts > t) continue;
+    if (!before || ts >= Number(before.timestamp_ms ?? ts)) before = frame;
+  }
+  const chosen = before || earliest;
+  const box = chosen.box;
+  return {
+    x: Math.round(Number(box.x) || 0),
+    y: Math.round(Number(box.y) || 0),
+    width: Math.max(1, Math.round(Number(box.width) || 0)),
+    height: Math.max(1, Math.round(Number(box.height) || 0)),
+    observed: Boolean(chosen.observed),
+    timestampMs: Number(chosen.timestamp_ms) || 0,
+  };
+}
+
+function regionDeltaInputs() {
+  const read = (selector) => {
+    const value = Number($(selector)?.value);
+    return Number.isFinite(value) ? Math.round(value) : 0;
+  };
+  return { dx: read("#region-dx"), dy: read("#region-dy"), dw: read("#region-dw"), dh: read("#region-dh") };
+}
+
+function setRegionDeltaInputs(deltas) {
+  const write = (selector, value) => {
+    const node = $(selector);
+    if (node) node.value = String(Math.round(value));
+  };
+  write("#region-dx", deltas.dx);
+  write("#region-dy", deltas.dy);
+  write("#region-dw", deltas.dw);
+  write("#region-dh", deltas.dh);
+}
+
+function resetRegionDeltaInputs() {
+  setRegionDeltaInputs({ dx: 0, dy: 0, dw: 0, dh: 0 });
+}
+
+function offsetRegionBox(box, deltas) {
+  return {
+    x: box.x + deltas.dx,
+    y: box.y + deltas.dy,
+    width: box.width + deltas.dw,
+    height: box.height + deltas.dh,
+  };
+}
+
+function regionBoxChanged(before, after) {
+  return before.x !== after.x || before.y !== after.y || before.width !== after.width || before.height !== after.height;
+}
+
+function regionDeltaBetween(from, to) {
+  return { dx: to.x - from.x, dy: to.y - from.y, dw: to.width - from.width, dh: to.height - from.height };
+}
+
+// Union rect of every tracked keyframe. Deltas apply to all keyframes at once, so
+// the frame constraint must be computed on their union: a shift that fits the
+// keyframe on screen but pushes a sibling keyframe off-frame would be refused by
+// the RuntimeHost contract after the fact.
+function regionUnionBox(region) {
+  const frames = (region?.keyframes || []).filter((frame) => frame?.box);
+  if (!frames.length) return null;
+  let left = Infinity;
+  let top = Infinity;
+  let right = -Infinity;
+  let bottom = -Infinity;
+  for (const frame of frames) {
+    const box = frame.box;
+    const x = Math.round(Number(box.x) || 0);
+    const y = Math.round(Number(box.y) || 0);
+    left = Math.min(left, x);
+    top = Math.min(top, y);
+    right = Math.max(right, x + Math.max(1, Math.round(Number(box.width) || 0)));
+    bottom = Math.max(bottom, y + Math.max(1, Math.round(Number(box.height) || 0)));
+  }
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+function formatRegionBox(box) {
+  return `x=${box.x} y=${box.y} w=${box.width} h=${box.height}`;
+}
+
+function formatRegionDelta(deltas) {
+  const sign = (value) => (value > 0 ? `+${value}` : String(value));
+  return `Δx ${sign(deltas.dx)} · Δy ${sign(deltas.dy)} · Δw ${sign(deltas.dw)} · Δh ${sign(deltas.dh)}`;
+}
+
+// Fail-closed geometry validation mirroring the RuntimeHost override contract:
+// out-of-frame or collapsed rectangles are refused and surfaced, never silently
+// clamped into range. Deltas apply to every keyframe of the region, so every
+// keyframe is validated, not just the one currently rendered.
+function validateRegionBox(box, frameWidth, frameHeight) {
+  if (box.width < REGION_MIN_CANONICAL_PX || box.height < REGION_MIN_CANONICAL_PX) {
+    return `quá nhỏ (tối thiểu ${REGION_MIN_CANONICAL_PX}px canonical): ${formatRegionBox(box)}`;
+  }
+  if (box.x < 0 || box.y < 0 || box.x + box.width > frameWidth || box.y + box.height > frameHeight) {
+    return `vượt biên khung hình ${frameWidth}×${frameHeight}: ${formatRegionBox(box)}`;
+  }
+  return "";
+}
+
+function validateRegionDelta(region, deltas, frameWidth, frameHeight) {
+  const frames = (region?.keyframes || []).filter((frame) => frame?.box);
+  if (!frames.length) return "region không có keyframe hình học để chỉnh";
+  if (!(frameWidth > 0) || !(frameHeight > 0)) return "TextRegionPlan không khai báo kích thước khung hình";
+  for (const frame of frames) {
+    const base = regionBoxAt({ keyframes: [frame] }, frame.timestamp_ms);
+    const problem = validateRegionBox(offsetRegionBox(base, deltas), frameWidth, frameHeight);
+    if (problem) return `keyframe ${Math.round(Number(frame.timestamp_ms) || 0)}ms ${problem}`;
+  }
+  return "";
+}
+
+// The region the overlay edits: an explicit selection wins, then the region of a
+// selected review item, then whatever region is live under the playhead.
+function regionOverlayTarget(timeMs) {
+  if (state.selectedRegionId) {
+    const selected = regionById(state.selectedRegionId);
+    if (selected) return selected;
+  }
+  const reviewRegionId = state.selectedReviewItem?.region_id;
+  if (reviewRegionId) {
+    const reviewed = regionById(reviewRegionId);
+    if (reviewed) return reviewed;
+  }
+  return (state.textRegionPlan?.regions || []).find((region) => {
+    const start = Number(region?.first_seen_ms);
+    const end = Number(region?.last_seen_ms);
+    return timeMs >= (Number.isFinite(start) ? start : 0) && timeMs <= (Number.isFinite(end) ? end : Infinity);
+  }) || null;
+}
+
+function boxToOverlay(box, viewport) {
+  return {
+    left: box.x * viewport.scale,
+    top: box.y * viewport.scale,
+    width: box.width * viewport.scale,
+    height: box.height * viewport.scale,
+  };
+}
+
+// Pointer distance in rendered pixels converted through the single letterbox
+// scale factor into a canonical union rect; display pixels never leave here.
+function regionDragUnionRect(drag, clientX, clientY) {
+  const dx = (clientX - drag.startX) / drag.scale;
+  const dy = (clientY - drag.startY) / drag.scale;
+  const base = drag.unionStart;
+  if (drag.mode !== "resize") {
+    return { x: Math.round(base.x + dx), y: Math.round(base.y + dy), width: base.width, height: base.height };
+  }
+
+  let left = base.x;
+  let top = base.y;
+  let right = base.x + base.width;
+  let bottom = base.y + base.height;
+  const handle = drag.handle || "";
+  if (handle.includes("w")) left = Math.min(Math.round(base.x + dx), right - REGION_MIN_CANONICAL_PX);
+  if (handle.includes("e")) right = Math.max(Math.round(base.x + base.width + dx), left + REGION_MIN_CANONICAL_PX);
+  if (handle.includes("n")) top = Math.min(Math.round(base.y + dy), bottom - REGION_MIN_CANONICAL_PX);
+  if (handle.includes("s")) bottom = Math.max(Math.round(base.y + base.height + dy), top + REGION_MIN_CANONICAL_PX);
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+// Clamps one axis of a rectangle into the canonical frame. When an edge handle
+// owns the axis, the dragged edge stops at the frame bound and the opposite edge
+// stays anchored where it was: clamping the origin while keeping the requested
+// size would grow the stationary edge instead (a west-edge drag past x=0 would
+// expand the box to the right). Otherwise - a move, or typed deltas - the whole
+// extent is clamped, which is what the form's Δ model means.
+function constrainRegionAxis(origin, size, frame, movingStart, movingEnd) {
+  const minimum = Math.min(REGION_MIN_CANONICAL_PX, frame);
+  if (movingStart) {
+    const start = Math.max(0, Math.min(origin, origin + size - minimum));
+    return { origin: start, size: origin + size - start };
+  }
+  if (movingEnd) {
+    const end = Math.min(frame, Math.max(origin + size, origin + minimum));
+    return { origin, size: end - origin };
+  }
+  const finalSize = Math.min(Math.max(size, minimum), frame);
+  return { origin: Math.min(Math.max(origin, 0), Math.max(0, frame - finalSize)), size: finalSize };
+}
+
+// Constrains a dragged rectangle to the canonical frame. The constraint is
+// surfaced (bounded class + hint) rather than applied silently, and the value
+// that reaches the form is the constrained one, so what the operator sees over
+// the video is what gets submitted.
+function constrainRegionBox(box, frameWidth, frameHeight, handle = "") {
+  const horizontal = constrainRegionAxis(box.x, box.width, frameWidth, handle.includes("w"), handle.includes("e"));
+  const vertical = constrainRegionAxis(box.y, box.height, frameHeight, handle.includes("n"), handle.includes("s"));
+  const constrained = { x: horizontal.origin, y: vertical.origin, width: horizontal.size, height: vertical.size };
+  return { box: constrained, bounded: regionBoxChanged(box, constrained) };
+}
+
+function renderRegionOverlay() {
+  const overlay = $("#region-overlay");
+  const boxEl = $("#region-box");
+  const ghostEl = $("#region-ghost");
+  const hintEl = $("#region-overlay-hint");
+  const tagEl = $("#region-box-tag");
+  if (!overlay || !boxEl) return;
+
+  const timeMs = currentPlayheadMs();
+  const region = state.preview ? regionOverlayTarget(timeMs) : null;
+  const base = region ? regionBoxAt(region, timeMs) : null;
+  const viewport = region ? regionViewport() : null;
+
+  if (!region || !base || !viewport) {
+    overlay.classList.add("hidden");
+    boxEl.dataset.regionId = "";
+    if (hintEl) hintEl.textContent = "";
+    return;
+  }
+
+  const dragging = Boolean(regionDrag && regionDrag.regionId === region.id);
+  const deltas = regionDeltaInputs();
+  const after = dragging ? regionDrag.current : constrainRegionBox(offsetRegionBox(base, deltas), viewport.frameWidth, viewport.frameHeight).box;
+  const bounded = dragging ? regionDrag.bounded : regionBoxChanged(offsetRegionBox(base, deltas), after);
+  const changed = regionBoxChanged(base, after);
+
+  overlay.classList.remove("hidden");
+  overlay.style.left = `${viewport.left}px`;
+  overlay.style.top = `${viewport.top}px`;
+  overlay.style.width = `${viewport.width}px`;
+  overlay.style.height = `${viewport.height}px`;
+
+  if (ghostEl) {
+    const ghost = boxToOverlay(base, viewport);
+    ghostEl.classList.toggle("hidden", !changed);
+    ghostEl.style.left = `${ghost.left}px`;
+    ghostEl.style.top = `${ghost.top}px`;
+    ghostEl.style.width = `${ghost.width}px`;
+    ghostEl.style.height = `${ghost.height}px`;
+  }
+
+  const placed = boxToOverlay(after, viewport);
+  boxEl.dataset.regionId = region.id;
+  boxEl.dataset.regionRole = region.role || "";
+  boxEl.classList.toggle("is-dragging", dragging);
+  boxEl.classList.toggle("is-clamped", bounded);
+  boxEl.style.left = `${placed.left}px`;
+  boxEl.style.top = `${placed.top}px`;
+  boxEl.style.width = `${placed.width}px`;
+  boxEl.style.height = `${placed.height}px`;
+  if (tagEl) {
+    const role = region.role || "region";
+    tagEl.textContent = changed ? `${role} · ${formatRegionDelta({ dx: after.x - base.x, dy: after.y - base.y, dw: after.width - base.width, dh: after.height - base.height })}` : role;
+  }
+  if (hintEl) {
+    hintEl.textContent = bounded
+      ? "Đã chạm biên video — kéo thả không thể đưa region ra ngoài khung."
+      : base.observed
+        ? `Keyframe gần nhất ${Math.round(base.timestampMs)}ms`
+        : `Keyframe nội suy ${Math.round(base.timestampMs)}ms`;
+  }
+}
+
+function renderRegionDiff() {
+  const node = $("#region-diff");
+  if (!node) return;
+  const { frameWidth, frameHeight } = regionFrameSize();
+  const region = state.selectedRegionId ? regionById(state.selectedRegionId) : null;
+  const base = region ? regionBoxAt(region, currentPlayheadMs()) : null;
+  if (!region || !base) {
+    node.innerHTML = "";
+    node.classList.add("hidden");
+    return;
+  }
+
+  const deltas = regionDeltaInputs();
+  const after = constrainRegionBox(offsetRegionBox(base, deltas), frameWidth, frameHeight).box;
+  const changed = regionBoxChanged(base, after);
+  const roleSelect = $("#region-role");
+  const nextRole = roleSelect?.value || "";
+  const roleChanged = Boolean(nextRole) && nextRole !== region.role;
+
+  node.classList.remove("hidden");
+  node.innerHTML = `
+    <div class="region-diff-row"><span>Trước</span><code>${esc(formatRegionBox(base))} · ${esc(region.role || "—")}</code></div>
+    <div class="region-diff-row ${changed ? "is-changed" : ""}"><span>Sau</span><code>${esc(formatRegionBox(after))}${changed ? ` · ${esc(formatRegionDelta({ dx: after.x - base.x, dy: after.y - base.y, dw: after.width - base.width, dh: after.height - base.height }))}` : " · chưa đổi"}</code></div>
+    <div class="region-diff-row ${roleChanged ? "is-changed" : ""}"><span>Role</span><code>${esc(region.role || "—")} → ${esc(nextRole || region.role || "—")}</code></div>
+    <div class="region-diff-row"><span>Khung</span><code>${frameWidth}×${frameHeight} canonical px</code></div>`;
+}
+
+function setRegionError(message) {
+  const node = $("#region-error");
+  if (!node) return;
+  node.textContent = message || "";
+  node.classList.toggle("hidden", !message);
+}
+
+function renderRegionApplyResult(result) {
+  const node = $("#region-result");
+  if (!node) return;
+  if (!result) {
+    node.innerHTML = "";
+    node.classList.add("hidden");
+    return;
+  }
+  const pending = result.status !== "auto_resolved";
+  node.classList.remove("hidden");
+  node.classList.toggle("is-pending", pending);
+  node.innerHTML = `
+    <strong>${esc(pending ? "Đã áp dụng — vẫn cần review" : "Đã áp dụng — auto-resolved")}</strong>
+    <span>${esc(result.message || "")}</span>
+    <span>LocalizedVisualTrack: ${esc(shortID(result.localized_visual_track_cas || "—", 18))}</span>
+    <span>LocalizedSubtitle: ${esc(shortID(result.localized_subtitle_cas || "—", 18))}</span>
+    <span>RenderPlan: ${esc(shortID(result.render_plan_cas || "—", 18))}</span>`;
+}
+
+function beginRegionDrag(event) {
+  const overlay = $("#region-overlay");
+  if (!overlay || overlay.classList.contains("hidden")) return;
+  // One gesture owns the drag: a second pointer (touch/pen) and non-primary
+  // buttons must not hijack or restart an in-flight edit.
+  if (event.button != null && event.button !== 0) return;
+  if (regionDrag && regionDrag.pointerId != null && event.pointerId != null && regionDrag.pointerId !== event.pointerId) return;
+  const target = event.target;
+  const handleEl = typeof target?.closest === "function" ? target.closest("[data-region-handle]") : null;
+  const boxEl = typeof target?.closest === "function" ? target.closest("#region-box") : null;
+  if (!boxEl && !handleEl) return;
+
+  const timeMs = currentPlayheadMs();
+  const region = regionOverlayTarget(timeMs);
+  const base = region ? regionBoxAt(region, timeMs) : null;
+  const union = region ? regionUnionBox(region) : null;
+  const viewport = regionViewport();
+  if (!region || !base || !union || !viewport || !(viewport.scale > 0)) return;
+
+  // Only the selected region owns the form's Δ fields, so a drag also selects it.
+  if (state.selectedRegionId !== region.id) {
+    selectTimelineTarget({ regionId: region.id });
+  }
+
+  const startUnion = constrainRegionBox(offsetRegionBox(union, regionDeltaInputs()), viewport.frameWidth, viewport.frameHeight).box;
+  const startDelta = regionDeltaBetween(union, startUnion);
+  regionDrag = {
+    regionId: region.id,
+    mode: handleEl ? "resize" : "move",
+    handle: handleEl?.dataset?.regionHandle || "",
+    pointerId: event.pointerId,
+    startX: Number(event.clientX) || 0,
+    startY: Number(event.clientY) || 0,
+    scale: viewport.scale,
+    frameWidth: viewport.frameWidth,
+    frameHeight: viewport.frameHeight,
+    union,
+    unionStart: startUnion,
+    renderBase: base,
+    delta: startDelta,
+    current: offsetRegionBox(base, startDelta),
+    bounded: false,
+  };
+  if (boxEl && typeof boxEl.setPointerCapture === "function" && event.pointerId != null) {
+    try {
+      boxEl.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture is an enhancement; the wrapper listeners still track the gesture.
+    }
+  }
+  event.preventDefault?.();
+  renderRegionOverlay();
+}
+
+function moveRegionDrag(event) {
+  if (!regionDrag) return;
+  // A second pointer must never steer an in-flight gesture, and a move with no
+  // button held means the release happened outside the window: end the gesture
+  // there instead of leaving a drag that follows the bare cursor.
+  if (event.pointerId != null && regionDrag.pointerId != null && event.pointerId !== regionDrag.pointerId) return;
+  if (event.buttons === 0) {
+    endRegionDrag(event);
+    return;
+  }
+  const requested = regionDragUnionRect(regionDrag, Number(event.clientX) || 0, Number(event.clientY) || 0);
+  const constrained = constrainRegionBox(requested, regionDrag.frameWidth, regionDrag.frameHeight, regionDrag.mode === "resize" ? regionDrag.handle : "");
+  regionDrag.delta = regionDeltaBetween(regionDrag.union, constrained.box);
+  regionDrag.current = offsetRegionBox(regionDrag.renderBase, regionDrag.delta);
+  regionDrag.bounded = regionBoxChanged(requested, constrained.box);
+  event.preventDefault?.();
+  renderRegionOverlay();
+}
+
+function endRegionDrag(event) {
+  if (!regionDrag) return;
+  if (event?.pointerId != null && regionDrag.pointerId != null && event.pointerId !== regionDrag.pointerId) return;
+  const drag = regionDrag;
+  regionDrag = null;
+  // Commit the gesture into the existing form fields: the same Δ model the
+  // RuntimeHost override contract already consumes, expressed in canonical px.
+  setRegionDeltaInputs(drag.delta);
+  setRegionError("");
+  renderRegionDiff();
+  renderRegionOverlay();
 }
 
 // Single entry point for transcript / region / review selection so video seek,
@@ -986,8 +1471,12 @@ function selectTimelineTarget({ segmentIndex = null, regionId = null, reviewId =
   renderSpeakers();
   renderZoneInspector();
   syncEditorToSelection();
+  renderRegionDiff();
   scrollSelectionIntoView(tab);
   if (startMs != null) seekVideoTo(startMs);
+  // Keep the projected geometry and the selected review target in step even when
+  // the target carries no start timestamp of its own.
+  renderRegionOverlay();
 }
 
 function updatePlayhead() {
@@ -1000,6 +1489,10 @@ function updatePlayhead() {
   const curSec = player && player.currentTime ? player.currentTime : 0;
   const curMs = curSec * 1000;
 
+  // The projected text region tracks the playhead directly, so it stays correct
+  // even when the observational timeline has no duration to draw yet.
+  renderRegionOverlay();
+
   if (!(totalMs > 0)) {
     playhead.style.left = "0%";
     if (timeDisplay) timeDisplay.textContent = `${formatMs(curMs)} / —`;
@@ -1008,7 +1501,6 @@ function updatePlayhead() {
 
   const pct = Math.max(0, Math.min(100, (curMs / totalMs) * 100));
   playhead.style.left = `${pct}%`;
-
   if (timeDisplay) {
     timeDisplay.textContent = `${formatMs(curMs)} / ${formatMs(totalMs)}`;
   }
@@ -1207,8 +1699,9 @@ function renderInspectorRegions() {
 
   list.innerHTML = regions
     .map((reg) => {
-      const startMs = Number.isFinite(Number(reg.start_ms)) ? Number(reg.start_ms) : 0;
-      const persistedEndMs = Number(reg.end_ms);
+      const startMs = Number.isFinite(Number(reg.start_ms)) ? Number(reg.start_ms) : Number.isFinite(Number(reg.first_seen_ms)) ? Number(reg.first_seen_ms) : 0;
+      const rawEndMs = Number(reg.end_ms);
+      const persistedEndMs = Number.isFinite(rawEndMs) ? rawEndMs : Number(reg.last_seen_ms);
       const endMs = Number.isFinite(persistedEndMs) && persistedEndMs >= startMs ? persistedEndMs : startMs;
       const isSelected = state.selectedRegionId === reg.id;
 
@@ -1795,21 +2288,41 @@ async function submitRegionCorrection(event) {
   event.preventDefault();
   if (!state.selectedRun || !state.selectedJob) return;
   const button = $("button[type=submit]", event.currentTarget);
+  const regionId = ($("#region-id")?.value || "").trim();
+  const region = regionById(regionId);
+  if (!region) {
+    setRegionError(`Không tìm thấy text region "${regionId}" trong TextRegionPlan của asset này.`);
+    return;
+  }
+
+  // Fail-closed pre-flight: the deltas apply to every keyframe of the region, so
+  // an edit that would leave the frame or collapse the rectangle is refused with
+  // an actionable Inspector error instead of being silently clamped downstream.
+  const deltas = regionDeltaInputs();
+  const { frameWidth, frameHeight } = regionFrameSize();
+  const geometryProblem = validateRegionDelta(region, deltas, frameWidth, frameHeight);
+  if (geometryProblem) {
+    setRegionError(`Override bị từ chối (fail-closed): ${geometryProblem}.`);
+    renderRegionDiff();
+    return;
+  }
+  setRegionError("");
+
   setBusy(button, true, "Đang cập nhật region…");
   try {
     const override = {
-      region_id: $("#region-id").value.trim(),
-      box_delta_x: Number($("#region-dx").value || 0),
-      box_delta_y: Number($("#region-dy").value || 0),
-      box_delta_w: Number($("#region-dw").value || 0),
-      box_delta_h: Number($("#region-dh").value || 0),
-      notes: $("#region-reason").value.trim(),
+      region_id: region.id,
+      box_delta_x: deltas.dx,
+      box_delta_y: deltas.dy,
+      box_delta_w: deltas.dw,
+      box_delta_h: deltas.dh,
+      notes: $("#region-reason")?.value.trim() || "",
     };
-    const role = $("#region-role").value;
-    const text = $("#region-text").value.trim();
+    const role = $("#region-role")?.value || "";
+    const text = $("#region-text")?.value.trim() || "";
     if (role) override.new_role = role;
     if (text) override.new_text = text;
-    await api(`/api/v1/runs/${encodeURIComponent(state.selectedRun.id)}/inspector/override-region`, {
+    const data = await api(`/api/v1/runs/${encodeURIComponent(state.selectedRun.id)}/inspector/override-region`, {
       method: "POST",
       body: jsonBody({
         run_id: state.selectedRun.id,
@@ -1818,15 +2331,24 @@ async function submitRegionCorrection(event) {
         target_language: state.selectedJob.target_language,
         overrides: [override],
         scene_protected_regions: [],
-        reason: $("#region-reason").value.trim(),
+        reason: $("#region-reason")?.value.trim() || "",
         operator: operatorName(),
       }),
     });
-    toast("Text region đã cập nhật", "Chỉ visual/render descendants được targeted rerun.", "success");
+    const result = data?.result || null;
+    renderRegionApplyResult(result);
+    toast("Text region đã cập nhật", result?.message || "Chỉ visual/render descendants được targeted rerun.", "success");
     state.handoff = null;
     await loadSelectedRun();
-    renderInspector();
+    // The reloaded plan already contains the applied geometry: the pending deltas
+    // are spent, so the before/after readout returns to the canonical state.
+    resetRegionDeltaInputs();
+    renderRegionDiff();
+    renderRegionOverlay();
   } catch (error) {
+    // The pending edit stays intact so the operator can correct the rejected
+    // geometry, and the RuntimeHost rejection is surfaced where the edit is made.
+    setRegionError(`RuntimeHost từ chối region override: ${error?.message || String(error)}`);
     showError(error);
   } finally {
     setBusy(button, false);
@@ -2176,6 +2698,24 @@ function bindEvents() {
   $("#text-form")?.addEventListener("submit", submitTextCorrection);
   $("#voice-form")?.addEventListener("submit", submitVoiceCorrection);
   $("#region-form")?.addEventListener("submit", submitRegionCorrection);
+
+  // Direct manipulation of the projected text region over the video. Pointer
+  // gestures only ever write canonical deltas into the region form above.
+  const videoWrapper = $("#video-wrapper");
+  if (videoWrapper) {
+    videoWrapper.addEventListener("pointerdown", beginRegionDrag);
+    videoWrapper.addEventListener("pointermove", moveRegionDrag);
+    videoWrapper.addEventListener("pointerup", endRegionDrag);
+    videoWrapper.addEventListener("pointercancel", endRegionDrag);
+  }
+  ["#region-dx", "#region-dy", "#region-dw", "#region-dh"].forEach((selector) => {
+    $(selector)?.addEventListener("input", () => {
+      setRegionError("");
+      renderRegionDiff();
+      renderRegionOverlay();
+    });
+  });
+  $("#region-role")?.addEventListener("change", renderRegionDiff);
 
   // Result view buttons
   $("#check-handoff")?.addEventListener("click", (event) => checkHandoff(event.currentTarget));

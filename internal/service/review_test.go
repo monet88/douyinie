@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -1754,6 +1755,97 @@ func TestReviewService_CorrectRegionGeometry_MissingDubMixFailsClosed(t *testing
 	}
 }
 
+func TestReviewService_CorrectRegionGeometry_ProtectedOcclusionRestoresCurrentPlan(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-occlusion-01"
+	bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
+
+	// A protected brand mark and a semantic region whose overlay can be dragged onto it.
+	brandBox := domain.BoundingBox{X: 50, Y: 60, Width: 120, Height: 40}
+	semBox := domain.BoundingBox{X: 100, Y: 200, Width: 300, Height: 60}
+	srcPlan := domain.TextRegionPlan{
+		ID:             "text-plan-occlusion-1",
+		AssetID:        assetID,
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		ProvenanceHash: "prov-text-occlusion-1",
+		Regions: []domain.TrackedTextRegion{
+			{
+				ID:                "reg-brand",
+				Text:              "SUPOR",
+				Role:              domain.TextRoleBrandKeep,
+				ProtectedMetadata: domain.ProtectedRegionMetadata{IsProtected: true, Reason: "brand_authenticity"},
+				FirstSeenMs:       0,
+				LastSeenMs:        1500,
+				Keyframes:         []domain.RegionKeyframe{{TimestampMs: 0, Box: brandBox, Observed: true, Confidence: 0.98}},
+			},
+			{
+				ID:          "reg-sem",
+				Text:        "关注",
+				Role:        domain.TextRoleSemanticText,
+				FirstSeenMs: 0,
+				LastSeenMs:  1500,
+				Keyframes:   []domain.RegionKeyframe{{TimestampMs: 0, Box: semBox, Observed: true, Confidence: 0.9}},
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	srcBytes, _ := json.Marshal(srcPlan)
+	srcObj, _ := casStore.Put(bytes.NewReader(srcBytes))
+	if err := db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             srcPlan.ID,
+		AssetID:        assetID,
+		CASHash:        srcObj.SHA256,
+		ProvenanceHash: srcPlan.ProvenanceHash,
+		CreatedAt:      srcPlan.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save source plan index: %v", err)
+	}
+
+	// Drag the semantic overlay onto the protected brand mark (-150 canonical px on Y).
+	_, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides: []domain.RegionOverride{
+			{RegionID: "reg-sem", BoxDeltaY: -150},
+		},
+		Reason:   "Drag semantic overlay onto the protected brand mark",
+		Operator: "tester",
+	})
+	if err == nil || !errors.Is(err, domain.ErrSubtitleOverlapsProtectedRegion) {
+		t.Fatalf("expected fail-closed protected-region rejection, got: %v", err)
+	}
+
+	// Fail-closed means the rejected edit must not remain the asset's current plan.
+	current, err := db.GetTextRegionPlanIndex(ctx, assetID)
+	if err != nil {
+		t.Fatalf("get current text region plan index: %v", err)
+	}
+	if current.ProvenanceHash != srcPlan.ProvenanceHash || current.CASHash != srcObj.SHA256 {
+		t.Errorf("rejected edit stayed current: provenance=%s cas=%s, want %s / %s",
+			current.ProvenanceHash, current.CASHash, srcPlan.ProvenanceHash, srcObj.SHA256)
+	}
+
+	// The restored plan is the usable base: a non-occluding reclassification still succeeds.
+	brandRole := domain.TextRoleBrandKeep
+	res, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides: []domain.RegionOverride{
+			{RegionID: "reg-sem", NewRole: &brandRole},
+		},
+		Reason:   "Recover after the rejected drag",
+		Operator: "tester",
+	})
+	if err != nil {
+		t.Fatalf("recovery correction on the restored plan failed: %v", err)
+	}
+	_ = res
+}
+
 func TestReviewService_CorrectRegionGeometry_OverrideMintsNewImmutablePlanIdentity(t *testing.T) {
 	svc, db, casStore, assetID := setupFullReviewHarness(t)
 	ctx := context.Background()
@@ -1834,6 +1926,43 @@ func TestReviewService_CorrectRegionGeometry_OverrideMintsNewImmutablePlanIdenti
 	}
 	if srcIdx == nil || srcIdx.CASHash != srcObj.SHA256 {
 		t.Errorf("source plan index was overwritten: got %+v, want CAS %s", srcIdx, srcObj.SHA256)
+	}
+
+	// The operator's intent is recorded as an append-only audit row bound to the run.
+	audits, err := db.GetReviewOverridesByRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get region correction audit: %v", err)
+	}
+	if len(audits) != 1 {
+		t.Fatalf("expected exactly 1 audit row for the correction, got %d", len(audits))
+	}
+	audit := audits[0]
+	if audit.Action != string(domain.ReviewOverrideActionRegionGeometry) {
+		t.Errorf("expected region geometry audit action, got %q", audit.Action)
+	}
+	if audit.ItemType != domain.ReviewItemTypeRegionGeometry {
+		t.Errorf("expected region geometry item type, got %q", audit.ItemType)
+	}
+	if audit.RegionID != "reg-lineage-1" || audit.ItemIndex != 0 {
+		t.Errorf("audit must name the corrected region and its index, got region=%q index=%d", audit.RegionID, audit.ItemIndex)
+	}
+	if audit.Reason != "Reclassify uncertain region" || audit.Operator != "tester" {
+		t.Errorf("audit must carry operator intent, got reason=%q operator=%q", audit.Reason, audit.Operator)
+	}
+	if audit.AssetID != assetID || audit.TargetLanguage != "vi" {
+		t.Errorf("audit must be bound to the corrected asset/language, got asset=%q lang=%q", audit.AssetID, audit.TargetLanguage)
+	}
+
+	// A region correction is not an acceptance of a projected exception item, so it
+	// must never flip a review item to manual_override.
+	allItems, err := svc.ProjectAllReviewItemsForRun(ctx, assetID, "vi", runID)
+	if err != nil {
+		t.Fatalf("project all review items: %v", err)
+	}
+	for _, it := range allItems {
+		if it.Status == domain.ReviewItemStatusManualOverride {
+			t.Errorf("region correction must not mark review item %q as manual_override", it.ID)
+		}
 	}
 }
 

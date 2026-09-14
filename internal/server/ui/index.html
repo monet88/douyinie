@@ -327,6 +327,24 @@
                     <strong>Chưa có preview render</strong>
                     <span id="preview-placeholder-text">Run đang chạy hoặc chưa hoàn tất stage render_preview.</span>
                   </div>
+                  <!-- Canonical TextRegionPlan geometry projected over the rendered video.
+                       The overlay is sized to the letterboxed content rect, so child boxes
+                       are plain canonical-pixel * scale and never display pixels. -->
+                  <div class="region-overlay hidden" id="region-overlay">
+                    <div class="region-ghost" id="region-ghost" aria-hidden="true"></div>
+                    <div class="region-box" id="region-box">
+                      <span class="region-box-tag" id="region-box-tag"></span>
+                      <span class="region-handle" data-region-handle="nw"></span>
+                      <span class="region-handle" data-region-handle="n"></span>
+                      <span class="region-handle" data-region-handle="ne"></span>
+                      <span class="region-handle" data-region-handle="e"></span>
+                      <span class="region-handle" data-region-handle="se"></span>
+                      <span class="region-handle" data-region-handle="s"></span>
+                      <span class="region-handle" data-region-handle="sw"></span>
+                      <span class="region-handle" data-region-handle="w"></span>
+                    </div>
+                    <p class="region-overlay-hint" id="region-overlay-hint"></p>
+                  </div>
                 </div>
               </div>
 
@@ -490,7 +508,10 @@
                         <label class="field field-span-2"><span>Text mới (tùy chọn)</span><input id="region-text" type="text"></label>
                         <label class="field field-span-2"><span>Lý do</span><input id="region-reason" type="text" value="Operator adjusted text region from Inspector"></label>
                       </div>
+                      <div class="region-diff" id="region-diff" aria-live="polite"></div>
+                      <p class="region-error hidden" id="region-error" role="alert"></p>
                       <button class="primary-button" type="submit">Áp dụng & targeted rerun</button>
+                      <div class="region-result hidden" id="region-result" aria-live="polite"></div>
                     </form>
                   </div>
                 </div>

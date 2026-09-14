@@ -12,8 +12,10 @@ import (
 // and driven through its real event listeners. It fails if selection stops
 // keeping video seek / active target / inspector tab / editor content in sync,
 // if contextual voice audition is missing or untethered from the selected
-// segment, or if non-404 artifact load failures are silently flattened to
-// "no data".
+// segment, if non-404 artifact load failures are silently flattened to
+// "no data", or if the direct-manipulation text-region overlay stops projecting
+// canonical geometry, stops converting pointer deltas through the letterbox
+// scale factor, or stops failing closed on invalid/refused geometry.
 //
 // Requires the `node` binary used by the UI gate (`node --check
 // internal/server/ui/app.js`); skipped when it is unavailable.

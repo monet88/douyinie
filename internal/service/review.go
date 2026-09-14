@@ -146,7 +146,7 @@ func (s *ReviewService) RecordManualOverride(ctx context.Context, in ManualOverr
 		ItemIndex:      targetItem.ItemIndex,
 		SegmentID:      targetItem.SegmentID,
 		RegionID:       targetItem.RegionID,
-		Action:         "manual_override",
+		Action:         string(domain.ReviewOverrideActionManualOverride),
 		Reason:         in.Reason,
 		Operator:       in.Operator,
 		CreatedAt:      time.Now().UTC(),
@@ -733,7 +733,7 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 
 // CorrectRegionGeometry applies direct-manipulation overrides (reclassify, drag, resize, relabel)
 // to text regions and regenerates the visual track and render plan descendants.
-func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeometryCorrectionInput) (*RegionGeometryCorrectionResult, error) {
+func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeometryCorrectionInput) (result *RegionGeometryCorrectionResult, err error) {
 	if strings.TrimSpace(in.AssetID) == "" {
 		return nil, errors.New("asset_id is required")
 	}
@@ -822,6 +822,22 @@ func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeom
 		return nil, fmt.Errorf("save updated text region plan index: %w", err)
 	}
 
+	// Fail-closed: the overridden plan becomes the asset's current plan only once
+	// its declared descendants actually regenerate. Persisting it first is required
+	// (LocalizeVisualTrack resolves the current plan by index) but a rejected edit
+	// must not stay silently accepted as the current plan, so any regeneration
+	// failure withdraws the row this correction just made current, leaving the
+	// pre-override plan latest again.
+	descendantsRegenerated := false
+	defer func() {
+		if err == nil || descendantsRegenerated {
+			return
+		}
+		if derr := s.db.DeleteTextRegionPlanIndex(ctx, in.AssetID, updatedPlan.ProvenanceHash); derr != nil {
+			err = fmt.Errorf("%w (and the rejected plan could not be withdrawn: %v)", err, derr)
+		}
+	}()
+
 	// 2. Localize visual track with direct manipulation overrides
 	visIn := LocalizeVisualTrackInput{
 		RunID:                 in.RunID,
@@ -836,7 +852,7 @@ func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeom
 		return nil, fmt.Errorf("localize visual track with overrides failed: %w", err)
 	}
 
-	result := &RegionGeometryCorrectionResult{
+	result = &RegionGeometryCorrectionResult{
 		LocalizedVisualTrackCAS: visTrack.CASHash,
 		LocalizedSubtitleCAS:    visTrack.SubtitleTrackCAS,
 	}
@@ -876,8 +892,18 @@ func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeom
 		return nil, fmt.Errorf("freeze render plan rerun failed: %w", err)
 	}
 	result.RenderPlanCAS = rPlan.CASHash
+	descendantsRegenerated = true
 
-	// 3. Evaluate resolution status
+	// 3. Record the operator's direct-manipulation intent as an append-only audit
+	// row, one per corrected region. The before/after geometry and role are fully
+	// reconstructible from the immutable overridden TextRegionPlan CAS artifact
+	// this correction minted; this row supplies WHO applied WHICH region edit and
+	// WHY. An unrecorded correction must not be reported as successful.
+	if err := s.recordRegionCorrectionAudit(ctx, in, updatedPlan.Regions); err != nil {
+		return nil, err
+	}
+
+	// 4. Evaluate resolution status
 	isResolved := result.LocalizedVisualTrackCAS != "" && result.LocalizedSubtitleCAS != "" && result.RenderPlanCAS != ""
 	if isResolved {
 		targetedMap := make(map[string]bool, len(in.Overrides))
@@ -901,6 +927,45 @@ func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeom
 		result.Message = "Region updated but candidate still requires review"
 	}
 	return result, nil
+}
+
+// recordRegionCorrectionAudit persists one append-only ReviewOverride row per applied
+// region override, naming the corrected region and the operator intent that produced it.
+// The row is region-scoped (no ReviewItemID): a correction is not an acceptance of a
+// projected exception item, so it must never flip a review item to manual_override.
+func (s *ReviewService) recordRegionCorrectionAudit(ctx context.Context, in RegionGeometryCorrectionInput, regions []domain.TrackedTextRegion) error {
+	targeted := make(map[string]bool, len(in.Overrides))
+	for _, ov := range in.Overrides {
+		targeted[strings.TrimSpace(ov.RegionID)] = true
+	}
+
+	operator := strings.TrimSpace(in.Operator)
+	if operator == "" {
+		operator = "operator"
+	}
+
+	for i, reg := range regions {
+		if !targeted[reg.ID] {
+			continue
+		}
+		if err := s.db.SaveReviewOverride(ctx, domain.ReviewOverride{
+			RunID:          in.RunID,
+			JobID:          in.JobID,
+			AssetID:        in.AssetID,
+			TargetLanguage: in.TargetLanguage,
+			ItemType:       domain.ReviewItemTypeRegionGeometry,
+			Stage:          "detect_text",
+			ItemIndex:      i,
+			RegionID:       reg.ID,
+			Action:         string(domain.ReviewOverrideActionRegionGeometry),
+			Reason:         in.Reason,
+			Operator:       operator,
+			CreatedAt:      time.Now().UTC(),
+		}); err != nil {
+			return fmt.Errorf("persist region correction audit for region %q: %w", reg.ID, err)
+		}
+	}
+	return nil
 }
 
 // EvaluateFinalRenderHandoff evaluates whether the exception queue is zero, and if so,

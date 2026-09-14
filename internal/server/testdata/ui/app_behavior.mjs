@@ -56,6 +56,10 @@ class StubElement {
     this.currentTime = 0;
     this.duration = 0;
     this.src = "";
+    this.videoWidth = 0;
+    this.videoHeight = 0;
+    this.capturedPointers = [];
+    this.rect = { left: 0, top: 0, width: 0, height: 0 };
   }
   querySelector(selector) {
     return StubElement.lookup(selector);
@@ -77,7 +81,16 @@ class StubElement {
     this.removed = true;
   }
   removeAttribute(name) {
-    delete this[name];
+    // A real element clears the reflected IDL property rather than deleting it:
+    // `video.removeAttribute("src")` leaves `.src === ""`, not undefined.
+    if (name === "src") this.src = "";
+    else delete this[name];
+  }
+  setPointerCapture(pointerId) {
+    this.capturedPointers.push(pointerId);
+  }
+  getBoundingClientRect() {
+    return this.rect;
   }
   play() {
     return Promise.resolve();
@@ -122,6 +135,19 @@ function createHarness() {
   const els = {
     video,
     toastRegion,
+    videoWrapper: register("#video-wrapper"),
+    regionOverlay: register("#region-overlay", { classes: ["hidden"] }),
+    regionGhost: register("#region-ghost"),
+    regionBox: register("#region-box"),
+    regionBoxTag: register("#region-box-tag"),
+    regionOverlayHint: register("#region-overlay-hint"),
+    regionDiff: register("#region-diff"),
+    regionError: register("#region-error", { classes: ["hidden"] }),
+    regionResult: register("#region-result", { classes: ["hidden"] }),
+    regionDX: register("#region-dx", { value: "0" }),
+    regionDY: register("#region-dy", { value: "0" }),
+    regionDW: register("#region-dw", { value: "0" }),
+    regionDH: register("#region-dh", { value: "0" }),
     timelineViewport: register("#timeline-viewport"),
     playhead: register("#timeline-playhead"),
     timelineTime: register("#timeline-time-display"),
@@ -239,6 +265,23 @@ function createHarness() {
   vm.runInContext("Object.assign(globalThis, globalThis.__operatorUI); delete globalThis.__operatorUI;", context);
   const evalIn = (code) => vm.runInContext(code, context);
   const click = (node, mapping) => node.dispatch("click", { target: { closest: (selector) => mapping[selector] ?? null } });
+  // Pointer gesture on a container: `closest` mirrors what a real event target
+  // resolves to (e.g. a resize handle inside #region-box).
+  const point = (node, type, { clientX = 0, clientY = 0, closest = {}, pointerId = 1, button = 0, buttons = 1 } = {}) =>
+    node.dispatch(type, {
+      clientX,
+      clientY,
+      pointerId,
+      button,
+      buttons,
+      preventDefault: () => {},
+      target: { closest: (selector) => closest[selector] ?? null },
+    });
+  const submit = (form) =>
+    form.dispatch("submit", {
+      preventDefault: () => {},
+      currentTarget: { querySelector: (selector) => (selector === "button[type=submit]" ? { textContent: "apply", dataset: {} } : null) },
+    });
   const settle = () => new Promise((resolve) => setImmediate(resolve));
   // app.js boots itself on load; wait for that async chain and drop its
   // requests/toasts so each test only observes its own actions.
@@ -249,7 +292,7 @@ function createHarness() {
     toastRegion.children.length = 0;
   };
 
-  return { els, requests, evalIn, click, settle, ready, setResponder: (fn) => (respond = fn) };
+  return { els, requests, evalIn, click, point, submit, settle, ready, setResponder: (fn) => (respond = fn) };
 }
 
 function buttonTag(html, action) {
@@ -499,6 +542,382 @@ test("a missing artifact (404) stays silent and an identical failure does not sp
   await failing.evalIn("loadSelectedRun()");
   await failing.evalIn("loadSelectedRun()");
   assert.equal(failing.els.toastRegion.children.length, 1, "a persistent failure must be reported once, not on every poll");
+});
+
+// Canonical TextRegionPlan geometry: 1080x1920 media, tracked box at
+// canonical (100,200,300,80) from 1000-3000ms and (120,210,300,80) at 2000ms.
+// The rendered player is 800x960, so the video is pillarboxed: scale is exactly
+// 0.5 with a 130px horizontal letterbox offset that must be honoured.
+const regionOverlayFixture = `
+state.selectedRunId = "run-1";
+state.selectedRun = { id: "run-1", job_id: "job-1", status: "running", config_snapshot_json: "" };
+state.selectedJob = { id: "job-1", source_asset_id: "asset-1", target_language: "vi" };
+state.preview = { cas_hash: "preview-cas" };
+state.translation = null;
+state.transcript = null;
+state.voiceAssignment = null;
+state.textRegionPlan = {
+  frame_width: 1080,
+  frame_height: 1920,
+  regions: [
+    { id: "reg-box", role: "semantic_text", text: "Bấm để tải", first_seen_ms: 1000, last_seen_ms: 3000,
+      keyframes: [
+        { frame_index: 0, timestamp_ms: 1000, box: { x: 100, y: 200, width: 300, height: 80 }, observed: true },
+        { frame_index: 30, timestamp_ms: 2000, box: { x: 120, y: 210, width: 300, height: 80 }, observed: true }
+      ] },
+    { id: "reg-none", role: "uncertain", text: "Không keyframe", first_seen_ms: 5000, last_seen_ms: 6000, keyframes: [] }
+  ]
+};
+state.reviewItems = [{ id: "rev-region", type: "uncertain_role", severity: "warning", status: "pending", region_id: "reg-box", start_ms: 1000, end_ms: 3000 }];
+state.selectedSegmentIndex = null;
+state.selectedRegionId = null;
+state.selectedReviewItem = null;
+renderInspector();
+`;
+
+// Rendered player (800x960) inside the same-sized wrapper: 1080x1920 media is
+// pillarboxed to a 540x960 content rect at x=130.
+// Only the region override calls, so a submit test observes its own action and
+// not the artifact reloads that follow a successful apply.
+function overrideRequests(h) {
+  return h.requests.filter((request) => request.url.includes("/inspector/override-region"));
+}
+
+// Drives the real playhead path: the preview player emits timeupdate, exactly as
+// it does during playback.
+function playTo(h, timeMs) {
+  h.els.video.currentTime = timeMs / 1000;
+  h.els.video.dispatch("timeupdate", {});
+}
+
+// Selects a region through the real list click path (seek + selection + editor).
+function selectRegionRow(h, regionId, seekMs) {
+  h.click(h.els.regionsList, { "[data-region-seek]": { dataset: { regionSeek: seekMs, regionId } } });
+}
+
+function stageRegionOverlay(h) {
+  h.els.video.rect = { left: 0, top: 0, width: 800, height: 960 };
+  h.els.videoWrapper.rect = { left: 0, top: 0, width: 800, height: 960 };
+}
+
+test("selecting a visual review item seeks and projects its canonical geometry", async () => {
+  const h = createHarness();
+  await h.ready();
+  stageRegionOverlay(h);
+  h.evalIn(regionOverlayFixture);
+
+  h.click(h.els.exceptionList, { "[data-review-id]": { dataset: { reviewId: "rev-region" } } });
+
+  assert.equal(h.els.video.currentTime, 1, "selecting the review item must seek to its timestamp");
+  assert.equal(h.els.regionOverlay.classList.contains("hidden"), false, "the tracked region must be projected over the video");
+  assert.equal(h.els.regionBox.dataset.regionId, "reg-box", "the overlay must project the review item's own region");
+  // The letterbox origin lives on the overlay; the box is canonical px * scale.
+  assert.equal(h.els.regionOverlay.style.left, "130px", "the overlay must be placed on the letterboxed content rect");
+  assert.equal(h.els.regionOverlay.style.top, "0px", "the overlay must be placed on the letterboxed content rect");
+  assert.equal(h.els.regionOverlay.style.width, "540px", "the overlay must be sized to the rendered media, not the element");
+  assert.equal(h.els.regionOverlay.style.height, "960px", "the overlay must be sized to the rendered media, not the element");
+  // canonical (100,200,300,80) at scale 0.5.
+  assert.equal(h.els.regionBox.style.left, "50px", "canonical x must be scaled into the overlay");
+  assert.equal(h.els.regionBox.style.top, "100px", "canonical y must be scaled into the overlay");
+  assert.equal(h.els.regionBox.style.width, "150px", "canonical width must be scaled");
+  assert.equal(h.els.regionBox.style.height, "40px", "canonical height must be scaled");
+  assert.equal(h.els.regionGhost.classList.contains("hidden"), true, "no pending edit means no before-state ghost");
+
+  // Opening the region editor for that same projected region must show the
+  // canonical before-state the operator is about to correct.
+  h.click(h.els.regionsList, { "[data-edit-region]": { dataset: { editRegion: "reg-box" } } });
+  assert.equal(h.els.regionDiff.classList.contains("hidden"), false, "the inspector must show the canonical before state");
+  assert.match(h.els.regionDiff.innerHTML, /x=100 y=200 w=300 h=80/, "the before state must be the canonical geometry");
+  assert.match(h.els.regionDiff.innerHTML, /semantic_text/, "the before state must include the current role");
+});
+
+test("the projected geometry follows the playhead keyframe", async () => {
+  const h = createHarness();
+  await h.ready();
+  stageRegionOverlay(h);
+  h.evalIn(regionOverlayFixture);
+  selectRegionRow(h, "reg-box", "1000");
+  playTo(h, 2500);
+
+  // Keyframe at 2000ms is canonical (120,210) => (60,105) at scale 0.5.
+  assert.equal(h.els.regionBox.style.left, "60px", "the overlay must use the keyframe at the playhead");
+  assert.equal(h.els.regionBox.style.top, "105px", "the overlay must use the keyframe at the playhead");
+});
+
+test("dragging stores canonical deltas, never display pixels", async () => {
+  const h = createHarness();
+  await h.ready();
+  stageRegionOverlay(h);
+  h.evalIn(regionOverlayFixture);
+  selectRegionRow(h, "reg-box", "1000");
+
+  const onBox = { "#region-box": h.els.regionBox };
+  h.point(h.els.videoWrapper, "pointerdown", { clientX: 180, clientY: 100, closest: onBox });
+  h.point(h.els.videoWrapper, "pointermove", { clientX: 205, clientY: 110, closest: onBox });
+  h.point(h.els.videoWrapper, "pointerup", { clientX: 205, clientY: 110, closest: onBox });
+
+  // +25 rendered px / 0.5 scale = +50 canonical px (not +25).
+  assert.equal(h.els.regionDX.value, "50", "drag must convert rendered pixels to canonical media pixels");
+  assert.equal(h.els.regionDY.value, "20", "drag must convert rendered pixels to canonical media pixels");
+  assert.equal(h.els.regionDW.value, "0", "a move must not change the box size");
+  assert.equal(h.els.regionDH.value, "0", "a move must not change the box size");
+  // canonical (150,220) at scale 0.5 inside the 130px pillarbox.
+  assert.equal(h.els.regionBox.style.left, "75px", "the box must render the pending (after) geometry");
+  assert.equal(h.els.regionGhost.classList.contains("hidden"), false, "a pending edit must show the before-state ghost");
+  assert.match(h.els.regionDiff.innerHTML, /Δx \+50/, "the inspector must show the applied delta");
+});
+
+test("dragging a handle resizes from the dragged edge in canonical space", async () => {
+  const h = createHarness();
+  await h.ready();
+  stageRegionOverlay(h);
+  h.evalIn(regionOverlayFixture);
+  selectRegionRow(h, "reg-box", "1000");
+
+  const onHandle = { "[data-region-handle]": { dataset: { regionHandle: "se" } }, "#region-box": h.els.regionBox };
+  h.point(h.els.videoWrapper, "pointerdown", { clientX: 330, clientY: 140, closest: onHandle });
+  h.point(h.els.videoWrapper, "pointermove", { clientX: 355, clientY: 150, closest: onHandle });
+  h.point(h.els.videoWrapper, "pointerup", { clientX: 355, clientY: 150, closest: onHandle });
+
+  assert.equal(h.els.regionDX.value, "0", "a south-east resize must not move the box origin");
+  assert.equal(h.els.regionDW.value, "50", "resize must convert rendered pixels to canonical width");
+  assert.equal(h.els.regionDH.value, "20", "resize must convert rendered pixels to canonical height");
+});
+
+test("a drag beyond the frame is bounded visibly and submits the bounded geometry", async () => {
+  const h = createHarness();
+  await h.ready();
+  stageRegionOverlay(h);
+  h.evalIn(regionOverlayFixture);
+  h.setResponder(() => ({
+    status: 200,
+    payload: { result: { status: "auto_resolved", message: "ok", localized_visual_track_cas: "v", localized_subtitle_cas: "s", render_plan_cas: "r" } },
+  }));
+  selectRegionRow(h, "reg-box", "1000");
+
+  const onBox = { "#region-box": h.els.regionBox };
+  h.point(h.els.videoWrapper, "pointerdown", { clientX: 180, clientY: 100, closest: onBox });
+  h.point(h.els.videoWrapper, "pointermove", { clientX: 3000, clientY: 100, closest: onBox });
+  // The bound is surfaced while the operator is still dragging, so the gesture is
+  // never silently absorbed.
+  assert.equal(h.els.regionBox.classList.contains("is-clamped"), true, "the bound must be visible, not silent");
+  assert.match(h.els.regionOverlayHint.textContent, /biên video/, "the bound must be explained to the operator");
+  h.point(h.els.videoWrapper, "pointerup", { clientX: 3000, clientY: 100, closest: onBox });
+
+  // Keyframes union is canonical (100,200)-(420,290), so the largest legal shift
+  // in a 1080px frame is 1080 - 320 - 100 = 660 - and the same bound keeps the
+  // second keyframe inside the frame, which the RuntimeHost would otherwise reject.
+  assert.equal(h.els.regionDX.value, "660", "an out-of-frame drag must be bounded to the canonical frame");
+  assert.match(h.els.regionDiff.innerHTML, /Δx \+660/, "the committed delta must be the bounded canonical delta");
+
+  h.submit(h.els.regionForm);
+  await h.settle();
+
+  const applied = overrideRequests(h);
+  assert.equal(applied.length, 1, "bounded geometry must still be applicable");
+  assert.equal(applied[0].body.overrides[0].box_delta_x, 660, "only canonical deltas reach RuntimeHost");
+  assert.equal(h.els.regionError.classList.contains("hidden"), true, "bounded geometry is valid, not an error");
+});
+
+test("an out-of-frame typed delta fails closed with an actionable inspector error", async () => {
+  const h = createHarness();
+  await h.ready();
+  stageRegionOverlay(h);
+  h.evalIn(regionOverlayFixture);
+  selectRegionRow(h, "reg-box", "1000");
+
+  h.els.regionDX.value = "-500";
+  h.submit(h.els.regionForm);
+  await h.settle();
+
+  assert.equal(h.requests.length, 0, "invalid geometry must never be sent to RuntimeHost");
+  assert.equal(h.els.regionError.classList.contains("hidden"), false, "the refusal must be surfaced in the Inspector");
+  assert.match(h.els.regionError.textContent, /fail-closed/, "the error must name the fail-closed refusal");
+  assert.match(h.els.regionError.textContent, /1080×1920/, "the error must name the violated frame bounds");
+  assert.match(h.els.regionError.textContent, /reg-box|keyframe/, "the error must be actionable for the edited region");
+});
+
+test("a RuntimeHost region rejection is surfaced and keeps the pending edit", async () => {
+  const h = createHarness();
+  await h.ready();
+  stageRegionOverlay(h);
+  h.evalIn(regionOverlayFixture);
+  h.setResponder((url) => {
+    if (String(url).includes("/inspector/override-region")) {
+      return { status: 422, payload: { error: "subtitle or overlay overlaps protected region" } };
+    }
+    return loadRunResponder(() => ({ status: 404, payload: { error: "not found" } }))(url);
+  });
+  selectRegionRow(h, "reg-box", "1000");
+
+  h.els.regionDX.value = "50";
+  // The rejection path legitimately logs the RuntimeHost failure; the harness
+  // asserts on the surfaced outcome instead of the console trace.
+  const realConsoleError = console.error;
+  console.error = () => {};
+  try {
+    h.submit(h.els.regionForm);
+    await h.settle();
+  } finally {
+    console.error = realConsoleError;
+  }
+
+  assert.equal(overrideRequests(h).length, 1, "the edit must be attempted through the RuntimeHost override flow");
+  assert.equal(h.els.regionError.classList.contains("hidden"), false, "the rejection must reach the Inspector");
+  assert.match(h.els.regionError.textContent, /protected region/, "the Inspector error must carry the RuntimeHost reason");
+  assert.equal(h.els.regionDX.value, "50", "a rejected edit must stay pending so the operator can correct it");
+  assert.equal(h.els.regionResult.classList.contains("hidden"), true, "no success outcome may be shown for a rejected edit");
+});
+
+test("applying an edit posts canonical deltas to the run override flow and reports descendants", async () => {
+  const h = createHarness();
+  await h.ready();
+  stageRegionOverlay(h);
+  h.evalIn(regionOverlayFixture);
+  h.setResponder((url) => {
+    if (String(url).includes("/inspector/override-region")) {
+      return {
+        status: 200,
+        payload: {
+          result: {
+            status: "auto_resolved",
+            message: "Region geometry/classification updated and visual track regenerated (auto-resolved)",
+            localized_visual_track_cas: "vis-cas-1",
+            localized_subtitle_cas: "sub-cas-1",
+            render_plan_cas: "plan-cas-1",
+          },
+        },
+      };
+    }
+    return loadRunResponder(() => ({ status: 404, payload: { error: "not found" } }))(url);
+  });
+  selectRegionRow(h, "reg-box", "1000");
+  h.els.regionRole.value = "instructional_ui_text";
+
+  h.els.regionDX.value = "50";
+  h.els.regionDY.value = "20";
+  h.submit(h.els.regionForm);
+  await h.settle();
+
+  const applied = overrideRequests(h);
+  assert.equal(applied.length, 1, "apply must use the existing run-scoped region override flow");
+  const request = applied[0];
+  assert.match(request.url, /\/api\/v1\/runs\/run-1\/inspector\/override-region$/);
+  assert.equal(request.method, "POST");
+  assert.equal(request.body.run_id, "run-1");
+  assert.equal(request.body.asset_id, "asset-1");
+  assert.equal(request.body.target_language, "vi");
+  assert.equal(request.body.operator, "local-operator");
+  const override = request.body.overrides[0];
+  assert.equal(override.region_id, "reg-box");
+  assert.equal(override.box_delta_x, 50, "canonical deltas must be posted, not display pixels");
+  assert.equal(override.box_delta_y, 20);
+  assert.equal(override.new_role, "instructional_ui_text", "reclassification must ride along with the geometry edit");
+  assert.equal(request.body.overrides.length, 1, "only the edited region may be targeted");
+
+  const result = h.els.regionResult;
+  assert.equal(result.classList.contains("hidden"), false, "the apply outcome must be confirmed in the Inspector");
+  assert.match(result.innerHTML, /auto-resolved/, "the outcome must state the resolution status");
+  assert.match(result.innerHTML, /LocalizedVisualTrack: vis-cas-1/, "the outcome must name the visual descendant that reran");
+  assert.match(result.innerHTML, /RenderPlan: plan-cas-1/, "the outcome must name the render descendant that reran");
+  assert.equal(h.els.regionDX.value, "0", "the applied deltas are spent once the canonical plan reloads");
+});
+
+test("a west-edge resize past the frame stops at the bound and keeps the east edge", async () => {
+  const h = createHarness();
+  await h.ready();
+  stageRegionOverlay(h);
+  h.evalIn(regionOverlayFixture);
+  selectRegionRow(h, "reg-box", "1000");
+
+  // Keyframe union is canonical (100,200)-(420,290): the east edge is 420.
+  const onHandle = { "[data-region-handle]": { dataset: { regionHandle: "w" } }, "#region-box": h.els.regionBox };
+  h.point(h.els.videoWrapper, "pointerdown", { clientX: 50, clientY: 100, closest: onHandle });
+  h.point(h.els.videoWrapper, "pointermove", { clientX: -5000, clientY: 100, closest: onHandle });
+  // The bound is surfaced while the operator is still dragging, so the clamped
+  // edge is never silently absorbed.
+  assert.equal(h.els.regionBox.classList.contains("is-clamped"), true, "hitting the frame bound must be visible");
+  assert.match(h.els.regionOverlayHint.textContent, /biên video/, "hitting the frame bound must be explained");
+  h.point(h.els.videoWrapper, "pointerup", { clientX: -5000, clientY: 100, closest: onHandle });
+
+  // Left edge reaches 0 => dx -100; the dragged edge must stop there, so the
+  // width grows by exactly that much and the anchored east edge stays at 420
+  // (420 - 0 width, not a box grown rightward to the 1080 frame bound).
+  assert.equal(h.els.regionDX.value, "-100", "a west-edge resize must stop the dragged edge at the frame");
+  assert.equal(h.els.regionDW.value, "100", "the width must take up exactly the clamped movement");
+  assert.match(h.els.regionDiff.innerHTML, /x=100 y=200 w=300 h=80/, "the before state stays canonical");
+
+  h.submit(h.els.regionForm);
+  await h.settle();
+  const applied = overrideRequests(h);
+  assert.equal(applied.length, 1, "a bounded resize must be applicable");
+  assert.equal(applied[0].body.overrides[0].box_delta_x, -100, "the clamped delta is what RuntimeHost receives");
+  assert.equal(applied[0].body.overrides[0].box_delta_w, 100, "the clamped resize is what RuntimeHost receives");
+});
+
+test("a second pointer cannot hijack the active gesture and a missed release ends it", async () => {
+  const h = createHarness();
+  await h.ready();
+  stageRegionOverlay(h);
+  h.evalIn(regionOverlayFixture);
+  selectRegionRow(h, "reg-box", "1000");
+
+  const onBox = { "#region-box": h.els.regionBox };
+  h.point(h.els.videoWrapper, "pointerdown", { clientX: 180, clientY: 100, closest: onBox, pointerId: 1 });
+  h.point(h.els.videoWrapper, "pointermove", { clientX: 205, clientY: 100, closest: onBox, pointerId: 1 });
+  // A second finger touching the same region must not restart the drag.
+  h.point(h.els.videoWrapper, "pointerdown", { clientX: 600, clientY: 600, closest: onBox, pointerId: 2 });
+  h.point(h.els.videoWrapper, "pointermove", { clientX: 700, clientY: 700, closest: onBox, pointerId: 2 });
+  assert.equal(h.els.regionDX.value, "0", "a foreign pointer must not move the box before the gesture ends");
+  h.point(h.els.videoWrapper, "pointerup", { clientX: 700, clientY: 700, closest: onBox, pointerId: 2 });
+  assert.equal(h.els.regionDX.value, "0", "a foreign pointerup must not commit the gesture");
+  h.point(h.els.videoWrapper, "pointerup", { clientX: 205, clientY: 100, closest: onBox, pointerId: 1 });
+  // +25 rendered px / 0.5 scale, from the owning pointer only.
+  assert.equal(h.els.regionDX.value, "50", "the owning pointer must still commit its own gesture");
+
+  // A move with no button held means the release was missed: the gesture ends at
+  // the last position tracked under a press instead of following the bare cursor.
+  h.point(h.els.videoWrapper, "pointerdown", { clientX: 200, clientY: 100, closest: onBox, pointerId: 1 });
+  h.point(h.els.videoWrapper, "pointermove", { clientX: 400, clientY: 100, closest: onBox, pointerId: 1, buttons: 0 });
+  assert.equal(h.els.regionDX.value, "50", "a missed release must not invent movement");
+  h.point(h.els.videoWrapper, "pointermove", { clientX: 700, clientY: 400, closest: onBox, pointerId: 1, buttons: 0 });
+  assert.equal(h.els.regionDX.value, "50", "a released pointer must not keep dragging on hover");
+
+  // The next press starts a fresh gesture that accumulates onto the pending edit
+  // (+50 canonical already in the form, +50 rendered = +100 canonical more).
+  h.point(h.els.videoWrapper, "pointerdown", { clientX: 200, clientY: 100, closest: onBox, pointerId: 1 });
+  h.point(h.els.videoWrapper, "pointermove", { clientX: 250, clientY: 100, closest: onBox, pointerId: 1 });
+  h.point(h.els.videoWrapper, "pointerup", { clientX: 250, clientY: 100, closest: onBox, pointerId: 1 });
+  assert.equal(h.els.regionDX.value, "150", "a fresh gesture must accumulate onto the pending edit");
+});
+
+test("a region without keyframes projects nothing instead of inventing geometry", async () => {
+  const h = createHarness();
+  await h.ready();
+  stageRegionOverlay(h);
+  h.evalIn(regionOverlayFixture);
+
+  selectRegionRow(h, "reg-none", "5000");
+
+  assert.equal(h.els.regionOverlay.classList.contains("hidden"), true, "absent canonical geometry must not be invented");
+  assert.equal(h.els.regionBox.dataset.regionId, "", "no region may stay armed for direct manipulation");
+});
+
+test("the overlay follows the playhead when no region is selected", async () => {
+  const h = createHarness();
+  await h.ready();
+  stageRegionOverlay(h);
+  h.evalIn(regionOverlayFixture);
+
+  playTo(h, 1500);
+  assert.equal(h.els.regionOverlay.classList.contains("hidden"), false, "the region live under the playhead must be projected");
+  assert.equal(h.els.regionBox.dataset.regionId, "reg-box", "the projected region must be the one active at the playhead");
+
+  playTo(h, 5500);
+  assert.equal(h.els.regionOverlay.classList.contains("hidden"), true, "a keyframe-less active region must degrade to no overlay");
+
+  playTo(h, 1500);
+  assert.equal(h.els.regionOverlay.classList.contains("hidden"), false, "returning to a tracked region must restore the projection");
 });
 
 let failed = 0;

@@ -275,6 +275,53 @@ tr.is-selected-row td { background: rgba(231,255,87,.03); }
 .video-overlay-placeholder strong { font-size: 12px; }
 .video-overlay-placeholder span { color: var(--text-dim); font-size: 11px; max-width: 320px; }
 
+/* Direct-manipulation text-region overlay.
+   #region-overlay is positioned and sized to the rendered (letterboxed) video
+   content rect, so .region-ghost/.region-box offsets are canonical pixels scaled
+   by one factor and can never be persisted as display pixels. */
+.region-overlay { position: absolute; pointer-events: none; z-index: 3; }
+.region-ghost, .region-box { position: absolute; }
+.region-ghost { border: 1px dashed rgba(255,255,255,.5); background: rgba(255,255,255,.045); border-radius: 2px; }
+.region-ghost::after { content: "trước"; position: absolute; top: -16px; left: 0; font-size: 9px; letter-spacing: .04em; text-transform: uppercase; color: var(--text-dim); }
+.region-box { --handle-hit: 7px; --handle-hit-x: 5px; border: 1.5px solid var(--accent); background: rgba(231,255,87,.12); border-radius: 2px; pointer-events: auto; cursor: move; touch-action: none; box-shadow: 0 0 0 1px rgba(0,0,0,.55); }
+.region-box.is-clamped { border-color: var(--warning); background: rgba(241,184,75,.16); }
+.region-box.is-dragging { cursor: grabbing; }
+.region-box-tag { position: absolute; left: 0; top: -18px; max-width: 100%; padding: 1px 5px; border-radius: 4px; background: var(--accent); color: var(--accent-ink); font: 700 9.5px/1.5 ui-monospace, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.region-handle { position: absolute; width: 11px; height: 11px; background: var(--accent); border: 1px solid #05060700; border-radius: 2px; touch-action: none; }
+/* Handle hit areas expand OUTWARD only. A uniform inset would reach ~12px into
+   the box and, on a short region (e.g. 55 canonical px tall), the n/s hit zones
+   would blank the whole body and make the move gesture unreachable. */
+.region-handle::before { content: ""; position: absolute; }
+.region-handle[data-region-handle="n"]::before { inset: calc(-1 * var(--handle-hit)) calc(-1 * var(--handle-hit-x)) 0; }
+.region-handle[data-region-handle="s"]::before { inset: 0 calc(-1 * var(--handle-hit-x)) calc(-1 * var(--handle-hit)); }
+.region-handle[data-region-handle="w"]::before { inset: calc(-1 * var(--handle-hit-x)) 0 calc(-1 * var(--handle-hit-x)) calc(-1 * var(--handle-hit)); }
+.region-handle[data-region-handle="e"]::before { inset: calc(-1 * var(--handle-hit-x)) calc(-1 * var(--handle-hit)) calc(-1 * var(--handle-hit-x)) 0; }
+.region-handle[data-region-handle="nw"]::before { inset: calc(-1 * var(--handle-hit)) 0 0 calc(-1 * var(--handle-hit)); }
+.region-handle[data-region-handle="ne"]::before { inset: calc(-1 * var(--handle-hit)) calc(-1 * var(--handle-hit)) 0 0; }
+.region-handle[data-region-handle="se"]::before { inset: 0 calc(-1 * var(--handle-hit)) calc(-1 * var(--handle-hit)) 0; }
+.region-handle[data-region-handle="sw"]::before { inset: 0 0 calc(-1 * var(--handle-hit)) calc(-1 * var(--handle-hit)); }
+.region-handle[data-region-handle="nw"] { left: -6px; top: -6px; cursor: nwse-resize; }
+.region-handle[data-region-handle="n"] { left: 50%; top: -6px; margin-left: -5.5px; cursor: ns-resize; }
+.region-handle[data-region-handle="ne"] { right: -6px; top: -6px; cursor: nesw-resize; }
+.region-handle[data-region-handle="e"] { right: -6px; top: 50%; margin-top: -5.5px; cursor: ew-resize; }
+.region-handle[data-region-handle="se"] { right: -6px; bottom: -6px; cursor: nwse-resize; }
+.region-handle[data-region-handle="s"] { left: 50%; bottom: -6px; margin-left: -5.5px; cursor: ns-resize; }
+.region-handle[data-region-handle="sw"] { left: -6px; bottom: -6px; cursor: nesw-resize; }
+.region-handle[data-region-handle="w"] { left: -6px; top: 50%; margin-top: -5.5px; cursor: ew-resize; }
+.region-overlay-hint { position: absolute; left: 0; bottom: -20px; margin: 0; color: var(--warning); font-size: 10px; white-space: nowrap; }
+
+/* Region editor: before/after truth, fail-closed error, apply outcome */
+.region-diff { margin-top: 10px; border: 1px solid var(--border); border-radius: 9px; padding: 9px 10px; display: grid; gap: 4px; background: var(--surface-soft); }
+.region-diff-row { display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 8px; align-items: baseline; }
+.region-diff-row span:first-child { color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+.region-diff-row code { font: 500 10.5px/1.5 ui-monospace, monospace; color: var(--text); overflow-wrap: anywhere; }
+.region-diff-row.is-changed code { color: var(--accent); }
+.region-error { margin: 10px 0 0; border: 1px solid rgba(255,107,107,.45); border-left-width: 3px; border-radius: 8px; padding: 8px 10px; background: rgba(255,107,107,.07); color: var(--text); font-size: 11px; line-height: 1.45; }
+.region-result { margin-top: 10px; border: 1px solid var(--border); border-left: 3px solid var(--success); border-radius: 8px; padding: 9px 10px; display: grid; gap: 4px; background: var(--surface-soft); }
+.region-result.is-pending { border-left-color: var(--warning); }
+.region-result strong { font-size: 11px; }
+.region-result span { color: var(--text-dim); font: 500 10.5px/1.5 ui-monospace, monospace; overflow-wrap: anywhere; }
+
 /* Observational Timeline */
 .observational-timeline-panel { padding: 12px 14px 16px; border-top: 1px solid var(--border); background: #080a0d; display: flex; flex-direction: column; gap: 10px; }
 .timeline-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -452,4 +499,12 @@ tr.is-selected-row td { background: rgba(231,255,87,.03); }
   .video-wrapper { min-height: 220px; }
   .form-grid { grid-template-columns: 1fr; }
   .field-span-2 { grid-column: auto; }
+  /* Direct manipulation degrades safely on narrow layouts: handles keep their
+     generous touch hit area and hints wrap instead of overflowing the viewport. */
+  .region-box { --handle-hit: 11px; }
+  .region-overlay-hint { white-space: normal; }
+}
+
+@media (pointer: coarse) {
+  .region-box { --handle-hit: 12px; }
 }

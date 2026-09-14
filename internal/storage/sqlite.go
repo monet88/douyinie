@@ -3762,6 +3762,25 @@ func (s *DB) SaveTextRegionPlanIndex(ctx context.Context, idx TextRegionPlanInde
 	return nil
 }
 
+// DeleteTextRegionPlanIndex withdraws one plan row for an asset. A correction persists the
+// overridden plan before regenerating its descendants (LocalizeVisualTrack resolves the current
+// plan by index), so a regeneration failure must be able to take that row back out: otherwise a
+// rejected edit stays the asset's latest plan even though the API failed closed.
+func (s *DB) DeleteTextRegionPlanIndex(ctx context.Context, assetID, provenanceHash string) error {
+	if strings.TrimSpace(assetID) == "" || strings.TrimSpace(provenanceHash) == "" {
+		return errors.New("asset_id and provenance_hash are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM text_region_plans WHERE asset_id = ? AND provenance_hash = ?`,
+		assetID, provenanceHash,
+	); err != nil {
+		return fmt.Errorf("delete text_region_plans index: %w", err)
+	}
+	return nil
+}
+
 // GetTextRegionPlanIndex retrieves the latest index row for an asset.
 func (s *DB) GetTextRegionPlanIndex(ctx context.Context, assetID string) (*TextRegionPlanIndex, error) {
 	s.mu.RLock()
