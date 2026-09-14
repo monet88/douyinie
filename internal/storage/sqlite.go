@@ -3889,6 +3889,23 @@ func (s *DB) SaveRenderPlanIndex(ctx context.Context, idx RenderPlanIndex) error
 	return nil
 }
 
+// DeleteRenderArtifactIndex withdraws a preview/final render artifact index row.
+// The CAS blob is immutable and stays; the index row is what makes an artifact
+// the latest one a reader resolves, so a rejected correction takes back the row.
+func (s *DB) DeleteRenderArtifactIndex(ctx context.Context, provenanceHash string) error {
+	if strings.TrimSpace(provenanceHash) == "" {
+		return errors.New("provenance_hash is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM render_artifacts WHERE provenance_hash = ?`, provenanceHash,
+	); err != nil {
+		return fmt.Errorf("delete render_artifacts index: %w", err)
+	}
+	return nil
+}
+
 // DeleteRenderPlanIndex withdraws one render plan row by provenance. A region correction
 // regenerates its render plan before recording the operator's audit row, so a failure after that
 // regeneration must be able to take the plan back out: otherwise a correction that reported an
@@ -4371,41 +4388,64 @@ func (s *DB) GetLocalizedVisualTrackByProvenance(ctx context.Context, provenance
 
 // SaveReviewOverride records an auditable operator acceptance/override of a flagged exception item.
 func (s *DB) SaveReviewOverride(ctx context.Context, ro domain.ReviewOverride) error {
+	return s.SaveReviewOverrides(ctx, []domain.ReviewOverride{ro})
+}
+
+// SaveReviewOverrides persists a batch of append-only override rows in one
+// transaction. A correction records one row per corrected region and treats that
+// batch as its commit point, so a partially written batch — some regions recorded,
+// others not — must never survive a failed correction: the audit trail would claim
+// part of an edit that was rolled back.
+func (s *DB) SaveReviewOverrides(ctx context.Context, overrides []domain.ReviewOverride) error {
+	if len(overrides) == 0 {
+		return nil
+	}
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if ro.ID == "" {
-		ro.ID = uuid.NewString()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin review_override batch tx: %w", err)
 	}
-	if ro.CreatedAt.IsZero() {
-		ro.CreatedAt = time.Now().UTC()
-	}
-	if ro.Action == "" {
-		ro.Action = "manual_override"
-	}
+	defer tx.Rollback()
 
 	query := `INSERT INTO review_overrides (id, run_id, job_id, asset_id, target_language, review_item_id, item_type, stage, item_index, segment_id, region_id, action, reason, operator, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-
-	_, err := s.db.ExecContext(ctx, query,
-		ro.ID,
-		ro.RunID,
-		ro.JobID,
-		ro.AssetID,
-		ro.TargetLanguage,
-		ro.ReviewItemID,
-		string(ro.ItemType),
-		ro.Stage,
-		ro.ItemIndex,
-		ro.SegmentID,
-		ro.RegionID,
-		ro.Action,
-		ro.Reason,
-		ro.Operator,
-		ro.CreatedAt.Format(time.RFC3339Nano),
-	)
-	if err != nil {
-		return fmt.Errorf("insert review_override: %w", err)
+	for _, ro := range overrides {
+		if ro.ID == "" {
+			ro.ID = uuid.NewString()
+		}
+		if ro.CreatedAt.IsZero() {
+			ro.CreatedAt = time.Now().UTC()
+		}
+		if ro.Action == "" {
+			ro.Action = "manual_override"
+		}
+		if _, err := tx.ExecContext(ctx, query,
+			ro.ID,
+			ro.RunID,
+			ro.JobID,
+			ro.AssetID,
+			ro.TargetLanguage,
+			ro.ReviewItemID,
+			string(ro.ItemType),
+			ro.Stage,
+			ro.ItemIndex,
+			ro.SegmentID,
+			ro.RegionID,
+			ro.Action,
+			ro.Reason,
+			ro.Operator,
+			ro.CreatedAt.Format(time.RFC3339Nano),
+		); err != nil {
+			return fmt.Errorf("insert review_override: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit review_override batch tx: %w", err)
 	}
 	return nil
 }

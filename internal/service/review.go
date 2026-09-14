@@ -233,6 +233,7 @@ type RegionGeometryCorrectionResult struct {
 	LocalizedVisualTrackCAS string                  `json:"localized_visual_track_cas"`
 	LocalizedSubtitleCAS    string                  `json:"localized_subtitle_cas"`
 	RenderPlanCAS           string                  `json:"render_plan_cas,omitempty"`
+	PreviewRenderCAS        string                  `json:"preview_render_cas,omitempty"`
 	Status                  domain.ReviewItemStatus `json:"status"` // "auto_resolved" or "pending"
 	Message                 string                  `json:"message"`
 }
@@ -731,6 +732,12 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 	return result, nil
 }
 
+// regionCorrectionRollbackTimeout bounds the withdrawal of a rejected correction.
+// The rollback runs detached from the request context, so it needs a deadline of
+// its own: without one, a healthy database that is slow to answer could hold the
+// request goroutine (and its transaction) open indefinitely.
+const regionCorrectionRollbackTimeout = 15 * time.Second
+
 // CorrectRegionGeometry applies direct-manipulation overrides (reclassify, drag, resize, relabel)
 // to text regions and regenerates the visual track and render plan descendants.
 func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeometryCorrectionInput) (result *RegionGeometryCorrectionResult, err error) {
@@ -849,12 +856,19 @@ func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeom
 		if err == nil {
 			return
 		}
+		// The withdrawal must not depend on the request that failed: a client that
+		// disconnects (or a cancelled job) between persistence and the audit row is
+		// exactly when the rejected state is most likely to be left current, so the
+		// rollback runs on a context detached from that cancellation and bounded by
+		// its own deadline instead of running on a context that is already done.
+		rollbackCtx, cancelRollback := context.WithTimeout(context.WithoutCancel(ctx), regionCorrectionRollbackTimeout)
+		defer cancelRollback()
 		if updatedPlan.ProvenanceHash != planIdx.ProvenanceHash {
-			if derr := s.db.DeleteTextRegionPlanIndex(ctx, in.AssetID, updatedPlan.ProvenanceHash); derr != nil {
+			if derr := s.db.DeleteTextRegionPlanIndex(rollbackCtx, in.AssetID, updatedPlan.ProvenanceHash); derr != nil {
 				err = fmt.Errorf("%w (and the rejected plan could not be withdrawn: %v)", err, derr)
 			}
 		}
-		if derr := s.withdrawCorrectionDescendants(ctx, in, priorDescendants); derr != nil {
+		if derr := s.withdrawCorrectionDescendants(rollbackCtx, in, priorDescendants); derr != nil {
 			err = fmt.Errorf("%w (and the rejected descendants could not be withdrawn: %v)", err, derr)
 		}
 	}()
@@ -914,6 +928,25 @@ func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeom
 	}
 	result.RenderPlanCAS = rPlan.CASHash
 
+	// Render the preview the operator will actually look at from the plan just frozen.
+	// The UI resolves "the run's preview" as the latest preview artifact, so a refrozen
+	// plan without a new preview leaves the pre-correction geometry on screen after a
+	// reported success. Rendering is pinned to this exact plan, and it reuses the
+	// already-frozen DubMix/DubSegment audio: no speech, translation, TTS or audio stage
+	// runs here.
+	previewArt, err := s.renderSvc.RenderPreview(ctx, RenderExecutionInput{
+		RunID:          in.RunID,
+		JobID:          in.JobID,
+		AssetID:        in.AssetID,
+		TargetLanguage: in.TargetLanguage,
+		PlanProvenance: rPlan.ProvenanceHash,
+		PlanCAS:        rPlan.CASHash,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("preview render for the corrected plan failed: %w", err)
+	}
+	result.PreviewRenderCAS = previewArt.CASHash
+
 	// 3. Record the operator's direct-manipulation intent as an append-only audit
 	// row, one per corrected region. The before/after geometry and role are fully
 	// reconstructible from the immutable overridden TextRegionPlan CAS artifact
@@ -924,7 +957,7 @@ func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeom
 	}
 
 	// 4. Evaluate resolution status
-	isResolved := result.LocalizedVisualTrackCAS != "" && result.LocalizedSubtitleCAS != "" && result.RenderPlanCAS != ""
+	isResolved := result.LocalizedVisualTrackCAS != "" && result.LocalizedSubtitleCAS != "" && result.RenderPlanCAS != "" && result.PreviewRenderCAS != ""
 	if isResolved {
 		targetedMap := make(map[string]bool, len(in.Overrides))
 		for _, ov := range in.Overrides {
@@ -955,11 +988,13 @@ type regionCorrectionDescendants struct {
 	visual   string
 	subtitle string
 	render   string
+	preview  string
 }
 
-// currentDescendantArtifacts resolves the visual/subtitle/render artifacts current for the scope a
-// region correction regenerates: run-scoped when the caller supplied a run, asset-latest for the
-// legacy asset-scoped route, mirroring how the correction's descendants resolve it themselves.
+// currentDescendantArtifacts resolves the visual/subtitle/render/preview artifacts current for the
+// scope a region correction regenerates: run-scoped when the caller supplied a run, asset-latest
+// for the legacy asset-scoped route, mirroring how the correction's descendants resolve it
+// themselves.
 //
 // A missing artifact is a valid empty snapshot. Every other storage error is returned: a read
 // failure silently treated as "nothing is current" would skip part of a rollback (or let a
@@ -988,6 +1023,15 @@ func (s *ReviewService) currentDescendantArtifacts(ctx context.Context, in Regio
 		if render != nil {
 			snap.render = render.ProvenanceHash
 		}
+		preview, err := s.db.GetRenderArtifactIndicesByRun(ctx, runID)
+		if err != nil {
+			return snap, fmt.Errorf("read current preview render: %w", err)
+		}
+		for _, idx := range preview {
+			if idx.Kind == domain.RenderKindPreview && strings.EqualFold(idx.TargetLanguage, in.TargetLanguage) {
+				snap.preview = idx.ProvenanceHash
+			}
+		}
 		return snap, nil
 	}
 
@@ -1011,6 +1055,13 @@ func (s *ReviewService) currentDescendantArtifacts(ctx context.Context, in Regio
 	}
 	if render != nil {
 		snap.render = render.ProvenanceHash
+	}
+	preview, err := s.db.GetLatestRenderArtifactIndex(ctx, in.AssetID, in.TargetLanguage, domain.RenderKindPreview)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return snap, fmt.Errorf("read current preview render: %w", err)
+	}
+	if preview != nil {
+		snap.preview = preview.ProvenanceHash
 	}
 	return snap, nil
 }
@@ -1043,6 +1094,11 @@ func (s *ReviewService) withdrawCorrectionDescendants(ctx context.Context, in Re
 			failures = append(failures, err.Error())
 		}
 	}
+	if now.preview != "" && now.preview != prior.preview {
+		if err := s.db.DeleteRenderArtifactIndex(ctx, now.preview); err != nil {
+			failures = append(failures, err.Error())
+		}
+	}
 	if len(failures) > 0 {
 		return errors.New(strings.Join(failures, "; "))
 	}
@@ -1053,6 +1109,10 @@ func (s *ReviewService) withdrawCorrectionDescendants(ctx context.Context, in Re
 // region override, naming the corrected region and the operator intent that produced it.
 // The row is region-scoped (no ReviewItemID): a correction is not an acceptance of a
 // projected exception item, so it must never flip a review item to manual_override.
+//
+// The batch is committed in one transaction: the audit rows are the correction's commit
+// point, so a partially recorded batch would leave an audit trail of an edit the caller
+// then reports as failed — and the rollback has nothing to withdraw it by.
 func (s *ReviewService) recordRegionCorrectionAudit(ctx context.Context, in RegionGeometryCorrectionInput, regions []domain.TrackedTextRegion) error {
 	targeted := make(map[string]bool, len(in.Overrides))
 	for _, ov := range in.Overrides {
@@ -1064,11 +1124,12 @@ func (s *ReviewService) recordRegionCorrectionAudit(ctx context.Context, in Regi
 		operator = "operator"
 	}
 
+	rows := make([]domain.ReviewOverride, 0, len(regions))
 	for i, reg := range regions {
 		if !targeted[reg.ID] {
 			continue
 		}
-		if err := s.db.SaveReviewOverride(ctx, domain.ReviewOverride{
+		rows = append(rows, domain.ReviewOverride{
 			RunID:          in.RunID,
 			JobID:          in.JobID,
 			AssetID:        in.AssetID,
@@ -1081,9 +1142,10 @@ func (s *ReviewService) recordRegionCorrectionAudit(ctx context.Context, in Regi
 			Reason:         in.Reason,
 			Operator:       operator,
 			CreatedAt:      time.Now().UTC(),
-		}); err != nil {
-			return fmt.Errorf("persist region correction audit for region %q: %w", reg.ID, err)
-		}
+		})
+	}
+	if err := s.db.SaveReviewOverrides(ctx, rows); err != nil {
+		return fmt.Errorf("persist region correction audit: %w", err)
 	}
 	return nil
 }

@@ -708,7 +708,13 @@ function renderMediaURL(kind) {
   const asset = encodeURIComponent(state.selectedJob.source_asset_id);
   const target = encodeURIComponent(state.selectedJob.target_language || "vi");
   const runParam = state.selectedRun ? `&run_id=${encodeURIComponent(state.selectedRun.id)}` : "";
-  return `/api/v1/assets/${asset}/render/${kind}/media?target_language=${target}${runParam}`;
+  // The media route always serves the run's *latest* artifact for this kind, so the
+  // URL alone cannot tell the player that a correction replaced the preview it is
+  // still showing. Binding the artifact identity into the URL is what makes the
+  // player refetch instead of keeping the previous geometry on screen.
+  const artifact = kind === "preview" ? state.preview : state.final;
+  const versionParam = artifact?.cas_hash ? `&artifact=${encodeURIComponent(artifact.cas_hash)}` : "";
+  return `/api/v1/assets/${asset}/render/${kind}/media?target_language=${target}${runParam}${versionParam}`;
 }
 
 function renderZoneCenter() {
@@ -1363,7 +1369,8 @@ function renderRegionApplyResult(result) {
     <span>${esc(result.message || "")}</span>
     <span>LocalizedVisualTrack: ${esc(shortID(result.localized_visual_track_cas || "—", 18))}</span>
     <span>LocalizedSubtitle: ${esc(shortID(result.localized_subtitle_cas || "—", 18))}</span>
-    <span>RenderPlan: ${esc(shortID(result.render_plan_cas || "—", 18))}</span>`;
+    <span>RenderPlan: ${esc(shortID(result.render_plan_cas || "—", 18))}</span>
+    <span>Preview render: ${esc(shortID(result.preview_render_cas || "—", 18))}</span>`;
 }
 
 function beginRegionDrag(event) {
