@@ -88,6 +88,13 @@ type Command struct {
 	Inputs     []ArtifactRef  `json:"inputs"`
 	Config     map[string]any `json:"config"`
 	OutputPath string         `json:"output_path"`
+
+	// CPUOnly declares that this command's stage runs on CPU only, so the host
+	// must not acquire the authoritative single-GPU lease before spawning. The
+	// zero value keeps the GPU-leased behavior every accelerator-backed family
+	// relies on; only a provider whose resource contract is CPU-only sets it
+	// (Issue #91).
+	CPUOnly bool `json:"cpu_only,omitempty"`
 }
 
 // ArtifactRef is a metadata-only reference to a content-addressed artifact.
