@@ -55,6 +55,7 @@ type FitEvaluationInput struct {
 	CurrentSpeed       float64 `json:"current_speed"`        // Current speed multiplier
 	CanShortenText     bool    `json:"can_shorten_text"`     // Whether text can be further condensed
 	SupportsSpeedFit   bool    `json:"supports_speed_fit"`   // Whether provider supports native speed adjustment
+	FixedRateVoice     bool    `json:"fixed_rate_voice"`     // Whether a non-1.0 speed request fails closed (preset-voice lanes)
 }
 
 // FitEvaluationResult contains the controller's decision and fit metrics.
@@ -155,7 +156,10 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 		speedFactor = in.CurrentSpeed * (float64(in.MeasuredDurationMs) / float64(usableSlotMs))
 	}
 
-	if in.AttemptNumber < 2 && speedFactor <= fc.config.MaxSpeedMultiplier && (in.SupportsSpeedFit || speedFactor <= 1.15) {
+	// A fixed-rate preset-voice lane rejects any non-1.0 speed request, so a
+	// speed resynthesis is not a remedy for it: overrun must go through
+	// rewrite/regroup/review instead of a request the provider cannot honor.
+	if !in.FixedRateVoice && in.AttemptNumber < 2 && speedFactor <= fc.config.MaxSpeedMultiplier && (in.SupportsSpeedFit || speedFactor <= 1.15) {
 		return FitEvaluationResult{
 			Decision:           domain.FitActionResynth,
 			UsableSlotMs:       usableSlotMs,

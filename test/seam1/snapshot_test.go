@@ -918,18 +918,46 @@ func TestSeam1_Snapshot_TTS_RegistrationAndVerification(t *testing.T) {
 	licSvc := governance.NewLicenseService(db)
 	snapSvc := governance.NewSnapshotService(db, licSvc)
 
-	// 1. Verify default preset voice rotations (Issue #68)
+	// 1. Verify default preset voice rotations (Issue #68 / #93)
+	// Vietnamese unattended default is the approved ZeroTTS rotation, in order.
 	viVoices := provider.DefaultPresetVoices("vi")
-	if len(viVoices) != 4 {
-		t.Fatalf("expected exactly 4 VieNeu preset voices in default rotation, got %d", len(viVoices))
+	if len(viVoices) != provider.DefaultVIUnattendedVoiceCount {
+		t.Fatalf("expected exactly %d ZeroTTS preset voices in the unattended VI rotation, got %d",
+			provider.DefaultVIUnattendedVoiceCount, len(viVoices))
 	}
-	expectedVI := []string{"Trúc Ly", "Phạm Tuyên", "Đoan Trang", "Xuân Vĩnh"}
+	expectedVI := []string{"quangminh", "maichi"}
 	for i, exp := range expectedVI {
 		if viVoices[i].VoiceID != exp {
 			t.Errorf("vi voice [%d] expected %s, got %s", i, exp, viVoices[i].VoiceID)
 		}
-		if viVoices[i].ProviderID != provider.VieNeuProviderID {
-			t.Errorf("vi voice [%d] provider expected %s, got %s", i, provider.VieNeuProviderID, viVoices[i].ProviderID)
+		if viVoices[i].ProviderID != provider.ZeroTTSProviderID {
+			t.Errorf("vi voice [%d] provider expected %s, got %s", i, provider.ZeroTTSProviderID, viVoices[i].ProviderID)
+		}
+	}
+
+	// Verified presets beyond the unattended rotation stay selectable/frozen-capable
+	// without becoming defaults merely because they exist in the snapshot.
+	allPresets := provider.ZeroTTSPresetVoices()
+	if len(allPresets) <= provider.DefaultVIUnattendedVoiceCount {
+		t.Fatalf("expected verified ZeroTTS presets beyond the unattended rotation, got %d", len(allPresets))
+	}
+	for _, v := range allPresets {
+		if !provider.IsVerifiedTTSVoice(provider.ZeroTTSProviderID, v.VoiceID) {
+			t.Errorf("ZeroTTS preset %s must remain selectable/auditable", v.VoiceID)
+		}
+	}
+	// VieNeu stays the compatibility lane for historical frozen assignments.
+	vieneuVoices := provider.VieNeuPresetVoices()
+	if len(vieneuVoices) != 4 {
+		t.Fatalf("expected exactly 4 VieNeu compatibility voices, got %d", len(vieneuVoices))
+	}
+	expectedVieNeu := []string{"Trúc Ly", "Phạm Tuyên", "Đoan Trang", "Xuân Vĩnh"}
+	for i, exp := range expectedVieNeu {
+		if vieneuVoices[i].VoiceID != exp {
+			t.Errorf("vieneu voice [%d] expected %s, got %s", i, exp, vieneuVoices[i].VoiceID)
+		}
+		if vieneuVoices[i].ProviderID != provider.VieNeuProviderID {
+			t.Errorf("vieneu voice [%d] provider expected %s, got %s", i, provider.VieNeuProviderID, vieneuVoices[i].ProviderID)
 		}
 	}
 
@@ -995,8 +1023,8 @@ func TestSeam1_Snapshot_TTS_RegistrationAndVerification(t *testing.T) {
 		t.Fatalf("expected dependency name %s, got %s", provider.VieNeuModelID, vBinding.DependencyName)
 	}
 
-	// All 4 voices resolve
-	for _, vID := range expectedVI {
+	// All 4 VieNeu compatibility voices resolve
+	for _, vID := range expectedVieNeu {
 		ep, epErr := domain.ResolveTTSVoiceEntrypoint(vieneuManifest, vieneuDir, provider.VieNeuModelID, vID)
 		if epErr != nil {
 			t.Errorf("expected voice %s to resolve, got err: %v", vID, epErr)

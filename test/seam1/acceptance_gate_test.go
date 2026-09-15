@@ -418,15 +418,13 @@ func TestSeam1_AcceptanceGate_NormativeInvariants(t *testing.T) {
 func configureFixtureProviders(t *testing.T, h *testHarness, fg fixtureGate) {
 	t.Helper()
 	// TTS: per-segment measured durations + a deliberately wrong predicted duration.
-	if p, ok := h.registry.Get("fake_vieneu_tts_vi"); ok {
-		fake := p.(*provider.FakeTTSProvider)
-		fake.CustomDurations = fg.ttsDurations
-		if fg.ttsDuration > 0 {
-			fake.DurationMs = fg.ttsDuration
-		}
-		fake.CustomPredictedMs = fg.predictedMs
-		fake.Invocations = 0
+	fakeTTS := defaultVITTSFake(t, h)
+	fakeTTS.CustomDurations = fg.ttsDurations
+	if fg.ttsDuration > 0 {
+		fakeTTS.DurationMs = fg.ttsDuration
 	}
+	fakeTTS.CustomPredictedMs = fg.predictedMs
+	fakeTTS.Invocations = 0
 	// OCR: fixture-specific detections + frame geometry (Video 5 is 3:4).
 	if p, ok := h.registry.Get("fake_paddle_ocr"); ok {
 		fake := p.(*provider.FakeOCRProvider)

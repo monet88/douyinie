@@ -85,9 +85,10 @@ func TestRouter_PolicyBeforeHealth(t *testing.T) {
 	runID1 := uuid.NewString()
 	seedDefaultAudioRolePlan(t, db, runID1)
 	res, err := router.Route(ctx, provider.RouteRequest{
-		RunID:    runID1,
-		Stage:    provider.TypeTTS,
-		Language: "vi",
+		RunID:             runID1,
+		Stage:             provider.TypeTTS,
+		Language:          "vi",
+		ExcludedProviders: []string{"fake_zerotts_tts_vi"},
 	})
 	if err != nil {
 		t.Fatalf("Route failed: %v", err)
@@ -107,9 +108,10 @@ func TestRouter_PolicyBeforeHealth(t *testing.T) {
 	runID2 := uuid.NewString()
 	seedDefaultAudioRolePlan(t, db, runID2)
 	_, err = router.Route(ctx, provider.RouteRequest{
-		RunID:    runID2,
-		Stage:    provider.TypeTTS,
-		Language: "vi",
+		RunID:             runID2,
+		Stage:             provider.TypeTTS,
+		Language:          "vi",
+		ExcludedProviders: []string{"fake_zerotts_tts_vi"},
 	})
 	if !errors.Is(err, domain.ErrNoEligibleProvider) {
 		t.Errorf("expected ErrNoEligibleProvider when all candidates are blocked, got %v", err)
@@ -120,8 +122,9 @@ func TestRouter_ConsentRequirement(t *testing.T) {
 	router, db, _, polSvc, _, _ := setupTestRouter(t)
 	ctx := context.Background()
 
-	// Block local provider so only cloud consent provider remains
+	// Block local providers so only cloud consent provider remains
 	_ = polSvc.SetPolicy(ctx, "fake_vieneu_tts_vi", domain.PolicyBlocked, "disabled")
+	_ = polSvc.SetPolicy(ctx, "fake_zerotts_tts_vi", domain.PolicyBlocked, "disabled")
 
 	// 1. Without consent -> rejection
 	runID1 := uuid.NewString()
@@ -273,10 +276,11 @@ func TestRouter_ExecuteWithRetry_QualityVsTransient(t *testing.T) {
 	runIDQuality := uuid.NewString()
 	seedDefaultAudioRolePlan(t, db, runIDQuality)
 	reqQuality := provider.RouteRequest{
-		RunID:          runIDQuality,
-		Stage:          provider.TypeTTS,
-		Language:       "vi",
-		ConsentGranted: true, // Allows fallback to cloud TTS
+		RunID:             runIDQuality,
+		Stage:             provider.TypeTTS,
+		Language:          "vi",
+		ConsentGranted:    true, // Allows fallback to cloud TTS
+		ExcludedProviders: []string{"fake_zerotts_tts_vi"},
 	}
 	qualityAttempts := 0
 	var invokedProviders []string
@@ -336,11 +340,12 @@ func TestRouter_CircuitBreaker_SkipsAndRecordsProvenance(t *testing.T) {
 	runID := uuid.NewString()
 	seedDefaultAudioRolePlan(t, db, runID)
 	req := provider.RouteRequest{
-		RunID:            runID,
-		Stage:            provider.TypeTTS,
-		Language:         "vi",
-		ExecutionProfile: domain.ExecutionProfileCloud,
-		ConsentGranted:   true,
+		RunID:             runID,
+		Stage:             provider.TypeTTS,
+		Language:          "vi",
+		ExecutionProfile:  domain.ExecutionProfileCloud,
+		ConsentGranted:    true,
+		ExcludedProviders: []string{"fake_zerotts_tts_vi"},
 	}
 
 	// In the execution with Cloud profile:
@@ -561,7 +566,7 @@ func TestRouter_ExecuteWithRetry_HonorsExcludedProviders(t *testing.T) {
 		Stage:             provider.TypeTTS,
 		Language:          "vi",
 		ConsentGranted:    true,
-		ExcludedProviders: []string{"fake_vieneu_tts_vi"},
+		ExcludedProviders: []string{"fake_vieneu_tts_vi", "fake_zerotts_tts_vi"},
 	}
 
 	var executedProvider string
@@ -594,10 +599,11 @@ func TestRouter_FallbackSelectionDecision_PersistsEffectivePolicyState(t *testin
 	}
 
 	req := provider.RouteRequest{
-		RunID:          runID,
-		Stage:          provider.TypeTTS,
-		Language:       "vi",
-		ConsentGranted: false, // Consent is false, but PolicyService says ALLOWED!
+		RunID:             runID,
+		Stage:             provider.TypeTTS,
+		Language:          "vi",
+		ConsentGranted:    false, // Consent is false, but PolicyService says ALLOWED!
+		ExcludedProviders: []string{"fake_zerotts_tts_vi"},
 	}
 
 	// First candidate fake_vieneu_tts_vi fails quality; fallback selects fake_cloud_tts_consent.
@@ -667,7 +673,7 @@ func TestRouter_PerProviderRetryPolicyOverride(t *testing.T) {
 		RunID:             runID,
 		Stage:             provider.TypeTTS,
 		Language:          "vi",
-		ExcludedProviders: []string{"fake_vieneu_tts_vi", "fake_cloud_tts_consent", "fake_indextts2_blocked"},
+		ExcludedProviders: []string{"fake_zerotts_tts_vi", "fake_vieneu_tts_vi", "fake_cloud_tts_consent", "fake_indextts2_blocked"},
 	}
 
 	callCount := 0
@@ -723,7 +729,7 @@ func TestRouter_UnknownPolicyFailsClosed(t *testing.T) {
 		RunID:             runID,
 		Stage:             provider.TypeTTS,
 		Language:          "vi",
-		ExcludedProviders: []string{"fake_vieneu_tts_vi", "fake_cloud_tts_consent", "fake_indextts2_blocked"},
+		ExcludedProviders: []string{"fake_zerotts_tts_vi", "fake_vieneu_tts_vi", "fake_cloud_tts_consent", "fake_indextts2_blocked"},
 	}
 
 	_, err := router.Route(ctx, req)

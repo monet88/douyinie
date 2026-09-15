@@ -191,6 +191,7 @@ type FakeTTSProvider struct {
 	DurationMs        int64
 	CustomDurations   map[int]int64
 	SpeedFitEnabled   bool
+	RejectRateChange  bool
 	InjectError       error
 	CustomPredictedMs int64
 	CustomVoices      []domain.VoiceProfile
@@ -242,19 +243,9 @@ func (p *FakeTTSProvider) VoiceCatalog() []domain.VoiceProfile {
 	}
 	var voices []domain.VoiceProfile
 	for _, l := range p.Cap.Languages {
-		if strings.Contains(p.ProviderID, "cosyvoice") {
-			for _, v := range CosyVoicePresetVoices(l) {
-				v.ProviderID = p.ProviderID
-				voices = append(voices, v)
-			}
-		} else {
-			for _, v := range DefaultPresetVoices(l) {
-				if v.ProviderID == p.ProviderID || (p.ProviderID == "fake_vieneu_tts_vi" && v.ProviderID == "vieneu_tts_vi") ||
-					(p.ProviderID == "fake_kokoro_tts_en" && v.ProviderID == "kokoro_tts_en") {
-					v.ProviderID = p.ProviderID
-					voices = append(voices, v)
-				}
-			}
+		for _, v := range p.presetVoicesFor(l) {
+			v.ProviderID = p.ProviderID
+			voices = append(voices, v)
 		}
 	}
 	if len(voices) == 0 {
@@ -272,6 +263,25 @@ func (p *FakeTTSProvider) VoiceCatalog() []domain.VoiceProfile {
 	return voices
 }
 
+// presetVoicesFor maps the fake's identity to the production preset catalog it
+// stands in for, so Seam 1 covers the real per-lane catalog (ZeroTTS preset
+// rotation, VieNeu compatibility rotation, Kokoro/EN rotation).
+func (p *FakeTTSProvider) presetVoicesFor(lang string) []domain.VoiceProfile {
+	id := strings.TrimPrefix(p.ProviderID, "fake_")
+	switch {
+	case strings.Contains(id, "cosyvoice"):
+		return CosyVoicePresetVoices(lang)
+	case strings.Contains(id, "zerotts"):
+		return ZeroTTSPresetVoices()
+	case strings.Contains(id, "vieneu"):
+		return VieNeuPresetVoices()
+	case strings.Contains(id, "kokoro"):
+		return DefaultPresetVoices("en")
+	default:
+		return nil
+	}
+}
+
 // SynthesizeSpeech implements TTSProvider.
 func (p *FakeTTSProvider) SynthesizeSpeech(ctx context.Context, req TTSSynthesisRequest) (*TTSSynthesisResult, error) {
 	p.Invocations++
@@ -280,6 +290,11 @@ func (p *FakeTTSProvider) SynthesizeSpeech(ctx context.Context, req TTSSynthesis
 	}
 	if p.InjectError != nil {
 		return nil, p.InjectError
+	}
+	if p.RejectRateChange && req.Speed != 0 && req.Speed != 1.0 {
+		// Mirrors the real fixed-rate preset-voice lane (ZeroTTS): a non-1.0
+		// speed request fails closed instead of being honored.
+		return nil, fmt.Errorf("%w: fixed-rate provider requires speed=1.0, got %.3f", domain.ErrTTSSpeedUnsupported, req.Speed)
 	}
 	durMs := p.DurationMs
 	if p.CustomDurations != nil {
@@ -895,6 +910,12 @@ func NewSeam1FakeRegistry() *Registry {
 	_ = reg.Register(NewFakeASRProvider("fake_qwen3_asr"))
 	_ = reg.Register(NewFakeASRProvider06B("fake_qwen3_asr_06b"))
 	_ = reg.Register(NewFakeAlignerProvider("fake_qwen3_aligner"))
+	// ZeroTTS is the unattended Vietnamese default (Issue #93): fixed-rate
+	// preset-voice lane that fails closed on any non-1.0 speed request.
+	fakeZeroTTS := NewFakeTTSProvider("fake_zerotts_tts_vi", 1500)
+	fakeZeroTTS.Cap.Features = []string{FeatureFixedRateVoice}
+	fakeZeroTTS.RejectRateChange = true
+	_ = reg.Register(fakeZeroTTS)
 	_ = reg.Register(NewFakeTTSProvider("fake_vieneu_tts_vi", 1500))
 	_ = reg.Register(NewFakeTTSProvider("fake_kokoro_tts_en", 1400))
 	_ = reg.Register(NewFakeSeparatorProvider("fake_uvr_separator"))

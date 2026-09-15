@@ -129,8 +129,8 @@ func TestSeam1_MultiSpeaker_IndependentAssignment_And_DistinguishabilityQC(t *te
 	_ = json.NewDecoder(runResp3.Body).Decode(&run3)
 	runID3 := run3.Run.ID
 
-	voiceA := provider.DefaultPresetVoices("vi")[0] // vieneu female
-	voiceB := provider.DefaultPresetVoices("vi")[1] // vieneu male
+	voiceA := provider.DefaultPresetVoices("vi")[0] // ZeroTTS quangminh
+	voiceB := provider.DefaultPresetVoices("vi")[1] // ZeroTTS maichi
 	respDet, assignDet := runAssignVoices(t, h, assetID, map[string]any{
 		"run_id":                 runID3,
 		"target_language":        "vi",
@@ -404,12 +404,8 @@ func TestSeam1_VoiceChange_InvalidationScope_And_SpeakerScopedRegeneration(t *te
 	}
 
 	// Instrument provider invocations before synthesis 2
-	fakeVieneu, ok := h.registry.Get("fake_vieneu_tts_vi")
-	if !ok {
-		t.Fatalf("fake_vieneu_tts_vi not found in registry")
-	}
-	vieneuProv := fakeVieneu.(*provider.FakeTTSProvider)
-	vieneuInvocationsBefore := vieneuProv.Invocations
+	zeroTTSProv := defaultVITTSFake(t, h)
+	zeroTTSInvocationsBefore := zeroTTSProv.Invocations
 	cosyInvocationsBefore := fakeCosy.Invocations
 
 	// 5. Synthesize with new VoiceAssignment CAS
@@ -427,9 +423,9 @@ func TestSeam1_VoiceChange_InvalidationScope_And_SpeakerScopedRegeneration(t *te
 	}
 
 	// Hard Red-Capable Invariant: Unchanged speaker SPEAKER_01 must cause EXACTLY ZERO new TTS invocations
-	vieneuDelta := vieneuProv.Invocations - vieneuInvocationsBefore
-	if vieneuDelta != 0 {
-		t.Fatalf("expected unchanged speaker (SPEAKER_01) to cause 0 new TTS invocations, but got %d new invocations", vieneuDelta)
+	zeroTTSDelta := zeroTTSProv.Invocations - zeroTTSInvocationsBefore
+	if zeroTTSDelta != 0 {
+		t.Fatalf("expected unchanged speaker (SPEAKER_01) to cause 0 new TTS invocations, but got %d new invocations", zeroTTSDelta)
 	}
 
 	// Hard Red-Capable Invariant: Changed speaker SPEAKER_00 must cause EXACTLY 2 new TTS invocations (2 segments)
@@ -549,12 +545,8 @@ func TestSeam1_VoiceChange_DubScriptChangeForcesSynthesisEvenWithSupersession(t 
 	}
 
 	// Instrument provider invocations
-	fakeVieneu, ok := h.registry.Get("fake_vieneu_tts_vi")
-	if !ok {
-		t.Fatalf("fake_vieneu_tts_vi not found in registry")
-	}
-	vieneuProv := fakeVieneu.(*provider.FakeTTSProvider)
-	vieneuInvocationsBefore := vieneuProv.Invocations
+	zeroTTSProv := defaultVITTSFake(t, h)
+	zeroTTSInvocationsBefore := zeroTTSProv.Invocations
 	cosyInvocationsBefore := fakeCosy.Invocations
 
 	// Synthesize with dubVariant2 and assign2
@@ -571,9 +563,9 @@ func TestSeam1_VoiceChange_DubScriptChangeForcesSynthesisEvenWithSupersession(t 
 	// Red-Capable Invariant: When DubScriptVariantCAS differs from prior variant,
 	// prior segments CANNOT be reused even for non-invalidated SPEAKER_01!
 	// SPEAKER_01 MUST be re-synthesized for the new dub script.
-	vieneuDelta := vieneuProv.Invocations - vieneuInvocationsBefore
-	if vieneuDelta != 2 {
-		t.Fatalf("expected unchanged speaker (SPEAKER_01) to be synthesized for new dub script (2 invocations), but got %d", vieneuDelta)
+	zeroTTSDelta := zeroTTSProv.Invocations - zeroTTSInvocationsBefore
+	if zeroTTSDelta != 2 {
+		t.Fatalf("expected unchanged speaker (SPEAKER_01) to be synthesized for new dub script (2 invocations), but got %d", zeroTTSDelta)
 	}
 
 	// SPEAKER_00 synthesized for new voice profile (2 invocations)
@@ -656,12 +648,8 @@ func TestSeam1_VoiceChange_InvalidPriorFitPlanBypassesReuse(t *testing.T) {
 		t.Fatalf("reassign voice failed: %d", respReassign.StatusCode)
 	}
 
-	fakeVieneu, ok := h.registry.Get("fake_vieneu_tts_vi")
-	if !ok {
-		t.Fatalf("fake_vieneu_tts_vi not found in registry")
-	}
-	vieneuProv := fakeVieneu.(*provider.FakeTTSProvider)
-	vieneuInvocationsBefore := vieneuProv.Invocations
+	zeroTTSProv := defaultVITTSFake(t, h)
+	zeroTTSInvocationsBefore := zeroTTSProv.Invocations
 
 	// Synthesize with dubVariant and assign2
 	respSynth2, variant2 := runDubSynthesize(t, h, assetID, map[string]any{
@@ -676,9 +664,9 @@ func TestSeam1_VoiceChange_InvalidPriorFitPlanBypassesReuse(t *testing.T) {
 
 	// Red-Capable Invariant: Because prior fit plans were missing/invalid,
 	// SPEAKER_01 CANNOT be silently reused and must be synthesized anew!
-	vieneuDelta := vieneuProv.Invocations - vieneuInvocationsBefore
-	if vieneuDelta < 2 {
-		t.Fatalf("expected at least 2 new invocations due to invalid prior fit plan, got %d", vieneuDelta)
+	zeroTTSDelta := zeroTTSProv.Invocations - zeroTTSInvocationsBefore
+	if zeroTTSDelta < 2 {
+		t.Fatalf("expected at least 2 new invocations due to invalid prior fit plan, got %d", zeroTTSDelta)
 	}
 
 	// Resulting variant must be valid and contain all 4 fit plans
