@@ -24,4 +24,3 @@ Closes #
 - [ ] Relevant tests pass
 - [ ] `git diff --check` passes
 - [ ] Required review/acceptance gates pass
-
