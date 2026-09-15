@@ -8,6 +8,11 @@ import (
 )
 
 const (
+	// ZeroTTS production VI identities (Issue #92).
+	ZeroTTSProviderID   = "zerotts_tts_vi"
+	ZeroTTSModelID      = domain.PinnedZeroTTSModelID
+	ZeroTTSModelVersion = domain.PinnedZeroTTSModelVersion
+
 	// VieNeu frozen RC identities (Issue #68)
 	VieNeuModelID      = "pnnbao-ump/VieNeu-TTS-v3-Turbo"
 	VieNeuModelVersion = "v3.2.9"
@@ -169,6 +174,23 @@ func DefaultPresetVoices(lang string) []domain.VoiceProfile {
 	}
 }
 
+// ZeroTTSPresetVoices returns all verified packaged ZeroTTS presets for explicit selection.
+func ZeroTTSPresetVoices() []domain.VoiceProfile {
+	voices := make([]domain.VoiceProfile, 0, len(domain.FrozenZeroTTSVoiceOrder))
+	for _, voiceID := range domain.FrozenZeroTTSVoiceOrder {
+		voices = append(voices, domain.VoiceProfile{
+			ID:         "zerotts_vi_" + voiceID,
+			ProviderID: ZeroTTSProviderID,
+			VoiceID:    voiceID,
+			Name:       "ZeroTTS " + voiceID,
+			Language:   "vi",
+			Pitch:      1.0,
+			Speed:      1.0,
+		})
+	}
+	return voices
+}
+
 // CosyVoicePresetVoices returns conditional CosyVoice3 voice profiles (not in default rotation).
 func CosyVoicePresetVoices(lang string) []domain.VoiceProfile {
 	switch lang {
@@ -210,6 +232,11 @@ func OrderedVieNeuVoices() []string {
 	return append([]string(nil), domain.FrozenVieNeuVoiceOrder...)
 }
 
+// OrderedZeroTTSVoices returns the verified ZeroTTS packaged voice order.
+func OrderedZeroTTSVoices() []string {
+	return append([]string(nil), domain.FrozenZeroTTSVoiceOrder...)
+}
+
 // OrderedKokoroVoices returns the frozen ordered Kokoro preset voice rotation.
 func OrderedKokoroVoices() []string {
 	return append([]string(nil), domain.FrozenKokoroVoiceOrder...)
@@ -221,6 +248,13 @@ func IsVerifiedTTSVoice(providerID, voiceID string) bool {
 		return true
 	}
 	switch providerID {
+	case ZeroTTSProviderID, "zerotts", ZeroTTSModelID:
+		for _, v := range OrderedZeroTTSVoices() {
+			if v == voiceID {
+				return true
+			}
+		}
+		return false
 	case VieNeuProviderID, "vieneu-tts", "pnnbao-ump/VieNeu-TTS-v3-Turbo":
 		for _, v := range OrderedVieNeuVoices() {
 			if v == voiceID {

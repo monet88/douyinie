@@ -32,15 +32,156 @@ from tts_engine import (
     run_kokoro_tts,
     run_tts,
     run_vieneu_tts,
+    run_zerotts_tts,
 )
+
+
+def make_zerotts_snapshot(root, voices=("quangminh",)):
+    required = {
+        "config.json": "{}",
+        "tokenizer.json": "{}",
+        "null_voice_emb.npy": "null",
+        "onnx/text_encoder.onnx": "onnx",
+        "onnx/prefix_step.onnx": "onnx",
+        "onnx/local_frame_decode.onnx": "onnx",
+        "onnx/codec/decode_full.onnx": "onnx",
+        "voices/index.json": json.dumps({"voices": [{"name": v} for v in voices]}),
+    }
+    for rel, content in required.items():
+        path = os.path.join(root, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(content.encode("utf-8"))
+    for voice in voices:
+        voice_path = os.path.join(root, "voices", voice, "voice.npz")
+        os.makedirs(os.path.dirname(voice_path), exist_ok=True)
+        with open(voice_path, "wb") as f:
+            f.write(b"voice")
+    return os.path.join(root, "voices", voices[0], "voice.npz")
 
 
 class TestTTSEngineUpstreamContracts(unittest.TestCase):
     def tearDown(self):
+        tts_engine._ZEROTTS_MODEL_FACTORY = None
+        tts_engine._ZEROTTS_PROBE_FACTORY = None
         tts_engine._VIENEU_MODEL_FACTORY = None
         tts_engine._COSYVOICE_MODEL_FACTORY = None
         tts_engine._KOKORO_MODEL_FACTORY = None
         tts_engine._CHATTERBOX_MODEL_FACTORY = None
+
+    def test_run_zerotts_exact_upstream_contract_cpu_only(self):
+        calls = {}
+
+        class MockZeroTTS:
+            def __init__(self, model_dir=None, providers=None):
+                calls["model_dir"] = model_dir
+                calls["providers"] = providers
+                self.sample_rate = 48000
+
+            def synthesize(self, text, voice=None):
+                calls["synthesize"] = (text, voice)
+                return [0.05] * 48000
+
+        tts_engine._ZEROTTS_MODEL_FACTORY = MockZeroTTS
+        with tempfile.TemporaryDirectory() as tmpdir:
+            entrypoint = make_zerotts_snapshot(tmpdir)
+            resp = run_zerotts_tts(
+                "Xin chào Việt Nam",
+                "vi",
+                "quangminh",
+                1.0,
+                model_path=tmpdir,
+                entrypoint_file=entrypoint,
+            )
+
+        self.assertEqual(calls["providers"], ["CPUExecutionProvider"])
+        self.assertEqual(calls["synthesize"], ("Xin chào Việt Nam", "quangminh"))
+        self.assertEqual(resp["measured_duration_ms"], 1000)
+        self.assertEqual(resp["model_name"], tts_engine.ZEROTTS_MODEL_ID)
+        self.assertEqual(os.environ.get("HF_HUB_OFFLINE"), "1")
+        self.assertEqual(os.environ.get("TRANSFORMERS_OFFLINE"), "1")
+
+    def test_run_zerotts_rejects_speed_and_unverified_voice(self):
+        with self.assertRaises(ValueError) as ctx:
+            run_zerotts_tts("Xin chào", "vi", "quangminh", 1.01)
+        self.assertIn("TTS_SPEED_UNSUPPORTED", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:
+            run_zerotts_tts("Xin chào", "vi", "unknown", 1.0)
+        self.assertIn("TTS_VOICE_ASSET_MISSING", str(ctx.exception))
+
+    def test_run_zerotts_requires_canonical_snapshot_assets_and_entrypoint(self):
+        tts_engine._ZEROTTS_MODEL_FACTORY = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(RuntimeError) as ctx:
+                run_zerotts_tts(
+                    "Xin chào", "vi", "quangminh", 1.0,
+                    model_path=tmpdir,
+                    entrypoint_file=os.path.join(tmpdir, "voices", "quangminh", "voice.npz"),
+                )
+            self.assertIn("TTS_MODEL_ASSET_MISSING", str(ctx.exception))
+
+            entrypoint = make_zerotts_snapshot(tmpdir)
+            wrong = os.path.join(tmpdir, "voices", "maichi", "voice.npz")
+            with self.assertRaises(RuntimeError) as ctx:
+                run_zerotts_tts(
+                    "Xin chào", "vi", "quangminh", 1.0,
+                    model_path=tmpdir,
+                    entrypoint_file=wrong,
+                )
+            self.assertIn("TTS_VOICE_ASSET_MISSING", str(ctx.exception))
+
+    def test_run_zerotts_empty_audio_fails_closed(self):
+        class EmptyZeroTTS:
+            def __init__(self, **kwargs):
+                self.sample_rate = 48000
+
+            def synthesize(self, text, voice=None):
+                return []
+
+        tts_engine._ZEROTTS_MODEL_FACTORY = EmptyZeroTTS
+        with tempfile.TemporaryDirectory() as tmpdir:
+            entrypoint = make_zerotts_snapshot(tmpdir)
+            with self.assertRaises(RuntimeError) as ctx:
+                run_zerotts_tts(
+                    "Xin chào", "vi", "quangminh", 1.0,
+                    model_path=tmpdir,
+                    entrypoint_file=entrypoint,
+                )
+        self.assertIn("TTS_NO_AUDIO", str(ctx.exception))
+
+    def test_probe_zerotts_runtime_identity_requires_exact_pep610_vcs_evidence(self):
+        direct_url = {
+            "url": "https://github.com/zeroweight-ai/ZeroTTS.git",
+            "vcs_info": {
+                "vcs": "git",
+                "commit_id": tts_engine.ZEROTTS_SOURCE_COMMIT,
+            },
+        }
+        dist = MagicMock()
+        dist.version = tts_engine.ZEROTTS_PACKAGE_VERSION
+        dist.read_text.return_value = json.dumps(direct_url)
+
+        import unittest.mock as mock
+        with mock.patch("importlib.metadata.distribution", return_value=dist), \
+             mock.patch("importlib.metadata.version", side_effect=lambda name: "1.0.0"):
+            out = tts_engine.probe_zerotts_runtime_identity()
+
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["source_revision"], tts_engine.ZEROTTS_SOURCE_COMMIT)
+        self.assertEqual(out["runtime_versions"]["zerotts"], tts_engine.ZEROTTS_PACKAGE_VERSION)
+        self.assertEqual(out["adapter_revision"], tts_engine.ZEROTTS_ADAPTER_REVISION)
+
+    def test_probe_zerotts_runtime_identity_fails_without_pep610(self):
+        dist = MagicMock()
+        dist.version = tts_engine.ZEROTTS_PACKAGE_VERSION
+        dist.read_text.return_value = None
+
+        import unittest.mock as mock
+        with mock.patch("importlib.metadata.distribution", return_value=dist):
+            with self.assertRaises(RuntimeError) as ctx:
+                tts_engine.probe_zerotts_runtime_identity()
+        self.assertIn("no PEP 610 direct_url.json", str(ctx.exception))
 
     def test_encode_audio_to_wav_from_samples(self):
         # 24000 samples at 24000 Hz = exactly 1000 ms (1 second)
@@ -370,10 +511,12 @@ class Vieneu:
         import unittest.mock as mock
 
         # Mock run functions
-        with mock.patch("tts_engine.run_cosyvoice_tts") as mock_cosy, \
+        with mock.patch("tts_engine.run_zerotts_tts") as mock_zero, \
+             mock.patch("tts_engine.run_cosyvoice_tts") as mock_cosy, \
              mock.patch("tts_engine.run_vieneu_tts") as mock_vieneu, \
              mock.patch("tts_engine.run_kokoro_tts") as mock_kokoro:
 
+            mock_zero.return_value = {"model_name": "zerotts", "measured_duration_ms": 1000}
             mock_cosy.return_value = {"model_name": "cosyvoice3", "measured_duration_ms": 1000}
             mock_vieneu.return_value = {"model_name": "vieneu-tts", "measured_duration_ms": 1000}
             mock_kokoro.return_value = {"model_name": "kokoro-tts", "measured_duration_ms": 1000}
@@ -410,16 +553,46 @@ class Vieneu:
             })
             mock_kokoro.assert_called_once()
 
-            # 4. Default / unresolved model_name with language=vi routes to VieNeu
+            # 4. Explicit ZeroTTS with language=vi routes only to ZeroTTS.
             mock_vieneu.reset_mock()
             res4 = run_tts({
                 "text": "Xin chào",
-                "model_name": "default",
+                "model_name": "zeroweight-ai/ZeroTTS",
+                "model_version": tts_engine.ZEROTTS_MODEL_REVISION,
                 "language": "vi",
-                "voice_id": "Thục Đoan",
+                "voice_id": "quangminh",
                 "speed": 1.0,
             })
+            mock_zero.assert_called_once()
+            mock_vieneu.assert_not_called()
+            self.assertEqual(res4["model_name"], "zerotts")
+
+            # 5. Omitted model_name preserves the historical VI VieNeu fallback.
+            mock_zero.reset_mock()
+            mock_vieneu.reset_mock()
+            res5 = run_tts({
+                "text": "Xin chào",
+                "language": "vi",
+                "voice_id": "Trúc Ly",
+                "speed": 1.0,
+            })
+            mock_zero.assert_not_called()
             mock_vieneu.assert_called_once()
+            self.assertEqual(res5["model_name"], "vieneu-tts")
+
+            # 6. A non-canonical ZeroTTS identity fails closed instead of falling through.
+            mock_zero.reset_mock()
+            with self.assertRaises(ValueError) as ctx:
+                run_tts({
+                    "text": "Xin chào",
+                    "model_name": "zeroweight-ai/ZeroTTS-fake",
+                    "model_version": tts_engine.ZEROTTS_MODEL_REVISION,
+                    "language": "vi",
+                    "voice_id": "maichi",
+                    "speed": 1.0,
+                })
+            self.assertIn("TTS_MODEL_UNSUPPORTED", str(ctx.exception))
+            mock_zero.assert_not_called()
 
     def test_unverified_voice_fails_closed(self):
         """Unverified voice presets must fail closed with TTS_VOICE_ASSET_MISSING."""

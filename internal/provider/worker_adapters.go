@@ -192,7 +192,8 @@ func (b *workerBridge) run(ctx context.Context, cmd worker.Command) ([]byte, err
 					if mName != "" {
 						primaryBinding, err := b.snapshotSvc.GetBinding(mName, mVer)
 						if err != nil || primaryBinding == nil {
-							// Exact RC snapshot bindings required for TTS:
+							// Exact pinned snapshot bindings required for TTS:
+							// ZeroTTS: zeroweight-ai/ZeroTTS@8a0c3c29f6f047011f5cae02d0b14475a690be86
 							// VieNeu: pnnbao-ump/VieNeu-TTS-v3-Turbo:v3.2.9
 							// Kokoro: hexgrad/Kokoro-82M:v1.0
 							// Legacy aliases such as vieneu-tts 1.0.0 or kokoro-tts 1.0.0 are strictly prohibited when exact binding is absent.
@@ -232,9 +233,14 @@ func (b *workerBridge) run(ctx context.Context, cmd worker.Command) ([]byte, err
 									return nil, fmt.Errorf("resolve translation model entrypoint: %w", epErr)
 								}
 								entrypointFile = ep
-							} else if cmd.Family == "tts" || cmd.Stage == "tts" {
+							} else if (cmd.Family == "tts" || cmd.Stage == "tts") && cmd.Stage != "tts_probe" {
 								// Enforce that the resolved primaryBinding matches the exact RC identity
-								if strings.Contains(strings.ToLower(mName), "vieneu") || strings.Contains(strings.ToLower(mName), "pnnbao") {
+								if strings.Contains(strings.ToLower(mName), "zerotts") || strings.Contains(strings.ToLower(mName), "zeroweight") {
+									if primaryBinding.DependencyName != ZeroTTSModelID || primaryBinding.Version != ZeroTTSModelVersion {
+										return nil, fmt.Errorf("invalid ZeroTTS snapshot binding %s:%s (must be exact pin %s:%s): %w",
+											primaryBinding.DependencyName, primaryBinding.Version, ZeroTTSModelID, ZeroTTSModelVersion, domain.ErrSnapshotUnverified)
+									}
+								} else if strings.Contains(strings.ToLower(mName), "vieneu") || strings.Contains(strings.ToLower(mName), "pnnbao") {
 									if primaryBinding.DependencyName != VieNeuModelID || primaryBinding.Version != VieNeuModelVersion {
 										return nil, fmt.Errorf("invalid VieNeu snapshot binding %s:%s (must be exact RC %s:%s): %w",
 											primaryBinding.DependencyName, primaryBinding.Version, VieNeuModelID, VieNeuModelVersion, domain.ErrSnapshotUnverified)
@@ -615,8 +621,19 @@ func NewProductionSpeechRegistry(opts ...any) (*Registry, error) {
 		return nil, err
 	}
 
-	// Production TTS worker adapters per policy & benchmark #21
-	// 1. VieNeu VI baseline (Issue #68: pnnbao-ump/VieNeu-TTS-v3-Turbo@1278db0090b98ccf23e56f2423857fc9d32a5118)
+	// Production TTS worker adapters.
+	// 1. ZeroTTS explicit VI lane (Issue #92). CPU-only; preset voices; no rate control.
+	zerotts, err := NewWorkerTTSProvider(ZeroTTSProviderID, ZeroTTSModelID, ZeroTTSModelVersion, []string{"vi"}, 0.95)
+	if err != nil {
+		return nil, err
+	}
+	zerotts.SetCPUOnly(true)
+	zerotts.SetLeaseManager(mgr)
+	if err := reg.Register(zerotts); err != nil {
+		return nil, err
+	}
+
+	// 2. VieNeu VI compatibility lane for historical frozen assignments.
 	vieneu, err := NewWorkerTTSProvider(VieNeuProviderID, VieNeuModelID, VieNeuModelVersion, []string{"vi"}, 0.95)
 	if err != nil {
 		return nil, err
@@ -626,7 +643,7 @@ func NewProductionSpeechRegistry(opts ...any) (*Registry, error) {
 		return nil, err
 	}
 
-	// 2. CosyVoice3 measured-duration speed-fit lane (conditional only, not in default preset rotation)
+	// 3. CosyVoice3 measured-duration speed-fit lane (conditional only, not in default preset rotation)
 	cosyvoice, err := NewWorkerTTSProvider("cosyvoice3_tts", "cosyvoice3", "3.0.0", []string{"vi", "en"}, 0.98, "measured_duration_speed_fit")
 	if err != nil {
 		return nil, err
@@ -636,7 +653,7 @@ func NewProductionSpeechRegistry(opts ...any) (*Registry, error) {
 		return nil, err
 	}
 
-	// 3. Kokoro EN baseline (Issue #68: hexgrad/Kokoro-82M@f3ff3571791e39611d31c381e3a41a3af07b4987)
+	// 4. Kokoro EN baseline (Issue #68: hexgrad/Kokoro-82M@f3ff3571791e39611d31c381e3a41a3af07b4987)
 	kokoro, err := NewWorkerTTSProvider(KokoroProviderID, KokoroModelID, KokoroModelVersion, []string{"en"}, 0.95)
 	if err != nil {
 		return nil, err
@@ -1044,6 +1061,9 @@ func (p *WorkerTTSProvider) VoiceCatalog() []domain.VoiceProfile {
 		}
 		return voices
 	}
+	if p.id == ZeroTTSProviderID {
+		return ZeroTTSPresetVoices()
+	}
 	var voices []domain.VoiceProfile
 	for _, l := range p.capability.Languages {
 		voices = append(voices, DefaultPresetVoices(l)...)
@@ -1059,9 +1079,82 @@ type ttsArtifact struct {
 	PredictedDurationMs int64  `json:"predicted_duration_ms"`
 }
 
+func (p *WorkerTTSProvider) ensureZeroTTSRuntimeIdentity(ctx context.Context) error {
+	if p.id != ZeroTTSProviderID || !p.requiresSnapshot {
+		return nil
+	}
+	if p.snapshotSvc == nil {
+		return fmt.Errorf("%w: snapshot service not configured for ZeroTTS %s:%s",
+			domain.ErrSnapshotUnverified, p.modelName, p.modelVer)
+	}
+	binding, err := p.snapshotSvc.GetBinding(ZeroTTSModelID, ZeroTTSModelVersion)
+	if err != nil || binding == nil {
+		return fmt.Errorf("%w: missing exact ZeroTTS model snapshot %s:%s",
+			domain.ErrSnapshotUnverified, ZeroTTSModelID, ZeroTTSModelVersion)
+	}
+	if err := p.snapshotSvc.CheckBindingFingerprints(binding.DependencyName, binding.Version); err != nil {
+		return fmt.Errorf("%w: ZeroTTS snapshot validation failed: %v", domain.ErrSnapshotMutatedRehashRequired, err)
+	}
+	if binding.RuntimeIdentity != nil {
+		rt := binding.RuntimeIdentity
+		if rt.SourceRevision != domain.PinnedZeroTTSSourceRevision ||
+			rt.RuntimeVersions["zerotts"] != domain.PinnedZeroTTSPackageVersion ||
+			rt.AdapterRevision != domain.PinnedZeroTTSAdapterRevision {
+			return fmt.Errorf("%w: invalid ZeroTTS runtime identity evidence", domain.ErrSnapshotUnverified)
+		}
+		return nil
+	}
+
+	bridge, err := newWorkerBridge(p.leaseManager, p.snapshotSvc)
+	if err != nil {
+		return fmt.Errorf("%w: %v", domain.ErrSnapshotUnverified, err)
+	}
+	cmd := newCommand("tts_probe", stageWorkerFamilyTTS, worker.ArtifactRef{}, p.modelName, p.modelVer)
+	cmd.CPUOnly = true
+	cmd.Config["mode"] = "probe"
+	cmd.OutputPath = filepath.Join(os.TempDir(), fmt.Sprintf("douyinie-tts-probe-%s.json", cmd.ID))
+	defer os.Remove(cmd.OutputPath)
+	data, err := bridge.run(ctx, cmd)
+	if err != nil {
+		return fmt.Errorf("%w: ZeroTTS runtime probe failed: %v", domain.ErrSnapshotUnverified, err)
+	}
+	var probe struct {
+		Status          string            `json:"status"`
+		PackageName     string            `json:"package_name"`
+		PackageVersion  string            `json:"package_version"`
+		SourceRevision  string            `json:"source_revision"`
+		RuntimeVersions map[string]string `json:"runtime_versions"`
+		AdapterRevision string            `json:"adapter_revision"`
+		Error           string            `json:"error,omitempty"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return fmt.Errorf("%w: invalid ZeroTTS runtime probe output: %v", domain.ErrSnapshotUnverified, err)
+	}
+	if probe.Status != "ok" || probe.Error != "" {
+		return fmt.Errorf("%w: ZeroTTS runtime probe rejected: status=%q error=%q", domain.ErrSnapshotUnverified, probe.Status, probe.Error)
+	}
+	rt := domain.RuntimeIdentity{
+		AdapterRevision:       probe.AdapterRevision,
+		SourceRevision:        probe.SourceRevision,
+		RuntimeVersions:       probe.RuntimeVersions,
+		PrimarySnapshotSHA256: binding.SnapshotManifestSHA256,
+	}
+	rt.RuntimeManifestSHA256 = rt.ComputeRuntimeManifestSHA256()
+	if err := p.snapshotSvc.SetRuntimeIdentity(binding.DependencyName, binding.Version, rt); err != nil {
+		return fmt.Errorf("set ZeroTTS runtime identity: %w", err)
+	}
+	return nil
+}
+
 func (p *WorkerTTSProvider) SynthesizeSpeech(ctx context.Context, req TTSSynthesisRequest) (*TTSSynthesisResult, error) {
 	if !IsVerifiedTTSVoice(p.id, req.Voice.VoiceID) {
 		return nil, fmt.Errorf("%w: unverified voice preset %q for provider %s", domain.ErrTTSVoiceAssetMissing, req.Voice.VoiceID, p.id)
+	}
+	if p.id == ZeroTTSProviderID && req.Speed != 1.0 {
+		return nil, fmt.Errorf("%w: ZeroTTS requires speed=1.0, got %.3f", domain.ErrTTSSpeedUnsupported, req.Speed)
+	}
+	if err := p.ensureZeroTTSRuntimeIdentity(ctx); err != nil {
+		return nil, err
 	}
 
 	bridge, err := newWorkerBridge(p.leaseManager, p.snapshotSvc)

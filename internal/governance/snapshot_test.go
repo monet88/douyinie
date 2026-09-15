@@ -600,6 +600,70 @@ func TestSnapshot_SetRuntimeIdentity_HardenValidation(t *testing.T) {
 	}
 }
 
+func TestSnapshot_SetRuntimeIdentity_ZeroTTSExactPins(t *testing.T) {
+	ctx := context.Background()
+	db, snapSvc, licSvc := setupTestSnapshotService(t)
+	defer db.Close()
+
+	dir := t.TempDir()
+	content := []byte("zerotts-snapshot")
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), content, 0644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+	manifest := domain.SnapshotManifest{
+		SchemaVersion: "1.0",
+		ModelID:       domain.PinnedZeroTTSModelID,
+		ModelVersion:  domain.PinnedZeroTTSModelVersion,
+		Files:         []domain.SnapshotFileEntry{{RelativePath: "config.json", SHA256: hex.EncodeToString(sum[:]), SizeBytes: int64(len(content))}},
+	}
+	manifestSHA, _ := domain.ComputeSnapshotManifestSHA256(&manifest)
+	manifest.SnapshotManifestSHA256 = manifestSHA
+	if err := licSvc.RegisterManifest(ctx, domain.LicenseManifestEntry{
+		ID: uuid.NewString(), DependencyName: manifest.ModelID, Version: manifest.ModelVersion,
+		SHA256: manifestSHA, CodeLicense: "Apache-2.0", ModelLicense: "Apache-2.0",
+		DataLicense: "Unknown", ServiceTerms: "Local-Offline", Verified: true, CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := snapSvc.RegisterAndVerifySnapshot(ctx, manifest, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRuntimeIdentity := func() domain.RuntimeIdentity {
+		rt := domain.RuntimeIdentity{
+			AdapterRevision:       domain.PinnedZeroTTSAdapterRevision,
+			SourceRevision:        domain.PinnedZeroTTSSourceRevision,
+			RuntimeVersions:       map[string]string{"zerotts": domain.PinnedZeroTTSPackageVersion},
+			PrimarySnapshotSHA256: binding.SnapshotManifestSHA256,
+		}
+		rt.RuntimeManifestSHA256 = rt.ComputeRuntimeManifestSHA256()
+		return rt
+	}
+
+	badPackage := newRuntimeIdentity()
+	badPackage.RuntimeVersions["zerotts"] = "0.1.3"
+	badPackage.RuntimeManifestSHA256 = badPackage.ComputeRuntimeManifestSHA256()
+	if err := snapSvc.SetRuntimeIdentity(manifest.ModelID, manifest.ModelVersion, badPackage); !errors.Is(err, domain.ErrSnapshotUnverified) {
+		t.Fatalf("expected wrong ZeroTTS package version to fail closed, got %v", err)
+	}
+
+	badSource := newRuntimeIdentity()
+	badSource.SourceRevision = "wrong"
+	badSource.RuntimeManifestSHA256 = badSource.ComputeRuntimeManifestSHA256()
+	if err := snapSvc.SetRuntimeIdentity(manifest.ModelID, manifest.ModelVersion, badSource); !errors.Is(err, domain.ErrSnapshotUnverified) {
+		t.Fatalf("expected wrong ZeroTTS source revision to fail closed, got %v", err)
+	}
+
+	valid := newRuntimeIdentity()
+	if err := snapSvc.SetRuntimeIdentity(manifest.ModelID, manifest.ModelVersion, valid); err != nil {
+		t.Fatalf("expected exact ZeroTTS runtime identity to pass: %v", err)
+	}
+	if binding.RuntimeIdentity == nil || binding.RuntimeIdentity.RuntimeVersions["zerotts"] != domain.PinnedZeroTTSPackageVersion {
+		t.Fatalf("ZeroTTS runtime identity not attached correctly: %+v", binding.RuntimeIdentity)
+	}
+}
+
 func TestSnapshot_SetRuntimeIdentity_ExactPackageVersion_SuffixRejection(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()

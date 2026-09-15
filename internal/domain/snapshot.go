@@ -197,6 +197,15 @@ type RuntimeIdentity struct {
 	RuntimeManifestSHA256  string            `json:"runtime_manifest_sha256,omitempty"`
 }
 
+// Pinned ZeroTTS runtime/model identities (Issue #92).
+const (
+	PinnedZeroTTSModelID         = "zeroweight-ai/ZeroTTS"
+	PinnedZeroTTSModelVersion    = "8a0c3c29f6f047011f5cae02d0b14475a690be86"
+	PinnedZeroTTSSourceRevision  = "9d85578bee9321d6ef8305a4d454baf33e3fe861"
+	PinnedZeroTTSPackageVersion  = "0.1.2"
+	PinnedZeroTTSAdapterRevision = "cmd/stageworker/adapters/tts_engine.py@zerotts-0.1.2"
+)
+
 // ComputeRuntimeManifestSHA256 computes a deterministic digest for the runtime identity binding.
 func (r *RuntimeIdentity) ComputeRuntimeManifestSHA256() string {
 	var deps []string
@@ -232,8 +241,9 @@ func (r *RuntimeIdentity) ComputeRuntimeManifestSHA256() string {
 
 // Frozen preset voice rotations for TTS (Issue #68).
 var (
-	FrozenKokoroVoiceOrder = []string{"af_heart", "am_michael", "af_bella", "am_fenrir"}
-	FrozenVieNeuVoiceOrder = []string{"Trúc Ly", "Phạm Tuyên", "Đoan Trang", "Xuân Vĩnh"}
+	FrozenKokoroVoiceOrder  = []string{"af_heart", "am_michael", "af_bella", "am_fenrir"}
+	FrozenVieNeuVoiceOrder  = []string{"Trúc Ly", "Phạm Tuyên", "Đoan Trang", "Xuân Vĩnh"}
+	FrozenZeroTTSVoiceOrder = []string{"quangminh", "maichi", "giahuy", "baotrang", "hamy", "huuduc", "kimoanh", "tiendat"}
 )
 
 // findManifestFile finds a file entry in the snapshot manifest whose normalized relative path satisfies match.
@@ -387,6 +397,66 @@ func ResolveTTSVoiceEntrypoint(manifest SnapshotManifest, snapshotRoot, modelNam
 	}
 
 	lowerModel := strings.ToLower(modelName)
+	if strings.Contains(lowerModel, "zerotts") || strings.Contains(lowerModel, "zeroweight") {
+		validZeroTTS := false
+		for _, v := range FrozenZeroTTSVoiceOrder {
+			if v == vID {
+				validZeroTTS = true
+				break
+			}
+		}
+		if !validZeroTTS {
+			return "", fmt.Errorf("%w: unverified or unknown ZeroTTS voice %q (must be one of %s)",
+				ErrTTSVoiceAssetMissing, vID, strings.Join(FrozenZeroTTSVoiceOrder, ", "))
+		}
+
+		required := []struct {
+			rel  string
+			desc string
+		}{
+			{"config.json", "ZeroTTS config"},
+			{"tokenizer.json", "ZeroTTS tokenizer"},
+			{"null_voice_emb.npy", "ZeroTTS null voice embedding"},
+			{"onnx/text_encoder.onnx", "ZeroTTS text encoder"},
+			{"onnx/prefix_step.onnx", "ZeroTTS prefix step model"},
+			{"onnx/local_frame_decode.onnx", "ZeroTTS local frame decoder"},
+			{"voices/index.json", "ZeroTTS voice index"},
+		}
+		for _, asset := range required {
+			entry := findManifestFile(manifest, func(norm string) bool { return norm == asset.rel })
+			if entry == nil {
+				return "", fmt.Errorf("%w: %s (%s) not declared in snapshot manifest for %s",
+					ErrSnapshotFileCorrupted, asset.desc, asset.rel, manifest.ModelID)
+			}
+			if _, err := verifySnapshotRegularFile(cleanRoot, entry, asset.desc); err != nil {
+				return "", err
+			}
+		}
+
+		codecEntries := 0
+		for i := range manifest.Files {
+			norm := strings.ToLower(NormalizeRelativePath(manifest.Files[i].RelativePath))
+			if strings.HasPrefix(norm, "onnx/codec/") {
+				codecEntries++
+				if _, err := verifySnapshotRegularFile(cleanRoot, &manifest.Files[i], "ZeroTTS codec model"); err != nil {
+					return "", err
+				}
+			}
+		}
+		if codecEntries == 0 {
+			return "", fmt.Errorf("%w: ZeroTTS codec assets under onnx/codec/ not declared in snapshot manifest for %s",
+				ErrSnapshotFileCorrupted, manifest.ModelID)
+		}
+
+		voiceRel := strings.ToLower("voices/" + vID + "/voice.npz")
+		voiceEntry := findManifestFile(manifest, func(norm string) bool { return norm == voiceRel })
+		if voiceEntry == nil {
+			return "", fmt.Errorf("%w: canonical ZeroTTS voice asset %s not declared in snapshot manifest for %s",
+				ErrTTSVoiceAssetMissing, "voices/"+vID+"/voice.npz", manifest.ModelID)
+		}
+		return verifySnapshotRegularFile(cleanRoot, voiceEntry, "ZeroTTS voice asset")
+	}
+
 	if strings.Contains(lowerModel, "kokoro") {
 		// Pinned Kokoro rotation
 		validKokoro := false

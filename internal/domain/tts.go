@@ -22,6 +22,8 @@ var (
 	ErrVoiceAssignmentFrozen = errors.New("voice assignment is frozen for this run")
 	// ErrNoEligibleTTSProvider is returned when no policy-eligible TTS provider is available.
 	ErrNoEligibleTTSProvider = errors.New("no eligible TTS provider found for voice assignment")
+	// ErrTTSSpeedUnsupported is returned when a preset-only provider cannot safely alter speaking speed.
+	ErrTTSSpeedUnsupported = errors.New("tts provider does not support requested speed")
 	// ErrDubSegmentCollision is returned when adjacent dub segments would collide on the timeline.
 	ErrDubSegmentCollision = errors.New("adjacent speech collision detected between dub segments")
 	// ErrVoiceProfileNotFound is returned when a speaker has no assigned voice profile.
