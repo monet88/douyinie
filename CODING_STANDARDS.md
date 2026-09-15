@@ -88,6 +88,7 @@ Do not rerun source acquisition, ASR, forced alignment, diarization, separation,
 - Cache identity must be deterministic over semantic inputs: stage + input hashes + semantic config + provider/model/version + target language where applicable + schema/pipeline version.
 - Cache identity must **not** depend on paths, mtimes, JobID, or RunID.
 - A retry or rerun creates new immutable evidence; it does not rewrite historical evidence in place.
+- Changing what a stage emits or persists requires bumping that stage's schema version (or its semantic-config token) in the same change; otherwise already-cached rows replay the old behavior and the new behavior is silently disabled.
 
 ## 5. Append-only evidence and review semantics
 
@@ -274,7 +275,7 @@ Before editing production symbols:
 
 1. Read `AGENTS.md` and the authoritative issue/spec for the task.
 2. Inspect `git status`, branch, HEAD, upstream, and unrelated WIP.
-3. Use GitNexus `impact` on each symbol being changed (`direction: upstream`, repo `douyinie`).
+3. Use GitNexus `impact` on each symbol being changed (`direction: upstream`, repo `douyinie`). If the index is stale — `gitnexus status` reports an indexed commit behind HEAD — refresh it first with `gitnexus analyze --index-only` (never `--force`; see `AGENTS.md`) and then run `impact`.
 4. If impact is HIGH or CRITICAL, surface the blast radius before proceeding.
 5. Map each acceptance criterion to an observable test/check.
 

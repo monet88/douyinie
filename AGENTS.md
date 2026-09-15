@@ -15,13 +15,14 @@
 - **Reserve constrained local compute for specialized media stages**: local hardware is for ASR/alignment/diarization, TTS, audio separation, OCR/tracking, mixing, and render. Do not reintroduce a local general-purpose LLM merely to satisfy a local-only ideology when an authorized API lane is available.
 - **Obligation layers**: `CODE_LICENSE`, `MODEL_LICENSE`, `DATA_LICENSE`, `SERVICE_TERMS` stay separate. Code changes do not remove model/data obligations.
 - **Completion is evidence-gated**: agent claims are evidence, not proof. Verify repo state, tests, and acceptance criteria before declaring PASS.
+- **GitNexus index refresh**: `gitnexus analyze --index-only` is safe. `gitnexus analyze --force` rewrites this file's machine-managed block with a machine-local runner path and live index statistics — run `git checkout -- AGENTS.md` before staging, or `test/steering` fails.
 
 ## Context by Task
 
 | Task | Read before starting |
 |------|---------------------|
 | **Architecture / design** | `docs/architecture/phase1-architecture.md`, `CONTEXT.md`, relevant `docs/adr/` |
-| **Implementation** | Above, plus the ticket's spec, `PRODUCT.md` §invariants, `docs/agents/domain.md` |
+| **Implementation** | Above, plus the ticket's spec, `PRODUCT.md` §invariants, `docs/agents/domain.md`, and `CODING_STANDARDS.md` §13 (pre-edit and pre-commit checklists) |
 | **Review** | Above, plus `docs/agents/orca-orchestration.md` §Mutation and Verification Boundaries |
 | **Coordination** | `docs/agents/orca-orchestration.md` (roles, workflow skills, mutation policy, continuity) |
 | **Issue tracker ops** | `docs/agents/issue-tracker.md` |
