@@ -1024,6 +1024,11 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 		if err != nil {
 			return nil, err
 		}
+		if superseding == nil {
+			// The run moved on to a newer assignment that is not this escalation, so
+			// the unresolved overrun above stays REVIEW instead of reverting it.
+			return pass, nil
+		}
 		return s.synthesizeSegmentsPass(ctx, in, dubScript, dubScriptCAS, superseding, superseding.CASHash, pass, plan.evidence)
 	}
 
@@ -1072,7 +1077,8 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 
 	// 5. Invalidation scope optimization: load superseded DubSegmentsVariant if current VoiceAssignment
 	// supersedes another assignment (Issue #40). Reuses prior selected DubSegments ONLY if the prior
-	// variant matches BOTH the superseded VoiceAssignmentCAS and the exact same DubScriptVariantCAS.
+	// variant was written under the current schema and matches BOTH the superseded VoiceAssignmentCAS
+	// and the exact same DubScriptVariantCAS.
 	var priorVariant *domain.DubSegmentsVariant
 	invalidatedSpeakersSet := make(map[string]bool)
 	if voiceAssign.SupersedesCAS != "" {
@@ -1081,7 +1087,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 		}
 		// An escalation regenerates against the exact variant it supersedes: an
 		// in-memory prior variant wins over the asset-scoped index lookup below.
-		priorFromHint := priorHint != nil && priorHint.VoiceAssignmentCAS == voiceAssign.SupersedesCAS && priorHint.DubScriptVariantCAS != "" && priorHint.DubScriptVariantCAS == dubScriptCAS
+		priorFromHint := priorHint != nil && priorHint.SchemaVersion == domain.DubSegmentsSchemaVersion && priorHint.VoiceAssignmentCAS == voiceAssign.SupersedesCAS && priorHint.DubScriptVariantCAS != "" && priorHint.DubScriptVariantCAS == dubScriptCAS
 		if priorFromHint {
 			priorVariant = priorHint
 		}
@@ -1091,6 +1097,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 					defer rc.Close()
 					var prevVar domain.DubSegmentsVariant
 					if err := json.NewDecoder(rc).Decode(&prevVar); err == nil &&
+						prevVar.SchemaVersion == domain.DubSegmentsSchemaVersion &&
 						prevVar.VoiceAssignmentCAS == voiceAssign.SupersedesCAS &&
 						prevVar.DubScriptVariantCAS != "" &&
 						prevVar.DubScriptVariantCAS == dubScriptCAS {
@@ -1793,15 +1800,36 @@ func (s *DubbingService) planSpeakerEscalation(ctx context.Context, in domain.Du
 
 	plan := &speakerEscalationPlan{target: target, assignments: make(map[string]domain.VoiceProfile, len(speakers))}
 	for _, spk := range speakers {
-		from := voiceAssign.Assignments[spk]
 		plan.assignments[spk] = target
+	}
+
+	// "One voice for all" keeps its meaning under escalation: the superseding assignment
+	// pins every speaker to the fallback lane voice, so every speaker whose profile
+	// actually changes is audited even when its own slots fit. A carried speaker has no
+	// overrun trigger of its own, which is what keeps the trigger evidence honest.
+	audited := speakers
+	if voiceAssign.UseSameVoiceForAll {
+		for spk, from := range voiceAssign.Assignments {
+			if slices.Contains(speakers, spk) || domain.VoiceProfileEquivalent(from, target) {
+				continue
+			}
+			audited = append(audited, spk)
+		}
+		sort.Strings(audited)
+	}
+	for _, spk := range audited {
+		from := voiceAssign.Assignments[spk]
+		reason := domain.VoiceEscalationReasonFixedRateOverrun
+		if len(triggers[spk]) == 0 {
+			reason = domain.VoiceEscalationReasonSharedVoiceScope
+		}
 		plan.evidence = append(plan.evidence, domain.VoiceProviderEscalation{
 			SpeakerID:               spk,
 			FromProviderID:          from.ProviderID,
 			FromVoiceID:             from.VoiceID,
 			ToProviderID:            target.ProviderID,
 			ToVoiceID:               target.VoiceID,
-			Reason:                  domain.VoiceEscalationReasonFixedRateOverrun,
+			Reason:                  reason,
 			TriggerSegmentIndices:   triggers[spk],
 			SupersededAssignmentCAS: voiceAssign.CASHash,
 		})
@@ -1831,8 +1859,18 @@ func (s *DubbingService) escalationLaneEligible(ctx context.Context, in domain.D
 // superseding VoiceAssignment and records the superseding CAS on the plan evidence.
 // A run whose current assignment already is exactly this escalation reuses it, so a
 // retried synthesis never mints a second superseding assignment for the same decision.
+// A run that has moved on to any other assignment refuses the escalation (nil, nil).
 func (s *DubbingService) applySpeakerEscalation(ctx context.Context, in domain.DubbingJobInput, base *domain.VoiceAssignment, plan *speakerEscalationPlan) (*domain.VoiceAssignment, error) {
-	superseding := s.currentEscalationAssignment(ctx, in, base, plan)
+	superseding, movedOn := s.currentRunAssignment(ctx, in, base)
+	if movedOn && (superseding == nil || !isEscalationOfBase(superseding, base, plan)) {
+		// The run already points at a newer assignment than the base this request
+		// synthesized under (an operator reassignment made while the request was in
+		// flight, for example). Minting from the stale base would make that older
+		// assignment current again and silently revert the operator's decision, so no
+		// escalation is applied and the unresolved pass stays REVIEW. An unreadable
+		// current assignment counts as moved on: never supersede what cannot be read.
+		return nil, nil
+	}
 	if superseding == nil {
 		var err error
 		superseding, err = s.supersedeVoiceAssignment(ctx, base, domain.VoiceAssignmentInput{
@@ -1855,28 +1893,46 @@ func (s *DubbingService) applySpeakerEscalation(ctx context.Context, in domain.D
 	return superseding, nil
 }
 
-// currentEscalationAssignment returns the run's current assignment when it already is
-// exactly this escalation of the base assignment, and nil otherwise.
-func (s *DubbingService) currentEscalationAssignment(ctx context.Context, in domain.DubbingJobInput, base *domain.VoiceAssignment, plan *speakerEscalationPlan) *domain.VoiceAssignment {
+// currentRunAssignment returns the assignment the run currently points at, plus whether
+// the run has moved past base at all. A run with no stored assignment (or one already
+// equal to base) has not moved; a run whose current assignment exists but cannot be read
+// still reports the move, so callers fail safe instead of minting from a stale base.
+func (s *DubbingService) currentRunAssignment(ctx context.Context, in domain.DubbingJobInput, base *domain.VoiceAssignment) (*domain.VoiceAssignment, bool) {
 	if s.db == nil || s.cas == nil {
-		return nil
+		return nil, false
 	}
 	idx, err := s.db.GetVoiceAssignmentIndexByRun(ctx, in.AssetID, in.RunID, in.TargetLanguage)
-	if err != nil || idx == nil || idx.CASHash == "" || idx.CASHash == base.CASHash {
-		return nil
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil, false
+	}
+	if err != nil {
+		// Unknown read failure: assume the run moved on so the caller never supersedes
+		// an assignment it could not read.
+		return nil, true
+	}
+	if idx == nil || idx.CASHash == "" || idx.CASHash == base.CASHash {
+		return nil, false
 	}
 	rc, err := s.cas.Get(idx.CASHash)
 	if err != nil {
-		return nil
+		return nil, true
 	}
 	defer rc.Close()
 	var current domain.VoiceAssignment
 	if err := json.NewDecoder(rc).Decode(&current); err != nil {
-		return nil
+		return nil, true
 	}
 	current.CASHash = idx.CASHash
-	if current.SupersedesCAS != base.CASHash || len(current.Assignments) != len(base.Assignments) {
-		return nil
+	return &current, true
+}
+
+// isEscalationOfBase reports whether current already is exactly the escalation the plan
+// would mint from base, so a retried synthesis reuses it instead of minting a second one.
+func isEscalationOfBase(current, base *domain.VoiceAssignment, plan *speakerEscalationPlan) bool {
+	if current.SupersedesCAS != base.CASHash ||
+		current.UseSameVoiceForAll != base.UseSameVoiceForAll ||
+		len(current.Assignments) != len(base.Assignments) {
+		return false
 	}
 	for spk, baseProfile := range base.Assignments {
 		// "One voice for all" keeps its meaning: escalation replaces every profile
@@ -1886,10 +1942,10 @@ func (s *DubbingService) currentEscalationAssignment(ctx context.Context, in dom
 			want = plan.target
 		}
 		if !domain.VoiceProfileEquivalent(current.Assignments[spk], want) {
-			return nil
+			return false
 		}
 	}
-	return &current
+	return true
 }
 
 // resolveSpeakers resolves all distinct speaker IDs from TranscriptArtifact or DubScriptVariant.

@@ -660,6 +660,24 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 	if err != nil {
 		return nil, fmt.Errorf("dub synthesize rerun failed: %w", err)
 	}
+	// SynthesizeAndFit may escalate a whole speaker to the duration-controlled lane
+	// (Issue #94), which pins the variant to a superseding VoiceAssignment. The
+	// correction must report the assignment actually in force, including which speakers
+	// that final assignment invalidated, not the one the correction asked for.
+	if finalCAS := dubSegsVar.VoiceAssignmentCAS; finalCAS != "" && finalCAS != newAssign.CASHash {
+		rc, err := s.cas.Get(finalCAS)
+		if err != nil {
+			return nil, fmt.Errorf("load final voice assignment from CAS (%s): %w", finalCAS, err)
+		}
+		var final domain.VoiceAssignment
+		if err := json.NewDecoder(rc).Decode(&final); err != nil {
+			rc.Close()
+			return nil, fmt.Errorf("decode final voice assignment (%s): %w", finalCAS, err)
+		}
+		rc.Close()
+		result.VoiceAssignmentCAS = finalCAS
+		result.InvalidatedSpeakers = final.InvalidatedSpeakers
+	}
 	result.DubSegmentsVariantCAS = dubSegsVar.CASHash
 
 	// 4. Audio stem mixing

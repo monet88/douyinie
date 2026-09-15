@@ -2,13 +2,19 @@ package seam1_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"testing"
 	"time"
 
+	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/provider"
+	"github.com/monet88/douyinie/internal/service"
+	"github.com/monet88/douyinie/internal/storage"
 )
 
 // Issue #94 — an unresolved fixed-rate (ZeroTTS) timing failure escalates to the
@@ -509,4 +515,546 @@ func segmentForSpeaker(t *testing.T, variant *domain.DubSegmentsVariant, speaker
 		t.Fatalf("expected exactly 1 selected segment for %s, got %d", speakerID, len(matches))
 	}
 	return matches[0], matches[0].AudioSHA256, matches[0].SlotDurationMs
+}
+
+// ---------------------------------------------------------------------------
+//  5. A variant cached under the pre-#94 stage identity cannot satisfy a #94 request.
+//     Issue #94 changed both what the TTS stage persists (Escalations,
+//     FixedRateSpeakers) and how it behaves (whole-speaker escalation), so the
+//     DubSegments cache identity had to move with it.
+// ---------------------------------------------------------------------------
+
+// legacyDubSegmentsSchemaVersion is the DubSegments schema identity a pre-#94 build
+// hashed into its stage cache key. It is deliberately pinned instead of derived from
+// domain.DubSegmentsSchemaVersion, so the test still describes the pre-#94 entry after
+// the current identity moves on.
+const legacyDubSegmentsSchemaVersion = 1
+
+// seedLegacyCachedDubSegmentsVariant writes the index row and CAS payload a pre-#94
+// build would have produced for this exact (dub script, voice assignment, language)
+// request: the pre-#94 stage cache key, and a variant body that predates both
+// Escalations and FixedRateSpeakers.
+func seedLegacyCachedDubSegmentsVariant(t *testing.T, h *testHarness, dubScriptCAS, voiceAssignCAS, assetID, runID string) string {
+	t.Helper()
+
+	legacyProvenance, err := cas.ComputeStageCacheKey(domain.StageCacheIdentityInput{
+		Stage:       string(provider.TypeTTS),
+		InputHashes: []string{dubScriptCAS, voiceAssignCAS},
+		SemanticConfig: map[string]any{
+			"zero_overrun_fit": "measured_media_truth_v1",
+		},
+		Language:      "vi",
+		SchemaVersion: legacyDubSegmentsSchemaVersion,
+	})
+	if err != nil {
+		t.Fatalf("compute pre-#94 stage cache key: %v", err)
+	}
+
+	legacy := &domain.DubSegmentsVariant{
+		ID:                  "legacy-pre-94-dub-segments",
+		SchemaVersion:       legacyDubSegmentsSchemaVersion,
+		AssetID:             assetID,
+		RunID:               runID,
+		TargetLanguage:      "vi",
+		DubScriptVariantCAS: dubScriptCAS,
+		VoiceAssignmentCAS:  voiceAssignCAS,
+		OverallStatus:       "REVIEW_REQUIRED",
+		ProvenanceHash:      legacyProvenance,
+		CreatedAt:           time.Now().UTC(),
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("marshal pre-#94 variant: %v", err)
+	}
+	obj, err := h.casStore.Put(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("put pre-#94 variant in CAS: %v", err)
+	}
+	if err := h.db.SaveDubSegmentsVariantIndex(context.Background(), storage.DubSegmentsVariantIndex{
+		ID:             legacy.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        obj.SHA256,
+		ProvenanceHash: legacyProvenance,
+		OverallStatus:  legacy.OverallStatus,
+		CreatedAt:      legacy.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save pre-#94 variant index: %v", err)
+	}
+	return obj.SHA256
+}
+
+func TestSeam1_ZeroTTS_PreIssue94CachedVariantCannotSatisfyTheEscalationContract(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	dubVariant := setupDubScriptForSeam1Lang(t, h, runID, assetID, "vi", escalationFixture())
+
+	respAssign, assign1 := runAssignVoices(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	})
+	if respAssign.StatusCode != http.StatusCreated || assign1 == nil {
+		t.Fatalf("voice assignment failed: %d", respAssign.StatusCode)
+	}
+
+	zeroTTSHardSlotFake(t, h)
+	registerCosyVoiceFallback(t, h, 700, true)
+
+	// A pre-#94 build already cached a variant for exactly this request identity.
+	legacyCAS := seedLegacyCachedDubSegmentsVariant(t, h, dubVariant.CASHash, assign1.CASHash, assetID, runID)
+
+	respSynth, variant := runDubSynthesize(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": dubVariant.CASHash,
+		"voice_assignment_cas":   assign1.CASHash,
+	})
+	if respSynth.StatusCode != http.StatusCreated || variant == nil {
+		t.Fatalf("dub-synthesize failed: %d", respSynth.StatusCode)
+	}
+	if variant.CASHash == legacyCAS {
+		t.Fatalf("the pre-#94 cached variant satisfied a #94 synthesis request: the DubSegments cache identity was not versioned")
+	}
+	// The #94 contract must be honoured from scratch: lane evidence, escalation, fit.
+	if len(variant.FixedRateSpeakers) == 0 {
+		t.Fatalf("expected fixed-rate lane evidence on the regenerated variant, got none")
+	}
+	if len(variant.Escalations) != 1 || !variant.Escalations[0].Resolved {
+		t.Fatalf("expected one resolved whole-speaker escalation, got %+v", variant.Escalations)
+	}
+	if variant.OverallStatus != "PASS" || len(variant.Segments) != 3 {
+		t.Fatalf("expected a fully fitted variant, got status %s (selected=%d)", variant.OverallStatus, len(variant.Segments))
+	}
+}
+
+// ---------------------------------------------------------------------------
+//  6. A review correction reports the assignment actually in force, even when the
+//     synthesis it drives escalates a speaker to the fallback lane.
+//
+// ---------------------------------------------------------------------------
+func TestSeam1_ZeroTTS_ReviewCorrectionReportsTheFinalAssignmentAfterEscalation(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	dubVariant := setupDubScriptForSeam1Lang(t, h, runID, assetID, "vi", escalationFixture())
+
+	respAssign, assign1 := runAssignVoices(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	})
+	if respAssign.StatusCode != http.StatusCreated || assign1 == nil {
+		t.Fatalf("voice assignment failed: %d", respAssign.StatusCode)
+	}
+
+	zeroTTSHardSlotFake(t, h)
+	registerCosyVoiceFallback(t, h, 700, true)
+
+	// The operator reassigns the unaffected speaker to another verified preset, so the
+	// correction regenerates that speaker while SPEAKER_00 keeps its unresolved overrun
+	// and takes the whole-speaker escalation.
+	presets := provider.ZeroTTSPresetVoices()
+	if len(presets) <= provider.DefaultVIUnattendedVoiceCount {
+		t.Fatalf("fixture needs a verified preset outside the unattended rotation")
+	}
+	reassignedVoice := presets[provider.DefaultVIUnattendedVoiceCount]
+
+	reassignBody, _ := json.Marshal(map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": "vi",
+		"custom_assignments": map[string]domain.VoiceProfile{
+			"SPEAKER_01": reassignedVoice,
+		},
+		"reason":   "operator selects another verified preset for the unaffected speaker",
+		"operator": "seam1",
+	})
+	reassignURL := fmt.Sprintf("%s/api/v1/assets/%s/inspector/reassign-voice", h.server.URL, assetID)
+	respReassign, err := http.Post(reassignURL, "application/json", bytes.NewReader(reassignBody))
+	if err != nil {
+		t.Fatalf("POST inspector/reassign-voice failed: %v", err)
+	}
+	if respReassign.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(respReassign.Body)
+		respReassign.Body.Close()
+		t.Fatalf("POST inspector/reassign-voice status %d: %s", respReassign.StatusCode, body)
+	}
+	var decoded struct {
+		Result service.VoiceReassignCorrectionResult `json:"result"`
+	}
+	if err := json.NewDecoder(respReassign.Body).Decode(&decoded); err != nil {
+		respReassign.Body.Close()
+		t.Fatalf("decode reassign correction result: %v", err)
+	}
+	respReassign.Body.Close()
+	res := decoded.Result
+
+	if res.DubSegmentsVariantCAS == "" {
+		t.Fatalf("expected a regenerated dub segments variant")
+	}
+	rc, err := h.casStore.Get(res.DubSegmentsVariantCAS)
+	if err != nil {
+		t.Fatalf("load regenerated variant from CAS: %v", err)
+	}
+	var variant domain.DubSegmentsVariant
+	if err := json.NewDecoder(rc).Decode(&variant); err != nil {
+		rc.Close()
+		t.Fatalf("decode regenerated variant: %v", err)
+	}
+	rc.Close()
+	if variant.DubScriptVariantCAS != dubVariant.CASHash {
+		t.Fatalf("correction regenerated against dub script %s, expected %s", variant.DubScriptVariantCAS, dubVariant.CASHash)
+	}
+
+	// The correction must genuinely have escalated, otherwise the CAS assertion below
+	// would hold for the wrong reason.
+	if len(variant.Escalations) != 1 || !variant.Escalations[0].Resolved {
+		t.Fatalf("expected one resolved whole-speaker escalation, got %+v", variant.Escalations)
+	}
+	if variant.Escalations[0].SpeakerID != "SPEAKER_00" {
+		t.Fatalf("expected SPEAKER_00 to escalate, got %s", variant.Escalations[0].SpeakerID)
+	}
+
+	// The reported CAS names the assignment the variant was pinned to, not the one the
+	// correction asked for before the escalation superseded it.
+	if res.VoiceAssignmentCAS != variant.VoiceAssignmentCAS {
+		t.Fatalf("correction reported assignment %s while the variant is pinned to %s", res.VoiceAssignmentCAS, variant.VoiceAssignmentCAS)
+	}
+	current := runGetVoiceAssignment(t, h, assetID, runID)
+	if current.CASHash != res.VoiceAssignmentCAS {
+		t.Fatalf("correction reported %s but the run assignment in force is %s", res.VoiceAssignmentCAS, current.CASHash)
+	}
+	if current.SupersedesCAS == "" || current.Assignments["SPEAKER_00"].ProviderID != provider.CosyVoiceProviderID {
+		t.Fatalf("expected the superseding escalation assignment in force, got %+v", current)
+	}
+	// The reported invalidation scope is the one the final assignment actually applied:
+	// the escalated speaker, not the speaker the correction reassigned before escalating.
+	if len(res.InvalidatedSpeakers) != 1 || res.InvalidatedSpeakers[0] != "SPEAKER_00" {
+		t.Fatalf("correction reported invalidation scope %v while the final assignment invalidated %v", res.InvalidatedSpeakers, current.InvalidatedSpeakers)
+	}
+}
+
+// ---------------------------------------------------------------------------
+//  7. A synthesis carrying a stale base assignment must not mint its escalation:
+//     doing so would make the older assignment current again and revert the
+//     operator's newer choice.
+//
+// ---------------------------------------------------------------------------
+func TestSeam1_ZeroTTS_StaleBaseEscalationCannotClobberNewerOperatorAssignment(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	dubVariant := setupDubScriptForSeam1Lang(t, h, runID, assetID, "vi", escalationFixture())
+
+	respAssign, assign1 := runAssignVoices(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	})
+	if respAssign.StatusCode != http.StatusCreated || assign1 == nil {
+		t.Fatalf("voice assignment failed: %d", respAssign.StatusCode)
+	}
+	zeroTTSHardSlotFake(t, h)
+	fakeCosy := registerCosyVoiceFallback(t, h, 700, true)
+
+	stalePayload := map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": dubVariant.CASHash,
+		"voice_assignment_cas":   assign1.CASHash,
+	}
+	respFirst, first := runDubSynthesize(t, h, assetID, stalePayload)
+	if respFirst.StatusCode != http.StatusCreated || first == nil || len(first.Escalations) != 1 {
+		t.Fatalf("expected the first synthesis to escalate: status %d", respFirst.StatusCode)
+	}
+	if first.VoiceAssignmentCAS == assign1.CASHash {
+		t.Fatalf("escalation must supersede the base assignment, still on %s", assign1.CASHash)
+	}
+
+	// The operator then reassigns the speaker that never overran, on the escalated run.
+	presets := provider.ZeroTTSPresetVoices()
+	if len(presets) <= provider.DefaultVIUnattendedVoiceCount {
+		t.Fatalf("fixture needs a verified preset outside the unattended rotation")
+	}
+	reassignedVoice := presets[provider.DefaultVIUnattendedVoiceCount]
+	reassignBody, _ := json.Marshal(map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": "vi",
+		"custom_assignments": map[string]domain.VoiceProfile{
+			"SPEAKER_01": reassignedVoice,
+		},
+	})
+	respReassign, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-assignment/reassign", "application/json", bytes.NewReader(reassignBody))
+	if err != nil {
+		t.Fatalf("POST voice-assignment/reassign failed: %v", err)
+	}
+	if respReassign.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(respReassign.Body)
+		respReassign.Body.Close()
+		t.Fatalf("POST voice-assignment/reassign status %d: %s", respReassign.StatusCode, body)
+	}
+	var reassigned struct {
+		Assignment domain.VoiceAssignment `json:"voice_assignment"`
+	}
+	if err := json.NewDecoder(respReassign.Body).Decode(&reassigned); err != nil {
+		respReassign.Body.Close()
+		t.Fatalf("decode operator reassignment: %v", err)
+	}
+	respReassign.Body.Close()
+	operatorCAS := reassigned.Assignment.CASHash
+	if operatorCAS == "" || operatorCAS == first.VoiceAssignmentCAS {
+		t.Fatalf("expected a superseding operator reassignment, got %q", operatorCAS)
+	}
+
+	// The stale caller retries its original request identity (base = assign1) after the
+	// run has moved on. It must leave the operator's assignment in force.
+	cosyInvocations := fakeCosy.Invocations
+	respStale, stale := runDubSynthesize(t, h, assetID, stalePayload)
+	if respStale.StatusCode != http.StatusCreated || stale == nil {
+		t.Fatalf("stale-base dub-synthesize failed: %d", respStale.StatusCode)
+	}
+	current := runGetVoiceAssignment(t, h, assetID, runID)
+	if current.CASHash != operatorCAS {
+		t.Fatalf("a stale-base synthesis replaced the operator assignment %s with %s", operatorCAS, current.CASHash)
+	}
+	if got := current.Assignments["SPEAKER_01"]; !domain.VoiceProfileEquivalent(got, reassignedVoice) {
+		t.Fatalf("the operator's voice choice was reverted to %+v", got)
+	}
+	if len(stale.Escalations) != 0 || fakeCosy.Invocations != cosyInvocations {
+		t.Fatalf("a stale-base synthesis applied an escalation it must not: %+v (+%d fallback invocations)", stale.Escalations, fakeCosy.Invocations-cosyInvocations)
+	}
+	if stale.OverallStatus != "REVIEW_REQUIRED" {
+		t.Fatalf("a refused escalation must leave the unresolved overrun on REVIEW, got %s", stale.OverallStatus)
+	}
+}
+
+// ---------------------------------------------------------------------------
+//  8. Under "one voice for all" the escalation pins every speaker to the fallback
+//     voice, so every speaker whose profile actually changes is audited: the shared
+//     voice follows the escalated speaker, and the trigger evidence stays honest.
+//
+// ---------------------------------------------------------------------------
+func TestSeam1_ZeroTTS_SharedVoiceEscalationAuditsEveryChangedSpeaker(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	dubVariant := setupDubScriptForSeam1Lang(t, h, runID, assetID, "vi", escalationFixture())
+
+	respAssign, assign1 := runAssignVoices(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"use_same_voice_for_all": true,
+	})
+	if respAssign.StatusCode != http.StatusCreated || assign1 == nil {
+		t.Fatalf("voice assignment failed: %d", respAssign.StatusCode)
+	}
+	if !assign1.UseSameVoiceForAll || !domain.VoiceProfileEquivalent(assign1.Assignments["SPEAKER_00"], assign1.Assignments["SPEAKER_01"]) {
+		t.Fatalf("fixture requires one shared frozen profile, got %+v", assign1.Assignments)
+	}
+
+	zeroTTSHardSlotFake(t, h)
+	fakeCosy := registerCosyVoiceFallback(t, h, 700, true)
+
+	respSynth, variant := runDubSynthesize(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": dubVariant.CASHash,
+		"voice_assignment_cas":   assign1.CASHash,
+	})
+	if respSynth.StatusCode != http.StatusCreated || variant == nil {
+		t.Fatalf("shared-voice dub-synthesize failed: %d", respSynth.StatusCode)
+	}
+	if variant.OverallStatus != "PASS" || len(variant.Segments) != 3 {
+		t.Fatalf("expected the fallback lane to fit every shared-voice slot, got %s (selected=%d)", variant.OverallStatus, len(variant.Segments))
+	}
+	// The flag makes the escalated speaker's fallback voice the shared one, so both
+	// speakers really changed lane and both must be audited.
+	if len(variant.Escalations) != 2 {
+		t.Fatalf("expected every actually changed speaker to be audited, got %+v", variant.Escalations)
+	}
+	escalated := make(map[string]domain.VoiceProviderEscalation, len(variant.Escalations))
+	for _, esc := range variant.Escalations {
+		escalated[esc.SpeakerID] = esc
+	}
+	triggered, carried := escalated["SPEAKER_00"], escalated["SPEAKER_01"]
+	if triggered.Reason != domain.VoiceEscalationReasonFixedRateOverrun || len(triggered.TriggerSegmentIndices) != 1 || triggered.TriggerSegmentIndices[0] != 0 {
+		t.Fatalf("expected the overrunning speaker to keep its trigger evidence, got %+v", triggered)
+	}
+	if carried.Reason != domain.VoiceEscalationReasonSharedVoiceScope || len(carried.TriggerSegmentIndices) != 0 {
+		t.Fatalf("expected the carried speaker to be audited without a trigger of its own, got %+v", carried)
+	}
+	for _, esc := range []domain.VoiceProviderEscalation{triggered, carried} {
+		if esc.FromProviderID != provider.ZeroTTSProviderID || esc.ToProviderID != provider.CosyVoiceProviderID {
+			t.Fatalf("unexpected lane change: %+v", esc)
+		}
+		if esc.SupersededAssignmentCAS != assign1.CASHash || esc.SupersedingAssignmentCAS != variant.VoiceAssignmentCAS {
+			t.Fatalf("escalation CAS pins must link superseded -> superseding, got %+v", esc)
+		}
+		if !esc.Resolved {
+			t.Fatalf("expected both shared-voice speakers to be fitted on the fallback lane, got %+v", esc)
+		}
+	}
+	// One lane per speaker: no sentence-level hopping inside the shared voice.
+	for _, seg := range variant.Segments {
+		if seg.Voice.ProviderID != provider.CosyVoiceProviderID {
+			t.Fatalf("segment %d stayed on %s after the shared-voice escalation", seg.Index, seg.Voice.ProviderID)
+		}
+	}
+	if len(variant.FixedRateSpeakers) != 0 {
+		t.Fatalf("no speaker may still claim a fixed-rate lane, got %v", variant.FixedRateSpeakers)
+	}
+	// The carried speaker was regenerated for real (its single slot) alongside the two
+	// overrunning-speaker slots, so the audit covers a change that actually happened.
+	if fakeCosy.Invocations != 3 {
+		t.Fatalf("expected both speakers regenerated on the fallback lane, got %d invocations", fakeCosy.Invocations)
+	}
+	current := runGetVoiceAssignment(t, h, assetID, runID)
+	if current.CASHash != variant.VoiceAssignmentCAS || !current.UseSameVoiceForAll {
+		t.Fatalf("variant must pin the superseding shared-voice assignment %s, got %s", variant.VoiceAssignmentCAS, current.CASHash)
+	}
+	if len(current.InvalidatedSpeakers) != 2 || current.InvalidatedSpeakers[0] != "SPEAKER_00" || current.InvalidatedSpeakers[1] != "SPEAKER_01" {
+		t.Fatalf("expected the shared-voice escalation to invalidate every speaker, got %v", current.InvalidatedSpeakers)
+	}
+}
+
+// seedLegacySchemaPriorDubSegmentsVariant re-files an already produced variant as the
+// asset-scoped prior variant for its own request identity (dub script + voice assignment
+// CAS), rewritten to the pre-#94 schema identity. The segment bodies are left untouched:
+// only the persisted contract they were written under differs.
+func seedLegacySchemaPriorDubSegmentsVariant(t *testing.T, h *testHarness, produced *domain.DubSegmentsVariant, assetID, runID string) {
+	t.Helper()
+	rc, err := h.casStore.Get(produced.CASHash)
+	if err != nil {
+		t.Fatalf("load produced variant from CAS: %v", err)
+	}
+	var legacy domain.DubSegmentsVariant
+	decodeErr := json.NewDecoder(rc).Decode(&legacy)
+	rc.Close()
+	if decodeErr != nil {
+		t.Fatalf("decode produced variant: %v", decodeErr)
+	}
+	legacy.SchemaVersion = legacyDubSegmentsSchemaVersion
+
+	data, err := json.Marshal(&legacy)
+	if err != nil {
+		t.Fatalf("marshal pre-#94 schema variant: %v", err)
+	}
+	obj, err := h.casStore.Put(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("put pre-#94 schema variant in CAS: %v", err)
+	}
+	if err := h.db.SaveDubSegmentsVariantIndex(context.Background(), storage.DubSegmentsVariantIndex{
+		ID:             legacy.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        obj.SHA256,
+		ProvenanceHash: legacy.ProvenanceHash,
+		OverallStatus:  legacy.OverallStatus,
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("save pre-#94 schema variant index: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+//  9. Prior segment reuse is only valid inside the same persisted contract: a variant
+//     written under the pre-#94 schema cannot donate its segments to a superseding
+//     synthesis that now requires the #94 lane evidence.
+//
+// ---------------------------------------------------------------------------
+func TestSeam1_ZeroTTS_LegacySchemaPriorVariantIsNotReusedBySupersedingSynthesis(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	dubVariant := setupDubScriptForSeam1Lang(t, h, runID, assetID, "vi", escalationFixture())
+
+	respAssign, assign1 := runAssignVoices(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	})
+	if respAssign.StatusCode != http.StatusCreated || assign1 == nil {
+		t.Fatalf("voice assignment failed: %d", respAssign.StatusCode)
+	}
+	fake := defaultVITTSFake(t, h)
+	// Every fixture slot fits at the lane's natural speed, so the test stays about reuse
+	// rather than the fit controller.
+	fake.DurationMs = 800
+
+	// The run's first synthesis fits every slot on the ZeroTTS lane.
+	respFirst, first := runDubSynthesize(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": dubVariant.CASHash,
+		"voice_assignment_cas":   assign1.CASHash,
+	})
+	if respFirst.StatusCode != http.StatusCreated || first == nil {
+		t.Fatalf("first dub-synthesize failed: %d", respFirst.StatusCode)
+	}
+	if first.OverallStatus != "PASS" || len(first.Segments) != 3 {
+		t.Fatalf("expected a fully fitted first synthesis, got %s (selected=%d)", first.OverallStatus, len(first.Segments))
+	}
+	seedLegacySchemaPriorDubSegmentsVariant(t, h, first, assetID, runID)
+
+	// The operator reassigns the unaffected speaker, producing a real superseding
+	// assignment, so the next synthesis has to decide what it may reuse from the prior
+	// variant filed above.
+	presets := provider.ZeroTTSPresetVoices()
+	if len(presets) <= provider.DefaultVIUnattendedVoiceCount {
+		t.Fatalf("fixture needs a verified preset outside the unattended rotation")
+	}
+	reassignBody, _ := json.Marshal(map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": "vi",
+		"custom_assignments": map[string]domain.VoiceProfile{
+			"SPEAKER_01": presets[provider.DefaultVIUnattendedVoiceCount],
+		},
+	})
+	respReassign, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-assignment/reassign", "application/json", bytes.NewReader(reassignBody))
+	if err != nil {
+		t.Fatalf("POST voice-assignment/reassign failed: %v", err)
+	}
+	var reassigned struct {
+		Assignment domain.VoiceAssignment `json:"voice_assignment"`
+	}
+	decodeErr := json.NewDecoder(respReassign.Body).Decode(&reassigned)
+	respReassign.Body.Close()
+	if decodeErr != nil {
+		t.Fatalf("decode operator reassignment: %v", decodeErr)
+	}
+	if respReassign.StatusCode != http.StatusOK || reassigned.Assignment.SupersedesCAS != assign1.CASHash {
+		t.Fatalf("expected a superseding assignment based on %s, got status %d with base %s", assign1.CASHash, respReassign.StatusCode, reassigned.Assignment.SupersedesCAS)
+	}
+
+	invocationsBefore := fake.Invocations
+	respSecond, second := runDubSynthesize(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": dubVariant.CASHash,
+		"voice_assignment_cas":   reassigned.Assignment.CASHash,
+	})
+	if respSecond.StatusCode != http.StatusCreated || second == nil {
+		t.Fatalf("superseding dub-synthesize failed: %d", respSecond.StatusCode)
+	}
+	if second.OverallStatus != "PASS" || len(second.Segments) != 3 {
+		t.Fatalf("expected the superseding synthesis to fit every slot, got %s (selected=%d)", second.OverallStatus, len(second.Segments))
+	}
+	// Reuse requires the prior variant to be written under the current contract, so the
+	// speaker the operator left alone is synthesized again rather than donated a
+	// pre-#94 segment.
+	if got := fake.Invocations - invocationsBefore; got != len(second.Segments) {
+		t.Fatalf("expected every segment synthesized under the current contract, got %d invocations for %d segments: pre-#94 prior segments were reused", got, len(second.Segments))
+	}
 }

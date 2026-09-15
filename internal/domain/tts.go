@@ -42,7 +42,12 @@ var (
 
 const (
 	VoiceAssignmentSchemaVersion = 1
-	DubSegmentsSchemaVersion     = 1
+	// DubSegmentsSchemaVersion is part of the TTS stage cache identity, so it must move
+	// whenever a DubSegmentsVariant's persisted contract or the synthesis behavior that
+	// produces it changes. Issue #94 added whole-speaker escalation plus the Escalations
+	// and FixedRateSpeakers evidence: a variant cached under version 1 predates both and
+	// must never satisfy a request that now requires them.
+	DubSegmentsSchemaVersion = 2
 )
 
 // VoiceProfile represents a preset or cloned voice configuration.
@@ -262,6 +267,12 @@ type DubSegmentReview struct {
 // fixed-rate preset lane (ZeroTTS) could not fit an immutable source slot after the
 // bounded natural-speed rewrite/regroup remedies were exhausted (Issue #94).
 const VoiceEscalationReasonFixedRateOverrun = "UNRESOLVED_FIXED_RATE_DURATION_OVERRUN"
+
+// VoiceEscalationReasonSharedVoiceScope is the deterministic reason recorded for a
+// speaker carried onto the fallback lane because the run pins one voice for every
+// speaker: the escalated speaker's fallback voice is theirs too. Such a speaker has no
+// unresolved overrun trigger of its own.
+const VoiceEscalationReasonSharedVoiceScope = "SHARED_VOICE_FOR_ALL_FOLLOWS_FALLBACK_LANE"
 
 // VoiceProviderEscalation records one whole-speaker provider escalation caused by an
 // unresolved timing failure on a fixed-rate preset lane. The provider change is applied
