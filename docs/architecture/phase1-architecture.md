@@ -594,7 +594,7 @@ The five live-tested video fixtures from `.ref/_live-tests/e2e-acceptance-202608
 
 The following items are recognized as implementation tuning and benchmark validation activities, not open architectural questions:
 
-1. **Exact Model Weights & Checkpoint Pins**: Finalizing specific Hugging Face model revisions, SHA-256 hashes, and license manifests for `Qwen3-ASR`, `Qwen3-ForcedAligner`, `ZeroTTS` (package `0.1.2`, source `9d85578bee9321d6ef8305a4d454baf33e3fe861`, model `zeroweight-ai/ZeroTTS` at `8a0c3c29f6f047011f5cae02d0b14475a690be86`), `VieNeu-TTS`, `CosyVoice3`, and `python-audio-separator` / UVR / Demucs families.
+1. **Exact Model Weights & Checkpoint Pins**: Finalizing specific Hugging Face model revisions, SHA-256 hashes, and license manifests for `Qwen3-ASR`, `Qwen3-ForcedAligner`, `VieNeu-TTS`, `CosyVoice3`, and `python-audio-separator` / UVR / Demucs families. `ZeroTTS` (package `0.1.2`, source `9d85578bee9321d6ef8305a4d454baf33e3fe861`, model `zeroweight-ai/ZeroTTS` at `8a0c3c29f6f047011f5cae02d0b14475a690be86`) is **no longer pending**: those pins are bound in `internal/domain/snapshot.go`, its runtime identity is observed through `SnapshotService`, and the real pinned StageWorker smoke asserts it (`test/seam2/zerotts_seam2_test.go`).
 2. **Separator Presets & Suppression Envelopes**: Tuning suppression fade-in/fade-out curves (15–30ms) around speech boundaries on diverse acoustic backgrounds.
 3. **Pacing & Breathing Pause Thresholds**: Calibrating empirical inter-turn pause thresholds across different video categories (fast tutorials vs. lifestyle vlogs).
 4. **OCR & Text Box Color Sampling**: Refining background box color extraction heuristics (average vs. median edge color) for high visual cohesion on complex video backgrounds.
