@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -328,6 +330,16 @@ func (s *DubbingService) ReassignVoice(ctx context.Context, in domain.VoiceAssig
 		return nil, fmt.Errorf("load existing frozen voice assignment: %w", domain.ErrVoiceAssignmentNotFound)
 	}
 
+	return s.supersedeVoiceAssignment(ctx, &existing, in)
+}
+
+// supersedeVoiceAssignment applies custom voice profiles on top of a base frozen
+// assignment and persists the result as an immutable superseding assignment that
+// records the base CAS, the affected speakers, and the descendant invalidation scope.
+// The base assignment object itself is never mutated.
+func (s *DubbingService) supersedeVoiceAssignment(ctx context.Context, existing *domain.VoiceAssignment, in domain.VoiceAssignmentInput) (*domain.VoiceAssignment, error) {
+	targetLang := in.TargetLanguage
+
 	// 2. Build new assignments
 	newAssignments := make(map[string]domain.VoiceProfile)
 	for spk, prof := range existing.Assignments {
@@ -368,7 +380,7 @@ func (s *DubbingService) ReassignVoice(ctx context.Context, in domain.VoiceAssig
 	affected := domain.AffectedSpeakers(existing.Assignments, newAssignments)
 	if len(affected) == 0 && existing.UseSameVoiceForAll == in.UseSameVoiceForAll {
 		// Idempotent: nothing changed
-		return &existing, nil
+		return existing, nil
 	}
 
 	provenanceHash, err := s.computeVoiceAssignmentProvenanceHash(in, newAssignments)
@@ -995,6 +1007,44 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 		return nil, fmt.Errorf("load voice assignment for synthesis: %w", err)
 	}
 	in.VoiceAssignmentCAS = voiceAssignCAS
+
+	pass, err := s.synthesizeSegmentsPass(ctx, in, dubScript, dubScriptCAS, voiceAssign, voiceAssignCAS, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Issue #94: a speaker whose immutable source slot is still overrun by a
+	// fixed-rate preset lane (ZeroTTS) after the bounded rewrite/regroup remedies
+	// are exhausted escalates once, at whole-speaker scope, to the duration-controlled
+	// fallback lane (CosyVoice3). The escalation supersedes that speaker's frozen
+	// assignment and regenerates only its descendants; whatever is still unresolved
+	// after the escalated regeneration projects REVIEW instead of hopping again.
+	if plan := s.planSpeakerEscalation(ctx, in, voiceAssign, pass); plan != nil {
+		superseding, err := s.applySpeakerEscalation(ctx, in, voiceAssign, plan)
+		if err != nil {
+			return nil, err
+		}
+		return s.synthesizeSegmentsPass(ctx, in, dubScript, dubScriptCAS, superseding, superseding.CASHash, pass, plan.evidence)
+	}
+
+	return pass, nil
+}
+
+// speakerEscalationPlan carries a whole-speaker escalation to the duration-controlled
+// fallback lane plus the audit evidence to record on the regenerated variant.
+type speakerEscalationPlan struct {
+	target      domain.VoiceProfile // the fallback lane voice every escalated speaker uses
+	assignments map[string]domain.VoiceProfile
+	evidence    []domain.VoiceProviderEscalation
+}
+
+// synthesizeSegmentsPass synthesizes every dub segment, probes the actual synthesized
+// duration, and runs the measured-duration fit controller (ACCEPT | RESYNTH | REWRITE |
+// REGROUP | REVIEW). A superseding assignment reuses prior selected segments for every
+// speaker it did not invalidate; priorHint hands the variant an escalation regenerates
+// over in memory instead of relying on the asset-scoped index lookup.
+func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.DubbingJobInput, dubScript *domain.DubScriptVariant, dubScriptCAS string, voiceAssign *domain.VoiceAssignment, voiceAssignCAS string, priorHint *domain.DubSegmentsVariant, escalations []domain.VoiceProviderEscalation) (*domain.DubSegmentsVariant, error) {
+	targetLang := in.TargetLanguage
 	// 3. Compute deterministic provenance hash
 	provenanceHash, err := s.computeDubSegmentsProvenanceHash(in, dubScript, voiceAssign)
 	if err != nil {
@@ -1029,7 +1079,13 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 		for _, spk := range voiceAssign.InvalidatedSpeakers {
 			invalidatedSpeakersSet[spk] = true
 		}
-		if s.db != nil && s.cas != nil {
+		// An escalation regenerates against the exact variant it supersedes: an
+		// in-memory prior variant wins over the asset-scoped index lookup below.
+		priorFromHint := priorHint != nil && priorHint.VoiceAssignmentCAS == voiceAssign.SupersedesCAS && priorHint.DubScriptVariantCAS != "" && priorHint.DubScriptVariantCAS == dubScriptCAS
+		if priorFromHint {
+			priorVariant = priorHint
+		}
+		if !priorFromHint && s.db != nil && s.cas != nil {
 			if prevIdx, err := s.db.GetDubSegmentsVariantIndex(ctx, in.AssetID, targetLang); err == nil && prevIdx != nil {
 				if rc, err := s.cas.Get(prevIdx.CASHash); err == nil {
 					defer rc.Close()
@@ -1060,6 +1116,7 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 	var selectedSegments []domain.DubSegment
 	var reviewSegments []domain.DubSegmentReview
 	var fitPlans []domain.DubbingFitPlan
+	fixedRateSpeakers := make(map[string]bool)
 	overallStatus := "PASS"
 	fc := s.fitController
 	if fc == nil {
@@ -1137,6 +1194,11 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 				}
 
 				if validGrouping {
+					// A reused segment keeps the lane evidence of the pass that
+					// actually produced it, so the variant stays self-describing.
+					if slices.Contains(priorVariant.FixedRateSpeakers, spkID) {
+						fixedRateSpeakers[spkID] = true
+					}
 					selectedSegments = append(selectedSegments, priorSeg)
 					fitPlans = append(fitPlans, priorFP)
 					if groupCount > 1 {
@@ -1214,6 +1276,9 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 			}
 
 			supportsSpeedFit, fixedRateVoice := ttsFitCapabilities(selectedProv)
+			if fixedRateVoice {
+				fixedRateSpeakers[spkID] = true
+			}
 
 			// Evaluate fit
 			evalInput := FitEvaluationInput{
@@ -1382,6 +1447,9 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 				}
 
 				supportsSpeedFit, fixedRateVoice := ttsFitCapabilities(selectedProv)
+				if fixedRateVoice {
+					fixedRateSpeakers[spkID] = true
+				}
 
 				regroupEvalInput := FitEvaluationInput{
 					SegmentIndex:       seg.Index,
@@ -1627,6 +1695,8 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 		FitPlans:            fitPlans,
 		ProvenanceHash:      provenanceHash,
 		OverallStatus:       overallStatus,
+		Escalations:         resolveEscalationOutcomes(escalations, reviewSegments),
+		FixedRateSpeakers:   slices.Sorted(maps.Keys(fixedRateSpeakers)),
 		CreatedAt:           time.Now().UTC(),
 	}
 
@@ -1659,6 +1729,167 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 	}
 
 	return variant, nil
+}
+
+// resolveEscalationOutcomes marks whether a whole-speaker regeneration cleared every
+// unresolved slot overrun for that speaker. A false outcome is what projects REVIEW.
+func resolveEscalationOutcomes(escalations []domain.VoiceProviderEscalation, reviewSegments []domain.DubSegmentReview) []domain.VoiceProviderEscalation {
+	if len(escalations) == 0 {
+		return nil
+	}
+	unresolved := make(map[string]bool)
+	for _, rev := range reviewSegments {
+		if rev.FitDecision == domain.FitActionReview && rev.SlotDurationMs > 0 && rev.MeasuredDurationMs > rev.SlotDurationMs {
+			unresolved[rev.SpeakerID] = true
+		}
+	}
+	resolved := append([]domain.VoiceProviderEscalation(nil), escalations...)
+	for i := range resolved {
+		resolved[i].Resolved = !unresolved[resolved[i].SpeakerID]
+	}
+	return resolved
+}
+
+// planSpeakerEscalation decides which speakers may escalate to the duration-controlled
+// fallback lane. A speaker qualifies only when a fixed-rate lane produced its candidate
+// and the immutable source slot is still overrun after rewrite/regroup exhaustion, the
+// affected speaker is not already on the fallback lane, and that lane is policy/license/
+// runtime eligible for this run. Everything else keeps the existing review outcome.
+func (s *DubbingService) planSpeakerEscalation(ctx context.Context, in domain.DubbingJobInput, voiceAssign *domain.VoiceAssignment, pass *domain.DubSegmentsVariant) *speakerEscalationPlan {
+	if s.router == nil || s.db == nil || pass == nil || len(pass.FixedRateSpeakers) == 0 {
+		return nil
+	}
+	targets := provider.CosyVoicePresetVoices(in.TargetLanguage)
+	if len(targets) == 0 || !provider.IsVerifiedTTSVoice(targets[0].ProviderID, targets[0].VoiceID) {
+		return nil
+	}
+	target := targets[0]
+
+	triggers := make(map[string][]int)
+	var speakers []string
+	for _, rev := range pass.ReviewSegments {
+		if rev.FitDecision != domain.FitActionReview || !slices.Contains(pass.FixedRateSpeakers, rev.SpeakerID) {
+			continue
+		}
+		if rev.SlotDurationMs <= 0 || rev.MeasuredDurationMs <= rev.SlotDurationMs {
+			continue
+		}
+		from, ok := voiceAssign.Assignments[rev.SpeakerID]
+		if !ok || isProviderEquivalent(from.ProviderID, target.ProviderID) {
+			continue
+		}
+		if _, seen := triggers[rev.SpeakerID]; !seen {
+			speakers = append(speakers, rev.SpeakerID)
+		}
+		triggers[rev.SpeakerID] = append(triggers[rev.SpeakerID], rev.Index)
+	}
+	if len(speakers) == 0 {
+		return nil
+	}
+	sort.Strings(speakers)
+	if !s.escalationLaneEligible(ctx, in, target.ProviderID) {
+		return nil
+	}
+
+	plan := &speakerEscalationPlan{target: target, assignments: make(map[string]domain.VoiceProfile, len(speakers))}
+	for _, spk := range speakers {
+		from := voiceAssign.Assignments[spk]
+		plan.assignments[spk] = target
+		plan.evidence = append(plan.evidence, domain.VoiceProviderEscalation{
+			SpeakerID:               spk,
+			FromProviderID:          from.ProviderID,
+			FromVoiceID:             from.VoiceID,
+			ToProviderID:            target.ProviderID,
+			ToVoiceID:               target.VoiceID,
+			Reason:                  domain.VoiceEscalationReasonFixedRateOverrun,
+			TriggerSegmentIndices:   triggers[spk],
+			SupersededAssignmentCAS: voiceAssign.CASHash,
+		})
+	}
+	return plan
+}
+
+// escalationLaneEligible proves through the router (policy -> license -> snapshot ->
+// capability -> health) that the duration-controlled fallback lane may run for this run
+// and language before any speaker assignment is superseded.
+func (s *DubbingService) escalationLaneEligible(ctx context.Context, in domain.DubbingJobInput, providerID string) bool {
+	res, err := s.router.Route(ctx, provider.RouteRequest{
+		RunID:                 in.RunID,
+		Stage:                 provider.TypeTTS,
+		Language:              in.TargetLanguage,
+		ExecutionProfile:      in.ExecutionProfile,
+		AuthorizedCredentials: in.AuthorizedCredentials,
+		PreferredProviderID:   providerID,
+	})
+	if err != nil || res == nil || res.SelectedProvider == nil {
+		return false
+	}
+	return isProviderEquivalent(res.SelectedProvider.ID(), providerID)
+}
+
+// applySpeakerEscalation persists the whole-speaker fallback provider change as a
+// superseding VoiceAssignment and records the superseding CAS on the plan evidence.
+// A run whose current assignment already is exactly this escalation reuses it, so a
+// retried synthesis never mints a second superseding assignment for the same decision.
+func (s *DubbingService) applySpeakerEscalation(ctx context.Context, in domain.DubbingJobInput, base *domain.VoiceAssignment, plan *speakerEscalationPlan) (*domain.VoiceAssignment, error) {
+	superseding := s.currentEscalationAssignment(ctx, in, base, plan)
+	if superseding == nil {
+		var err error
+		superseding, err = s.supersedeVoiceAssignment(ctx, base, domain.VoiceAssignmentInput{
+			RunID:                 in.RunID,
+			AssetID:               in.AssetID,
+			JobID:                 in.JobID,
+			TargetLanguage:        in.TargetLanguage,
+			UseSameVoiceForAll:    base.UseSameVoiceForAll,
+			CustomAssignments:     plan.assignments,
+			DubScriptVariantCAS:   in.DubScriptVariantCAS,
+			TranscriptArtifactCAS: base.TranscriptArtifactCAS,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("escalate unresolved timing failure to the duration-controlled lane: %w", err)
+		}
+	}
+	for i := range plan.evidence {
+		plan.evidence[i].SupersedingAssignmentCAS = superseding.CASHash
+	}
+	return superseding, nil
+}
+
+// currentEscalationAssignment returns the run's current assignment when it already is
+// exactly this escalation of the base assignment, and nil otherwise.
+func (s *DubbingService) currentEscalationAssignment(ctx context.Context, in domain.DubbingJobInput, base *domain.VoiceAssignment, plan *speakerEscalationPlan) *domain.VoiceAssignment {
+	if s.db == nil || s.cas == nil {
+		return nil
+	}
+	idx, err := s.db.GetVoiceAssignmentIndexByRun(ctx, in.AssetID, in.RunID, in.TargetLanguage)
+	if err != nil || idx == nil || idx.CASHash == "" || idx.CASHash == base.CASHash {
+		return nil
+	}
+	rc, err := s.cas.Get(idx.CASHash)
+	if err != nil {
+		return nil
+	}
+	defer rc.Close()
+	var current domain.VoiceAssignment
+	if err := json.NewDecoder(rc).Decode(&current); err != nil {
+		return nil
+	}
+	current.CASHash = idx.CASHash
+	if current.SupersedesCAS != base.CASHash || len(current.Assignments) != len(base.Assignments) {
+		return nil
+	}
+	for spk, baseProfile := range base.Assignments {
+		// "One voice for all" keeps its meaning: escalation replaces every profile
+		// under the shared-voice flag, leaving no mixed lanes inside a speaker.
+		want := baseProfile
+		if _, escalated := plan.assignments[spk]; escalated || base.UseSameVoiceForAll {
+			want = plan.target
+		}
+		if !domain.VoiceProfileEquivalent(current.Assignments[spk], want) {
+			return nil
+		}
+	}
+	return &current
 }
 
 // resolveSpeakers resolves all distinct speaker IDs from TranscriptArtifact or DubScriptVariant.

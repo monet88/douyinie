@@ -258,6 +258,30 @@ type DubSegmentReview struct {
 	AttemptCount       int          `json:"attempt_count"`
 }
 
+// VoiceEscalationReasonFixedRateOverrun is the deterministic reason recorded when a
+// fixed-rate preset lane (ZeroTTS) could not fit an immutable source slot after the
+// bounded natural-speed rewrite/regroup remedies were exhausted (Issue #94).
+const VoiceEscalationReasonFixedRateOverrun = "UNRESOLVED_FIXED_RATE_DURATION_OVERRUN"
+
+// VoiceProviderEscalation records one whole-speaker provider escalation caused by an
+// unresolved timing failure on a fixed-rate preset lane. The provider change is applied
+// by superseding the speaker's frozen VoiceAssignment, never by editing historical
+// assignment evidence and never sentence-by-sentence within one speaker.
+type VoiceProviderEscalation struct {
+	SpeakerID                string `json:"speaker_id"`
+	FromProviderID           string `json:"from_provider_id"`
+	FromVoiceID              string `json:"from_voice_id"`
+	ToProviderID             string `json:"to_provider_id"`
+	ToVoiceID                string `json:"to_voice_id"`
+	Reason                   string `json:"reason"`
+	TriggerSegmentIndices    []int  `json:"trigger_segment_indices"`
+	SupersededAssignmentCAS  string `json:"superseded_assignment_cas"`
+	SupersedingAssignmentCAS string `json:"superseding_assignment_cas"`
+	// Resolved reports whether the escalated regeneration cleared every unresolved
+	// slot overrun for this speaker. False means the run projects REVIEW.
+	Resolved bool `json:"resolved"`
+}
+
 // DubSegmentsVariant is the immutable target-language dubbing artifact containing all selected DubSegments.
 type DubSegmentsVariant struct {
 	ID                  string             `json:"id"`
@@ -271,10 +295,17 @@ type DubSegmentsVariant struct {
 	Segments            []DubSegment       `json:"segments"`                  // Strictly ACCEPTED fit-gated segments (mixer inputs)
 	ReviewSegments      []DubSegmentReview `json:"review_segments,omitempty"` // Flagged unselected candidates requiring review
 	FitPlans            []DubbingFitPlan   `json:"fit_plans,omitempty"`
-	CASHash             string             `json:"cas_hash,omitempty"`
-	ProvenanceHash      string             `json:"provenance_hash,omitempty"`
-	OverallStatus       string             `json:"overall_status"` // "PASS", "REVIEW_REQUIRED", "FAIL"
-	CreatedAt           time.Time          `json:"created_at"`
+	// Escalations records whole-speaker provider escalations performed while
+	// generating this variant (Issue #94): empty for the single-pass case.
+	Escalations []VoiceProviderEscalation `json:"escalations,omitempty"`
+	// FixedRateSpeakers lists the speakers whose candidates were produced by a lane
+	// that fails closed on any non-1.0 speed request, i.e. lanes whose overrun cannot
+	// be remediated by resynthesis and may therefore be escalated (Issue #94).
+	FixedRateSpeakers []string  `json:"fixed_rate_speakers,omitempty"`
+	CASHash           string    `json:"cas_hash,omitempty"`
+	ProvenanceHash    string    `json:"provenance_hash,omitempty"`
+	OverallStatus     string    `json:"overall_status"` // "PASS", "REVIEW_REQUIRED", "FAIL"
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 // VoiceAssignmentInput defines input parameters for generating/freezing a VoiceAssignment.
