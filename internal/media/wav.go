@@ -56,67 +56,16 @@ func GeneratePCM16WAV(sampleRate int, channels int, durationMs int64) []byte {
 }
 
 // ProbeWAVBytes probes the exact duration in milliseconds from standard WAV bytes.
+//
+// It delegates to ParseWAVHeader so a duration probe can never be more lenient
+// than the structural parser: corrupted or truncated containers that the parser
+// rejects must not yield a duration here either.
 func ProbeWAVBytes(data []byte) (int64, error) {
-	if len(data) < 44 {
-		return 0, ErrInvalidWAVHeader
+	info, err := ParseWAVHeader(data)
+	if err != nil {
+		return 0, err
 	}
-	if string(data[0:4]) != "RIFF" || string(data[8:12]) != "WAVE" {
-		return 0, ErrInvalidWAVHeader
-	}
-
-	reader := bytes.NewReader(data[12:])
-	var sampleRate uint32
-	var numChannels uint16
-	var bitsPerSample uint16
-	var dataSize uint32
-	var foundFmt, foundData bool
-
-	for {
-		var chunkID [4]byte
-		var chunkSize uint32
-		if err := binary.Read(reader, binary.LittleEndian, &chunkID); err != nil {
-			break
-		}
-		if err := binary.Read(reader, binary.LittleEndian, &chunkSize); err != nil {
-			break
-		}
-
-		id := string(chunkID[:])
-		if id == "fmt " {
-			var audioFormat uint16
-			_ = binary.Read(reader, binary.LittleEndian, &audioFormat)
-			_ = binary.Read(reader, binary.LittleEndian, &numChannels)
-			_ = binary.Read(reader, binary.LittleEndian, &sampleRate)
-			var byteRate uint32
-			_ = binary.Read(reader, binary.LittleEndian, &byteRate)
-			var blockAlign uint16
-			_ = binary.Read(reader, binary.LittleEndian, &blockAlign)
-			_ = binary.Read(reader, binary.LittleEndian, &bitsPerSample)
-
-			if chunkSize > 16 {
-				_, _ = reader.Seek(int64(chunkSize-16), io.SeekCurrent)
-			}
-			foundFmt = true
-		} else if id == "data" {
-			dataSize = chunkSize
-			foundData = true
-			break
-		} else {
-			_, _ = reader.Seek(int64(chunkSize), io.SeekCurrent)
-		}
-	}
-
-	if !foundFmt || !foundData || sampleRate == 0 || numChannels == 0 || bitsPerSample == 0 {
-		return 0, ErrInvalidWAVHeader
-	}
-
-	bytesPerSec := int64(sampleRate) * int64(numChannels) * int64(bitsPerSample/8)
-	if bytesPerSec == 0 {
-		return 0, ErrInvalidWAVHeader
-	}
-
-	durationMs := (int64(dataSize) * 1000) / bytesPerSec
-	return durationMs, nil
+	return info.DurationMs, nil
 }
 
 // ProbeAudioFileDuration probes the true audio duration in milliseconds from a file path.

@@ -102,7 +102,9 @@ func newWorkerBridge(leaseManager *worker.GPULeaseManager, snapshotSvc *governan
 // reads back the output artifact JSON while holding the GPU lease. It guarantees
 // deterministic cleanup: on success, error, timeout, or context cancellation,
 // the supervisor process tree is terminated AND reaped before the GPU lease
-// is released (Issue #44 Blocker 2).
+// is released (Issue #44 Blocker 2). A command whose resource contract is
+// CPU-only (cmd.CPUOnly) never acquires the lease (Issue #91); every other
+// command keeps the accelerator-backed serialization.
 func (b *workerBridge) run(ctx context.Context, cmd worker.Command) ([]byte, error) {
 	runCtx, cancel := context.WithTimeout(ctx, b.runTimeout)
 	defer cancel()
@@ -378,7 +380,7 @@ func (b *workerBridge) run(ctx context.Context, cmd worker.Command) ([]byte, err
 		}
 	}
 
-	if b.leaseManager != nil && cmd.Stage != "separator_probe" {
+	if b.leaseManager != nil && !cmd.CPUOnly && cmd.Stage != "separator_probe" {
 		leaseID, err := b.leaseManager.Acquire(runCtx, cmd.Family, nil)
 		if err != nil {
 			return nil, fmt.Errorf("acquire gpu lease for %s: %w", cmd.Family, err)
@@ -431,6 +433,7 @@ type workerProviderBase struct {
 	leaseManager     *worker.GPULeaseManager
 	snapshotSvc      *governance.SnapshotService
 	requiresSnapshot bool
+	cpuOnly          bool
 }
 
 func (p *workerProviderBase) ID() string               { return p.id }
@@ -451,6 +454,14 @@ func (p *workerProviderBase) RequiresSnapshot() bool {
 }
 func (p *workerProviderBase) SetRequiresSnapshot(req bool) {
 	p.requiresSnapshot = req
+}
+
+// SetCPUOnly declares that this provider's worker stage runs on CPU only, so its
+// commands must not acquire the authoritative GPU lease (Issue #91). It is off
+// by default, which preserves accelerator-backed behavior for every provider
+// that does not opt in.
+func (p *workerProviderBase) SetCPUOnly(cpu bool) {
+	p.cpuOnly = cpu
 }
 
 // newCommand builds the StageWorker command skeleton with manifest-driven
@@ -1058,6 +1069,7 @@ func (p *WorkerTTSProvider) SynthesizeSpeech(ctx context.Context, req TTSSynthes
 		return nil, fmt.Errorf("%w: %v", domain.ErrNoEligibleProvider, err)
 	}
 	cmd := newCommand("tts", stageWorkerFamilyTTS, worker.ArtifactRef{SHA256: req.AssetID}, p.modelName, p.modelVer)
+	cmd.CPUOnly = p.cpuOnly
 	cmd.Config["text"] = req.Text
 	cmd.Config["language"] = req.Language
 	cmd.Config["voice_id"] = req.Voice.VoiceID
@@ -1082,23 +1094,28 @@ func (p *WorkerTTSProvider) SynthesizeSpeech(ctx context.Context, req TTSSynthes
 		audioBytes, _ = os.ReadFile(art.AudioPath)
 	}
 
-	durMs := art.MeasuredDurationMs
-	if durMs <= 0 && len(audioBytes) > 0 {
-		durMs, _ = media.ProbeWAVBytes(audioBytes)
+	// Truthful media metadata is probed from the produced artifact, never assumed:
+	// VieNeu emits 48 kHz and Kokoro/CosyVoice3 24 kHz mono WAV, so a generic
+	// 16000 Hz/mono answer would be a lie. The WAV probe is authoritative for the
+	// media properties and for measured duration, and fails closed on media that
+	// is missing, truncated or not a valid WAV container.
+	probe, err := media.ParseWAVHeader(audioBytes)
+	if err != nil {
+		return nil, fmt.Errorf("%w: synthesized TTS media is not a valid WAV artifact: %v", domain.ErrQualityRejected, err)
 	}
 
 	return &TTSSynthesisResult{
 		AudioData:           audioBytes,
 		AudioSHA256:         art.AudioSHA256,
 		AudioCASPath:        art.AudioPath,
-		SampleRate:          16000,
-		Channels:            1,
+		SampleRate:          int(probe.SampleRate),
+		Channels:            int(probe.NumChannels),
 		Format:              "wav",
 		ProviderID:          p.id,
 		ModelName:           p.modelName,
 		ModelVersion:        p.modelVer,
 		PredictedDurationMs: art.PredictedDurationMs,
-		MeasuredDurationMs:  durMs,
+		MeasuredDurationMs:  probe.DurationMs,
 	}, nil
 }
 

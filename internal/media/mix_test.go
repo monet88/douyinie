@@ -1,6 +1,8 @@
 package media_test
 
 import (
+	"encoding/binary"
+	"errors"
 	"math"
 	"testing"
 
@@ -227,5 +229,48 @@ func TestMedia_MixPCM16Stems_SingingPreservationAndDialogueSuppression(t *testin
 	sampleAt2500ms := mixed[(sampleRate*2500)/1000]
 	if sampleAt2500ms != 3000 {
 		t.Errorf("expected outro vocals preserved (sample at 2500ms = 3000), got %d", sampleAt2500ms)
+	}
+}
+
+func TestMedia_ParseWAVHeader_RejectsDataChunkBeyondAvailableBytes(t *testing.T) {
+	// The truncation is header-valid: the complete RIFF/WAVE/fmt chunk (including the
+	// declared data chunk size) survives, only the audio bytes are cut off. Header
+	// validation alone cannot catch this, so the declared-vs-present size mismatch
+	// must fail closed instead of yielding phantom audio/duration downstream.
+	//
+	// Fixture validity is proven structurally from the bytes themselves, never by
+	// asking a parser to accept corrupt input.
+	const dataChunkSizeOffset = 40 // RIFF(12) + fmt chunk(24) + "data"(4)
+	full := media.GeneratePCM16WAV(24000, 2, 1000)
+	truncated := append([]byte(nil), full[:len(full)-4096]...)
+
+	if string(truncated[0:4]) != "RIFF" || string(truncated[8:12]) != "WAVE" {
+		t.Fatalf("fixture must retain the RIFF/WAVE magic, got % x", truncated[0:12])
+	}
+	declared := int64(binary.LittleEndian.Uint32(truncated[dataChunkSizeOffset : dataChunkSizeOffset+4]))
+	available := int64(len(truncated) - (dataChunkSizeOffset + 4))
+	if declared != int64(len(full)-(dataChunkSizeOffset+4)) {
+		t.Fatalf("fixture must retain the intact container's declared data size %d, got %d", len(full)-(dataChunkSizeOffset+4), declared)
+	}
+	if declared <= available {
+		t.Fatalf("fixture must declare more audio bytes (%d) than it carries (%d)", declared, available)
+	}
+
+	if _, err := media.ParseWAVHeader(truncated); !errors.Is(err, media.ErrInvalidWAVHeader) {
+		t.Fatalf("expected ErrInvalidWAVHeader for a data chunk larger than the available bytes, got %v", err)
+	}
+	if _, err := media.ProbeWAVBytes(truncated); !errors.Is(err, media.ErrInvalidWAVHeader) {
+		t.Fatalf("expected duration probing to inherit the parser's fail-closed verdict, got %v", err)
+	}
+	if _, _, err := media.ExtractPCM16Samples(truncated); !errors.Is(err, media.ErrInvalidWAVHeader) {
+		t.Fatalf("expected sample extraction to fail closed on truncated media, got %v", err)
+	}
+
+	info, err := media.ParseWAVHeader(full)
+	if err != nil {
+		t.Fatalf("intact container must still parse: %v", err)
+	}
+	if info.DurationMs != 1000 {
+		t.Errorf("expected 1000ms duration on the intact container, got %dms", info.DurationMs)
 	}
 }

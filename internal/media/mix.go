@@ -86,6 +86,14 @@ func ParseWAVHeader(data []byte) (*WAVHeaderInfo, error) {
 		return nil, ErrInvalidWAVHeader
 	}
 
+	// Fail closed on truncated containers: a header that is structurally valid can
+	// still advertise a data chunk whose bytes are not actually present, and every
+	// downstream reader (sample extraction, mixing, duration) would then work from
+	// audio that does not exist.
+	if int64(info.DataOffset)+int64(info.DataSize) > int64(len(data)) {
+		return nil, ErrInvalidWAVHeader
+	}
+
 	bytesPerSec := int64(info.SampleRate) * int64(info.NumChannels) * int64(info.BitsPerSample/8)
 	if bytesPerSec == 0 {
 		return nil, ErrInvalidWAVHeader
