@@ -83,6 +83,24 @@ func TestSeam2_ProtocolVersionMismatchRejected(t *testing.T) {
 	if !strings.Contains(err.Error(), "mismatch") && !strings.Contains(err.Error(), "got 99") {
 		t.Fatalf("expected version mismatch error, got %v", err)
 	}
+
+	// A RuntimeHost/StageWorker pair built before the cpu_only schema must fail at
+	// this handshake rather than deeper in strict command decoding. The literal is
+	// the pre-cpu_only schema version and stays stale on purpose.
+	const priorProtocolVersion = 1
+	priorEnv := worker.Envelope{
+		Type:    worker.MessageTypeHello,
+		Version: priorProtocolVersion,
+		At:      time.Now().UTC(),
+		Payload: mustJSON(t, worker.HelloPayload{WorkerID: "w1", Family: "asr", Schema: priorProtocolVersion}),
+	}
+	priorErr := worker.ValidateEnvelope(priorEnv)
+	if priorErr == nil {
+		t.Fatalf("expected protocol version %d to be rejected at handshake", priorProtocolVersion)
+	}
+	if !errors.Is(priorErr, worker.VersionError) {
+		t.Fatalf("expected VersionError for a prior schema version, got %v", priorErr)
+	}
 }
 
 func TestSeam2_StructuredErrorEnvelope(t *testing.T) {

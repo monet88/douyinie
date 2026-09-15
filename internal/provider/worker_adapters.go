@@ -1098,7 +1098,7 @@ func (p *WorkerTTSProvider) SynthesizeSpeech(ctx context.Context, req TTSSynthes
 	// VieNeu emits 48 kHz and Kokoro/CosyVoice3 24 kHz mono WAV, so a generic
 	// 16000 Hz/mono answer would be a lie. The WAV probe is authoritative for the
 	// media properties and for measured duration, and fails closed on media that
-	// is missing, truncated or not a valid PCM WAV container.
+	// is missing, truncated or not a valid WAV container.
 	probe, err := media.ParseWAVHeader(audioBytes)
 	if err != nil {
 		return nil, fmt.Errorf("%w: synthesized TTS media is not a valid WAV artifact: %v", domain.ErrQualityRejected, err)

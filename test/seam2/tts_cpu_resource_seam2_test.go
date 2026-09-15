@@ -35,6 +35,17 @@ reported_ms = 4242
 
 if os.environ.get("MOCK_TTS_MODE") == "corrupt":
     payload = b"NOT-A-WAV-CONTAINER"
+elif os.environ.get("MOCK_TTS_MODE") == "truncated":
+    # Keep the RIFF/WAVE/fmt header and its declared data chunk size intact while
+    # cutting the audio bytes short: only declaration-vs-availability validation
+    # can reject this container.
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(b"\x00" * (24000 * 2 * 2))
+    payload = buf.getvalue()[:-4096]
 else:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
@@ -60,7 +71,7 @@ print(json.dumps(out))
 // runs without acquiring the authoritative GPU lease while the default provider
 // contract still cannot bypass a held lease, and (2) TTS results report media
 // properties probed from the produced WAV artifact instead of generic constants,
-// failing closed on corrupt media.
+// failing closed on corrupt or truncated media.
 func TestSeam2_WorkerTTSProvider_CPUOnlyResourceContract(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
@@ -165,6 +176,24 @@ func TestSeam2_WorkerTTSProvider_CPUOnlyResourceContract(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "not a valid WAV artifact") {
 			t.Fatalf("expected a WAV artifact rejection, got %v", err)
+		}
+		if holder := sched.Holder(); holder != "" {
+			t.Fatalf("CPU-only failing invocation must not acquire the GPU lease, holder is %q", holder)
+		}
+	})
+
+	t.Run("truncated_media_fails_closed", func(t *testing.T) {
+		t.Setenv("MOCK_TTS_MODE", "truncated")
+
+		sched := scheduler.New()
+		leaseMgr := worker.NewGPULeaseManager(sched)
+
+		_, err := newSeam2TTSProvider(t, snapSvc, leaseMgr, true).SynthesizeSpeech(ctx, req)
+		if err == nil {
+			t.Fatal("a header-valid WAV that declares more data bytes than it carries must fail closed")
+		}
+		if !strings.Contains(err.Error(), "not a valid WAV artifact") {
+			t.Fatalf("expected a WAV artifact rejection for truncated media, got %v", err)
 		}
 		if holder := sched.Holder(); holder != "" {
 			t.Fatalf("CPU-only failing invocation must not acquire the GPU lease, holder is %q", holder)

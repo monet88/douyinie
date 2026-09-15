@@ -17,7 +17,11 @@ import (
 const (
 	// ProtocolVersion is the current NDJSON envelope schema version. Both
 	// RuntimeHost and StageWorker reject mismatched versions on handshake.
-	ProtocolVersion = 1
+	//
+	// Version 2 added Command.cpu_only. Command payloads decode with strict
+	// unknown-field rejection, so a mixed old/new pair must fail at the version
+	// handshake instead of surfacing as an unexplained command decode error.
+	ProtocolVersion = 2
 
 	// MessageTypeHello is sent by the worker immediately after startup.
 	MessageTypeHello = "hello"

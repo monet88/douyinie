@@ -683,6 +683,51 @@ func TestSeam1_AudioMix_FailClosed_CorruptOrMissingBackgroundStem(t *testing.T) 
 	if respMix.StatusCode == http.StatusCreated || respMix.StatusCode == http.StatusOK {
 		t.Fatalf("expected mix to fail closed on missing background stem, got status %d", respMix.StatusCode)
 	}
+
+	// A truncated background stem is the harder case: its RIFF/WAVE header and the
+	// declared data chunk size survive the cut, so only the fail-closed
+	// declared-vs-present size check can reject it. Extraction inherits that verdict
+	// and the mix must refuse instead of mixing phantom audio.
+	fullBG := media.GeneratePCM16WAV(16000, 1, 4000)
+	truncatedBG := append([]byte(nil), fullBG[:len(fullBG)-4096]...)
+	truncBGObj, err := h.casStore.Put(bytes.NewReader(truncatedBG))
+	if err != nil {
+		t.Fatalf("store truncated background stem: %v", err)
+	}
+
+	truncStems := domain.AudioStemArtifacts{
+		ID:            "bad_stems_truncated_bg",
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: truncBGObj.SHA256,
+				SampleRate:   16000,
+				Channels:     1,
+				DurationMs:   4000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	truncStemsBytes, _ := json.Marshal(truncStems)
+	truncStemsObj, err := h.casStore.Put(bytes.NewReader(truncStemsBytes))
+	if err != nil {
+		t.Fatalf("store truncated stems artifact: %v", err)
+	}
+
+	respTrunc, _ := runAudioMix(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+		"audio_stems_cas": truncStemsObj.SHA256,
+	})
+	if respTrunc.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected truncated background stem to fail closed, got status %d", respTrunc.StatusCode)
+	}
+	truncBody, _ := io.ReadAll(respTrunc.Body)
+	if !bytes.Contains(truncBody, []byte(domain.ErrSoundtrackPreservationFailed.Error())) {
+		t.Fatalf("expected soundtrack preservation failure on truncated stem, got body %s", truncBody)
+	}
 }
 
 // ---------------------------------------------------------------------------
