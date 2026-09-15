@@ -34,6 +34,11 @@ const (
 	// rewrite/regroup/review rather than request a speed resynthesis.
 	FeatureFixedRateVoice = "fixed_rate_voice"
 
+	// CosyVoiceProviderID is the duration-controlled fallback lane identity
+	// (Issue #94): the only lane an unresolved fixed-rate (ZeroTTS) timing
+	// failure may escalate a whole speaker to.
+	CosyVoiceProviderID = "cosyvoice3_tts"
+
 	// DefaultVIUnattendedVoiceCount is the size of the approved unattended
 	// Vietnamese rotation (Issue #93): the leading verified ZeroTTS presets,
 	// quangminh then maichi. Presets beyond it are selectable only through
@@ -233,7 +238,7 @@ func CosyVoicePresetVoices(lang string) []domain.VoiceProfile {
 		return []domain.VoiceProfile{
 			{
 				ID:         "cosyvoice3_vi_female_1",
-				ProviderID: "cosyvoice3_tts",
+				ProviderID: CosyVoiceProviderID,
 				VoiceID:    "cosy_vi_f1",
 				Name:       "CosyVoice3 VI Nữ (Fit)",
 				Language:   "vi",
@@ -247,7 +252,7 @@ func CosyVoicePresetVoices(lang string) []domain.VoiceProfile {
 		return []domain.VoiceProfile{
 			{
 				ID:         "cosyvoice3_en_female_1",
-				ProviderID: "cosyvoice3_tts",
+				ProviderID: CosyVoiceProviderID,
 				VoiceID:    "cosy_en_f1",
 				Name:       "CosyVoice3 EN Female (Fit)",
 				Language:   "en",
@@ -304,7 +309,7 @@ func IsVerifiedTTSVoice(providerID, voiceID string) bool {
 			}
 		}
 		return false
-	case "cosyvoice3_tts", "cosyvoice3":
+	case CosyVoiceProviderID, "cosyvoice3":
 		return voiceID == "cosy_vi_f1" || voiceID == "cosy_en_f1"
 	default:
 		return false
