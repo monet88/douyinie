@@ -27,6 +27,19 @@ const (
 	KokoroSourceCommit  = "dfb907a02bba8152ca444717ca5d78747ccb4bec"
 	KokoroCheckpointSHA = "496dba118d1a58f5f3db2efc88dbdc216e0483fc89fe6e47ee1f2c53f18ad1e4"
 	KokoroProviderID    = "kokoro_tts_en"
+
+	// FeatureFixedRateVoice marks a TTS lane that synthesizes only at its native
+	// speaking rate: a non-1.0 speed request fails closed instead of being
+	// honored or silently ignored. Overrun remediation for such a lane must
+	// rewrite/regroup/review rather than request a speed resynthesis.
+	FeatureFixedRateVoice = "fixed_rate_voice"
+
+	// DefaultVIUnattendedVoiceCount is the size of the approved unattended
+	// Vietnamese rotation (Issue #93): the leading verified ZeroTTS presets,
+	// quangminh then maichi. Presets beyond it are selectable only through
+	// explicit operator audition/assignment; catalog presence alone never makes
+	// a preset an unattended default.
+	DefaultVIUnattendedVoiceCount = 2
 )
 
 // TTSSynthesisRequest encapsulates the parameters needed to synthesize speech for one segment.
@@ -67,61 +80,18 @@ type TTSProvider interface {
 	VoiceCatalog() []domain.VoiceProfile
 }
 
-// DefaultPresetVoices returns standard default preset voices by language.
-// For Vietnamese, it returns the frozen ordered VieNeu v3 Turbo rotation (Issue #68):
-// 1. Trúc Ly (female natural), 2. Phạm Tuyên (male natural), 3. Đoan Trang (female), 4. Xuân Vĩnh (male).
+// DefaultPresetVoices returns the unattended default preset voices by language.
+// For Vietnamese, it returns the approved unattended ZeroTTS rotation (Issue #93):
+// 1. quangminh, 2. maichi.
 // For English, it returns the frozen ordered Kokoro rotation (Issue #68):
 // 1. af_heart (female natural), 2. am_michael (male natural), 3. af_bella (female), 4. am_fenrir (male).
-// CosyVoice3 remains conditional only and is excluded from default hard-route rotation.
+// VieNeu remains the Vietnamese compatibility lane for historical frozen
+// assignments (see VieNeuPresetVoices), and CosyVoice3 remains conditional for
+// duration-controlled fit; neither is part of the default rotation.
 func DefaultPresetVoices(lang string) []domain.VoiceProfile {
 	switch lang {
 	case "vi":
-		return []domain.VoiceProfile{
-			{
-				ID:         "vieneu_vi_truc_ly",
-				ProviderID: VieNeuProviderID,
-				VoiceID:    "Trúc Ly",
-				Name:       "VieNeu Trúc Ly (Nữ Tự nhiên)",
-				Language:   "vi",
-				Gender:     "female",
-				Pitch:      1.0,
-				Speed:      1.0,
-				Timbre:     "natural_warm",
-			},
-			{
-				ID:         "vieneu_vi_pham_tuyen",
-				ProviderID: VieNeuProviderID,
-				VoiceID:    "Phạm Tuyên",
-				Name:       "VieNeu Phạm Tuyên (Nam Trầm ấm)",
-				Language:   "vi",
-				Gender:     "male",
-				Pitch:      1.0,
-				Speed:      1.0,
-				Timbre:     "deep_resonant",
-			},
-			{
-				ID:         "vieneu_vi_doan_trang",
-				ProviderID: VieNeuProviderID,
-				VoiceID:    "Đoan Trang",
-				Name:       "VieNeu Đoan Trang (Nữ)",
-				Language:   "vi",
-				Gender:     "female",
-				Pitch:      1.0,
-				Speed:      1.0,
-				Timbre:     "expressive",
-			},
-			{
-				ID:         "vieneu_vi_xuan_vinh",
-				ProviderID: VieNeuProviderID,
-				VoiceID:    "Xuân Vĩnh",
-				Name:       "VieNeu Xuân Vĩnh (Nam)",
-				Language:   "vi",
-				Gender:     "male",
-				Pitch:      1.0,
-				Speed:      1.0,
-				Timbre:     "authoritative",
-			},
-		}
+		return UnattendedZeroTTSVoices()
 	case "en":
 		return []domain.VoiceProfile{
 			{
@@ -189,6 +159,71 @@ func ZeroTTSPresetVoices() []domain.VoiceProfile {
 		})
 	}
 	return voices
+}
+
+// UnattendedZeroTTSVoices returns the approved unattended Vietnamese rotation:
+// the leading verified ZeroTTS presets in frozen catalog order (quangminh, then
+// maichi). Verified presets beyond the rotation stay selectable/auditionable via
+// ZeroTTSPresetVoices but are never auto-assigned.
+func UnattendedZeroTTSVoices() []domain.VoiceProfile {
+	presets := ZeroTTSPresetVoices()
+	if len(presets) <= DefaultVIUnattendedVoiceCount {
+		return presets
+	}
+	return append([]domain.VoiceProfile(nil), presets[:DefaultVIUnattendedVoiceCount]...)
+}
+
+// VieNeuPresetVoices returns the frozen VieNeu v3 Turbo rotation (Issue #68):
+// 1. Trúc Ly (female natural), 2. Phạm Tuyên (male natural), 3. Đoan Trang (female), 4. Xuân Vĩnh (male).
+// These stay routable for historical frozen assignments but are no longer the
+// unattended Vietnamese default.
+func VieNeuPresetVoices() []domain.VoiceProfile {
+	return []domain.VoiceProfile{
+		{
+			ID:         "vieneu_vi_truc_ly",
+			ProviderID: VieNeuProviderID,
+			VoiceID:    "Trúc Ly",
+			Name:       "VieNeu Trúc Ly (Nữ Tự nhiên)",
+			Language:   "vi",
+			Gender:     "female",
+			Pitch:      1.0,
+			Speed:      1.0,
+			Timbre:     "natural_warm",
+		},
+		{
+			ID:         "vieneu_vi_pham_tuyen",
+			ProviderID: VieNeuProviderID,
+			VoiceID:    "Phạm Tuyên",
+			Name:       "VieNeu Phạm Tuyên (Nam Trầm ấm)",
+			Language:   "vi",
+			Gender:     "male",
+			Pitch:      1.0,
+			Speed:      1.0,
+			Timbre:     "deep_resonant",
+		},
+		{
+			ID:         "vieneu_vi_doan_trang",
+			ProviderID: VieNeuProviderID,
+			VoiceID:    "Đoan Trang",
+			Name:       "VieNeu Đoan Trang (Nữ)",
+			Language:   "vi",
+			Gender:     "female",
+			Pitch:      1.0,
+			Speed:      1.0,
+			Timbre:     "expressive",
+		},
+		{
+			ID:         "vieneu_vi_xuan_vinh",
+			ProviderID: VieNeuProviderID,
+			VoiceID:    "Xuân Vĩnh",
+			Name:       "VieNeu Xuân Vĩnh (Nam)",
+			Language:   "vi",
+			Gender:     "male",
+			Pitch:      1.0,
+			Speed:      1.0,
+			Timbre:     "authoritative",
+		},
+	}
 }
 
 // CosyVoicePresetVoices returns conditional CosyVoice3 voice profiles (not in default rotation).

@@ -26,10 +26,12 @@ func TestSeam1_PolicyBeforeHealth(t *testing.T) {
 	// 1. Route TTS for Vietnamese:
 	// "fake_indextts2_blocked" has higher quality (0.99) and is Healthy=true, but has PolicyState=BLOCKED.
 	// Router must select "fake_vieneu_tts_vi" (0.92, ALLOWED) and NEVER select the blocked provider.
+	// The ZeroTTS default lane is excluded so this fixture pins the VieNeu compatibility inventory.
 	routePayload := map[string]any{
-		"run_id":   runID,
-		"stage":    "tts",
-		"language": "vi",
+		"run_id":             runID,
+		"stage":              "tts",
+		"language":           "vi",
+		"excluded_providers": []string{"fake_zerotts_tts_vi"},
 	}
 	body, _ := json.Marshal(routePayload)
 
@@ -305,6 +307,8 @@ func TestSeam1_RetryProvenanceAndDecisions_RealExecutionPath(t *testing.T) {
 		"consent_granted": true, // allows fallback to fake_cloud_tts_consent
 		"input_hash":      "hash_input_quality_002",
 		"max_retries":     2,
+		// Exclude the ZeroTTS default lane so candidate 1 stays fake_vieneu_tts_vi.
+		"excluded_providers": []string{"fake_zerotts_tts_vi"},
 	}
 	body2, _ := json.Marshal(execQualityPayload)
 	resp2, err := http.Post(h.server.URL+"/api/v1/routing/execute", "application/json", bytes.NewReader(body2))
@@ -908,7 +912,7 @@ func TestSeam1_RouteExecute_HonorsExcludedProviders(t *testing.T) {
 		"language":           "vi",
 		"consent_granted":    true,
 		"input_hash":         "hash_excluded_test_seam1",
-		"excluded_providers": []string{"fake_vieneu_tts_vi"},
+		"excluded_providers": []string{"fake_vieneu_tts_vi", "fake_zerotts_tts_vi"},
 	}
 	body, _ := json.Marshal(execPayload)
 
@@ -957,12 +961,13 @@ func TestSeam1_FallbackSelectionDecision_PersistsEffectivePolicyState(t *testing
 	})
 
 	execPayload := map[string]any{
-		"run_id":          runID,
-		"stage":           "tts",
-		"language":        "vi",
-		"consent_granted": false, // Consent is false, but PolicyService has ALLOWED
-		"input_hash":      "hash_fallback_effective_policy",
-		"max_retries":     1,
+		"run_id":             runID,
+		"stage":              "tts",
+		"language":           "vi",
+		"consent_granted":    false, // Consent is false, but PolicyService has ALLOWED
+		"input_hash":         "hash_fallback_effective_policy",
+		"max_retries":        1,
+		"excluded_providers": []string{"fake_zerotts_tts_vi"},
 	}
 	execBody, _ := json.Marshal(execPayload)
 	resp, err := http.Post(h.server.URL+"/api/v1/routing/execute", "application/json", bytes.NewReader(execBody))
@@ -1120,7 +1125,7 @@ func TestSeam1_UnknownPolicy_NoDeclaredDefault_FailsClosed(t *testing.T) {
 		"run_id":             setupRunAndPlan(t, h),
 		"stage":              "tts",
 		"language":           "vi",
-		"excluded_providers": []string{"fake_vieneu_tts_vi", "fake_cloud_tts_consent", "fake_indextts2_blocked"},
+		"excluded_providers": []string{"fake_zerotts_tts_vi", "fake_vieneu_tts_vi", "fake_cloud_tts_consent", "fake_indextts2_blocked"},
 	}
 	decBody, _ := json.Marshal(decidePayload)
 	resp, err := http.Post(h.server.URL+"/api/v1/routing/decide", "application/json", bytes.NewReader(decBody))

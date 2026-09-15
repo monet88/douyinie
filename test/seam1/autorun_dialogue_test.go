@@ -82,10 +82,7 @@ func TestSeam1_AutoRun_Dialogue_EndToEnd(t *testing.T) {
 	configureDialogueTranslationGateway(t, h)
 
 	// Ensure fake TTS fits within speech slot (slot is 300ms)
-	if p, ok := h.registry.Get("fake_vieneu_tts_vi"); ok {
-		fake := p.(*provider.FakeTTSProvider)
-		fake.DurationMs = 250
-	}
+	defaultVITTSFake(t, h).DurationMs = 250
 
 	assetID := ingestSyntheticAssetWithFrequency(t, h.server.URL, h.dir, "dialogue_autorun.mp4", 2.0, 2500)
 	jobID := createJob(t, h.server.URL, assetID, domain.TargetLanguageVI)
@@ -327,10 +324,7 @@ func TestSeam1_AutoRun_Dialogue_ReviewPosture_Handoff(t *testing.T) {
 	h := setupAutoRunHarness(t)
 	configureDialogueTranslationGateway(t, h)
 
-	if p, ok := h.registry.Get("fake_vieneu_tts_vi"); ok {
-		fake := p.(*provider.FakeTTSProvider)
-		fake.DurationMs = 250
-	}
+	defaultVITTSFake(t, h).DurationMs = 250
 
 	assetID := ingestSyntheticAssetWithFrequency(t, h.server.URL, h.dir, "review_posture.mp4", 2.0, 2500)
 	jobID := createJob(t, h.server.URL, assetID, domain.TargetLanguageVI)
@@ -408,10 +402,7 @@ func TestSeam1_AutoRun_Dialogue_SoundtrackPreservation_NonSpeechPreserved(t *tes
 	h := setupAutoRunHarness(t)
 	configureDialogueTranslationGateway(t, h)
 
-	if p, ok := h.registry.Get("fake_vieneu_tts_vi"); ok {
-		fake := p.(*provider.FakeTTSProvider)
-		fake.DurationMs = 250
-	}
+	defaultVITTSFake(t, h).DurationMs = 250
 
 	assetID := ingestSyntheticAssetWithFrequency(t, h.server.URL, h.dir, "soundtrack_preservation.mp4", 2.0, 2500)
 
@@ -572,10 +563,7 @@ func TestSeam1_AutoRun_Dialogue_TerminalQC_FailClosed(t *testing.T) {
 		h := setupAutoRunHarness(t)
 		configureDialogueTranslationGateway(t, h)
 
-		if p, ok := h.registry.Get("fake_vieneu_tts_vi"); ok {
-			fake := p.(*provider.FakeTTSProvider)
-			fake.DurationMs = 800
-		}
+		defaultVITTSFake(t, h).DurationMs = 800
 
 		assetID1 := ingestSyntheticAssetWithFrequency(t, h.server.URL, h.dir, "qc_fail_1.mp4", 2.0, 2500)
 
@@ -624,10 +612,7 @@ func TestSeam1_AutoRun_Dialogue_TerminalQC_FailClosed(t *testing.T) {
 		h := setupAutoRunHarness(t)
 		configureDialogueTranslationGateway(t, h)
 
-		if p, ok := h.registry.Get("fake_vieneu_tts_vi"); ok {
-			fake := p.(*provider.FakeTTSProvider)
-			fake.DurationMs = 800
-		}
+		defaultVITTSFake(t, h).DurationMs = 800
 
 		// Disable ReviewService to simulate unconfigured terminal QC service
 		h.srv.SetReviewService(nil)
@@ -678,10 +663,7 @@ func TestSeam1_AutoRun_Dialogue_MalformedPosture_FailsClosedAndReleasesSlot(t *t
 	h := setupAutoRunHarness(t)
 	configureDialogueTranslationGateway(t, h)
 
-	if p, ok := h.registry.Get("fake_vieneu_tts_vi"); ok {
-		fake := p.(*provider.FakeTTSProvider)
-		fake.DurationMs = 250
-	}
+	defaultVITTSFake(t, h).DurationMs = 250
 
 	assetID1 := ingestSyntheticAssetWithFrequency(t, h.server.URL, h.dir, "malformed_posture.mp4", 2.0, 2500)
 	jobID1 := createJob(t, h.server.URL, assetID1, domain.TargetLanguageVI)
@@ -741,10 +723,7 @@ func TestSeam1_AutoRun_Dialogue_HandoffCASFailure_FailsClosedAndReleasesSlot(t *
 	h := setupAutoRunHarness(t)
 	configureDialogueTranslationGateway(t, h)
 
-	if p, ok := h.registry.Get("fake_vieneu_tts_vi"); ok {
-		fake := p.(*provider.FakeTTSProvider)
-		fake.DurationMs = 250
-	}
+	defaultVITTSFake(t, h).DurationMs = 250
 
 	assetID1 := ingestSyntheticAssetWithFrequency(t, h.server.URL, h.dir, "handoff_cas_fail.mp4", 2.0, 2500)
 	jobID1 := createJob(t, h.server.URL, assetID1, domain.TargetLanguageVI)
@@ -997,10 +976,7 @@ func TestSeam1_AutoRun_Dialogue_MixedRole_NonDialogueFiltered(t *testing.T) {
 	h := setupAutoRunHarness(t)
 	configureDialogueTranslationGateway(t, h)
 
-	if p, ok := h.registry.Get("fake_vieneu_tts_vi"); ok {
-		fake := p.(*provider.FakeTTSProvider)
-		fake.DurationMs = 250
-	}
+	defaultVITTSFake(t, h).DurationMs = 250
 
 	// Configure fake aligner with 3 words across dialogue [0, 800], singing [800, 1400], and BGM [1400, 2000]
 	if p, ok := h.registry.Get("fake_qwen3_aligner"); ok {

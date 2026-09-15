@@ -77,7 +77,7 @@ The Douyinie architecture strictly bifurcates the **Control Plane** and the **Ex
 │   └────────────────────────┘ └────────────────────────┘ └────────────────┘  │
 │   ┌────────────────────────┐ ┌────────────────────────┐ ┌────────────────┐  │
 │   │   StageWorker: TTS     │ │ StageWorker: Renderer  │ │ Cloud Adapter  │  │
-│   │   (VieNeu/CosyVoice3)  │ │ (FFmpeg / Native Mix)  │ │ (LLM/Cloud TTS)│  │
+│   │ (ZeroTTS/VieNeu/Cosy)  │ │ (FFmpeg / Native Mix)  │ │ (LLM/Cloud TTS)│  │
 │   └────────────────────────┘ └────────────────────────┘ └────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -349,7 +349,7 @@ Localized Speech Bus  Original Singing Bus  Preserved BG Bus
 
 ### 6.3 Pre-Dub Voice Audition & Selection
 Before initiating a full video dub render, operators have direct pre-dub audition capabilities:
-- **AI Recommended Default**: System assigns an optimal voice per speaker automatically based on detected gender, pitch, and energy.
+- **AI Recommended Default**: System assigns an optimal voice per speaker automatically based on detected gender, pitch, and energy. Vietnamese runs default to the ZeroTTS unattended rotation (`quangminh`, then `maichi`); English runs keep the Kokoro rotation.
 - **Standalone Audition (~5s)**: Immediate preview of the voice profile speaking a short sample phrase or playing a representative voice preset sample.
 - **Contextual Audition (~10s)**: High-fidelity preview synthesizing an actual translated segment from the current video mixed in real-time with the separated background BGM/SFX.
 - **Stable Per-Speaker Assignment**: One voice profile is assigned per speaker for the entire video run. Sentence-by-sentence engine hopping is prohibited.
@@ -357,10 +357,13 @@ Before initiating a full video dub render, operators have direct pre-dub auditio
 - **No-Speech Bypass**: Videos with 0 spoken dialogue lines display `No dubbing required` and bypass voice audition.
 
 ### 6.4 TTS Provider Routing
-- **Vietnamese (VI) Baseline**: `VieNeu-TTS` (fast, natural, lightweight local/hybrid execution).
-- **High-Quality / Duration-Controlled**: `CosyVoice3` operating under a calibrated multi-pass lane:
+- **Vietnamese (VI) Default**: `ZeroTTS` (CPU-only, offline, packaged preset voices) using the approved unattended rotation `quangminh` first, then `maichi`. The remaining verified packaged presets stay selectable through explicit operator audition/assignment; catalog presence alone never makes a preset an unattended default.
+- **VI Compatibility Lane**: `VieNeu-TTS` remains routable for historical frozen `VoiceAssignment`s and preserves their original provider/voice identity; it is no longer the unattended default and no historical assignment is rewritten in place.
+- **VI High-Quality / Duration-Controlled Fallback**: `CosyVoice3` operating under a calibrated multi-pass lane:
   $$\text{Natural Pass} \longrightarrow \text{Probe Duration} \longrightarrow \text{Measured Speed-Fit} \longrightarrow \text{Re-Probe} \longrightarrow \text{AV Quality Gate}$$
+  It remains conditional and outside the unattended default rotation. The ZeroTTS preset lane declares a fixed speaking rate: a non-1.0 speed request fails closed, so overrun remediation on that lane is rewrite/regroup/review rather than speed resynthesis.
 - **English (EN) Baseline**: `Kokoro` (lightweight, non-cloning) and `Chatterbox` (lower-VRAM clone fallback).
+- **Measured-Duration Authority**: Selection and acceptance for every lane use the probed actual synthesized WAV duration, never a predicted duration; an overrunning candidate cannot enter the selected/final mixed set.
 - **Policy Enforcement & Exclusions**: Provider license and privacy eligibility strictly outrank synthesis quality. `IndexTTS2` is explicitly excluded from routing for unauthorized source-reference cloning.
 
 ---
@@ -385,7 +388,7 @@ Before initiating a full video dub render, operators have direct pre-dub auditio
 │   ┌──────────────────────────────────▼──────────────────────────────────┐   │
 │   │ [Active] StageWorker: family_tts (PID 11840)                        │   │
 │   │   ├── NDJSON Protocol (stdin/stdout)                                │   │
-│   │   └── Single GPU Lease Acquired (VieNeu / CosyVoice3)               │   │
+│   │   └── GPU Lease: VieNeu / CosyVoice3 (ZeroTTS is CPU-only)          │   │
 │   └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -590,7 +593,7 @@ The five live-tested video fixtures from `.ref/_live-tests/e2e-acceptance-202608
 
 The following items are recognized as implementation tuning and benchmark validation activities, not open architectural questions:
 
-1. **Exact Model Weights & Checkpoint Pins**: Finalizing specific Hugging Face model revisions, SHA-256 hashes, and license manifests for `Qwen3-ASR`, `Qwen3-ForcedAligner`, `VieNeu-TTS`, `CosyVoice3`, and `python-audio-separator` / UVR / Demucs families.
+1. **Exact Model Weights & Checkpoint Pins**: Finalizing specific Hugging Face model revisions, SHA-256 hashes, and license manifests for `Qwen3-ASR`, `Qwen3-ForcedAligner`, `ZeroTTS` (package `0.1.2`, source `9d85578bee9321d6ef8305a4d454baf33e3fe861`, model `zeroweight-ai/ZeroTTS` at `8a0c3c29f6f047011f5cae02d0b14475a690be86`), `VieNeu-TTS`, `CosyVoice3`, and `python-audio-separator` / UVR / Demucs families.
 2. **Separator Presets & Suppression Envelopes**: Tuning suppression fade-in/fade-out curves (15–30ms) around speech boundaries on diverse acoustic backgrounds.
 3. **Pacing & Breathing Pause Thresholds**: Calibrating empirical inter-turn pause thresholds across different video categories (fast tutorials vs. lifestyle vlogs).
 4. **OCR & Text Box Color Sampling**: Refining background box color extraction heuristics (average vs. median edge color) for high visual cohesion on complex video backgrounds.

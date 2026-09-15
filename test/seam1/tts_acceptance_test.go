@@ -124,12 +124,8 @@ func TestSeam1_TTSOverflowGate_OverlongCandidateFlaggedForReview(t *testing.T) {
 		t.Fatalf("voice assignment failed: %d", respAssign.StatusCode)
 	}
 
-	// 2. Force fake provider to emit 2500ms audio (severe overrun vs 1500ms slot)
-	fakeTTS, ok := h.registry.Get("fake_vieneu_tts_vi")
-	if !ok {
-		t.Fatalf("fake_vieneu_tts_vi not found")
-	}
-	fakeProv := fakeTTS.(*provider.FakeTTSProvider)
+	// 2. Force the default VI lane to emit 2500ms audio (severe overrun vs 1500ms slot)
+	fakeProv := defaultVITTSFake(t, h)
 	fakeProv.DurationMs = 2500
 
 	// 3. Synthesize
@@ -207,8 +203,7 @@ func TestSeam1_TTS_NoAdjacentCollisionAndNoAnchorDrift(t *testing.T) {
 	}
 
 	// 2. Normal fitting durations (1400ms <= 2000ms slot)
-	fakeTTS, _ := h.registry.Get("fake_vieneu_tts_vi")
-	fakeProv := fakeTTS.(*provider.FakeTTSProvider)
+	fakeProv := defaultVITTSFake(t, h)
 	fakeProv.DurationMs = 1400
 
 	// 3. Synthesize
@@ -318,9 +313,8 @@ func TestSeam1_TTS_ActualSynthesizedDurationProbed(t *testing.T) {
 	}
 	_, dubVariant := setupDubScriptForSeam1(t, h, runID, assetID, segments)
 
-	// Setup fake provider where predicted duration is 1200ms but probed waveform duration is 1800ms
-	fakeTTS, _ := h.registry.Get("fake_vieneu_tts_vi")
-	fakeProv := fakeTTS.(*provider.FakeTTSProvider)
+	// Setup the default VI lane where predicted duration is 1200ms but probed waveform duration is 1800ms
+	fakeProv := defaultVITTSFake(t, h)
 	fakeProv.DurationMs = 1800
 	fakeProv.CustomPredictedMs = 1200 // planning estimate lies / deviates
 

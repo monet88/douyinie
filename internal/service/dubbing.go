@@ -1213,15 +1213,7 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 				audioSHA = synthRes.AudioSHA256
 			}
 
-			supportsSpeedFit := false
-			if selectedProv != nil {
-				for _, f := range selectedProv.Capability().Features {
-					if f == "measured_duration_speed_fit" || f == "zero_overrun_fit" {
-						supportsSpeedFit = true
-						break
-					}
-				}
-			}
+			supportsSpeedFit, fixedRateVoice := ttsFitCapabilities(selectedProv)
 
 			// Evaluate fit
 			evalInput := FitEvaluationInput{
@@ -1237,6 +1229,7 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 				CurrentSpeed:       currentSpeed,
 				CanShortenText:     len(strings.Fields(currentText)) > 3,
 				SupportsSpeedFit:   supportsSpeedFit,
+				FixedRateVoice:     fixedRateVoice,
 			}
 
 			evalRes := fc.EvaluateCandidate(ctx, evalInput)
@@ -1388,15 +1381,7 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 					return nil, fmt.Errorf("regroup probe media duration for segment %d (group %v): %w", seg.Index, consumedIndices, probeErr)
 				}
 
-				supportsSpeedFit := false
-				if selectedProv != nil {
-					for _, f := range selectedProv.Capability().Features {
-						if f == "measured_duration_speed_fit" || f == "zero_overrun_fit" {
-							supportsSpeedFit = true
-							break
-						}
-					}
-				}
+				supportsSpeedFit, fixedRateVoice := ttsFitCapabilities(selectedProv)
 
 				regroupEvalInput := FitEvaluationInput{
 					SegmentIndex:       seg.Index,
@@ -1411,6 +1396,7 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 					CurrentSpeed:       1.0,
 					CanShortenText:     len(strings.Fields(combinedSpokenText)) > 4,
 					SupportsSpeedFit:   supportsSpeedFit,
+					FixedRateVoice:     fixedRateVoice,
 				}
 				regroupEvalRes := fc.EvaluateCandidate(ctx, regroupEvalInput)
 
@@ -2049,6 +2035,25 @@ func isVoiceAssignmentEquivalent(existing *domain.VoiceAssignment, newAssignment
 		}
 	}
 	return true
+}
+
+// ttsFitCapabilities reports the rate-control contract of the TTS lane that
+// actually produced a candidate: whether it accepts a measured speed-fit
+// resynthesis, and whether it is a fixed-rate lane that fails closed on any
+// non-1.0 speed request (so overrun must use rewrite/regroup/review instead).
+func ttsFitCapabilities(p provider.Provider) (supportsSpeedFit, fixedRateVoice bool) {
+	if p == nil {
+		return false, false
+	}
+	for _, f := range p.Capability().Features {
+		switch f {
+		case "measured_duration_speed_fit", "zero_overrun_fit":
+			supportsSpeedFit = true
+		case provider.FeatureFixedRateVoice:
+			fixedRateVoice = true
+		}
+	}
+	return supportsSpeedFit, fixedRateVoice
 }
 
 // isProviderEquivalent checks if two provider IDs match (allowing fake_ prefix normalization).

@@ -622,8 +622,8 @@ func NewProductionSpeechRegistry(opts ...any) (*Registry, error) {
 	}
 
 	// Production TTS worker adapters.
-	// 1. ZeroTTS explicit VI lane (Issue #92). CPU-only; preset voices; no rate control.
-	zerotts, err := NewWorkerTTSProvider(ZeroTTSProviderID, ZeroTTSModelID, ZeroTTSModelVersion, []string{"vi"}, 0.95)
+	// 1. ZeroTTS default VI lane (Issue #92/#93). CPU-only; preset voices; no rate control.
+	zerotts, err := NewWorkerTTSProvider(ZeroTTSProviderID, ZeroTTSModelID, ZeroTTSModelVersion, []string{"vi"}, 0.95, FeatureFixedRateVoice)
 	if err != nil {
 		return nil, err
 	}
@@ -1062,7 +1062,13 @@ func (p *WorkerTTSProvider) VoiceCatalog() []domain.VoiceProfile {
 		return voices
 	}
 	if p.id == ZeroTTSProviderID {
+		// The full verified preset catalog stays selectable; only its leading
+		// entries are the unattended default rotation (DefaultPresetVoices).
 		return ZeroTTSPresetVoices()
+	}
+	if p.id == VieNeuProviderID {
+		// VieNeu compatibility lane for historical frozen assignments.
+		return VieNeuPresetVoices()
 	}
 	var voices []domain.VoiceProfile
 	for _, l := range p.capability.Languages {

@@ -614,14 +614,12 @@ func TestSeam1_QualityCorpus_SyntheticRegression_BoundProfile48Executions(t *tes
 			"en:首批 现货 仅售 四十九元 请勿错过": "First batch only 49 yuan do not miss out",
 		}
 	}
-	if p, ok := h.registry.Get("fake_vieneu_tts_vi"); ok {
-		fakeTTS := p.(*provider.FakeTTSProvider)
-		fakeTTS.DurationMs = 3000
-		fakeTTS.CustomDurations = map[int]int64{
-			0: 3000,
-			1: 3500,
-			2: 3500,
-		}
+	fakeTTS := defaultVITTSFake(t, h)
+	fakeTTS.DurationMs = 3000
+	fakeTTS.CustomDurations = map[int]int64{
+		0: 3000,
+		1: 3500,
+		2: 3500,
 	}
 	if p, ok := h.registry.Get("fake_kokoro_tts_en"); ok {
 		fakeTTS := p.(*provider.FakeTTSProvider)
