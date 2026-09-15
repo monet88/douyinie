@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Douyinie StageWorker Adapter: TTS Engines (VieNeu, CosyVoice3, Kokoro, Chatterbox)
+Douyinie StageWorker Adapter: TTS Engines (ZeroTTS, VieNeu, CosyVoice3, Kokoro, Chatterbox)
 Invokes official upstream TTS Python APIs or fails closed with descriptive errors.
 
 Contract:
@@ -21,7 +21,18 @@ import wave
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# Frozen Phase 1.1 RC Model Identities & Allowed Voices (Issue #68)
+# Pinned production VI ZeroTTS identity (Issue #92)
+ZEROTTS_MODEL_ID = "zeroweight-ai/ZeroTTS"
+ZEROTTS_MODEL_REVISION = "8a0c3c29f6f047011f5cae02d0b14475a690be86"
+ZEROTTS_PACKAGE_VERSION = "0.1.2"
+ZEROTTS_SOURCE_COMMIT = "9d85578bee9321d6ef8305a4d454baf33e3fe861"
+ZEROTTS_SOURCE_REPO = "zeroweight-ai/ZeroTTS"
+ZEROTTS_ADAPTER_REVISION = "cmd/stageworker/adapters/tts_engine.py@zerotts-0.1.2"
+ZEROTTS_ALLOWED_VOICES = {
+    "quangminh", "maichi", "giahuy", "baotrang", "hamy", "huuduc", "kimoanh", "tiendat"
+}
+
+# Frozen Phase 1.1 compatibility identities & allowed voices (Issue #68)
 VIENEU_MODEL_ID = "pnnbao-ump/VieNeu-TTS-v3-Turbo"
 VIENEU_MODEL_VERSION = "v3.2.9"
 VIENEU_MODEL_DIGEST = "1278db0090b98ccf23e56f2423857fc9d32a5118"
@@ -35,6 +46,8 @@ KOKORO_CHECKPOINT_SHA256 = "496dba118d1a58f5f3db2efc88dbdc216e0483fc89fe6e47ee1f
 KOKORO_ALLOWED_VOICES = {"af_heart", "am_michael", "af_bella", "am_fenrir"}
 
 # Pluggable factory hooks for deterministic testing without full ML packages
+_ZEROTTS_MODEL_FACTORY = None
+_ZEROTTS_PROBE_FACTORY = None
 _VIENEU_MODEL_FACTORY = None
 _COSYVOICE_MODEL_FACTORY = None
 _KOKORO_MODEL_FACTORY = None
@@ -193,6 +206,171 @@ def build_tts_response(
         "model_name": model_name,
         "model_version": model_version,
     }
+
+
+def _normalize_github_repo_url(url: str) -> str:
+    value = (url or "").strip().lower()
+    if value.startswith("git+"):
+        value = value[4:]
+    if value.startswith("git@github.com:"):
+        value = "https://github.com/" + value[len("git@github.com:"):]
+    elif value.startswith("ssh://git@github.com/"):
+        value = "https://github.com/" + value[len("ssh://git@github.com/"):]
+    if value.endswith(".git"):
+        value = value[:-4]
+    return value.rstrip("/")
+
+
+def probe_zerotts_runtime_identity() -> Dict[str, Any]:
+    """Observe and prove the exact ZeroTTS runtime package and source revision."""
+    if _ZEROTTS_PROBE_FACTORY is not None and callable(_ZEROTTS_PROBE_FACTORY):
+        return _ZEROTTS_PROBE_FACTORY()
+
+    import importlib.metadata
+
+    try:
+        dist = importlib.metadata.distribution("zerotts")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise RuntimeError(
+            f"RUNTIME_IDENTITY_PROBE_FAILED: zerotts=={ZEROTTS_PACKAGE_VERSION} is not installed in {sys.executable}"
+        ) from exc
+
+    pkg_version = (getattr(dist, "version", "") or "").strip()
+    if pkg_version != ZEROTTS_PACKAGE_VERSION:
+        raise RuntimeError(
+            f"RUNTIME_IDENTITY_PROBE_FAILED: zerotts package version mismatch: expected {ZEROTTS_PACKAGE_VERSION}, got {pkg_version or 'unknown'}"
+        )
+
+    direct_url_text = dist.read_text("direct_url.json")
+    if not direct_url_text:
+        raise RuntimeError(
+            "RUNTIME_IDENTITY_PROBE_FAILED: zerotts has no PEP 610 direct_url.json; exact VCS source revision cannot be proven"
+        )
+    try:
+        direct_url = json.loads(direct_url_text)
+    except Exception as exc:
+        raise RuntimeError(f"RUNTIME_IDENTITY_PROBE_FAILED: zerotts direct_url.json is malformed: {exc}") from exc
+    vcs_info = direct_url.get("vcs_info") if isinstance(direct_url, dict) else None
+    origin = _normalize_github_repo_url(direct_url.get("url", "") if isinstance(direct_url, dict) else "")
+    expected_origin = f"https://github.com/{ZEROTTS_SOURCE_REPO.lower()}"
+    if not isinstance(vcs_info, dict) or str(vcs_info.get("vcs", "")).lower() != "git":
+        raise RuntimeError("RUNTIME_IDENTITY_PROBE_FAILED: zerotts direct_url.json cannot prove a git VCS origin")
+    if origin != expected_origin:
+        raise RuntimeError(
+            f"RUNTIME_IDENTITY_PROBE_FAILED: zerotts VCS origin mismatch: expected {expected_origin}, got {origin or 'missing'}"
+        )
+    observed_commit = str(vcs_info.get("commit_id") or "").strip().lower()
+    if observed_commit != ZEROTTS_SOURCE_COMMIT:
+        raise RuntimeError(
+            f"RUNTIME_IDENTITY_PROBE_FAILED: zerotts source revision mismatch: expected {ZEROTTS_SOURCE_COMMIT}, got {observed_commit or 'missing'}"
+        )
+
+    runtime_versions = {"zerotts": pkg_version}
+    for backend in ("onnxruntime", "numpy"):
+        try:
+            runtime_versions[backend] = importlib.metadata.version(backend)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+
+    return {
+        "status": "ok",
+        "package_name": "zerotts",
+        "package_version": pkg_version,
+        "source_revision": observed_commit,
+        "runtime_versions": runtime_versions,
+        "adapter_revision": ZEROTTS_ADAPTER_REVISION,
+    }
+
+
+def run_zerotts_tts(
+    text: str,
+    language: str,
+    voice_id: str,
+    speed: float,
+    model_name: str = ZEROTTS_MODEL_ID,
+    model_version: str = ZEROTTS_MODEL_REVISION,
+    model_path: Optional[str] = None,
+    entrypoint_file: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run the pinned ZeroTTS preset-voice runtime from a verified local snapshot."""
+    if not voice_id or voice_id not in ZEROTTS_ALLOWED_VOICES:
+        raise ValueError(
+            f"TTS_VOICE_ASSET_MISSING: unverified or unknown ZeroTTS voice preset {voice_id!r} "
+            f"(must be one of {sorted(ZEROTTS_ALLOWED_VOICES)})"
+        )
+    if float(speed) != 1.0:
+        raise ValueError(f"TTS_SPEED_UNSUPPORTED: ZeroTTS requires speed=1.0, got {speed}")
+    if not model_path:
+        raise RuntimeError(
+            "WORKER_SNAPSHOT_PATH_REQUIRED: ZeroTTS requires a verified local snapshot model_path; Hub download is prohibited"
+        )
+
+    mp = Path(os.path.abspath(model_path))
+    if not mp.is_dir():
+        raise RuntimeError(f"WORKER_SNAPSHOT_PATH_REQUIRED: ZeroTTS snapshot path does not exist: {model_path}")
+
+    required_files = (
+        "config.json",
+        "tokenizer.json",
+        "null_voice_emb.npy",
+        "onnx/text_encoder.onnx",
+        "onnx/prefix_step.onnx",
+        "onnx/local_frame_decode.onnx",
+        "voices/index.json",
+    )
+    for rel in required_files:
+        asset = mp / Path(rel)
+        if not asset.is_file():
+            raise RuntimeError(f"TTS_MODEL_ASSET_MISSING: ZeroTTS required model asset missing: {asset}")
+
+    codec_dir = mp / "onnx" / "codec"
+    if not codec_dir.is_dir() or not any(p.is_file() for p in codec_dir.iterdir()):
+        raise RuntimeError(f"TTS_MODEL_ASSET_MISSING: ZeroTTS codec assets missing: {codec_dir}")
+
+    voice_path = mp / "voices" / voice_id / "voice.npz"
+    if not voice_path.is_file():
+        raise RuntimeError(
+            f"TTS_VOICE_ASSET_MISSING: ZeroTTS voice asset missing from canonical snapshot path: {voice_path}"
+        )
+    if not entrypoint_file:
+        raise RuntimeError("WORKER_SNAPSHOT_PATH_REQUIRED: ZeroTTS verified snapshot entrypoint_file is required")
+    entrypoint_path = Path(os.path.abspath(entrypoint_file))
+    if os.path.normcase(str(entrypoint_path)) != os.path.normcase(str(voice_path)):
+        raise RuntimeError(
+            f"TTS_VOICE_ASSET_MISSING: ZeroTTS entrypoint {entrypoint_path} does not match canonical voice asset {voice_path}"
+        )
+
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_DATASETS_OFFLINE"] = "1"
+
+    factory = _ZEROTTS_MODEL_FACTORY
+    if factory is None:
+        try:
+            from zerotts import ZeroTTS, __version__ as zerotts_version
+        except ImportError as exc:
+            raise RuntimeError(
+                f"TTS_RUNTIME_MISSING: zerotts=={ZEROTTS_PACKAGE_VERSION} is required for ZeroTTS synthesis"
+            ) from exc
+        if str(zerotts_version) != ZEROTTS_PACKAGE_VERSION:
+            raise RuntimeError(
+                f"TTS_RUNTIME_VERSION_MISMATCH: expected zerotts=={ZEROTTS_PACKAGE_VERSION}, got {zerotts_version}"
+            )
+        factory = ZeroTTS
+
+    engine = _instantiate_model(
+        factory,
+        {"model_dir": str(mp), "providers": ["CPUExecutionProvider"]},
+    )
+    if not hasattr(engine, "synthesize"):
+        raise RuntimeError("TTS_RUNTIME_MISSING: ZeroTTS engine instance missing required 'synthesize' method")
+
+    audio = engine.synthesize(text, voice=voice_id)
+    sample_rate = int(getattr(engine, "sample_rate", 48000))
+    wav_bytes, dur_ms = encode_audio_to_wav(audio, sample_rate=sample_rate)
+    if dur_ms <= 0:
+        raise RuntimeError("TTS_NO_AUDIO: ZeroTTS synthesis produced empty audio")
+    return build_tts_response(wav_bytes, dur_ms, model_name, model_version)
 
 
 def run_vieneu_tts(
@@ -748,6 +926,9 @@ def run_chatterbox_tts(
 
 def run_tts(req: Dict[str, Any]) -> Dict[str, Any]:
     """Main dispatch for StageWorker TTS request."""
+    if str(req.get("mode", "")).strip().lower() == "probe":
+        return probe_zerotts_runtime_identity()
+
     text = req.get("text", "")
     if not text.strip():
         raise ValueError("empty text provided for TTS synthesis")
@@ -766,8 +947,27 @@ def run_tts(req: Dict[str, Any]) -> Dict[str, Any]:
     model_path = req.get("model_path")
     entrypoint_file = req.get("entrypoint_file")
 
-    # Explicit recognized model names take precedence over language fallback
-    if "vieneu" in model_name or "pnnbao" in model_name:
+    # Explicit recognized model names take precedence over language fallback.
+    if model_name == ZEROTTS_MODEL_ID.lower():
+        if model_version != ZEROTTS_MODEL_REVISION:
+            raise ValueError(
+                f"TTS_MODEL_UNSUPPORTED: ZeroTTS requires exact model revision {ZEROTTS_MODEL_REVISION}, got {model_version or 'missing'}"
+            )
+        return run_zerotts_tts(
+            text=text,
+            language=language,
+            voice_id=voice_id,
+            speed=speed,
+            model_name=ZEROTTS_MODEL_ID,
+            model_version=ZEROTTS_MODEL_REVISION,
+            model_path=model_path,
+            entrypoint_file=entrypoint_file,
+        )
+    elif "zerotts" in model_name or "zeroweight" in model_name:
+        raise ValueError(
+            f"TTS_MODEL_UNSUPPORTED: unsupported ZeroTTS model identity {model_name!r}; expected {ZEROTTS_MODEL_ID}"
+        )
+    elif "vieneu" in model_name or "pnnbao" in model_name:
         return run_vieneu_tts(
             text=text,
             language=language,
@@ -809,7 +1009,7 @@ def run_tts(req: Dict[str, Any]) -> Dict[str, Any]:
             model_version=model_version,
         )
     else:
-        # Default to VieNeu for VI, Kokoro for EN, CosyVoice for others
+        # Preserve the historical language fallback for unresolved model names.
         if language == "en":
             return run_kokoro_tts(
                 text, language, voice_id, speed, model_name, model_version, model_path=model_path, entrypoint_file=entrypoint_file

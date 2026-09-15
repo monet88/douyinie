@@ -397,9 +397,27 @@ func (ss *SnapshotService) SetRuntimeIdentity(dependencyName, version string, rt
 	}
 	rt.RuntimeManifestSHA256 = expectedManifestSHA
 
-	// 3. For separator dependencies: validate frozen source revision and package version
+	// 3. For pinned runtime packs: validate frozen source revision and package version.
 	lowerDep := strings.ToLower(dependencyName)
-	if strings.Contains(lowerDep, "demucs") {
+	if strings.Contains(lowerDep, "zerotts") || strings.Contains(lowerDep, "zeroweight") {
+		if dependencyName != domain.PinnedZeroTTSModelID || version != domain.PinnedZeroTTSModelVersion {
+			return fmt.Errorf("%w: ZeroTTS model identity mismatch: expected %s:%s, got %s:%s",
+				domain.ErrSnapshotUnverified, domain.PinnedZeroTTSModelID, domain.PinnedZeroTTSModelVersion, dependencyName, version)
+		}
+		if rt.SourceRevision != domain.PinnedZeroTTSSourceRevision {
+			return fmt.Errorf("%w: ZeroTTS runtime source revision mismatch: expected %s, got %s",
+				domain.ErrSnapshotUnverified, domain.PinnedZeroTTSSourceRevision, rt.SourceRevision)
+		}
+		ver, ok := rt.RuntimeVersions["zerotts"]
+		if !ok || strings.TrimSpace(ver) != domain.PinnedZeroTTSPackageVersion {
+			return fmt.Errorf("%w: ZeroTTS runtime package version mismatch: expected exact %s, got %s",
+				domain.ErrSnapshotUnverified, domain.PinnedZeroTTSPackageVersion, ver)
+		}
+		if rt.AdapterRevision != domain.PinnedZeroTTSAdapterRevision {
+			return fmt.Errorf("%w: ZeroTTS adapter revision mismatch: expected %s, got %s",
+				domain.ErrSnapshotUnverified, domain.PinnedZeroTTSAdapterRevision, rt.AdapterRevision)
+		}
+	} else if strings.Contains(lowerDep, "demucs") {
 		if rt.SourceRevision != domain.PinnedDemucsSourceRevision {
 			return fmt.Errorf("%w: Demucs runtime source revision mismatch: expected %s, got %s",
 				domain.ErrSnapshotUnverified, domain.PinnedDemucsSourceRevision, rt.SourceRevision)

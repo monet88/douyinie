@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -379,6 +380,8 @@ func dispatchStage(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 		return runDiarizerEvidenceAdapter(ctx, cmd, enc)
 	case "tts":
 		return runTTSAdapter(ctx, cmd, enc)
+	case "tts_probe":
+		return runTTSProbeAdapter(ctx, cmd, enc)
 	case "separator":
 		if mode, _ := cmd.Config["mode"].(string); mode == "probe" {
 			return runSeparatorProbeAdapter(ctx, cmd, enc)
@@ -623,7 +626,111 @@ func runTTSAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 		}
 	}
 	lowerModel := strings.ToLower(modelName)
-	if strings.Contains(lowerModel, "kokoro") {
+	if lowerModel == strings.ToLower(provider.ZeroTTSModelID) {
+		if modelVersion != provider.ZeroTTSModelVersion {
+			return worker.ArtifactRef{}, worker.NewError("TTS_MODEL_UNSUPPORTED",
+				fmt.Sprintf("ZeroTTS requires exact model revision %s, got %s", provider.ZeroTTSModelVersion, modelVersion),
+				map[string]any{"stage": "tts", "command_id": cmd.ID})
+		}
+		speedValue := 1.0
+		if strings.TrimSpace(speed) == "" {
+			speed = "1.0"
+		}
+		if rawSpeed, ok := cmd.Config["speed"]; ok {
+			switch v := rawSpeed.(type) {
+			case string:
+				if strings.TrimSpace(v) != "" {
+					parsed, parseSpeedErr := strconv.ParseFloat(v, 64)
+					if parseSpeedErr != nil {
+						return worker.ArtifactRef{}, worker.NewError("TTS_SPEED_UNSUPPORTED",
+							fmt.Sprintf("invalid ZeroTTS speed %q", v), map[string]any{"stage": "tts", "command_id": cmd.ID})
+					}
+					speed = v
+					speedValue = parsed
+				}
+			case float64:
+				speedValue = v
+				speed = strconv.FormatFloat(v, 'f', -1, 64)
+			case float32:
+				speedValue = float64(v)
+				speed = strconv.FormatFloat(float64(v), 'f', -1, 64)
+			default:
+				return worker.ArtifactRef{}, worker.NewError("TTS_SPEED_UNSUPPORTED",
+					fmt.Sprintf("invalid ZeroTTS speed type %T", rawSpeed), map[string]any{"stage": "tts", "command_id": cmd.ID})
+			}
+		}
+		if speedValue != 1.0 {
+			return worker.ArtifactRef{}, worker.NewError("TTS_SPEED_UNSUPPORTED",
+				fmt.Sprintf("ZeroTTS requires speed=1.0, got %s", speed),
+				map[string]any{"stage": "tts", "command_id": cmd.ID})
+		}
+		validZeroTTS := false
+		for _, v := range domain.FrozenZeroTTSVoiceOrder {
+			if v == voiceID {
+				validZeroTTS = true
+				break
+			}
+		}
+		if !validZeroTTS {
+			return worker.ArtifactRef{}, worker.NewError("TTS_VOICE_ASSET_MISSING",
+				fmt.Sprintf("unverified or unknown ZeroTTS voice preset %q (must be one of %s)", voiceID, strings.Join(domain.FrozenZeroTTSVoiceOrder, ", ")),
+				map[string]any{"stage": "tts", "command_id": cmd.ID})
+		}
+		if modelPath == "" || snapEnv == nil {
+			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				"ZeroTTS requires a verified local model_snapshot envelope", map[string]any{"stage": "tts", "command_id": cmd.ID})
+		}
+		if snapEnv.Primary.DependencyName != provider.ZeroTTSModelID || snapEnv.Primary.Version != provider.ZeroTTSModelVersion {
+			return worker.ArtifactRef{}, worker.NewError("TTS_MODEL_UNSUPPORTED",
+				fmt.Sprintf("ZeroTTS snapshot envelope identity must be %s:%s, got %s:%s",
+					provider.ZeroTTSModelID, provider.ZeroTTSModelVersion,
+					snapEnv.Primary.DependencyName, snapEnv.Primary.Version),
+				map[string]any{"stage": "tts", "command_id": cmd.ID})
+		}
+		if entrypointFile == "" {
+			return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
+				"verified model_snapshot envelope missing required entrypoint_file for ZeroTTS",
+				map[string]any{"stage": "tts", "command_id": cmd.ID})
+		}
+		for _, rel := range []string{
+			"config.json",
+			"tokenizer.json",
+			"null_voice_emb.npy",
+			filepath.Join("onnx", "text_encoder.onnx"),
+			filepath.Join("onnx", "prefix_step.onnx"),
+			filepath.Join("onnx", "local_frame_decode.onnx"),
+			filepath.Join("voices", "index.json"),
+		} {
+			assetPath := filepath.Join(modelPath, rel)
+			if fi, err := os.Stat(assetPath); err != nil || fi.IsDir() {
+				return worker.ArtifactRef{}, worker.NewError("TTS_MODEL_ASSET_MISSING",
+					fmt.Sprintf("ZeroTTS required model asset missing: %s", assetPath),
+					map[string]any{"stage": "tts", "command_id": cmd.ID})
+			}
+		}
+		codecDir := filepath.Join(modelPath, "onnx", "codec")
+		codecEntries, codecErr := os.ReadDir(codecDir)
+		if codecErr != nil || len(codecEntries) == 0 {
+			return worker.ArtifactRef{}, worker.NewError("TTS_MODEL_ASSET_MISSING",
+				fmt.Sprintf("ZeroTTS codec assets missing: %s", codecDir),
+				map[string]any{"stage": "tts", "command_id": cmd.ID})
+		}
+		voicePath := filepath.Join(modelPath, "voices", voiceID, "voice.npz")
+		if fi, err := os.Stat(voicePath); err != nil || fi.IsDir() {
+			return worker.ArtifactRef{}, worker.NewError("TTS_VOICE_ASSET_MISSING",
+				fmt.Sprintf("ZeroTTS voice asset missing from canonical snapshot path: %s", voicePath),
+				map[string]any{"stage": "tts", "command_id": cmd.ID})
+		}
+		if filepath.Clean(entrypointFile) != filepath.Clean(voicePath) {
+			return worker.ArtifactRef{}, worker.NewError("TTS_VOICE_ASSET_MISSING",
+				fmt.Sprintf("ZeroTTS envelope entrypoint (%s) does not match canonical voice path (%s)", entrypointFile, voicePath),
+				map[string]any{"stage": "tts", "command_id": cmd.ID})
+		}
+	} else if strings.Contains(lowerModel, "zerotts") || strings.Contains(lowerModel, "zeroweight") {
+		return worker.ArtifactRef{}, worker.NewError("TTS_MODEL_UNSUPPORTED",
+			fmt.Sprintf("unsupported ZeroTTS model identity %q; expected %s", modelName, provider.ZeroTTSModelID),
+			map[string]any{"stage": "tts", "command_id": cmd.ID})
+	} else if strings.Contains(lowerModel, "kokoro") {
 		validKokoro := false
 		for _, v := range domain.FrozenKokoroVoiceOrder {
 			if v == voiceID {
@@ -707,7 +814,12 @@ func runTTSAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 		}
 	}
 
-	runner, err := resolveTTSRunner()
+	var runner commandRunner
+	if lowerModel == strings.ToLower(provider.ZeroTTSModelID) {
+		runner, err = resolvePinnedZeroTTSRunner()
+	} else {
+		runner, err = resolveTTSRunner()
+	}
 	if err != nil {
 		return worker.ArtifactRef{}, err
 	}
@@ -754,6 +866,59 @@ func runTTSAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 
 	return writeOutputArtifact(cmd, out)
 }
+
+// runTTSProbeAdapter observes the configured ZeroTTS runtime through the
+// repo-owned TTS adapter and returns verifiable package/source identity.
+func runTTSProbeAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder) (worker.ArtifactRef, error) {
+	modelName, err := requireConfigString(cmd.Config, cfgModelName)
+	if err != nil || !strings.EqualFold(modelName, provider.ZeroTTSModelID) {
+		return worker.ArtifactRef{}, worker.NewError("TTS_RUNTIME_PROBE_FAILED",
+			fmt.Sprintf("ZeroTTS runtime probe requires exact model identity %s", provider.ZeroTTSModelID),
+			map[string]any{"stage": "tts_probe", "command_id": cmd.ID})
+	}
+	modelVersion, _ := cmd.Config[cfgModelVersion].(string)
+	if modelVersion != provider.ZeroTTSModelVersion {
+		return worker.ArtifactRef{}, worker.NewError("TTS_RUNTIME_PROBE_FAILED",
+			fmt.Sprintf("ZeroTTS runtime probe requires exact model revision %s, got %s", provider.ZeroTTSModelVersion, modelVersion),
+			map[string]any{"stage": "tts_probe", "command_id": cmd.ID})
+	}
+
+	runner, err := resolvePinnedZeroTTSRunner()
+	if err != nil {
+		return worker.ArtifactRef{}, err
+	}
+	req := map[string]any{
+		"mode":          "probe",
+		"run_id":        cmd.RunID,
+		"attempt_id":    cmd.AttemptID,
+		cfgModelName:    provider.ZeroTTSModelID,
+		cfgModelVersion: provider.ZeroTTSModelVersion,
+	}
+	var out struct {
+		Status          string            `json:"status"`
+		PackageName     string            `json:"package_name"`
+		PackageVersion  string            `json:"package_version"`
+		SourceRevision  string            `json:"source_revision"`
+		RuntimeVersions map[string]string `json:"runtime_versions"`
+		AdapterRevision string            `json:"adapter_revision"`
+		Error           string            `json:"error,omitempty"`
+	}
+	if err := invokeCommand(ctx, runner.binary, runner.args, req, &out); err != nil {
+		return worker.ArtifactRef{}, worker.NewError("TTS_RUNTIME_PROBE_FAILED",
+			fmt.Sprintf("ZeroTTS runtime probe failed: %v", err),
+			map[string]any{"stage": "tts_probe", "command_id": cmd.ID})
+	}
+	if out.Error != "" || out.Status != "ok" || out.SourceRevision == "" {
+		msg := out.Error
+		if msg == "" {
+			msg = fmt.Sprintf("invalid ZeroTTS runtime probe response status=%q source_revision=%q", out.Status, out.SourceRevision)
+		}
+		return worker.ArtifactRef{}, worker.NewError("TTS_RUNTIME_PROBE_FAILED", msg,
+			map[string]any{"stage": "tts_probe", "command_id": cmd.ID})
+	}
+	return writeOutputArtifact(cmd, out)
+}
+
 func invokeCommand(ctx context.Context, binary string, args []string, req any, out any) error {
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -776,6 +941,18 @@ func invokeCommand(ctx context.Context, binary string, args []string, req any, o
 		stderrStr := strings.TrimSpace(stderr.String())
 		if strings.Contains(stderrStr, "TTS_VOICE_ASSET_MISSING") {
 			code = "TTS_VOICE_ASSET_MISSING"
+		} else if strings.Contains(stderrStr, "TTS_MODEL_ASSET_MISSING") {
+			code = "TTS_MODEL_ASSET_MISSING"
+		} else if strings.Contains(stderrStr, "TTS_RUNTIME_MISSING") {
+			code = "TTS_RUNTIME_MISSING"
+		} else if strings.Contains(stderrStr, "TTS_RUNTIME_VERSION_MISMATCH") {
+			code = "TTS_RUNTIME_VERSION_MISMATCH"
+		} else if strings.Contains(stderrStr, "TTS_SPEED_UNSUPPORTED") {
+			code = "TTS_SPEED_UNSUPPORTED"
+		} else if strings.Contains(stderrStr, "TTS_NO_AUDIO") {
+			code = "TTS_NO_AUDIO"
+		} else if strings.Contains(stderrStr, "TTS_MODEL_UNSUPPORTED") {
+			code = "TTS_MODEL_UNSUPPORTED"
 		} else if strings.Contains(stderrStr, "WORKER_SNAPSHOT_PATH_REQUIRED") {
 			code = "WORKER_SNAPSHOT_PATH_REQUIRED"
 		} else if strings.Contains(stderrStr, "SEPARATOR_METADATA_ASSET_MISSING") {
@@ -792,7 +969,7 @@ func invokeCommand(ctx context.Context, binary string, args []string, req any, o
 			code = "DEMUCS_FT_SUBSTITUTION_REJECTED"
 		} else if strings.Contains(stageTarget, "trans") {
 			code = "TRANSLATION_EXEC_FAILED"
-		} else if strings.Contains(stageTarget, "tts") || strings.Contains(stageTarget, "vieneu") || strings.Contains(stageTarget, "cosyvoice") || strings.Contains(stageTarget, "kokoro") || strings.Contains(stageTarget, "chatterbox") {
+		} else if strings.Contains(stageTarget, "tts") || strings.Contains(stageTarget, "zerotts") || strings.Contains(stageTarget, "vieneu") || strings.Contains(stageTarget, "cosyvoice") || strings.Contains(stageTarget, "kokoro") || strings.Contains(stageTarget, "chatterbox") {
 			code = "TTS_EXEC_FAILED"
 		} else if strings.Contains(stageTarget, "align") {
 			code = "ALIGNER_EXEC_FAILED"
@@ -811,7 +988,7 @@ func invokeCommand(ctx context.Context, binary string, args []string, req any, o
 		code := "OUTPUT_INVALID"
 		if strings.Contains(stageTarget, "trans") {
 			code = "TRANSLATION_OUTPUT_INVALID"
-		} else if strings.Contains(stageTarget, "tts") || strings.Contains(stageTarget, "vieneu") || strings.Contains(stageTarget, "cosyvoice") || strings.Contains(stageTarget, "kokoro") || strings.Contains(stageTarget, "chatterbox") {
+		} else if strings.Contains(stageTarget, "tts") || strings.Contains(stageTarget, "zerotts") || strings.Contains(stageTarget, "vieneu") || strings.Contains(stageTarget, "cosyvoice") || strings.Contains(stageTarget, "kokoro") || strings.Contains(stageTarget, "chatterbox") {
 			code = "TTS_OUTPUT_INVALID"
 		} else if strings.Contains(stageTarget, "align") {
 			code = "ALIGNER_OUTPUT_INVALID"
@@ -1069,6 +1246,53 @@ func resolveTTSRunner() (commandRunner, error) {
 	return commandRunner{}, worker.NewError("TTS_BINARY_NOT_FOUND",
 		"TTS adapter or binary not available: configure DOUYINIE_TTS_ADAPTER/DOUYINIE_TTS_BIN or ensure tts_engine.py dependencies are installed",
 		nil)
+}
+
+// resolvePinnedZeroTTSRunner deliberately ignores DOUYINIE_TTS_BIN,
+// DOUYINIE_TTS_ADAPTER, and PATH TTS wrappers. ZeroTTS always runs through the
+// repo-owned adapter; only the Python interpreter is configurable.
+func resolvePinnedZeroTTSRunner() (commandRunner, error) {
+	adapterPaths := []string{
+		filepath.Join("cmd", "stageworker", "adapters", "tts_engine.py"),
+		filepath.Join("adapters", "tts_engine.py"),
+		filepath.Join("..", "..", "cmd", "stageworker", "adapters", "tts_engine.py"),
+		filepath.Join("..", "cmd", "stageworker", "adapters", "tts_engine.py"),
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		adapterPaths = append(adapterPaths,
+			filepath.Join(exeDir, "adapters", "tts_engine.py"),
+			filepath.Join(exeDir, "..", "cmd", "stageworker", "adapters", "tts_engine.py"),
+			filepath.Join(exeDir, "..", "..", "cmd", "stageworker", "adapters", "tts_engine.py"),
+		)
+	}
+
+	pyBin := ""
+	if configured := strings.TrimSpace(os.Getenv("DOUYINIE_TTS_PYTHON_BIN")); configured != "" {
+		if path, err := exec.LookPath(configured); err == nil {
+			pyBin = path
+		} else if fi, statErr := os.Stat(configured); statErr == nil && !fi.IsDir() {
+			pyBin = configured
+		} else {
+			return commandRunner{}, worker.NewError("TTS_RUNTIME_MISSING",
+				fmt.Sprintf("configured DOUYINIE_TTS_PYTHON_BIN %q is unavailable", configured), nil)
+		}
+	} else {
+		pyBin = resolvePythonBinary()
+	}
+	if pyBin == "" {
+		return commandRunner{}, worker.NewError("TTS_RUNTIME_MISSING",
+			"Python runtime not found for pinned ZeroTTS adapter", nil)
+	}
+	for _, p := range adapterPaths {
+		if absP, err := filepath.Abs(p); err == nil {
+			if fi, statErr := os.Stat(absP); statErr == nil && !fi.IsDir() {
+				return commandRunner{binary: pyBin, args: []string{absP}}, nil
+			}
+		}
+	}
+	return commandRunner{}, worker.NewError("TTS_RUNTIME_MISSING",
+		"repo-owned ZeroTTS adapter cmd/stageworker/adapters/tts_engine.py not found", nil)
 }
 
 func resolveSeparatorRunner(requireSnap bool) (commandRunner, error) {

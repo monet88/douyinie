@@ -126,6 +126,53 @@ func TestProductionSpeechRegistry_ContainsAllRequiredCapabilities(t *testing.T) 
 	}
 }
 
+func TestProductionSpeechRegistry_ZeroTTSVietnameseLane(t *testing.T) {
+	reg, err := provider.NewProductionSpeechRegistry(false)
+	if err != nil {
+		t.Fatalf("NewProductionSpeechRegistry: %v", err)
+	}
+
+	p, ok := reg.Get(provider.ZeroTTSProviderID)
+	if !ok {
+		t.Fatalf("missing %s provider", provider.ZeroTTSProviderID)
+	}
+	modelName, modelVersion := p.ModelInfo()
+	if modelName != provider.ZeroTTSModelID || modelVersion != provider.ZeroTTSModelVersion {
+		t.Fatalf("unexpected ZeroTTS model identity: %s:%s", modelName, modelVersion)
+	}
+	for _, feature := range p.Capability().Features {
+		if feature == "measured_duration_speed_fit" {
+			t.Fatal("ZeroTTS must not advertise measured_duration_speed_fit")
+		}
+	}
+
+	tts, ok := p.(provider.TTSProvider)
+	if !ok {
+		t.Fatalf("%s does not implement TTSProvider", p.ID())
+	}
+	catalog := tts.VoiceCatalog()
+	if len(catalog) != 8 {
+		t.Fatalf("expected all 8 verified ZeroTTS preset voices, got %d", len(catalog))
+	}
+	if catalog[0].VoiceID != "quangminh" || catalog[1].VoiceID != "maichi" {
+		t.Fatalf("unexpected ZeroTTS catalog priority: %q, %q", catalog[0].VoiceID, catalog[1].VoiceID)
+	}
+	for _, voice := range catalog {
+		if voice.ProviderID != provider.ZeroTTSProviderID || voice.IsClone {
+			t.Fatalf("invalid ZeroTTS preset profile: %+v", voice)
+		}
+	}
+
+	vieneu, ok := reg.Get(provider.VieNeuProviderID)
+	if !ok {
+		t.Fatalf("historical VieNeu provider %s missing", provider.VieNeuProviderID)
+	}
+	vieneuTTS := vieneu.(provider.TTSProvider)
+	if got := vieneuTTS.VoiceCatalog(); len(got) != len(provider.OrderedVieNeuVoices()) || got[0].ProviderID != provider.VieNeuProviderID {
+		t.Fatalf("VieNeu compatibility catalog changed: %+v", got)
+	}
+}
+
 func TestProductionSpeechRegistry_TranslationProvidersAreGatewayOnly(t *testing.T) {
 	reg, err := provider.NewProductionSpeechRegistry(provider.GatewayTranslationConfig{
 		Endpoint:           "https://gateway.example.test/v1",
