@@ -644,7 +644,7 @@ func NewProductionSpeechRegistry(opts ...any) (*Registry, error) {
 	}
 
 	// 3. CosyVoice3 measured-duration speed-fit lane (conditional only, not in default preset rotation)
-	cosyvoice, err := NewWorkerTTSProvider(CosyVoiceProviderID, "cosyvoice3", "3.0.0", []string{"vi", "en"}, 0.98, "measured_duration_speed_fit")
+	cosyvoice, err := NewWorkerTTSProvider(CosyVoiceProviderID, CosyVoiceModelID, CosyVoiceModelVersion, []string{"vi", "en"}, 0.98, "measured_duration_speed_fit")
 	if err != nil {
 		return nil, err
 	}

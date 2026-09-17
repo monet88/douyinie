@@ -632,6 +632,125 @@ func TestSeam1_ZeroTTS_PreIssue94CachedVariantCannotSatisfyTheEscalationContract
 }
 
 // ---------------------------------------------------------------------------
+//  5b. A variant cached by a build that keyed the TTS stage WITHOUT the runtime
+//      identity cannot satisfy a request from a build that keys it with one.
+//      A TTS pin upgrade (model revision, runtime pack, adapter revision) changes the
+//      audio this stage emits while the dub script, the voice assignment, the fit
+//      semantics and the artifact schema all stay identical, so the stage cache
+//      identity is what has to move. If it does not, every asset processed before the
+//      upgrade silently replays audio synthesized by the previous runtime.
+// ---------------------------------------------------------------------------
+
+// preRuntimeIdentityStageCacheKey is the DubSegments stage cache key a build without the
+// tts_runtime_identity token recorded for this (dub script, voice assignment) pair: the
+// current schema version and fit-semantics token, no runtime identity.
+func preRuntimeIdentityStageCacheKey(t *testing.T, dubScriptCAS, voiceAssignCAS string) string {
+	t.Helper()
+
+	key, err := cas.ComputeStageCacheKey(domain.StageCacheIdentityInput{
+		Stage:       string(provider.TypeTTS),
+		InputHashes: []string{dubScriptCAS, voiceAssignCAS},
+		SemanticConfig: map[string]any{
+			"zero_overrun_fit": "measured_media_truth_v1",
+		},
+		Language:      "vi",
+		SchemaVersion: domain.DubSegmentsSchemaVersion,
+	})
+	if err != nil {
+		t.Fatalf("compute pre-runtime-identity stage cache key: %v", err)
+	}
+	return key
+}
+
+// seedPreRuntimeIdentityCachedDubSegmentsVariant writes the index row and CAS payload a
+// build without the tts_runtime_identity token would have produced for this exact
+// (dub script, voice assignment, language) request: current schema version, current fit
+// semantics token, no runtime identity. It deliberately reuses
+// domain.DubSegmentsSchemaVersion (unlike the pre-#94 seeder) so the only thing that can
+// invalidate it is the runtime identity.
+func seedPreRuntimeIdentityCachedDubSegmentsVariant(t *testing.T, h *testHarness, dubScriptCAS, voiceAssignCAS, assetID, runID string) string {
+	t.Helper()
+
+	preRuntimeIdentityKey := preRuntimeIdentityStageCacheKey(t, dubScriptCAS, voiceAssignCAS)
+
+	stale := &domain.DubSegmentsVariant{
+		ID:                  "cached-before-tts-runtime-identity",
+		SchemaVersion:       domain.DubSegmentsSchemaVersion,
+		AssetID:             assetID,
+		RunID:               runID,
+		TargetLanguage:      "vi",
+		DubScriptVariantCAS: dubScriptCAS,
+		VoiceAssignmentCAS:  voiceAssignCAS,
+		OverallStatus:       "REVIEW_REQUIRED",
+		ProvenanceHash:      preRuntimeIdentityKey,
+		CreatedAt:           time.Now().UTC(),
+	}
+	data, err := json.Marshal(stale)
+	if err != nil {
+		t.Fatalf("marshal pre-runtime-identity variant: %v", err)
+	}
+	obj, err := h.casStore.Put(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("put pre-runtime-identity variant in CAS: %v", err)
+	}
+	if err := h.db.SaveDubSegmentsVariantIndex(context.Background(), storage.DubSegmentsVariantIndex{
+		ID:             stale.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        obj.SHA256,
+		ProvenanceHash: preRuntimeIdentityKey,
+		OverallStatus:  stale.OverallStatus,
+		CreatedAt:      stale.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save pre-runtime-identity variant index: %v", err)
+	}
+	return obj.SHA256
+}
+
+func TestSeam1_TTSPinUpgradeCannotBeSatisfiedByPreUpgradeCachedVariant(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	dubVariant := setupDubScriptForSeam1Lang(t, h, runID, assetID, "vi", escalationFixture())
+
+	respAssign, assign1 := runAssignVoices(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	})
+	if respAssign.StatusCode != http.StatusCreated || assign1 == nil {
+		t.Fatalf("voice assignment failed: %d", respAssign.StatusCode)
+	}
+
+	zeroTTSHardSlotFake(t, h)
+	registerCosyVoiceFallback(t, h, 700, true)
+
+	// A build without the runtime-identity token already cached a variant for exactly
+	// this request identity, under the current schema and fit semantics.
+	staleCAS := seedPreRuntimeIdentityCachedDubSegmentsVariant(t, h, dubVariant.CASHash, assign1.CASHash, assetID, runID)
+
+	respSynth, variant := runDubSynthesize(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": dubVariant.CASHash,
+		"voice_assignment_cas":   assign1.CASHash,
+	})
+	if respSynth.StatusCode != http.StatusCreated || variant == nil {
+		t.Fatalf("dub-synthesize failed: %d", respSynth.StatusCode)
+	}
+	if variant.CASHash == staleCAS {
+		t.Fatalf("a variant cached without the TTS runtime identity satisfied this request: the DubSegments cache identity does not depend on the pinned TTS runtime, so a TTS pin upgrade is invisible to already-processed assets")
+	}
+	// The request must have been honored by real synthesis, not by a stale row.
+	if len(variant.Segments) == 0 || variant.ProvenanceHash == "" {
+		t.Fatalf("expected a freshly synthesized variant, got status %s (selected=%d, provenance=%q)",
+			variant.OverallStatus, len(variant.Segments), variant.ProvenanceHash)
+	}
+}
+
+// ---------------------------------------------------------------------------
 //  6. A review correction reports the assignment actually in force, even when the
 //     synthesis it drives escalates a speaker to the fallback lane.
 //

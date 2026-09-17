@@ -1108,6 +1108,17 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 		}
 	}
 
+	// A prior variant may only be spliced into this pass when it was produced under the
+	// same stage cache identity (same TTS runtime/model pins, same fit semantics, same
+	// schema). A pin upgrade changes that identity without changing the assignment, so
+	// reusing the prior segments would emit a variant whose audio came from two runtimes.
+	priorReusable := false
+	if priorVariant != nil && voiceAssign.SupersedesCAS != "" {
+		if priorKey, err := s.computeDubSegmentsProvenanceHash(in, dubScript, &domain.VoiceAssignment{CASHash: voiceAssign.SupersedesCAS}); err == nil {
+			priorReusable = priorVariant.ProvenanceHash == priorKey
+		}
+	}
+
 	priorSegmentByIndex := make(map[int]domain.DubSegment)
 	priorFitPlanByIndex := make(map[int]domain.DubbingFitPlan)
 	if priorVariant != nil {
@@ -1150,10 +1161,11 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 		// Fail-safe speaker-scoped invalidation check:
 		// If this VoiceAssignment supersedes a prior assignment and this speaker was NOT invalidated,
 		// reuse the prior validated DubSegment and FitPlan directly without re-synthesizing ONLY IF:
+		// 0) The prior variant was produced under this exact stage cache identity (priorReusable).
 		// 1) Matching prior segment is present and valid with non-empty audio and accepted status.
 		// 2) Corresponding prior DubbingFitPlan exists, has decision ACCEPT, no review, and satisfies zero-overrun fit.
 		// 3) Grouped SpeechBlockIndices / timing match the current dub script and speaker sequence.
-		if voiceAssign.SupersedesCAS != "" && !invalidatedSpeakersSet[spkID] && priorVariant != nil {
+		if priorReusable && !invalidatedSpeakersSet[spkID] {
 			priorSeg, segExists := priorSegmentByIndex[seg.Index]
 			priorFP, fpExists := priorFitPlanByIndex[seg.Index]
 			if segExists && fpExists &&
@@ -2183,6 +2195,15 @@ func (s *DubbingService) computeVoiceAssignmentProvenanceHash(in domain.VoiceAss
 }
 
 // computeDubSegmentsProvenanceHash computes deterministic cache identity for DubSegmentsVariant.
+//
+// The variant's audio is produced by a pinned TTS runtime, so that runtime identity is a
+// semantic input: `tts_runtime_identity` carries every lane's model revision and runtime pack.
+// Without it a pin upgrade leaves the key unchanged and already-cached rows replay audio from
+// the previous runtime (CODING_STANDARDS §4). No single ProviderID/ModelName/ModelVersion
+// triple is set because one pass can legitimately mix lanes (the assignment picks one per
+// speaker and a fixed-rate lane may escalate a speaker to the fallback lane), so the map —
+// not a scalar — is the honest identity. The artifact's shape is unchanged by a pin upgrade,
+// which is why the schema version stays put and the identity token moves instead.
 func (s *DubbingService) computeDubSegmentsProvenanceHash(in domain.DubbingJobInput, dubScript *domain.DubScriptVariant, voiceAssign *domain.VoiceAssignment) (string, error) {
 	var inputHashes []string
 	if dubScript != nil && dubScript.CASHash != "" {
@@ -2196,7 +2217,8 @@ func (s *DubbingService) computeDubSegmentsProvenanceHash(in domain.DubbingJobIn
 		Stage:       string(provider.TypeTTS),
 		InputHashes: inputHashes,
 		SemanticConfig: map[string]any{
-			"zero_overrun_fit": "measured_media_truth_v1",
+			"zero_overrun_fit":     "measured_media_truth_v1",
+			"tts_runtime_identity": provider.TTSRuntimeIdentities(),
 		},
 		Language:      in.TargetLanguage,
 		SchemaVersion: domain.DubSegmentsSchemaVersion,

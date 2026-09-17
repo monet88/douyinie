@@ -679,3 +679,166 @@ func TestSeam1_VoiceChange_InvalidPriorFitPlanBypassesReuse(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Test 7: A prior variant produced under a different TTS stage identity is not spliced
+//         into an escalation pass.
+//
+// An escalation reuses the segments of every speaker it did not invalidate. Reuse is
+// legitimate only while the prior variant was produced by the same stage identity: after
+// a TTS pin upgrade the prior segments carry audio from the previous runtime, so reusing
+// them would emit one variant whose segments came from two different runtimes, with
+// nothing in the artifact recording it.
+// ---------------------------------------------------------------------------
+
+// rekeyDubSegmentsVariantToPreRuntimeIdentityProvenance republishes an already-synthesized
+// variant under the provenance hash a build without the tts_runtime_identity token would
+// have recorded for the same (dub script, voice assignment) pair, and rebinds the
+// asset-scoped index row to it. The variant body — segments, fit plans, audio — is
+// untouched, so only the recorded stage identity differs.
+func rekeyDubSegmentsVariantToPreRuntimeIdentityProvenance(
+	t *testing.T, h *testHarness, variant *domain.DubSegmentsVariant,
+	dubScriptCAS, voiceAssignCAS, assetID, runID string,
+) string {
+	t.Helper()
+
+	preRuntimeIdentityKey := preRuntimeIdentityStageCacheKey(t, dubScriptCAS, voiceAssignCAS)
+
+	rekeyed := *variant
+	rekeyed.ID = variant.ID + "-pre-runtime-identity"
+	rekeyed.CASHash = ""
+	rekeyed.ProvenanceHash = preRuntimeIdentityKey
+	rekeyed.CreatedAt = time.Now().UTC()
+	data, err := json.Marshal(&rekeyed)
+	if err != nil {
+		t.Fatalf("marshal rekeyed variant: %v", err)
+	}
+	obj, err := h.casStore.Put(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("put rekeyed variant in CAS: %v", err)
+	}
+	if err := h.db.SaveDubSegmentsVariantIndex(context.Background(), storage.DubSegmentsVariantIndex{
+		ID:             rekeyed.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        obj.SHA256,
+		ProvenanceHash: preRuntimeIdentityKey,
+		OverallStatus:  rekeyed.OverallStatus,
+		CreatedAt:      rekeyed.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save rekeyed variant index: %v", err)
+	}
+	return obj.SHA256
+}
+
+func TestSeam1_VoiceChange_PreUpgradeVariantProvenanceBypassesReuse(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	segments := []domain.TranslationInputSegment{
+		{Index: 0, SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 2000, SourceText: "今天天气很好。"},
+		{Index: 1, SpeakerID: "SPEAKER_00", StartMs: 2200, EndMs: 4200, SourceText: "测试语音输入"},
+		{Index: 2, SpeakerID: "SPEAKER_01", StartMs: 4500, EndMs: 6500, SourceText: "我们去公园散步吧。"},
+		{Index: 3, SpeakerID: "SPEAKER_01", StartMs: 6700, EndMs: 8700, SourceText: "明天再继续工作。"},
+	}
+	_, dubVariant := setupDubScriptForSeam1(t, h, runID, assetID, segments)
+
+	respAssign, assign1 := runAssignVoices(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	})
+	if respAssign.StatusCode != http.StatusCreated || assign1 == nil {
+		t.Fatalf("initial assign voices failed: %d", respAssign.StatusCode)
+	}
+
+	// 1. Initial synthesis: a prior variant with fully accepted evidence for both speakers.
+	respSynth1, variant1 := runDubSynthesize(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": dubVariant.CASHash,
+		"voice_assignment_cas":   assign1.CASHash,
+	})
+	if respSynth1.StatusCode != http.StatusCreated || variant1 == nil {
+		t.Fatalf("initial synthesis failed: %d", respSynth1.StatusCode)
+	}
+	if len(variant1.Segments) != 4 {
+		t.Fatalf("expected 4 selected segments in variant 1, got %d", len(variant1.Segments))
+	}
+
+	// 2. That variant was produced by the previous TTS runtime: republish it under the
+	//    pre-runtime-identity provenance the older build recorded.
+	rekeyedCAS := rekeyDubSegmentsVariantToPreRuntimeIdentityProvenance(t, h, variant1, dubVariant.CASHash, assign1.CASHash, assetID, runID)
+	if rekeyedCAS == variant1.CASHash {
+		t.Fatalf("expected the rekeyed variant to be a distinct CAS object")
+	}
+
+	// 3. Register the CosyVoice3 lane and reassign SPEAKER_00 only (SPEAKER_01 stays).
+	fakeCosy := provider.NewFakeTTSProvider("fake_cosyvoice3_tts", 1350)
+	fakeCosy.SpeedFitEnabled = true
+	_ = h.registry.Register(fakeCosy)
+
+	licBody, _ := json.Marshal(domain.LicenseManifestEntry{
+		DependencyName: "fake_cosyvoice3_tts",
+		Version:        "1.0.0",
+		SHA256:         "sha256_mock_fake_cosyvoice3_tts",
+		SourceRepo:     "github.com/monet88/douyinie/models/fake_cosyvoice3_tts",
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Standard",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	})
+	licResp, err := http.Post(h.server.URL+"/api/v1/licenses", "application/json", bytes.NewReader(licBody))
+	if err != nil || licResp.StatusCode != http.StatusCreated {
+		t.Fatalf("register license manifest for cosyvoice3 failed: %v", err)
+	}
+	licResp.Body.Close()
+
+	respReassign, assign2 := runReassignVoices(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+		"custom_assignments": map[string]domain.VoiceProfile{
+			"SPEAKER_00": fakeCosy.VoiceCatalog()[0],
+		},
+	})
+	if respReassign.StatusCode != http.StatusOK || assign2 == nil {
+		t.Fatalf("reassign voice failed: %d", respReassign.StatusCode)
+	}
+	if assign2.SupersedesCAS != assign1.CASHash {
+		t.Fatalf("expected SupersedesCAS=%s, got %s", assign1.CASHash, assign2.SupersedesCAS)
+	}
+
+	// 4. Synthesis with the superseding assignment: SPEAKER_01 was not invalidated, but
+	//    the prior variant predates the current TTS stage identity, so it cannot be reused.
+	zeroTTSProv := defaultVITTSFake(t, h)
+	zeroTTSInvocationsBefore := zeroTTSProv.Invocations
+	cosyInvocationsBefore := fakeCosy.Invocations
+
+	respSynth2, variant2 := runDubSynthesize(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": dubVariant.CASHash,
+		"voice_assignment_cas":   assign2.CASHash,
+	})
+	if respSynth2.StatusCode != http.StatusCreated || variant2 == nil {
+		t.Fatalf("synthesis with reassigned voice failed: %d", respSynth2.StatusCode)
+	}
+
+	// Red-Capable Invariant: the unchanged speaker must be re-synthesized (2 segments),
+	// not spliced in from a variant produced by the previous TTS runtime.
+	zeroTTSDelta := zeroTTSProv.Invocations - zeroTTSInvocationsBefore
+	if zeroTTSDelta != 2 {
+		t.Fatalf("expected the non-invalidated speaker to be re-synthesized under the current TTS stage identity (2 invocations), got %d", zeroTTSDelta)
+	}
+	cosyDelta := fakeCosy.Invocations - cosyInvocationsBefore
+	if cosyDelta != 2 {
+		t.Fatalf("expected the changed speaker to cause exactly 2 new invocations, got %d", cosyDelta)
+	}
+	if len(variant2.Segments) != 4 {
+		t.Fatalf("expected 4 selected segments in variant 2, got %d", len(variant2.Segments))
+	}
+}
