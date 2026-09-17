@@ -227,6 +227,30 @@ class TestTTSEngineUpstreamContracts(unittest.TestCase):
         )
         self.assertIn("TTS_NO_AUDIO", err)
 
+    def test_shipped_pins_match_the_provisioned_v0_1_5_pack(self):
+        # Expected values are literals rather than reads of the constants under test:
+        # reading them back would let a one-sided pin edit pass unnoticed. The runtime
+        # identity gate above compares signals to the constants, so a wrong constant is
+        # only caught here and in the real pinned-runtime smoke.
+        self.assertEqual(tts_engine.ZEROTTS_PACKAGE_VERSION, "0.1.5")
+        self.assertEqual(tts_engine.ZEROTTS_MODULE_VERSION_LITERAL, "0.1.2")
+        self.assertEqual(tts_engine.ZEROTTS_SOURCE_COMMIT, "47e466d7a1a36517cfd240de536523d17c00adac")
+        self.assertEqual(tts_engine.ZEROTTS_MODEL_REVISION, "c2bfbd67dc648cac455077333f7cf5c18a2e3bb4")
+        self.assertEqual(tts_engine.ZEROTTS_ADAPTER_REVISION, "cmd/stageworker/adapters/tts_engine.py@zerotts-0.1.5")
+
+        # The committed runtime pack manifest must provision the same VCS pin, so the
+        # adapter constants and the reproducible pack cannot drift apart silently.
+        manifest = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "requirements-zerotts-0.1.5.txt"
+        )
+        with open(manifest, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn(
+            "zerotts @ git+https://github.com/zeroweight-ai/ZeroTTS.git@"
+            + tts_engine.ZEROTTS_SOURCE_COMMIT,
+            text,
+        )
+
     def test_probe_zerotts_runtime_identity_requires_exact_pep610_vcs_evidence(self):
         direct_url = {
             "url": "https://github.com/zeroweight-ai/ZeroTTS.git",
