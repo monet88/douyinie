@@ -241,6 +241,13 @@ func registerVieNeuTTSSnapshot(t *testing.T, tmpDir string) *governance.Snapshot
 		"moss_tokenizer/tokenizer.json": `{"model": {"type": "BPE"}}`,
 		"model.safetensors":             "pinned vieneu weights placeholder",
 	}
+	// The lane's load-bearing files must be present and declared; their digests are stamped onto the
+	// verified binding below (registration hashes the fixture bytes, the resolver pins the real ones).
+	for _, asset := range domain.PinnedVieNeuAssets {
+		if _, ok := files[asset.RelativePath]; !ok {
+			files[asset.RelativePath] = "pinned fixture placeholder: " + asset.RelativePath
+		}
+	}
 	manifest := domain.SnapshotManifest{
 		SchemaVersion: "1.0",
 		ModelID:       provider.VieNeuModelID,
@@ -282,6 +289,22 @@ func registerVieNeuTTSSnapshot(t *testing.T, tmpDir string) *governance.Snapshot
 	}
 	if _, err := snapSvc.RegisterAndVerifySnapshot(ctx, manifest, snapRoot); err != nil {
 		t.Fatalf("RegisterAndVerifySnapshot: %v", err)
+	}
+
+	// The resolver pins the lane's load-bearing weight digests. Registration above is what proves the
+	// declared-digest -> on-disk-bytes link; stamping the pinned digests onto the verified binding's
+	// manifest exercises resolution the way a provisioned snapshot reaches it (same technique as
+	// worker_separator_envelope_test.go for the Demucs checkpoint).
+	binding, err := snapSvc.GetBinding(provider.VieNeuModelID, provider.VieNeuModelVersion)
+	if err != nil {
+		t.Fatalf("GetBinding: %v", err)
+	}
+	for i := range binding.Manifest.Files {
+		for _, asset := range domain.PinnedVieNeuAssets {
+			if binding.Manifest.Files[i].RelativePath == asset.RelativePath {
+				binding.Manifest.Files[i].SHA256 = asset.SHA256
+			}
+		}
 	}
 	return snapSvc
 }

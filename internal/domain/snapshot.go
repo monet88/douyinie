@@ -206,6 +206,65 @@ const (
 	PinnedZeroTTSAdapterRevision = "cmd/stageworker/adapters/tts_engine.py@zerotts-0.1.5"
 )
 
+// PinnedAsset names one snapshot-relative file whose exact bytes are pinned for a lane.
+type PinnedAsset struct {
+	RelativePath string
+	SHA256       string
+}
+
+// PinnedZeroTTSAssets pins the load-bearing ZeroTTS bytes of the revision this lane is bound to.
+// A revision label alone admits any snapshot whose own manifest is self-consistent: a snapshot
+// registered under the pinned revision with different graphs, codec, config or tokenizer was
+// accepted as long as it hashed itself. Registration verifies every declared digest against the
+// on-disk bytes, so requiring the declared digest to equal these constants pins the bytes.
+// Digests measured from the provisioned c2bfbd67… snapshot; the set is what the pinned ZeroTTS
+// package reads (`config.json`, `tokenizer.json`, `null_voice_emb.npy`, the three graphs, the codec
+// models and the codec layout descriptor).
+var PinnedZeroTTSAssets = []PinnedAsset{
+	{"config.json", "3676da6a9f4dba7a8f2d106d5c1fb02c491391dc19c91dae893133a7e219d666"},
+	{"tokenizer.json", "4fd646e8a1fd6694cb9c876c914a516ef8dd84b4f84db2605be1a7388885ae91"},
+	{"null_voice_emb.npy", "ec014c14f79e8fc16f4ca6ea557f33fa2cbd7d448b5de5f467aace9ca0321e9f"},
+	{"onnx/text_encoder.onnx", "d37557a4abe07953a02686a176664486e73838389a14ff4a3f36b47ac2bccd52"},
+	{"onnx/prefix_step.onnx", "b7544c9fdd3535b21fe8dea855407180ad2084f9da298f8a153893522496565b"},
+	{"onnx/local_frame_decode.onnx", "3c4540ef4e69dcf604dc6f60f6f99f119189694ff5f31113def20406e274f025"},
+	{"onnx/codec/moss_audio_tokenizer_decode_full.onnx", "0fbbafe3fd4afa2a019af5c5ced204af6e2d1db044fa40f021525d2aee95b4ac"},
+	{"onnx/codec/moss_audio_tokenizer_decode_shared.data", "e69d52e0f4e84ca27850557ee54face46632d3a5a16c89bd246c7c408466dcad"},
+	{"onnx/codec/moss_audio_tokenizer_decode_step.onnx", "9527c86a29e1837edec1f74db57d5eeaadb3a715af3382703566460afed25855"},
+	{"onnx/codec/codec_browser_onnx_meta.json", "32009d6ac1cd2663bbbf5c06d6835b3a862c02f7de121663071938f2edac8e92"},
+}
+
+// PinnedZeroTTSVoiceAssets pins the conditioning tensors of every voice in the frozen preset order.
+// `voice.bin` is deliberately absent: it is the browser demo's duplicate of `voice.npz` and the
+// pinned ZeroTTS package never reads it (upstream `hub.py`).
+var PinnedZeroTTSVoiceAssets = []PinnedAsset{
+	{"voices/quangminh/voice.npz", "4d2acb18f831ade23ed2d02e7b749fa745c95e9ee305795c5ddeb75f93d35fdb"},
+	{"voices/maichi/voice.npz", "d49e0a406d3a005e95f0a19476426973946c4a97e0087eefd638de222913ae3c"},
+	{"voices/giahuy/voice.npz", "3979a8369000eaaee1130801c1cacdadddc12e8d9a4a604be7430c4bcc6df32e"},
+	{"voices/baotrang/voice.npz", "abbc5807cc4767e7c62cc59f7b7cd04b4b7e0dba176086447a0c114578cf695a"},
+	{"voices/hamy/voice.npz", "a864c127386f74976154c840875f6ad615d74c377768bc6edcb75e3278f228b7"},
+	{"voices/huuduc/voice.npz", "d7a6370180263093eb9dd009661ba24b5309f0ba94ec18d8ff2323c80616a7eb"},
+	{"voices/kimoanh/voice.npz", "0aee413f25eae30123f930bd525d31a3b5a20c0803b4899305c2ff4a69466946"},
+	{"voices/tiendat/voice.npz", "a076fe7b938ad057652ffc4614678395edad90ab5cdc74546f3977636de15d0a"},
+}
+
+// PinnedVieNeuAssets pins the load-bearing VieNeu v3 Turbo bytes of the model revision this lane is
+// bound to (SDK v3.8.1): the `update/` subfolder the engine loads, the root speaker encoder and
+// denoiser, the local MOSS audio tokenizer, and the voice catalog the presets come from.
+// Digests measured from the provisioned 5f2a3e93… snapshot; `update/model.safetensors` equals the
+// HF LFS object id of that revision.
+var PinnedVieNeuAssets = []PinnedAsset{
+	{"update/model.safetensors", "119003a9e121760d1c3b9b50bd675bfde8d5f3de2b12641cf97a17d3883a5da7"},
+	{"update/config.json", "a9f8d9c4b4736448ab355d1a98cfe48f5e39aecf2916c37b0806c228612e9a2d"},
+	{"update/tokenizer.json", "6cc6bcbe380b8c37bd9f2514e37c5dfa3e00e122c6e3125dae5c4afe48e39158"},
+	{"update/tokenizer_config.json", "92275a9c86820184aef42a27439b1aab4605d96a694a1cc6e23970c6152c3fa6"},
+	{"update/special_tokens_map.json", "e7ad7c838b1e3c669a85e7caf940c01267e4d2448c99a14228e6d1708d7e99e6"},
+	{"speaker_encoder.onnx", "a6ac6a63997761ae2997373e2ee1c47040854b4b759ea41ec48e4e42df0f4d73"},
+	{"denoiser.onnx", "b7621953291cfe05e695a9c0ff4255aa2f93239fc17c26627e18b7b6b8f72f0b"},
+	{"moss_tokenizer/config.json", "b38892f8ba00efc18af2ad9eca999c7603f871548c2e7f99258cb1cefc70ee06"},
+	{"moss_tokenizer/model-00001-of-00001.safetensors", "34d9880d805eecb21bde975202b1c256dbd0eb98c8680b9d3aeffd2bc6ac2f67"},
+	{"src/vieneu/assets/voices_v3_turbo.json", "96ba275cfcdc19e07b73130cd85997102c709c999450e319a005cae12f98513c"},
+}
+
 // ComputeRuntimeManifestSHA256 computes a deterministic digest for the runtime identity binding.
 func (r *RuntimeIdentity) ComputeRuntimeManifestSHA256() string {
 	var deps []string
@@ -255,6 +314,44 @@ func findManifestFile(manifest SnapshotManifest, match func(normRelPath string) 
 		}
 	}
 	return nil
+}
+
+// verifyPinnedAsset fails closed unless rel is declared in the snapshot manifest with exactly
+// sha256, and returns its verified on-disk path. Registration hashed every declared file and
+// compared it to the declared digest, so an equal declared digest is evidence about the bytes on
+// disk, not merely about the manifest. missing selects the sentinel for an undeclared asset
+// (ErrSnapshotFileCorrupted for a model file, ErrTTSVoiceAssetMissing for a voice asset).
+func verifyPinnedAsset(manifest SnapshotManifest, cleanRoot, rel, sha256 string, missing error) (string, error) {
+	entry := findManifestFile(manifest, func(norm string) bool { return norm == rel })
+	if entry == nil {
+		return "", fmt.Errorf("%w: %s not declared in snapshot manifest for %s", missing, rel, manifest.ModelID)
+	}
+	if !strings.EqualFold(entry.SHA256, sha256) {
+		return "", fmt.Errorf("%w: %s SHA-256 mismatch: expected %s, got %s",
+			ErrSnapshotDigestMismatch, rel, sha256, entry.SHA256)
+	}
+	return verifySnapshotRegularFile(cleanRoot, entry, rel)
+}
+
+// verifyPinnedAssets applies verifyPinnedAsset to a lane's whole load-bearing set: every pinned
+// asset must be declared with its pinned digest and exist on disk.
+func verifyPinnedAssets(manifest SnapshotManifest, cleanRoot string, assets []PinnedAsset) error {
+	for _, asset := range assets {
+		if _, err := verifyPinnedAsset(manifest, cleanRoot, asset.RelativePath, asset.SHA256, ErrSnapshotFileCorrupted); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// findPinnedAsset returns the pinned digest declared for rel by a lane, if any.
+func findPinnedAsset(assets []PinnedAsset, rel string) (PinnedAsset, bool) {
+	for _, asset := range assets {
+		if asset.RelativePath == rel {
+			return asset, true
+		}
+	}
+	return PinnedAsset{}, false
 }
 
 // verifySnapshotRegularFile verifies that entry exists on disk under cleanRoot and is a regular file.
@@ -386,6 +483,9 @@ func ResolveTranslationGGUFEntrypoint(manifest SnapshotManifest, snapshotRoot, m
 // validates the file on disk, and verifies Kokoro checkpoint SHA-256 integrity if present.
 // For VieNeu, it ensures the manifest declares model/catalog assets, validates the preset voice
 // identity is one of the verified VieNeu presets, and ensures the snapshot root is accessible.
+// ZeroTTS and VieNeu additionally require the lane's load-bearing weight digests
+// (PinnedZeroTTSAssets / PinnedZeroTTSVoiceAssets / PinnedVieNeuAssets): the revision label alone
+// would admit a snapshot that declares different bytes under a self-consistent manifest.
 func ResolveTTSVoiceEntrypoint(manifest SnapshotManifest, snapshotRoot, modelName, voiceID string) (string, error) {
 	cleanRoot := strings.TrimSpace(snapshotRoot)
 	if cleanRoot == "" {
@@ -410,51 +510,28 @@ func ResolveTTSVoiceEntrypoint(manifest SnapshotManifest, snapshotRoot, modelNam
 				ErrTTSVoiceAssetMissing, vID, strings.Join(FrozenZeroTTSVoiceOrder, ", "))
 		}
 
-		required := []struct {
-			rel  string
-			desc string
-		}{
-			{"config.json", "ZeroTTS config"},
-			{"tokenizer.json", "ZeroTTS tokenizer"},
-			{"null_voice_emb.npy", "ZeroTTS null voice embedding"},
-			{"onnx/text_encoder.onnx", "ZeroTTS text encoder"},
-			{"onnx/prefix_step.onnx", "ZeroTTS prefix step model"},
-			{"onnx/local_frame_decode.onnx", "ZeroTTS local frame decoder"},
-			{"voices/index.json", "ZeroTTS voice index"},
-		}
-		for _, asset := range required {
-			entry := findManifestFile(manifest, func(norm string) bool { return norm == asset.rel })
-			if entry == nil {
-				return "", fmt.Errorf("%w: %s (%s) not declared in snapshot manifest for %s",
-					ErrSnapshotFileCorrupted, asset.desc, asset.rel, manifest.ModelID)
-			}
-			if _, err := verifySnapshotRegularFile(cleanRoot, entry, asset.desc); err != nil {
-				return "", err
-			}
+		// Load-bearing bytes: every pinned asset must be declared with its pinned digest. This is
+		// what makes the revision label mean the revision's weights instead of a self-consistent
+		// manifest, and it covers the codec assets by name.
+		if err := verifyPinnedAssets(manifest, cleanRoot, PinnedZeroTTSAssets); err != nil {
+			return "", err
 		}
 
-		codecEntries := 0
-		for i := range manifest.Files {
-			norm := strings.ToLower(NormalizeRelativePath(manifest.Files[i].RelativePath))
-			if strings.HasPrefix(norm, "onnx/codec/") {
-				codecEntries++
-				if _, err := verifySnapshotRegularFile(cleanRoot, &manifest.Files[i], "ZeroTTS codec model"); err != nil {
-					return "", err
-				}
-			}
-		}
-		if codecEntries == 0 {
-			return "", fmt.Errorf("%w: ZeroTTS codec assets under onnx/codec/ not declared in snapshot manifest for %s",
+		// Voice catalog listing: presence only, the entries carry no conditioning bytes.
+		indexEntry := findManifestFile(manifest, func(norm string) bool { return norm == "voices/index.json" })
+		if indexEntry == nil {
+			return "", fmt.Errorf("%w: ZeroTTS voice index (voices/index.json) not declared in snapshot manifest for %s",
 				ErrSnapshotFileCorrupted, manifest.ModelID)
 		}
-
-		voiceRel := strings.ToLower("voices/" + vID + "/voice.npz")
-		voiceEntry := findManifestFile(manifest, func(norm string) bool { return norm == voiceRel })
-		if voiceEntry == nil {
-			return "", fmt.Errorf("%w: canonical ZeroTTS voice asset %s not declared in snapshot manifest for %s",
-				ErrTTSVoiceAssetMissing, "voices/"+vID+"/voice.npz", manifest.ModelID)
+		if _, err := verifySnapshotRegularFile(cleanRoot, indexEntry, "ZeroTTS voice index"); err != nil {
+			return "", err
 		}
-		return verifySnapshotRegularFile(cleanRoot, voiceEntry, "ZeroTTS voice asset")
+
+		voiceAsset, ok := findPinnedAsset(PinnedZeroTTSVoiceAssets, strings.ToLower("voices/"+vID+"/voice.npz"))
+		if !ok {
+			return "", fmt.Errorf("%w: no pinned digest for ZeroTTS voice %q", ErrTTSVoiceAssetMissing, vID)
+		}
+		return verifyPinnedAsset(manifest, cleanRoot, voiceAsset.RelativePath, voiceAsset.SHA256, ErrTTSVoiceAssetMissing)
 	}
 
 	if strings.Contains(lowerModel, "kokoro") {
@@ -634,6 +711,13 @@ func ResolveTTSVoiceEntrypoint(manifest SnapshotManifest, snapshotRoot, modelNam
 		fullMossPath := filepath.Join(cleanRoot, "moss_tokenizer")
 		if _, err := os.Stat(fullMossPath); err != nil {
 			return "", fmt.Errorf("%w: fixed in-root MOSS tokenizer path inaccessible (%s)", ErrSnapshotFileCorrupted, fullMossPath)
+		}
+
+		// Load-bearing bytes: the `update/` weights the engine loads, the root speaker encoder and
+		// denoiser, the local MOSS tokenizer and the catalog the presets come from must all carry
+		// exactly the pinned digests (the catalog itself was located above).
+		if err := verifyPinnedAssets(manifest, cleanRoot, PinnedVieNeuAssets); err != nil {
+			return "", err
 		}
 
 		return fullCatalogPath, nil
