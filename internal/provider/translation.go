@@ -29,8 +29,21 @@ type TranslationResult struct {
 // Frozen RC translation provider identities (Issue #66).
 const (
 	GatewayGeminiTranslationProviderID   = "gateway_gemini_3_8_flash"
-	GatewayDeepSeekTranslationProviderID = "gateway_deepseek_v4_flash_vision_exp"
+	GatewayDeepSeekTranslationProviderID = "gateway_deepseek_v4_1_flash"
 	WorkerQwenTranslationProviderID      = "qwen3_4b_translation"
+)
+
+// Gateway model aliases — the single switch for a production model rename.
+// Aliases are whatever the configured gateway actually serves (cliproxy serves
+// `deepseek-v4.1-flash` bare, with no `deepseek/` prefix); they are recorded as
+// provenance at runtime, never pinned as checkpoint hashes.
+// Renaming upstream means: these constants, the wire-assertion literals pinned in
+// internal/provider/gateway_translation_test.go and test/seam1/translation_routing_seam1_test.go,
+// the model-route lines in AGENTS.md / CONTEXT.md / PRODUCT.md / docs/architecture, and the
+// operator's DOUYINIE_SERVICE_BASELINE_* value.
+const (
+	GatewayGeminiModelAlias   = "gemini-3.8-flash"
+	GatewayDeepSeekModelAlias = "deepseek-v4.1-flash"
 )
 
 // TextTranslationProvider is implemented by translation model/service adapters

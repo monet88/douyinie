@@ -152,8 +152,8 @@ func TestSeam1_Translation_LocalProfile_DisablesTranslation(t *testing.T) {
 
 	// 1. Register remote candidates with allowed policy
 	gemini, _ := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 		"http://127.0.0.1:8080",
@@ -162,8 +162,8 @@ func TestSeam1_Translation_LocalProfile_DisablesTranslation(t *testing.T) {
 	_ = reg.Register(gemini)
 
 	deepseek, _ := provider.NewGatewayTranslationProvider(
-		"gateway_deepseek_v4_flash_vision_exp",
-		"deepseek/deepseek-v4-flash-vision-exp",
+		provider.GatewayDeepSeekTranslationProviderID,
+		provider.GatewayDeepSeekModelAlias,
 		"baseline-deepseek-v4-2026-08",
 		0.95,
 		"http://127.0.0.1:8080",
@@ -217,11 +217,11 @@ func TestSeam1_Translation_HybridProfile_OrderingAndFallback(t *testing.T) {
 			http.Error(w, "upstream rate limit", http.StatusTooManyRequests)
 			return
 		}
-		if req.Model == "deepseek/deepseek-v4-flash-vision-exp" {
+		if req.Model == "deepseek-v4.1-flash" {
 			deepseekAttempted = true
 			resp := map[string]any{
 				"id":                 "chatcmpl-deepseek",
-				"model":              "deepseek-v4-flash-001",
+				"model":              "deepseek/deepseek-v4.1-flash",
 				"system_fingerprint": "fp_deepseek_exp",
 				"choices": []map[string]any{
 					{
@@ -251,8 +251,8 @@ func TestSeam1_Translation_HybridProfile_OrderingAndFallback(t *testing.T) {
 	defer ts.Close()
 
 	gemini, _ := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 		ts.Client(),
@@ -266,8 +266,8 @@ func TestSeam1_Translation_HybridProfile_OrderingAndFallback(t *testing.T) {
 	_ = reg.Register(gemini)
 
 	deepseek, _ := provider.NewGatewayTranslationProvider(
-		"gateway_deepseek_v4_flash_vision_exp",
-		"deepseek/deepseek-v4-flash-vision-exp",
+		provider.GatewayDeepSeekTranslationProviderID,
+		provider.GatewayDeepSeekModelAlias,
 		"baseline-deepseek-v4-2026-08",
 		0.95,
 		ts.Client(),
@@ -319,11 +319,11 @@ func TestSeam1_Translation_HybridProfile_OrderingAndFallback(t *testing.T) {
 	if !deepseekAttempted {
 		t.Fatalf("expected deepseek to be attempted as fallback")
 	}
-	if res.Variant.ProviderID != "gateway_deepseek_v4_flash_vision_exp" {
-		t.Fatalf("expected fallback provider gateway_deepseek_v4_flash_vision_exp, got %q", res.Variant.ProviderID)
+	if res.Variant.ProviderID != provider.GatewayDeepSeekTranslationProviderID {
+		t.Fatalf("expected fallback provider gateway_deepseek_v4_1_flash, got %q", res.Variant.ProviderID)
 	}
-	if res.Variant.ObservedModel != "deepseek-v4-flash-001" {
-		t.Fatalf("expected observed model 'deepseek-v4-flash-001', got %q", res.Variant.ObservedModel)
+	if res.Variant.ObservedModel != "deepseek/deepseek-v4.1-flash" {
+		t.Fatalf("expected observed model 'deepseek/deepseek-v4.1-flash', got %q", res.Variant.ObservedModel)
 	}
 	if res.Variant.ServiceBaselineID != "baseline-deepseek-v4-2026-08" {
 		t.Fatalf("expected service baseline 'baseline-deepseek-v4-2026-08', got %q", res.Variant.ServiceBaselineID)
@@ -334,10 +334,10 @@ func TestSeam1_Translation_HybridProfile_OrderingAndFallback(t *testing.T) {
 	if err != nil || len(attempts) != 2 {
 		t.Fatalf("expected 2 attempts recorded in SQLite, got: %d (err: %v)", len(attempts), err)
 	}
-	if attempts[0].ProviderID != "gateway_gemini_3_8_flash" || (attempts[0].Status != "failed" && attempts[0].Status != "quality_failed") {
+	if attempts[0].ProviderID != provider.GatewayGeminiTranslationProviderID || (attempts[0].Status != "failed" && attempts[0].Status != "quality_failed") {
 		t.Fatalf("unexpected first attempt: %+v", attempts[0])
 	}
-	if attempts[1].ProviderID != "gateway_deepseek_v4_flash_vision_exp" || attempts[1].Status != "succeeded" {
+	if attempts[1].ProviderID != provider.GatewayDeepSeekTranslationProviderID || attempts[1].Status != "succeeded" {
 		t.Fatalf("unexpected second attempt: %+v", attempts[1])
 	}
 }
@@ -456,8 +456,8 @@ func TestSeam1_VisualTrack_LocalProfile_DisablesTranslation(t *testing.T) {
 
 	// 1. Remote translation providers
 	gemini, _ := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 		"http://127.0.0.1:8080",
@@ -466,8 +466,8 @@ func TestSeam1_VisualTrack_LocalProfile_DisablesTranslation(t *testing.T) {
 	_ = reg.Register(gemini)
 
 	deepseek, _ := provider.NewGatewayTranslationProvider(
-		"gateway_deepseek_v4_flash_vision_exp",
-		"deepseek/deepseek-v4-flash-vision-exp",
+		provider.GatewayDeepSeekTranslationProviderID,
+		provider.GatewayDeepSeekModelAlias,
 		"baseline-deepseek-v4-2026-08",
 		0.95,
 		"http://127.0.0.1:8080",
@@ -546,8 +546,8 @@ func TestSeam1_VisualTrack_HybridProfile_ConsentAndCredentials(t *testing.T) {
 
 	// Remote gateways requiring explicit consent
 	gemini, _ := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 		mockServer.Client(),
@@ -558,8 +558,8 @@ func TestSeam1_VisualTrack_HybridProfile_ConsentAndCredentials(t *testing.T) {
 	_ = reg.Register(gemini)
 
 	deepseek, _ := provider.NewGatewayTranslationProvider(
-		"gateway_deepseek_v4_flash_vision_exp",
-		"deepseek/deepseek-v4-flash-vision-exp",
+		provider.GatewayDeepSeekTranslationProviderID,
+		provider.GatewayDeepSeekModelAlias,
 		"baseline-deepseek-v4-2026-08",
 		0.95,
 		mockServer.Client(),
@@ -648,7 +648,7 @@ func TestSeam1_VisualTrack_HybridProfile_ConsentAndCredentials(t *testing.T) {
 	}
 	for _, decision := range decisions2 {
 		for _, cand := range decision.CandidatesEvaluated {
-			if cand.ProviderID == "gateway_gemini_3_8_flash" || cand.ProviderID == "gateway_deepseek_v4_flash_vision_exp" {
+			if cand.ProviderID == provider.GatewayGeminiTranslationProviderID || cand.ProviderID == provider.GatewayDeepSeekTranslationProviderID {
 				if !cand.Eligible {
 					t.Fatalf("gateway %s must be eligible when consent_granted=true and authorized, got rejection: %s (%s)",
 						cand.ProviderID, cand.RejectionCode, cand.Reason)

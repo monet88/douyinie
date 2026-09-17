@@ -11,7 +11,7 @@
 ## Load-Bearing Guardrails
 
 - **Two testing seams only**: Seam 1 (RuntimeHost localhost API) and Seam 2 (StageWorker runtime contract). In-memory unit tests are not additional seams.
-- **Production translation is remote-LLM only**: VI/EN speech and visual-text translation route through the authorized gateway in order **gemini-3.8-flash** -> **deepseek/deepseek-v4-flash-vision-exp**. Local LLM translators are not production-eligible and are not fallbacks. If both remote lanes are unavailable or rejected by QA/policy, fail closed or surface review.
+- **Production translation is remote-LLM only**: VI/EN speech and visual-text translation route through the authorized gateway in order **gemini-3.8-flash** -> **deepseek-v4.1-flash**. Local LLM translators are not production-eligible and are not fallbacks. If both remote lanes are unavailable or rejected by QA/policy, fail closed or surface review.
 - **Reserve constrained local compute for specialized media stages**: local hardware is for ASR/alignment/diarization, TTS, audio separation, OCR/tracking, mixing, and render. Do not reintroduce a local general-purpose LLM merely to satisfy a local-only ideology when an authorized API lane is available.
 - **Obligation layers**: `CODE_LICENSE`, `MODEL_LICENSE`, `DATA_LICENSE`, `SERVICE_TERMS` stay separate. Code changes do not remove model/data obligations.
 - **Completion is evidence-gated**: agent claims are evidence, not proof. Verify repo state, tests, and acceptance criteria before declaring PASS.

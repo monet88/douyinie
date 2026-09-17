@@ -456,15 +456,15 @@ func TestTranslationService_HybridLadder_Gemini_DeepSeek_FailsClosedWithoutLocal
 	// Production ladder: Gemini -> DeepSeek. Local Qwen may be registered but is not translation-eligible.
 	geminiFake := provider.NewFakeTranslationProvider(provider.GatewayGeminiTranslationProviderID)
 	geminiFake.Cap.ExecutionTier = "cloud"
-	geminiFake.ModelName = "gemini-3.8-flash"
+	geminiFake.ModelName = provider.GatewayGeminiModelAlias
 	geminiFake.ModelVersion = "2026-08"
 	geminiFake.CorruptNumbers = true // Primary fails QA on numbers
 	_ = reg.Register(geminiFake)
 
 	deepseekFake := provider.NewFakeTranslationProvider(provider.GatewayDeepSeekTranslationProviderID)
 	deepseekFake.Cap.ExecutionTier = "cloud"
-	deepseekFake.ModelName = "deepseek-v4-flash"
-	deepseekFake.ModelVersion = "v4"
+	deepseekFake.ModelName = provider.GatewayDeepSeekModelAlias
+	deepseekFake.ModelVersion = "v4.1"
 	// First fallback fails QA on negation inversion
 	deepseekFake.CustomTranslations = map[string]string{
 		"请将温度调至25度，张伟说不要打开窗户。": "Vui lòng điều chỉnh nhiệt độ đến 25 độ, Trương Vĩ nói hãy mở cửa sổ.",

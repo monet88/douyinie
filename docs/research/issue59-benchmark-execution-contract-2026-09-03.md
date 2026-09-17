@@ -2,6 +2,7 @@
 
 Date: 2026-09-03
 Status: RESOLVED CONTRACT (research/design only; implementation-ready)
+Errata (2026-09-18): the gateway DeepSeek alias is now `deepseek-v4.1-flash` (no `deepseek/` prefix); ladder order and all other decisions here are unchanged.
 Parent: https://github.com/monet88/douyinie/issues/53
 Issue: https://github.com/monet88/douyinie/issues/59
 Authoritative references:

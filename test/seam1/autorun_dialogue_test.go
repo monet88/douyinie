@@ -20,22 +20,22 @@ import (
 )
 
 // configureDialogueTranslationGateway registers deterministic fakes representing the authorized
-// production translation gateway ladder (Gemini 3.8 Flash -> DeepSeek V4 Flash Vision Exp) and
+// production translation gateway ladder (Gemini 3.8 Flash -> DeepSeek V4.1 Flash) and
 // local Qwen (which must be rejected as ineligible for production translation).
 func configureDialogueTranslationGateway(t *testing.T, h *testHarness) {
 	t.Helper()
 
 	geminiFake := provider.NewFakeTranslationProvider(provider.GatewayGeminiTranslationProviderID)
 	geminiFake.Cap.ExecutionTier = "cloud"
-	geminiFake.ModelName = "gemini-3.8-flash"
+	geminiFake.ModelName = provider.GatewayGeminiModelAlias
 	geminiFake.ModelVersion = "2026-08"
 	geminiFake.Cap.QualityScore = 0.99
 	_ = h.registry.Register(geminiFake)
 
 	deepseekFake := provider.NewFakeTranslationProvider(provider.GatewayDeepSeekTranslationProviderID)
 	deepseekFake.Cap.ExecutionTier = "cloud"
-	deepseekFake.ModelName = "deepseek-v4-flash"
-	deepseekFake.ModelVersion = "v4"
+	deepseekFake.ModelName = provider.GatewayDeepSeekModelAlias
+	deepseekFake.ModelVersion = "v4.1"
 	deepseekFake.Cap.QualityScore = 0.95
 	_ = h.registry.Register(deepseekFake)
 

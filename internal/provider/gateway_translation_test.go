@@ -16,8 +16,8 @@ import (
 func TestGatewayTranslationProvider_RequiresAuth_FailsClosedWithoutSecret(t *testing.T) {
 	ctx := context.Background()
 	p, err := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 		"http://127.0.0.1:8080",
@@ -43,8 +43,8 @@ func TestGatewayTranslationProvider_RequiresAuth_FailsClosedWithoutSecret(t *tes
 
 func TestGatewayTranslationProvider_RemoteModelNeverRepresentedAsPinnedSnapshot(t *testing.T) {
 	p, err := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 		"http://127.0.0.1:8080",
@@ -71,8 +71,8 @@ func TestGatewayTranslationProvider_RemoteModelNeverRepresentedAsPinnedSnapshot(
 func TestGatewayTranslationProvider_NoConfiguredGateway_CannotHitOpenAI(t *testing.T) {
 	// 1. Missing endpoint must fail with ErrGatewayEndpointRequired
 	_, err := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 	)
@@ -89,8 +89,8 @@ func TestGatewayTranslationProvider_NoConfiguredGateway_CannotHitOpenAI(t *testi
 	}
 	for _, ep := range forbiddenEndpoints {
 		_, err = provider.NewGatewayTranslationProvider(
-			"gateway_gemini_3_8_flash",
-			"gemini-3.8-flash",
+			provider.GatewayGeminiTranslationProviderID,
+			provider.GatewayGeminiModelAlias,
 			"baseline-gemini-3.8-flash-2026-08",
 			0.99,
 			ep,
@@ -104,8 +104,8 @@ func TestGatewayTranslationProvider_NoConfiguredGateway_CannotHitOpenAI(t *testi
 func TestGatewayTranslationProvider_MissingOrBlankBaseline_FailsClosed(t *testing.T) {
 	for _, blankBaseline := range []string{"", "   ", "\t\n"} {
 		_, err := provider.NewGatewayTranslationProvider(
-			"gateway_gemini_3_8_flash",
-			"gemini-3.8-flash",
+			provider.GatewayGeminiTranslationProviderID,
+			provider.GatewayGeminiModelAlias,
 			blankBaseline,
 			0.99,
 			"http://127.0.0.1:8080",
@@ -173,8 +173,8 @@ func TestGatewayTranslationProvider_SuccessfulTranslationAndProvenance(t *testin
 	}
 
 	p, err := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 		secretResolver,
@@ -250,7 +250,7 @@ func TestGatewayTranslationProvider_PromptRequiresExplicitTargetNegation(t *test
 	}
 	p, err := provider.NewGatewayTranslationProvider(
 		provider.GatewayGeminiTranslationProviderID,
-		"gemini-3.8-flash",
+		provider.GatewayGeminiModelAlias,
 		"prompt-contract-baseline",
 		0.99,
 		secretResolver,
@@ -312,7 +312,7 @@ func TestGatewayTranslationProvider_PromptPreservesChineseClauseFinalBuAsQuestio
 	}
 	p, err := provider.NewGatewayTranslationProvider(
 		provider.GatewayGeminiTranslationProviderID,
-		"gemini-3.8-flash",
+		provider.GatewayGeminiModelAlias,
 		"prompt-contract-baseline",
 		0.99,
 		secretResolver,

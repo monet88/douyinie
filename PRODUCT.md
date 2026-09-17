@@ -39,7 +39,7 @@ The system is designed for unattended execution by default, surfacing only genui
    - Videos with no spoken dialogue display `No dubbing required` and bypass voice audition.
 
 5. **API-First Production Translation; Local Media Processing**:
-   - Production VI/EN translation uses the authorized remote gateway: `gemini-3.8-flash` first, then `deepseek/deepseek-v4-flash-vision-exp`.
+   - Production VI/EN translation uses the authorized remote gateway: `gemini-3.8-flash` first, then `deepseek-v4.1-flash`.
    - Local LLM translation is not a production requirement and is not a fallback. If the remote translation lanes cannot produce an acceptable result, fail closed or request review instead of silently lowering model quality.
    - The target desktop's limited compute budget is reserved for specialized local media work: ASR/alignment/diarization, voice/TTS, separation, OCR/tracking, mixing, and render.
    - Local OCR/tracking remains valid; detected visual text is translated through the same remote translation policy.

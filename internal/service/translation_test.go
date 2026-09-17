@@ -214,7 +214,7 @@ func TestTranslationService_ProviderReportedNegativeCannotOverrideLexicalNegatio
 	svc.TranslateInvoke = func(_ context.Context, _ provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
 		return &provider.TranslationResult{
 			ProviderID:   provider.GatewayGeminiTranslationProviderID,
-			ModelVersion: "gemini-3.8-flash",
+			ModelVersion: provider.GatewayGeminiModelAlias,
 			Segments: []domain.TranslationSegment{{
 				Index:            0,
 				SourceText:       req.Segments[0].SourceText,

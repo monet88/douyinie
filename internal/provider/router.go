@@ -581,7 +581,7 @@ func calculateScore(providerID string, cap domain.ProviderCapability, profile do
 		fallthrough
 	default:
 		// Translation stage has approved production ordering:
-		// gateway gemini-3.8-flash -> gateway deepseek/deepseek-v4-flash-vision-exp.
+		// gateway gemini-3.8-flash -> gateway deepseek-v4.1-flash.
 		// Local LLM translators are filtered before scoring.
 		// Uses exact provider IDs with deterministic score separation so lane ordering
 		// is explicitly guaranteed regardless of minor quality score deltas.

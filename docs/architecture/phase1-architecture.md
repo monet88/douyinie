@@ -24,7 +24,7 @@ The system is architected around seven non-negotiable principles:
 
 Provider neutrality remains an interface property, but production eligibility is intentionally narrower than the set of adapters present in the repository:
 
-- VI/EN meaning translation for both speech and translatable visual text uses the authorized gateway in order `gemini-3.8-flash` -> `deepseek/deepseek-v4-flash-vision-exp`.
+- VI/EN meaning translation for both speech and translatable visual text uses the authorized gateway in order `gemini-3.8-flash` -> `deepseek-v4.1-flash`.
 - Local general-purpose LLM translation is not production-eligible and is not a fallback after remote failure. If both remote lanes fail policy, authorization, availability, or meaning-first QA, the translation stage fails closed and may surface review.
 - `ExecutionProfileLocal` is not an end-to-end localization release path. It verifies specialized local media stages without requiring a local translation LLM.
 - Constrained local GPU/CPU resources are reserved for ASR/alignment/diarization, TTS, separation, OCR/tracking, mixing, and rendering. Local OCR remains the source text detector; its translatable text is passed through the remote translation provider contract.

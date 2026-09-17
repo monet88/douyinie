@@ -90,8 +90,8 @@ func TestTranslationService_CacheIsolationAcrossServiceBaselines(t *testing.T) {
 	// 1. First translation run with Baseline A
 	regA := provider.NewRegistry()
 	geminiA, _ := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-2026-08-A",
 		0.99,
 		ts.Client(),
@@ -148,8 +148,8 @@ func TestTranslationService_CacheIsolationAcrossServiceBaselines(t *testing.T) {
 	// 3. Third translation run with Baseline B -> CANNOT REUSE CACHE across service baselines!
 	regB := provider.NewRegistry()
 	geminiB, _ := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-2026-09-B", // Changed service baseline!
 		0.99,
 		ts.Client(),
@@ -195,8 +195,8 @@ func TestTranslationService_ConsentGatedRemoteTranslation(t *testing.T) {
 
 	reg := provider.NewRegistry()
 	gemini, _ := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 		"http://127.0.0.1:8080",

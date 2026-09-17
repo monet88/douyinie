@@ -1,5 +1,7 @@
 # Reference repositories & live test artifacts
 /.ref/
+# Separation stems dumped at repo root when a stageworker run inherits the repo as CWD
+/*.wav
 
 # Tooling & scratch directories
 /.playwright-cli/

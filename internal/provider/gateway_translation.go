@@ -18,7 +18,7 @@ import (
 
 // GatewayTranslationProvider is an OpenAI-compatible gateway translation adapter.
 // It routes through approved OpenAI-compatible gateway endpoints (e.g. Gemini 3.8 Flash,
-// DeepSeek v4 Flash Vision Exp) using an alias, without direct provider SDKs.
+// DeepSeek V4.1 Flash) using an alias, without direct provider SDKs.
 // Remote models are never represented as cryptographically pinned checkpoints.
 type GatewayTranslationProvider struct {
 	id                string
