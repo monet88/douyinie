@@ -39,13 +39,14 @@ This table supersedes the VieNeu pin block in
 | `ZEROTTS_ADAPTER_REVISION` | emitted by the probe; compared by `internal/governance/snapshot.go:416` and `internal/provider/worker_adapters.go:1106-1108` | check |
 | `ZEROTTS_MODEL_REVISION` | the adapter's model-revision gate (`tts_engine.py`, `TTS_MODEL_UNSUPPORTED`) plus binding equality | check (label, not bytes) |
 | `ZEROTTS_PACKAGE_VERSION` + `ZEROTTS_MODULE_VERSION_LITERAL` | additionally hashed into the DubSegments stage cache identity (`internal/service/dubbing.go`, `tts_runtime_identity`) so a pin bump invalidates cached segments instead of replaying old-runtime audio | check |
-| model weights of either lane (`voices/maichi/*`, `update/model.safetensors`, `onnx_int8/*`) | **nothing** — only the version label and the per-file hashes of the snapshot actually registered are compared | gap (follow-up) |
+| model weights of both lanes (`update/model.safetensors`, the ZeroTTS graphs/codec/tokenizer, every frozen voice tensor) | `PinnedVieNeuAssets` / `PinnedZeroTTSAssets` / `PinnedZeroTTSVoiceAssets` compared against the registered manifest's declared digests in `domain.ResolveTTSVoiceEntrypoint` (`internal/domain/snapshot.go`) | check (bytes, resolved 2026-09-18 — see `docs/research/tts-weights-digest-enforcement-2026-09-18.md`) |
 | `KokoroModelCommit`, `KokoroSourceCommit` | nothing at runtime — provenance records only. | record |
 
-Label-vs-weights caveat (applies to both lanes, not just VieNeu): the files this upgrade changed are
-covered only by the registration-time hashes of whatever snapshot is registered. A snapshot
-registered under `c2bfbd67…` / `v3.8.1` with different bytes is admitted as long as its own manifest
-matches those files. Enforcing a pinned weights digest is a follow-up for both lanes.
+Label-vs-weights caveat, now closed for ZeroTTS and VieNeu (Kokoro was already pinned): the file set
+the lanes load is pinned by digest, so a snapshot registered under `c2bfbd67…` / `v3.8.1` whose bytes
+are not the provisioned revision's is rejected even when its own manifest is self-consistent. The
+price is a manifest requirement: the snapshot manifest must declare the lane's load-bearing files
+(a manifest that omits them was never hashing them, so it fails closed instead of passing unchecked).
 
 The VieNeu SDK commit and model revision are likewise records, not checks, so no constant carries
 them: they live in the §1 table above.
@@ -299,9 +300,8 @@ available here. Whoever runs CI on this branch should watch for a repeat.
 - `zerotts.__version__` remains a stale `"0.1.2"` literal upstream; the pin is deliberate and
   documented next to the constant. If upstream fixes the literal, the adapter will fail closed until
   the constant is updated — intended.
-- The VieNeu lane's model revision / SDK commit are provenance records only — recorded in the §1
-  table, carried by no constant (see the §1 enforcement map): snapshot registration accepts the
-  operator-supplied version label, so a VieNeu snapshot
-  registered as `v3.8.1` with different weights would not be rejected. Enforcing the weights digest
-  (the HF LFS oid of `update/model.safetensors`) through snapshot verification is a follow-up, not
-  part of this upgrade.
+- The VieNeu lane's model revision / SDK commit are provenance records; the *bytes* are not: since
+  2026-09-18 a VieNeu snapshot registered as `v3.8.1` with different weights fails closed, because
+  `PinnedVieNeuAssets` pins `update/model.safetensors` (the HF LFS oid of the revision), the `update/`
+  tokenizer/config set, the root ONNX speaker encoder and denoiser, the local MOSS tokenizer, and the
+  voice catalog — see `docs/research/tts-weights-digest-enforcement-2026-09-18.md`.
