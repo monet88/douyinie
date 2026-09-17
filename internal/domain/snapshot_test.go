@@ -425,7 +425,7 @@ func TestSnapshot_ResolveTTSVoiceEntrypoint(t *testing.T) {
 	}
 	mVieNeuFab := domain.SnapshotManifest{
 		ModelID:      "pnnbao-ump/VieNeu-TTS-v3-Turbo",
-		ModelVersion: "v3.2.9",
+		ModelVersion: "v3.8.1",
 		Files: []domain.SnapshotFileEntry{
 			{RelativePath: "voices/Trúc Ly.pt", SHA256: dummySHA, SizeBytes: 7},
 		},
@@ -456,7 +456,7 @@ func TestSnapshot_ResolveTTSVoiceEntrypoint(t *testing.T) {
 	}
 	mVieNeuValid := domain.SnapshotManifest{
 		ModelID:      "pnnbao-ump/VieNeu-TTS-v3-Turbo",
-		ModelVersion: "v3.2.9",
+		ModelVersion: "v3.8.1",
 		Files: []domain.SnapshotFileEntry{
 			{RelativePath: "src/vieneu/assets/voices_v3_turbo.json", SHA256: dummySHA, SizeBytes: int64(len(catJSON))},
 			{RelativePath: "moss_tokenizer/tokenizer.json", SHA256: dummySHA, SizeBytes: 2},

@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import MagicMock
 import wave
@@ -149,6 +150,106 @@ class TestTTSEngineUpstreamContracts(unittest.TestCase):
                     entrypoint_file=entrypoint,
                 )
         self.assertIn("TTS_NO_AUDIO", str(ctx.exception))
+
+    def _fake_zerotts_module(self, version):
+        class FakeZeroTTS:
+            def __init__(self, model_dir=None, providers=None):
+                self.sample_rate = 48000
+
+            def synthesize(self, text, voice=None):
+                return []
+
+        module = types.ModuleType("zerotts")
+        module.ZeroTTS = FakeZeroTTS
+        module.__version__ = version
+        return module
+
+    def _run_zerotts_with_runtime(self, module_version, metadata):
+        import unittest.mock as mock
+
+        tts_engine._ZEROTTS_MODEL_FACTORY = None
+        with tempfile.TemporaryDirectory() as tmpdir:
+            entrypoint = make_zerotts_snapshot(tmpdir)
+            with mock.patch.dict(sys.modules, {"zerotts": self._fake_zerotts_module(module_version)}), metadata:
+                with self.assertRaises(RuntimeError) as ctx:
+                    run_zerotts_tts(
+                        "Xin chào", "vi", "quangminh", 1.0,
+                        model_path=tmpdir,
+                        entrypoint_file=entrypoint,
+                    )
+        return str(ctx.exception)
+
+    def test_run_zerotts_distribution_version_mismatch_fails_closed(self):
+        import unittest.mock as mock
+
+        # Distribution metadata is the authoritative identity: a pack that is not
+        # exactly zerotts==ZEROTTS_PACKAGE_VERSION must fail closed even when the
+        # (stale) upstream module literal matches.
+        err = self._run_zerotts_with_runtime(
+            tts_engine.ZEROTTS_MODULE_VERSION_LITERAL,
+            mock.patch("importlib.metadata.version", return_value="9.9.9"),
+        )
+        self.assertIn("TTS_RUNTIME_VERSION_MISMATCH", err)
+        self.assertIn(f"expected zerotts=={tts_engine.ZEROTTS_PACKAGE_VERSION}, got 9.9.9", err)
+
+    def test_run_zerotts_missing_distribution_metadata_fails_closed(self):
+        import importlib.metadata
+        import unittest.mock as mock
+
+        err = self._run_zerotts_with_runtime(
+            tts_engine.ZEROTTS_MODULE_VERSION_LITERAL,
+            mock.patch("importlib.metadata.version", side_effect=importlib.metadata.PackageNotFoundError("zerotts")),
+        )
+        self.assertIn("TTS_RUNTIME_VERSION_MISMATCH", err)
+        self.assertIn("distribution metadata unavailable", err)
+
+    def test_run_zerotts_module_literal_drift_fails_closed(self):
+        import unittest.mock as mock
+
+        # If upstream ever bumps src/zerotts/__init__.py, the pinned literal must be
+        # revisited deliberately rather than silently accepted.
+        err = self._run_zerotts_with_runtime(
+            "9.9.9",
+            mock.patch("importlib.metadata.version", return_value=tts_engine.ZEROTTS_PACKAGE_VERSION),
+        )
+        self.assertIn("TTS_RUNTIME_VERSION_MISMATCH", err)
+        self.assertIn(f"expected zerotts.__version__=={tts_engine.ZEROTTS_MODULE_VERSION_LITERAL}, got 9.9.9", err)
+
+    def test_run_zerotts_shipped_pin_pair_is_admitted(self):
+        import unittest.mock as mock
+
+        # The shipped v0.1.5 pack reports distribution 0.1.5 while the module still
+        # says 0.1.2; that exact pair must pass the identity gate (the empty stub
+        # then fails later on audio, proving the gate admitted it).
+        err = self._run_zerotts_with_runtime(
+            tts_engine.ZEROTTS_MODULE_VERSION_LITERAL,
+            mock.patch("importlib.metadata.version", return_value=tts_engine.ZEROTTS_PACKAGE_VERSION),
+        )
+        self.assertIn("TTS_NO_AUDIO", err)
+
+    def test_shipped_pins_match_the_provisioned_v0_1_5_pack(self):
+        # Expected values are literals rather than reads of the constants under test:
+        # reading them back would let a one-sided pin edit pass unnoticed. The runtime
+        # identity gate above compares signals to the constants, so a wrong constant is
+        # only caught here and in the real pinned-runtime smoke.
+        self.assertEqual(tts_engine.ZEROTTS_PACKAGE_VERSION, "0.1.5")
+        self.assertEqual(tts_engine.ZEROTTS_MODULE_VERSION_LITERAL, "0.1.2")
+        self.assertEqual(tts_engine.ZEROTTS_SOURCE_COMMIT, "47e466d7a1a36517cfd240de536523d17c00adac")
+        self.assertEqual(tts_engine.ZEROTTS_MODEL_REVISION, "c2bfbd67dc648cac455077333f7cf5c18a2e3bb4")
+        self.assertEqual(tts_engine.ZEROTTS_ADAPTER_REVISION, "cmd/stageworker/adapters/tts_engine.py@zerotts-0.1.5")
+
+        # The committed runtime pack manifest must provision the same VCS pin, so the
+        # adapter constants and the reproducible pack cannot drift apart silently.
+        manifest = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "requirements-zerotts-0.1.5.txt"
+        )
+        with open(manifest, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn(
+            "zerotts @ git+https://github.com/zeroweight-ai/ZeroTTS.git@"
+            + tts_engine.ZEROTTS_SOURCE_COMMIT,
+            text,
+        )
 
     def test_probe_zerotts_runtime_identity_requires_exact_pep610_vcs_evidence(self):
         direct_url = {

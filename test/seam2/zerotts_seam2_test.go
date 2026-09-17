@@ -25,8 +25,8 @@ import (
 	"github.com/monet88/douyinie/internal/worker"
 )
 
-const zeroTTSRealSnapshotWindows = `D:\douyinie-ref\zerotts-benchmark\cache\huggingface\hub\models--zeroweight-ai--ZeroTTS\snapshots\8a0c3c29f6f047011f5cae02d0b14475a690be86`
-const zeroTTSRealPythonWindows = `D:\douyinie-ref\phase1.1-runtime\venvs\tts-zerotts-0.1.2-9d85578\Scripts\python.exe`
+const zeroTTSRealSnapshotWindows = `D:\douyinie-ref\zerotts-benchmark\cache\huggingface\hub\models--zeroweight-ai--ZeroTTS\snapshots\c2bfbd67dc648cac455077333f7cf5c18a2e3bb4`
+const zeroTTSRealPythonWindows = `D:\douyinie-ref\phase1.1-runtime\venvs\tts-zerotts-0.1.5-47e466d\Scripts\python.exe`
 
 func resolveRealZeroTTSFixture(t *testing.T) (pythonBin, snapshotRoot string) {
 	t.Helper()
@@ -442,6 +442,9 @@ func TestSeam2_ZeroTTSInvalidEntrypointAndEmptyAudioFailClosed(t *testing.T) {
 
 	t.Run("empty_audio", func(t *testing.T) {
 		fakePkg := t.TempDir()
+		// The module literal must equal ZEROTTS_MODULE_VERSION_LITERAL in
+		// cmd/stageworker/adapters/tts_engine.py: upstream src/zerotts/__init__.py
+		// still hardcodes "0.1.2" at the v0.1.5 tag and the adapter pins it exactly.
 		fakeSource := `__version__ = "0.1.2"
 class ZeroTTS:
     def __init__(self, model_dir=None, providers=None): self.sample_rate = 48000

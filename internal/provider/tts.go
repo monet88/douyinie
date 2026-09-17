@@ -13,11 +13,11 @@ const (
 	ZeroTTSModelID      = domain.PinnedZeroTTSModelID
 	ZeroTTSModelVersion = domain.PinnedZeroTTSModelVersion
 
-	// VieNeu frozen RC identities (Issue #68)
+	// VieNeu frozen RC identities (Issue #68; SDK upgraded to v3.8.1). The provisioned SDK
+	// commit and model revision are provenance records in
+	// docs/research/tts-runtime-upgrade-2026-09-17.md §1 - nothing reads them at runtime.
 	VieNeuModelID      = "pnnbao-ump/VieNeu-TTS-v3-Turbo"
-	VieNeuModelVersion = "v3.2.9"
-	VieNeuModelDigest  = "1278db0090b98ccf23e56f2423857fc9d32a5118"
-	VieNeuSDKCommit    = "149ff16a6a50093a0cad1b75d5edf9e9d81d97f4"
+	VieNeuModelVersion = "v3.8.1"
 	VieNeuProviderID   = "vieneu_tts_vi"
 
 	// Kokoro frozen RC identities (Issue #68)
@@ -39,6 +39,11 @@ const (
 	// failure may escalate a whole speaker to.
 	CosyVoiceProviderID = "cosyvoice3_tts"
 
+	// CosyVoiceModelID / CosyVoiceModelVersion are the same fallback lane's registered
+	// model identity, used both at registration and in TTSRuntimeIdentities.
+	CosyVoiceModelID      = "cosyvoice3"
+	CosyVoiceModelVersion = "3.0.0"
+
 	// DefaultVIUnattendedVoiceCount is the size of the approved unattended
 	// Vietnamese rotation (Issue #93): the leading verified ZeroTTS presets,
 	// quangminh then maichi. Presets beyond it are selectable only through
@@ -46,6 +51,25 @@ const (
 	// a preset an unattended default.
 	DefaultVIUnattendedVoiceCount = 2
 )
+
+// TTSRuntimeIdentities returns the pinned runtime/model identity of every TTS lane that
+// can produce a DubSegment, keyed by provider ID. It is the semantic input a stage cache
+// identity needs when its emitted audio depends on which runtime produced it: the
+// DubSegments stage hashes this map, so bumping any lane's pin (model revision, runtime
+// pack, adapter revision) invalidates the artifacts that lane produced instead of silently
+// replaying audio from the previous runtime. A lane that gains a pinned identity must be
+// added here in the same change, or its bump goes back to being invisible to the cache.
+func TTSRuntimeIdentities() map[string]string {
+	join := func(parts ...string) string { return strings.Join(parts, "|") }
+	return map[string]string{
+		// ZeroTTS audio is determined by the model revision plus the runtime pack
+		// (source revision + adapter revision the snapshot governance pins).
+		ZeroTTSProviderID:   join(ZeroTTSModelID, ZeroTTSModelVersion, domain.PinnedZeroTTSSourceRevision, domain.PinnedZeroTTSAdapterRevision),
+		VieNeuProviderID:    join(VieNeuModelID, VieNeuModelVersion),
+		KokoroProviderID:    join(KokoroModelID, KokoroModelVersion, KokoroCheckpointSHA),
+		CosyVoiceProviderID: join(CosyVoiceModelID, CosyVoiceModelVersion),
+	}
+}
 
 // TTSSynthesisRequest encapsulates the parameters needed to synthesize speech for one segment.
 type TTSSynthesisRequest struct {
