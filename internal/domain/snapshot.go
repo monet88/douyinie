@@ -197,13 +197,13 @@ type RuntimeIdentity struct {
 	RuntimeManifestSHA256  string            `json:"runtime_manifest_sha256,omitempty"`
 }
 
-// Pinned ZeroTTS runtime/model identities (Issue #92).
+// Pinned ZeroTTS runtime/model identities (Issue #92, runtime pack upgraded to v0.1.5).
 const (
 	PinnedZeroTTSModelID         = "zeroweight-ai/ZeroTTS"
-	PinnedZeroTTSModelVersion    = "8a0c3c29f6f047011f5cae02d0b14475a690be86"
-	PinnedZeroTTSSourceRevision  = "9d85578bee9321d6ef8305a4d454baf33e3fe861"
-	PinnedZeroTTSPackageVersion  = "0.1.2"
-	PinnedZeroTTSAdapterRevision = "cmd/stageworker/adapters/tts_engine.py@zerotts-0.1.2"
+	PinnedZeroTTSModelVersion    = "c2bfbd67dc648cac455077333f7cf5c18a2e3bb4"
+	PinnedZeroTTSSourceRevision  = "47e466d7a1a36517cfd240de536523d17c00adac"
+	PinnedZeroTTSPackageVersion  = "0.1.5"
+	PinnedZeroTTSAdapterRevision = "cmd/stageworker/adapters/tts_engine.py@zerotts-0.1.5"
 )
 
 // ComputeRuntimeManifestSHA256 computes a deterministic digest for the runtime identity binding.

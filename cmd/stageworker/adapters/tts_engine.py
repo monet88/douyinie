@@ -21,22 +21,27 @@ import wave
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# Pinned production VI ZeroTTS identity (Issue #92)
+# Pinned production VI ZeroTTS identity (Issue #92; runtime pack upgraded to v0.1.5)
 ZEROTTS_MODEL_ID = "zeroweight-ai/ZeroTTS"
-ZEROTTS_MODEL_REVISION = "8a0c3c29f6f047011f5cae02d0b14475a690be86"
-ZEROTTS_PACKAGE_VERSION = "0.1.2"
-ZEROTTS_SOURCE_COMMIT = "9d85578bee9321d6ef8305a4d454baf33e3fe861"
+ZEROTTS_MODEL_REVISION = "c2bfbd67dc648cac455077333f7cf5c18a2e3bb4"
+ZEROTTS_PACKAGE_VERSION = "0.1.5"
+ZEROTTS_SOURCE_COMMIT = "47e466d7a1a36517cfd240de536523d17c00adac"
 ZEROTTS_SOURCE_REPO = "zeroweight-ai/ZeroTTS"
-ZEROTTS_ADAPTER_REVISION = "cmd/stageworker/adapters/tts_engine.py@zerotts-0.1.2"
+ZEROTTS_ADAPTER_REVISION = "cmd/stageworker/adapters/tts_engine.py@zerotts-0.1.5"
+# Upstream src/zerotts/__init__.py still hardcodes __version__ = "0.1.2" at the
+# v0.1.5 tag (it was never bumped for the 0.1.4/0.1.5 releases). Distribution
+# metadata is the authoritative identity; the module literal is pinned
+# separately so drift on either signal fails closed.
+ZEROTTS_MODULE_VERSION_LITERAL = "0.1.2"
 ZEROTTS_ALLOWED_VOICES = {
     "quangminh", "maichi", "giahuy", "baotrang", "hamy", "huuduc", "kimoanh", "tiendat"
 }
 
-# Frozen Phase 1.1 compatibility identities & allowed voices (Issue #68)
+# Frozen Phase 1.1 compatibility identities & allowed voices (Issue #68; SDK upgraded to v3.8.1)
 VIENEU_MODEL_ID = "pnnbao-ump/VieNeu-TTS-v3-Turbo"
-VIENEU_MODEL_VERSION = "v3.2.9"
-VIENEU_MODEL_DIGEST = "1278db0090b98ccf23e56f2423857fc9d32a5118"
-VIENEU_SDK_COMMIT = "149ff16a6a50093a0cad1b75d5edf9e9d81d97f4"
+VIENEU_MODEL_VERSION = "v3.8.1"
+VIENEU_MODEL_DIGEST = "5f2a3e93092efaba9153253ff5f2e6a8e810e4f2"
+VIENEU_SDK_COMMIT = "592ba27c8f932b80768f6cee405badaef32bdb17"
 VIENEU_ALLOWED_VOICES = {"Trúc Ly", "Phạm Tuyên", "Đoan Trang", "Xuân Vĩnh"}
 
 KOKORO_MODEL_ID = "hexgrad/Kokoro-82M"
@@ -352,9 +357,23 @@ def run_zerotts_tts(
             raise RuntimeError(
                 f"TTS_RUNTIME_MISSING: zerotts=={ZEROTTS_PACKAGE_VERSION} is required for ZeroTTS synthesis"
             ) from exc
-        if str(zerotts_version) != ZEROTTS_PACKAGE_VERSION:
+        # Distribution metadata is authoritative; the module literal is a separate
+        # stale upstream constant and is pinned exactly as well.
+        import importlib.metadata
+
+        try:
+            dist_version = importlib.metadata.version("zerotts")
+        except importlib.metadata.PackageNotFoundError as exc:
             raise RuntimeError(
-                f"TTS_RUNTIME_VERSION_MISMATCH: expected zerotts=={ZEROTTS_PACKAGE_VERSION}, got {zerotts_version}"
+                f"TTS_RUNTIME_VERSION_MISMATCH: zerotts distribution metadata unavailable: {exc}"
+            ) from exc
+        if dist_version != ZEROTTS_PACKAGE_VERSION:
+            raise RuntimeError(
+                f"TTS_RUNTIME_VERSION_MISMATCH: expected zerotts=={ZEROTTS_PACKAGE_VERSION}, got {dist_version}"
+            )
+        if str(zerotts_version) != ZEROTTS_MODULE_VERSION_LITERAL:
+            raise RuntimeError(
+                f"TTS_RUNTIME_VERSION_MISMATCH: expected zerotts.__version__=={ZEROTTS_MODULE_VERSION_LITERAL}, got {zerotts_version}"
             )
         factory = ZeroTTS
 

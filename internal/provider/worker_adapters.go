@@ -193,8 +193,8 @@ func (b *workerBridge) run(ctx context.Context, cmd worker.Command) ([]byte, err
 						primaryBinding, err := b.snapshotSvc.GetBinding(mName, mVer)
 						if err != nil || primaryBinding == nil {
 							// Exact pinned snapshot bindings required for TTS:
-							// ZeroTTS: zeroweight-ai/ZeroTTS@8a0c3c29f6f047011f5cae02d0b14475a690be86
-							// VieNeu: pnnbao-ump/VieNeu-TTS-v3-Turbo:v3.2.9
+							// ZeroTTS: zeroweight-ai/ZeroTTS@c2bfbd67dc648cac455077333f7cf5c18a2e3bb4
+							// VieNeu: pnnbao-ump/VieNeu-TTS-v3-Turbo:v3.8.1
 							// Kokoro: hexgrad/Kokoro-82M:v1.0
 							// Legacy aliases such as vieneu-tts 1.0.0 or kokoro-tts 1.0.0 are strictly prohibited when exact binding is absent.
 							if strings.Contains(strings.ToLower(mName), "vieneu") || strings.Contains(strings.ToLower(mName), "pnnbao") {
