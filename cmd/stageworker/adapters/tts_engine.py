@@ -37,11 +37,10 @@ ZEROTTS_ALLOWED_VOICES = {
     "quangminh", "maichi", "giahuy", "baotrang", "hamy", "huuduc", "kimoanh", "tiendat"
 }
 
-# Frozen Phase 1.1 compatibility identities & allowed voices (Issue #68; SDK upgraded to v3.8.1)
+# Frozen Phase 1.1 compatibility identities & allowed voices (Issue #68; SDK upgraded to v3.8.1).
+# The provisioned SDK commit and model revision are provenance records in
+# docs/research/tts-runtime-upgrade-2026-09-17.md §1 - nothing reads them at runtime.
 VIENEU_MODEL_ID = "pnnbao-ump/VieNeu-TTS-v3-Turbo"
-VIENEU_MODEL_VERSION = "v3.8.1"
-VIENEU_MODEL_DIGEST = "5f2a3e93092efaba9153253ff5f2e6a8e810e4f2"
-VIENEU_SDK_COMMIT = "592ba27c8f932b80768f6cee405badaef32bdb17"
 VIENEU_ALLOWED_VOICES = {"Trúc Ly", "Phạm Tuyên", "Đoan Trang", "Xuân Vĩnh"}
 
 KOKORO_MODEL_ID = "hexgrad/Kokoro-82M"

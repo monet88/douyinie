@@ -13,11 +13,11 @@ const (
 	ZeroTTSModelID      = domain.PinnedZeroTTSModelID
 	ZeroTTSModelVersion = domain.PinnedZeroTTSModelVersion
 
-	// VieNeu frozen RC identities (Issue #68; SDK upgraded to v3.8.1)
+	// VieNeu frozen RC identities (Issue #68; SDK upgraded to v3.8.1). The provisioned SDK
+	// commit and model revision are provenance records in
+	// docs/research/tts-runtime-upgrade-2026-09-17.md §1 - nothing reads them at runtime.
 	VieNeuModelID      = "pnnbao-ump/VieNeu-TTS-v3-Turbo"
 	VieNeuModelVersion = "v3.8.1"
-	VieNeuModelDigest  = "5f2a3e93092efaba9153253ff5f2e6a8e810e4f2"
-	VieNeuSDKCommit    = "592ba27c8f932b80768f6cee405badaef32bdb17"
 	VieNeuProviderID   = "vieneu_tts_vi"
 
 	// Kokoro frozen RC identities (Issue #68)
