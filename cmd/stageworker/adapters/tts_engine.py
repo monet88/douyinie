@@ -38,9 +38,10 @@ ZEROTTS_ALLOWED_VOICES = {
 }
 
 # Frozen Phase 1.1 compatibility identities & allowed voices (Issue #68; SDK upgraded to v3.8.1).
-# The provisioned SDK commit and model revision are provenance records in
-# docs/research/tts-runtime-upgrade-2026-09-17.md §1 - nothing reads them at runtime.
-VIENEU_MODEL_ID = "pnnbao-ump/VieNeu-TTS-v3-Turbo"
+# The provisioned model id, SDK commit and model revision are provenance records in
+# docs/research/tts-runtime-upgrade-2026-09-17.md §1 - nothing reads them at runtime, so no
+# constant carries them. The Go side enforces the identity the lane registration declares
+# (provider.VieNeuModelID / provider.VieNeuModelVersion).
 VIENEU_ALLOWED_VOICES = {"Trúc Ly", "Phạm Tuyên", "Đoan Trang", "Xuân Vĩnh"}
 
 KOKORO_MODEL_ID = "hexgrad/Kokoro-82M"
