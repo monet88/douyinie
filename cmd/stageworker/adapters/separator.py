@@ -326,7 +326,10 @@ def separate_uvr(
     runtime_identity = f"python-audio-separator {installed_ver or PINNED_AUDIO_SEPARATOR_VERSION}{backend_info}"
 
     model_dir = model_path if model_path else None
-    sep = Separator(model_file_dir=model_dir) if model_dir else Separator()
+    # audio-separator falls back to os.getcwd() when output_dir is None, so stems were written
+    # next to whatever directory the worker was launched in. Keep them in a scratch dir.
+    out_dir = tempfile.mkdtemp(prefix="uvr_out_")
+    sep = Separator(model_file_dir=model_dir, output_dir=out_dir) if model_dir else Separator(output_dir=out_dir)
 
     # Block all request-time network/download helpers on the Separator instance so floating network resolution is impossible
     def _blocked_download(*args, **kwargs):
@@ -378,32 +381,35 @@ def separate_uvr(
             if self._orig_requests_get is not None and "requests" in sys.modules:
                 sys.modules["requests"].get = self._orig_requests_get
 
-    with _OfflineNetworkGuard():
-        sep.load_model(model_name)
-        output_files = sep.separate(audio_path)
+    try:
+        with _OfflineNetworkGuard():
+            sep.load_model(model_name)
+            output_files = sep.separate(audio_path)
 
-    vocals_path = None
-    bg_path = None
-    for f in output_files:
-        if "Vocals" in f or "vocals" in f:
-            vocals_path = f
-        elif "Instrumental" in f or "background" in f or "no_vocals" in f:
-            bg_path = f
+        vocals_path = None
+        bg_path = None
+        for f in output_files:
+            if "Vocals" in f or "vocals" in f:
+                vocals_path = f
+            elif "Instrumental" in f or "background" in f or "no_vocals" in f:
+                bg_path = f
 
-    vocals_bytes = b""
-    if vocals_path and os.path.exists(vocals_path):
-        with open(vocals_path, "rb") as vf:
-            vocals_bytes = vf.read()
+        vocals_bytes = b""
+        if vocals_path and os.path.exists(vocals_path):
+            with open(vocals_path, "rb") as vf:
+                vocals_bytes = vf.read()
 
-    bg_bytes = b""
-    if bg_path and os.path.exists(bg_path):
-        with open(bg_path, "rb") as bf:
-            bg_bytes = bf.read()
+        bg_bytes = b""
+        if bg_path and os.path.exists(bg_path):
+            with open(bg_path, "rb") as bf:
+                bg_bytes = bf.read()
 
-    dur_ms = 5000
-    if bg_bytes:
-        with wave.open(io.BytesIO(bg_bytes), "rb") as wf:
-            dur_ms = int((wf.getnframes() * 1000) / wf.getframerate())
+        dur_ms = 5000
+        if bg_bytes:
+            with wave.open(io.BytesIO(bg_bytes), "rb") as wf:
+                dur_ms = int((wf.getnframes() * 1000) / wf.getframerate())
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
 
     return {
         "vocals_data": vocals_bytes,
