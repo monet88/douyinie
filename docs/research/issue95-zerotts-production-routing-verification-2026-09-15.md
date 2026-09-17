@@ -1,5 +1,13 @@
 # Issue #95: ZeroTTS Vietnamese Production Routing — Verification & Provenance Record
 
+> **Superseded pins (2026-09-17):** §1's ZeroTTS identity table below — and the
+> `requirements-zerotts-0.1.2.txt` / `venvs/tts-zerotts-0.1.2-9d85578` references in §"Reproducibility" —
+> record the state verified on 2026-09-15. The runtime pack and model revision have since moved to
+> package `0.1.5`, source `47e466d7a1a36517cfd240de536523d17c00adac`, model `c2bfbd67dc648cac455077333f7cf5c18a2e3bb4`,
+> venv `tts-zerotts-0.1.5-47e466d` and manifest `requirements-zerotts-0.1.5.txt`; see
+> `docs/research/tts-runtime-upgrade-2026-09-17.md` §1 and §3 for the current values. Everything else
+> in this record (routing, escalation, gate results at `31c7a20`) stands as the evidence of that revision.
+
 **Date:** 2026-09-15
 **Verdict:** PASS — #90 (ZeroTTS production integration) is implementation-ready for closure.
 **Tested revision:** `31c7a205d744ef33b04a4efccce9e7a79e6743e5` (branch `main`), working tree unmodified (`git status --porcelain` empty before and after every gate).

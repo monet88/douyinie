@@ -2196,14 +2196,12 @@ func (s *DubbingService) computeVoiceAssignmentProvenanceHash(in domain.VoiceAss
 
 // computeDubSegmentsProvenanceHash computes deterministic cache identity for DubSegmentsVariant.
 //
-// The variant's audio is produced by a pinned TTS runtime, so that runtime identity is a
-// semantic input: `tts_runtime_identity` carries every lane's model revision and runtime pack.
-// Without it a pin upgrade leaves the key unchanged and already-cached rows replay audio from
-// the previous runtime (CODING_STANDARDS §4). No single ProviderID/ModelName/ModelVersion
-// triple is set because one pass can legitimately mix lanes (the assignment picks one per
-// speaker and a fixed-rate lane may escalate a speaker to the fallback lane), so the map —
-// not a scalar — is the honest identity. The artifact's shape is unchanged by a pin upgrade,
-// which is why the schema version stays put and the identity token moves instead.
+// The variant's audio is produced by a pinned TTS runtime, so that identity is a semantic
+// input: `tts_runtime_identity` carries every lane's model revision and runtime pack, without
+// which a pin upgrade leaves the key unchanged and cached rows replay audio from the previous
+// runtime (CODING_STANDARDS §4). No single ProviderID/ModelName/ModelVersion triple is set —
+// one pass can mix lanes (per-speaker assignment plus fallback-lane escalation) — and the
+// schema version stays put because a pin upgrade does not change the artifact's shape.
 func (s *DubbingService) computeDubSegmentsProvenanceHash(in domain.DubbingJobInput, dubScript *domain.DubScriptVariant, voiceAssign *domain.VoiceAssignment) (string, error) {
 	var inputHashes []string
 	if dubScript != nil && dubScript.CASHash != "" {

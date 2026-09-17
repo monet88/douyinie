@@ -30,17 +30,25 @@ This table supersedes the VieNeu pin block in
 
 **Enforcement map** (what actually fails closed at runtime, as of this upgrade):
 
-| Value | Enforced by |
-|---|---|
-| `ZeroTTSModelVersion`, `VieNeuModelVersion`, `KokoroModelVersion` | exact snapshot-binding version equality (`internal/provider/worker_adapters.go`), exact voice/catalog/checkpoint resolution (`internal/domain/snapshot.go`), `cmd/stageworker/main.go` |
-| `ZEROTTS_PACKAGE_VERSION` + `ZEROTTS_MODULE_VERSION_LITERAL` | the adapter's dual runtime-identity gate, `cmd/stageworker/adapters/tts_engine.py` (`TTS_RUNTIME_VERSION_MISMATCH`) |
-| `ZEROTTS_SOURCE_COMMIT` | PEP 610 `direct_url.json` commit check in `probe_zerotts_runtime_identity()` |
-| `KokoroModelCommit`, `KokoroSourceCommit` | nothing at runtime — provenance records only. |
+| Value | Enforced by | Kind |
+|---|---|---|
+| `ZeroTTSModelVersion`, `VieNeuModelVersion`, `KokoroModelVersion` | exact snapshot-binding version equality (`internal/provider/worker_adapters.go:239-271`, `:626-657`), exact voice/catalog/checkpoint resolution (`internal/domain/snapshot.go:389+`), `cmd/stageworker/main.go` | check (label equality) |
+| `ZEROTTS_PACKAGE_VERSION` | the adapter's runtime-identity gate before synthesis (`cmd/stageworker/adapters/tts_engine.py`, `TTS_RUNTIME_VERSION_MISMATCH`), the probe's distribution check, **and** `SnapshotService.SetRuntimeIdentity` (`internal/governance/snapshot.go:412`, `runtime_versions["zerotts"]`) | check, three independent sites |
+| `ZEROTTS_MODULE_VERSION_LITERAL` | the adapter's second identity predicate (`tts_engine.py`) — the probe does **not** re-check it | check (Python only) |
+| `ZEROTTS_SOURCE_COMMIT` | PEP 610 `direct_url.json` commit check in `probe_zerotts_runtime_identity()` **and** `SnapshotService.SetRuntimeIdentity` (`internal/governance/snapshot.go:407`) | check |
+| `ZEROTTS_ADAPTER_REVISION` | emitted by the probe; compared by `internal/governance/snapshot.go:416` and `internal/provider/worker_adapters.go:1106-1108` | check |
+| `ZEROTTS_MODEL_REVISION` | the adapter's model-revision gate (`tts_engine.py`, `TTS_MODEL_UNSUPPORTED`) plus binding equality | check (label, not bytes) |
+| `ZEROTTS_PACKAGE_VERSION` + `ZEROTTS_MODULE_VERSION_LITERAL` | additionally hashed into the DubSegments stage cache identity (`internal/service/dubbing.go`, `tts_runtime_identity`) so a pin bump invalidates cached segments instead of replaying old-runtime audio | check |
+| model weights of either lane (`voices/maichi/*`, `update/model.safetensors`, `onnx_int8/*`) | **nothing** — only the version label and the per-file hashes of the snapshot actually registered are compared | gap (follow-up) |
+| `KokoroModelCommit`, `KokoroSourceCommit` | nothing at runtime — provenance records only. | record |
+
+Label-vs-weights caveat (applies to both lanes, not just VieNeu): the files this upgrade changed are
+covered only by the registration-time hashes of whatever snapshot is registered. A snapshot
+registered under `c2bfbd67…` / `v3.8.1` with different bytes is admitted as long as its own manifest
+matches those files. Enforcing a pinned weights digest is a follow-up for both lanes.
 
 The VieNeu SDK commit and model revision are likewise records, not checks, so no constant carries
-them: they live in the §1 table above. A VieNeu snapshot registered under the `v3.8.1` label with
-other weights is **not** rejected (registration accepts the operator-supplied version label plus file
-hashes). Enforcing the weights digest is a follow-up, not part of this upgrade.
+them: they live in the §1 table above.
 
 ---
 
@@ -96,11 +104,20 @@ hashes). Enforcing the weights digest is a follow-up, not part of this upgrade.
 - `infer(text=..., voice=...)` and `get_preset_voice()` are unchanged; output stays 48 kHz
   float32. The new `apply_watermark=True` default is a no-op here: `_init_watermarker()` swallows
   `ImportError` and `_apply_watermark()` returns the raw waveform when the watermarker is `None`.
-- **Model revision delta (measured via HF LFS oids):** `update/model.safetensors` and
-  `onnx_int8/vieneu_backbone_shared.data` changed content (same byte size, different SHA-256);
-  `onnx_update/*`, `tokenizer.json`, `speaker_encoder.onnx`, `denoiser.onnx` and `update/tokenizer*`
-  are unchanged, and `README.md` changed. The changed `update/` weights are exactly the subfolder
-  this lane loads, so the revision bump is substantive — re-provisioning was required, not optional.
+- **Model revision delta (measured: identical file listing, per-file LFS oid resolved at each
+  revision):** 7 of the 33 files changed. Same byte size, different SHA-256:
+  `update/model.safetensors`; and five of the seven `onnx_int8/` files —
+  `vieneu_backbone_shared.data`, `vieneu_acoustic_cached.onnx`, `vieneu_decode_step.onnx`,
+  `vieneu_prefill.onnx`, `vieneu_v3_heads.npz`. `README.md` changed size too (13318 → 15458).
+  Unchanged: `onnx_int8/config.json`, `onnx_int8/tokenizer.json`, everything under `onnx_update/`,
+  root `tokenizer.json`, `speaker_encoder.onnx`, `denoiser.onnx` and `update/tokenizer*`.
+  Measurement note: `GET /api/models/<repo>/tree/…?revision=<sha>` returns the *main* tree and
+  silently ignores `revision`, so both revisions compare identical that way; use
+  `HEAD /<repo>/resolve/<sha>/<file>` and read `X-Linked-Etag` (the LFS oid) per revision instead.
+  The changed `update/` weights are exactly the subfolder this lane loads, so the revision bump is
+  substantive — re-provisioning was required, not optional. The five changed `onnx_int8/` files are
+  on the lane this repo does **not** use today, but they are what a future `backend="onnx"` switch
+  (see §6) would load, so the ONNX path moved in this revision too.
 - Voice catalog: 25 presets; all four frozen voices (`Trúc Ly`, `Phạm Tuyên`, `Đoan Trang`,
   `Xuân Vĩnh`) remain present and the frozen order is untouched. `Trúc Ly`'s reference was refreshed
   upstream, so its synthesized audio differs from `v3.2.9` output at equal text.
@@ -131,27 +148,50 @@ The reproducible pip set for the ZeroTTS pack is committed as
 ## 4. Repo changes
 
 - `internal/domain/snapshot.go` — `PinnedZeroTTS*` identity constants.
+- `internal/provider/tts.go` — VieNeu identity the runtime enforces (`VieNeuModelVersion`), the
+  CosyVoice fallback lane's model identity constants, and `TTSRuntimeIdentities()` (below).
+- `internal/provider/worker_adapters.go` — pinned-identity doc comment, and the CosyVoice lane
+  registration reads its model identity from the constants instead of repeating the literals.
+- `internal/service/dubbing.go` — the DubSegments stage cache identity now includes
+  `tts_runtime_identity` (every lane's pinned model revision / runtime pack), and the
+  supersession-reuse path only reuses a prior variant recorded under that same identity. Without the
+  first change a pin upgrade leaves the key unchanged and every already-processed asset replays audio
+  from the previous runtime (`CODING_STANDARDS.md` §4: cache identity must cover
+  provider/model/version, and a change to what a stage emits requires the stage's identity to move
+  with it). Without the second, an escalation performed right after an upgrade would splice
+  pre-upgrade segments into a post-upgrade variant.
 - `cmd/stageworker/adapters/tts_engine.py` — `ZEROTTS_*` constants plus the VieNeu frozen
-  `VIENEU_MODEL_ID` / allowed-voices pair; the ZeroTTS runtime identity check now pins the
-  distribution version and the stale upstream module literal separately.
+  allowed-voices pair; the ZeroTTS runtime identity check now pins the distribution version and the
+  stale upstream module literal separately.
 - `cmd/stageworker/adapters/requirements-zerotts-0.1.5.txt` — new runtime pack manifest (old file
   removed); the re-resolved pack pins also moved (`filelock`, `huggingface-hub`).
 - `cmd/stageworker/adapters/test_tts_engine.py` — four fail-closed tests for the ZeroTTS dual-pin
-  identity gate (review remediation).
-- Review remediation also deleted the unread `VieNeuModelDigest` / `VIENEU_MODEL_DIGEST`-style
-  provenance scalars (`VieNeuModelRevision`, `VieNeuSDKCommit`, `VIENEU_MODEL_VERSION`,
-  `VIENEU_MODEL_REVISION`, `VIENEU_SDK_COMMIT`): nothing read them, and the §1 table above is where
-  those values are recorded.
-- `internal/provider/tts.go`, `internal/provider/worker_adapters.go` — the VieNeu identities the
-  runtime enforces (`VieNeuModelID` / `VieNeuModelVersion`) and the pinned-identity doc comment.
+  identity gate, plus one test that pins the shipped pin values and the requirements-manifest VCS
+  commit as literals (the gate tests compare signals to the constants, so only the literal test
+  catches a wrong constant).
+- Review remediation also deleted the unread provenance scalars `VieNeuModelDigest` and
+  `VieNeuSDKCommit` (Go), `VIENEU_MODEL_VERSION`, `VIENEU_MODEL_DIGEST` and `VIENEU_SDK_COMMIT`
+  (Python), and `VIENEU_MODEL_ID` (Python, written once and read nowhere): nothing read them, and the
+  §1 table above is where those values are recorded.
 - `test/seam2/zerotts_seam2_test.go` — real-snapshot/real-venv fallback paths and a note on the
   pinned module literal.
+- `test/seam1/zerotts_escalation_test.go` — a variant cached under the pre-runtime-identity key must
+  not satisfy a request from this build.
+- `test/seam1/multi_speaker_voice_test.go` — a prior variant recorded under the pre-runtime-identity
+  provenance cannot be reused by an escalation pass.
 - `test/seam2/snapshot_seam2_test.go`, `internal/domain/snapshot_test.go` — VieNeu fixture version
-  literals moved to `v3.8.1` (they model the pinned snapshot; the provider validates them exactly).
+  literals moved to `v3.8.1` for consistency with the pinned label; the domain fixture does not
+  require it (reverting it leaves `go test ./internal/domain/` green), so this is chrome, not a
+  contract.
 - `docs/architecture/phase1-architecture.md` §"pending pins" — pin record.
+- This record.
 
 Not changed on purpose: the frozen ZeroTTS/Kokoro/VieNeu voice orders, the unattended VI rotation,
-routing/escalation policy, the fixed-rate ZeroTTS contract, and the seam count.
+routing/escalation policy, the fixed-rate ZeroTTS contract, and the seam count. The DubSegments
+schema version is also deliberately **not** bumped: the artifact's shape and field semantics are
+unchanged, so the identity token — not the schema — is what moves. The consequence is that every
+DubSegments row cached before this upgrade is invalidated and regenerated on the next run of the same
+request; that regeneration is the point of the change (see §6).
 
 ---
 
@@ -160,8 +200,11 @@ routing/escalation policy, the fixed-rate ZeroTTS contract, and the seam count.
 | Check | Command | Result |
 |---|---|---|
 | Formatting / vet | `gofmt -l cmd internal test`; `go vet ./...` | clean |
-| Adapter contract tests | `python test_tts_engine.py` (in `cmd/stageworker/adapters`) | **39 tests OK** (35 pre-review + 4 added in review remediation) |
-| ZeroTTS dual-pin identity gate (fail-closed) | `python -m unittest test_tts_engine.TestTTSEngineUpstreamContracts.test_run_zerotts_distribution_version_mismatch_fails_closed test_run_zerotts_missing_distribution_metadata_fails_closed test_run_zerotts_module_literal_drift_fails_closed test_run_zerotts_shipped_pin_pair_is_admitted` | all **OK** — distribution-metadata mismatch, absent distribution metadata and module-literal drift each fail closed with `TTS_RUNTIME_VERSION_MISMATCH`; the shipped pair (`0.1.5` dist + `0.1.2` literal) is admitted. Red-proof: deleting the distribution-metadata check turns 3 of the 4 red (`FF.F`) |
+| Adapter contract tests | `python -m unittest test_tts_engine` (in `cmd/stageworker/adapters`) | **40 tests OK** |
+| Shipped pin values (independent of the constants) | `test_shipped_pins_match_the_provisioned_v0_1_5_pack` | **OK** — asserts the literal strings `0.1.5` / `0.1.2` / `47e466d7…` / `c2bfbd67…` / `@zerotts-0.1.5` and that `requirements-zerotts-0.1.5.txt` provisions the same VCS commit. Red-proof: a one-sided edit of `ZEROTTS_PACKAGE_VERSION` to `0.1.2` leaves the four gate tests green and fails only this one (`AssertionError: '0.1.2' != '0.1.5'`). |
+| ZeroTTS dual-pin identity gate (fail-closed) | `python -m unittest test_tts_engine.TestTTSEngineUpstreamContracts.test_run_zerotts_distribution_version_mismatch_fails_closed test_run_zerotts_missing_distribution_metadata_fails_closed test_run_zerotts_module_literal_drift_fails_closed test_run_zerotts_shipped_pin_pair_is_admitted` | all **OK** — distribution-metadata mismatch, absent distribution metadata and module-literal drift each fail closed with `TTS_RUNTIME_VERSION_MISMATCH`; the shipped pair (`0.1.5` dist + `0.1.2` literal) is admitted. Red-proof (mutation applied to copies, repo untouched, unittest progress string): drop the distribution-metadata check → `FF..`; drop the module-literal check → `..F.`; drop both → `FFF.`. Reverting the whole file to the pre-upgrade adapter turns all four into `ERROR` (`AttributeError: … no attribute 'ZEROTTS_MODULE_VERSION_LITERAL'`), which proves nothing about the tests, so the mutation matrix is the red-proof. |
+| DubSegments cache identity covers the TTS runtime | `go test ./test/seam1/ -run TestSeam1_TTSPinUpgradeCannotBeSatisfiedByPreUpgradeCachedVariant` | **PASS**. Red-proof via `go test -overlay` with the `tts_runtime_identity` token removed → **FAIL** ("a variant cached without the TTS runtime identity satisfied this request") |
+| Escalation reuse is bound to the producing identity | `go test ./test/seam1/ -run TestSeam1_VoiceChange_PreUpgradeVariantProvenanceBypassesReuse` | **PASS**. Red-proof via `go test -overlay` with the guard disabled → **FAIL** ("expected the non-invalidated speaker to be re-synthesized … got 0") |
 | Real pinned ZeroTTS runtime (new venv + new snapshot) | `go test ./test/seam2/ -count=1 -v -run 'TestSeam2_ZeroTTS'` | **PASS**, 47.58 s — `TestSeam2_ZeroTTSRealPinnedRuntime` 31.96 s: real StageWorker synthesis for `quangminh` and `maichi`, runtime identity observed at the new exact pins, 48 kHz mono WAV, `MeasuredDurationMs == ProbeWAVBytes`, audio SHA-256 self-consistent, competing `asr` GPU lease still held (CPU-only), plus absent-snapshot / missing-runtime / invalid-entrypoint / empty-audio / exact-identity fail-closed subtests |
 | VieNeu `v3.8.1` production adapter path (offline) | `run_vieneu_tts(text, "vi", "Trúc Ly", 1.0, model_path=<new snapshot>, entrypoint_file=<snapshot catalog>)` with `HF_HUB_OFFLINE=1`, `venvs\tts` runtime | success: `measured_duration_ms=2880`, audio SHA-256 `0875ea0d…`, 276 525 WAV bytes |
 | VieNeu `v3.8.1` against the *old* snapshot (control) | same probe with `…\staging\vieneu_v3_turbo` | success: `measured_duration_ms=3760`, SHA-256 `e7b34c65…` — the SDK loads either revision offline; the different duration reflects the changed weights/catalog |
@@ -192,7 +235,10 @@ snapshot-key helpers the pin constants feed). The review-remediation working tre
 separately: `--scope all` → 4 files, 32 symbols, risk **low**, 0 affected processes. `gitnexus impact` on `VieNeuModelVersion` and
 `ZeroTTSModelVersion` returns `UNKNOWN` (module-scope const reads produce no graph edges by design);
 every reference site was confirmed by text search instead — all of them go through the constants
-listed in §4, and no literal pin remains outside synthetic fixture markers.
+listed in §4. Two stale pin literals do remain, both inert synthetic fixtures with no production
+reader: `internal/benchmark/session_identity_test.go` and `test/seam1/benchmark_session_seam1_test.go`
+carry `tts_vi` / `vieneu_tts_vi` at `v3.2.9` with the old digest (no production code builds a
+`SessionIdentityInput`, so nothing compares them).
 
 ---
 
@@ -201,14 +247,51 @@ record corrections): `go test ./... -count=1 -timeout 3600s` → **exit 0**, 190
 **17 packages ok / 0 FAIL** (`test/seam1` 181.4 s, `test/seam2` 116.7 s, `test/steering`);
 `python test_tts_engine.py` → **39 tests OK**. Graph impact at
 the pushed head (`--scope compare --base-ref origin/main`, i.e. `ace14d3`): 11 files, 57 symbols,
-risk **medium**, same four TTS/snapshot flows.
+risk **medium**, same four TTS/snapshot flows (re-measured at `b715620`: 11 files, **56 symbols** —
+the symbol count drifts by one between runs of the same revision, so treat it as approximate).
+
+Re-run after the second review pass (DubSegments cache identity carries the runtime pins, the
+escalation reuse path is gated on the producing identity, the shipped pins get a literal assertion,
+and this record's numbers are corrected): `go test ./... -count=1 -timeout 3600s` → **exit 0**,
+175.3 s wall clock, **17 packages ok / 0 FAIL** (`test/seam1` 171.7 s, `test/seam2` 110.5 s,
+`test/steering` 0.061 s); `python -m unittest test_tts_engine` → **40 tests OK**;
+`gofmt -l cmd internal test`, `go vet ./...` and `git diff --check` → clean. Graph impact of that
+working tree (`--scope all`): 9 files, 61 symbols, risk **high**, 7 affected processes — the dub
+synthesis paths are the ones that read the changed cache identity, which is the intended blast
+radius (every cached DubSegments row for the same request identity is regenerated once).
+
+Flake observed once, unexplained: an intermediate full-suite run of this same revision failed
+`test/seam1` (179.6 s) while every other package passed; the failing test name was lost to the
+output tail, and the two subsequent runs — the whole suite again (green, 171.7 s) and `test/seam1`
+alone (green, 155.6 s) — both passed, as do the new tests under `-count=5`. Either an environment-
+sensitive seam1 test or transient contention, not attributable to this change from the evidence
+available here. Whoever runs CI on this branch should watch for a repeat.
 
 ## 6. Residual notes / risks
 
+- **Cache consequence (intended, plan for it).** The DubSegments stage identity now includes
+  `tts_runtime_identity`, so every DubSegments row cached by an earlier build stops matching and is
+  regenerated on the next run of the same request. That is the point — before this change the pin
+  bump was invisible to already-processed assets and they kept replaying old-runtime audio. Expect a
+  one-off re-synthesis of previously processed material (the whole point of the upgrade for those
+  assets: `maichi` and `Trúc Ly` sound different now).
+- **Escalation reuse is gated on the producing identity.** A superseding assignment only reuses the
+  segments of speakers it did not invalidate when the prior variant was recorded under the current
+  stage identity; otherwise those speakers are re-synthesized too. Without that gate, reassigning a
+  voice right after the upgrade would have produced one variant carrying audio from two different
+  runtimes.
+- **Production hosts must re-register the new snapshots.** Snapshot bindings are in-process and keyed
+  `dependency@version` (`internal/governance/snapshot.go:46-71`); `RuntimeHost` registers only the
+  manifests it finds under `DOUYINIE_SNAPSHOT_DIR` at startup and logs a *warning* (not a fatal) when
+  one fails (`cmd/runtimehost/main.go:105-124`). A host that takes this code change without
+  provisioning the new snapshot directories fails every TTS dispatch with
+  `ErrSnapshotUnverified` — the failure surfaces per request, not at boot. Historical frozen
+  `VoiceAssignment`s therefore stay routable only on a host that has registered
+  `zeroweight-ai/ZeroTTS@c2bfbd67…` and `pnnbao-ump/VieNeu-TTS-v3-Turbo@v3.8.1`.
 - The ZeroTTS `maichi` preset and the VieNeu `Trúc Ly` preset produce different audio than before
-  this upgrade. Historical frozen `VoiceAssignment`s keep their provider/voice identity and remain
-  routable, but re-synthesis of a historical assignment is not bit-identical — consistent with the
-  documented "identity preserved, artifacts regenerated on demand" contract.
+  this upgrade. Historical frozen `VoiceAssignment`s keep their provider/voice identity; a
+  re-synthesis regenerates the artifact rather than reproducing the previous bytes — consistent with
+  the documented "identity preserved, artifacts regenerated on demand" contract.
 - The VieNeu lane still resolves its codec/tokenizer via the snapshot-local `moss_tokenizer/` on the
   PyTorch path. If that lane is ever moved to the torch-free ONNX engine (`backend="onnx"`,
   `precision="fp32"`), the snapshot must additionally carry a local codec directory, otherwise the
