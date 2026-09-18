@@ -211,6 +211,21 @@ def probe_runtime_identity(model_name: str, model_version: str = "v3") -> Dict[s
         "runtime_versions": runtime_versions,
         "adapter_revision": f"cmd/stageworker/adapters/separator.py@v{pkg_version}",
     }
+# The pipeline contract for separated stems is 16 kHz 16-bit PCM (the audio-role analyzer
+# rejects any other rate). audio-separator defaults to 44.1 kHz, so the contract rate must be
+# requested explicitly: the mix is resampled to `sample_rate` when it is loaded, so every stem
+# written downstream really is at this rate.
+CONTRACT_SAMPLE_RATE = 16000
+
+
+def measure_wav_properties(wav_bytes: bytes) -> tuple:
+    """Return (sample_rate, channels, duration_ms) of a WAV payload, or (0, 0, 0) when unreadable."""
+    if not wav_bytes:
+        return 0, 0, 0
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        return wf.getframerate(), wf.getnchannels(), int((wf.getnframes() * 1000) / wf.getframerate())
+
+
 def generate_synthetic_pcm_wav(sample_rate: int = 16000, channels: int = 1, duration_ms: int = 5000) -> bytes:
     """Generate standard 16-bit PCM WAV bytes."""
     num_samples = int((sample_rate * duration_ms) / 1000)
@@ -329,7 +344,11 @@ def separate_uvr(
     # audio-separator falls back to os.getcwd() when output_dir is None, so stems were written
     # next to whatever directory the worker was launched in. Keep them in a scratch dir.
     out_dir = tempfile.mkdtemp(prefix="uvr_out_")
-    sep = Separator(model_file_dir=model_dir, output_dir=out_dir) if model_dir else Separator(output_dir=out_dir)
+    sep = (
+        Separator(model_file_dir=model_dir, output_dir=out_dir, sample_rate=CONTRACT_SAMPLE_RATE)
+        if model_dir
+        else Separator(output_dir=out_dir, sample_rate=CONTRACT_SAMPLE_RATE)
+    )
 
     # Block all request-time network/download helpers on the Separator instance so floating network resolution is impossible
     def _blocked_download(*args, **kwargs):
@@ -411,12 +430,18 @@ def separate_uvr(
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
 
+    # Report what was actually written, not what was requested: a stem whose rate drifted from
+    # the contract must be visible in the artifact instead of being papered over here.
+    sample_rate, channels, _ = measure_wav_properties(vocals_bytes)
+    if not sample_rate:
+        sample_rate, channels, _ = measure_wav_properties(bg_bytes)
+
     return {
         "vocals_data": vocals_bytes,
         "background_data": bg_bytes,
         "duration_ms": dur_ms,
-        "sample_rate": 16000,
-        "channels": 1,
+        "sample_rate": sample_rate,
+        "channels": channels,
         "model_name": UVR_CANONICAL_FILENAME,
         "model_version": model_version or "v3",
         "runtime_identity": runtime_identity,
@@ -554,12 +579,16 @@ def separate_demucs(
         with wave.open(io.BytesIO(bg_bytes), "rb") as wf:
             dur_ms = int((wf.getnframes() * 1000) / wf.getframerate())
 
+        sample_rate, channels, _ = measure_wav_properties(vocals_bytes)
+        if not sample_rate:
+            sample_rate, channels, _ = measure_wav_properties(bg_bytes)
+
         return {
             "vocals_data": vocals_bytes,
             "background_data": bg_bytes,
             "duration_ms": dur_ms,
-            "sample_rate": 16000,
-            "channels": 1,
+            "sample_rate": sample_rate,
+            "channels": channels,
             "model_name": "htdemucs",
             "model_version": model_version or "v4",
             "runtime_identity": runtime_identity,

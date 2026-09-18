@@ -93,6 +93,12 @@ type TranslationJobInput struct {
 	ExecutionProfile      ExecutionProfile          `json:"execution_profile,omitempty"`
 	AuthorizedCredentials []string                  `json:"authorized_credentials,omitempty"`
 	ConsentGranted        bool                      `json:"consent_granted,omitempty"`
+	// Ephemeral marks a translation whose result is consumed inline by the caller (overlay /
+	// visual text) rather than published as the run's canonical translation. An ephemeral call
+	// must not move the run-scoped TranslationVariant index: the canonical variant is the one
+	// the speech stages pin (DubScriptVariant.TranslationVariantCAS), and republishing it from an
+	// unrelated lane makes every later artifact validate against the wrong CAS.
+	Ephemeral bool `json:"ephemeral,omitempty"`
 }
 
 type DubScriptSegment struct {

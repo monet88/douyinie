@@ -38,11 +38,12 @@ per-family variables for the rest. Each family needs the venv that actually carr
 | `DOUYINIE_SEPARATOR_PYTHON_BIN` | `…\venvs\separator\Scripts\python.exe` |
 | `DOUYINIE_TRANSLATION_PYTHON_BIN` | `…\venvs\translation\Scripts\python.exe` |
 | `DOUYINIE_TTS_PYTHON_BIN` | `…\venvs\tts-zerotts-0.1.5-47e466d\Scripts\python.exe` |
-| `DOUYINIE_GATEWAY_URL`, `DOUYINIE_GATEWAY_API_KEY` | operator-supplied authorized gateway |
+| `DOUYINIE_GATEWAY_URL`, `DOUYINIE_GATEWAY_API_KEY` | operator-supplied authorized gateway. `DOUYINIE_GATEWAY_URL` must already carry the API prefix (`https://<host>/v1`): `GatewayTranslationProvider.resolveEndpointURL` appends `/chat/completions` verbatim, so a bare host yields HTTP 404 (recorded as `quality_failed` on both gateway lanes, surfacing as `all provider candidates failed for stage translation`) |
 | `DOUYINIE_SERVICE_BASELINE_GEMINI`, `DOUYINIE_SERVICE_BASELINE_DEEPSEEK` | operator-supplied baseline ids |
 
 Notes that were learned the hard way:
 
+- **Stems are requested at the pipeline contract rate.** The separator adapter constructs `Separator(..., sample_rate=16000)` and reports the rate/channels it measured from the produced WAV instead of a hardcoded 16 kHz/1 ch. audio-separator defaults to 44.1 kHz and the audio-role analyzer rejects anything but 16 kHz, so a default-rate separator dead-ends `audio_role_plan`, the first stage of every real run, while the persisted stem metadata claims otherwise.
 - **The diarizer has no per-family interpreter variable.** `resolvePythonBinary()` reads only
   `DOUYINIE_PYTHON_BIN`, and `venvs\asr` has no `modelscope`/`torchaudio`, so diarization dies with
   `DIARIZER_EXEC_FAILED` when the asr venv is the shared one. Until that gap is closed, point
@@ -111,8 +112,9 @@ Traps:
 - **The view does not auto-refresh after an override.** Pending counts stay stale until `Làm mới dữ liệu`
   (or a reload); confirm the real state with
   `GET /api/v1/runs/<run>/review-items?include_resolved=true`.
-- A run that is `interrupted` shows `Pause`/`Resume`/`Cancel` disabled — the UI offers no resume for a
-  terminal run; recovery is `POST /api/v1/runs/<id>/resume` (see §6).
+- A run that is `interrupted` now offers `Resume` in the console (the RuntimeHost accepts
+  `POST /api/v1/runs/<id>/resume` for it and re-drains from the incomplete stage); `Pause`/`Cancel` stay
+  disabled. Reload the page after changing `app.js` — the data-refresh button re-fetches state, not the script.
 
 ## 5. Read the run back
 
@@ -152,8 +154,10 @@ final-render handoff, which waits for the operator.
 | `translation QA gate flagged segment N: name/brand 'XX' missing from target` in `provider_attempts` | entity gate vs OCR'd short tokens; same rule — the candidate is kept and flagged |
 | `dub script QA gate flagged segment N` (pending `meaning_corrupted` item) | the spoken text drifted from the meaning text and the unshortened fallback did not clear it; correct the segment or accept it |
 | `conditional diarization failed … DIARIZER_EXEC_FAILED` | wrong interpreter for the diarizer family (§2) |
-| `subtitle or overlay overlaps protected region: overlay for instructional UI "region-NNN" (box {…}) occludes protected region (box {…})` | the tracked UI element sits next to another protected UI element (`GetProtectedBoxesForTimeWindow`) and the localized overlay cannot clear it, so `visual_text_localize` aborts the run. Recover in `03 Review Workspace` → `Chỉnh region` (drag/resize the region so the overlay clears the protected box, or reclassify the region to a non-overlay role such as `brand_keep` / `ignore/noise`), then resume the run |
+| `visual_occlusion` pending exception (`overlay for … occludes protected region …`) | the tracked UI element sits next to another protected UI element (`GetProtectedBoxesForTimeWindow`) and the localized overlay cannot clear it. Since the occlusion-as-exception change the overlay is skipped (source text stays on screen) and `visual_text_localize` **continues**: resolve the item in `03 Review Workspace` → `Chỉnh region` (move the region so the overlay clears the protected box, or reclassify it to `brand_keep` / `ignore/noise`) and re-apply. A collision with a *scene-protected* region (face / tap target) still fails the stage, and a geometry the operator dragged onto a protected region is still rejected outright by `Chỉnh region` |
 | `final render handoff blocked: N pending review exceptions` | correct gate: resolve the queue in `03 Review Workspace`, then re-check the handoff in `04 Kết quả` |
+| `meaning preservation validation failed: dub script translation CAS "…" does not match canonical translation CAS "…"` | the run-scoped `TranslationVariant` index moved after the dub script was frozen. Inline overlay translations must be `Ephemeral` (`TranslationJobInput.Ephemeral`) so the visual lane cannot republish the canonical variant; if it appears anyway, compare the newest run-scoped `translation_variants` row against the dub script's embedded `TranslationVariantCAS` and re-run `translation` + `dub_script` together instead of resuming the visual stage alone |
+| a region correction of an *overlay* region does not change the preview | `RenderPlan` currently freezes dub mix, audio and subtitle cues only — overlay geometry lives in the localized visual track (what the region inspector reads), so the preview artifact is legitimately identical. Freezing overlay references into `RenderPlan` (architecture §4) is an open gap |
 
 Workaround to keep a run moving while `audio_role_plan` is blocked: seed an operator plan, then resume.
 
@@ -179,6 +183,11 @@ curl -X POST -H "Content-Type: application/json" -d '{}' \
 - The agent shell cannot exec a relative `./thing.exe`; use an absolute path.
 - `orca snapshot` intermittently returns no `result` on a busy SPA — retry, or read state with `orca eval`.
 - Never pipe into `orca eval --stdin`; pass a one-line `--expression`.
+- `orca snapshot` (and with it every `--element <ref>` command, including `upload`) can fail with
+  `runtime_unavailable: The Orca runtime closed the connection` while `orca eval`, `orca find … --action click`,
+  `orca mouse` and `orca tab` keep working. That is not a reason to abandon the UI run: read state with `eval`,
+  click with `find --action click` or `mouse`, and when the file picker is needed attach a CDP-driven Chromium
+  (`browser.open({app: {path: <chrome.exe>}})`, then `page.$('#source-input')` + `uploadFile`).
 - Two minutes of `sleep` polling per stage is the normal cost of a real run; do not interpret a slow stage as
   a hang until `hub logs` shows no progress line for longer than the previous stage's worst case.
 

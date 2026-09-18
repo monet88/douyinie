@@ -178,6 +178,13 @@ function createHarness() {
     segmentRow1: register('[data-segment-index="1"]'),
     regionRow: register('[data-region-id="reg-1"]'),
     reviewRow: register('[data-review-id="rev-1"]'),
+    runTitle: register("#run-title"),
+    runStatus: register("#run-status"),
+    runDetails: register("#run-details"),
+    runStageList: register("#stage-list"),
+    runPause: register("[data-run-action=pause]", { dataset: { runAction: "pause" } }),
+    runResume: register("[data-run-action=resume]", { dataset: { runAction: "resume" } }),
+    runCancel: register("[data-run-action=cancel]", { dataset: { runAction: "cancel" } }),
   };
 
   lists.set("[data-inspector-tab]", [
@@ -188,6 +195,7 @@ function createHarness() {
   lists.get("[data-inspector-tab]")[0].classList.add("is-active");
   lists.set("[data-inspector-panel]", [els.panelExceptions, els.panelTranscript, els.panelRegions]);
   lists.set("[data-editor-panel]", [els.acceptForm, els.textForm, els.voiceForm, els.regionForm]);
+  lists.set("[data-run-action]", [els.runPause, els.runResume, els.runCancel]);
 
   class Headers {
     constructor(init) {
@@ -258,7 +266,7 @@ function createHarness() {
     "(function () {",
     '"use strict";',
     source,
-    "globalThis.__operatorUI = { state, loadSelectedRun, renderSpeakers, renderInspector };",
+    "globalThis.__operatorUI = { state, loadSelectedRun, renderSpeakers, renderInspector, renderSelectedRun };",
     "})();",
   ].join("\n");
   vm.runInContext(moduleScope, context, { filename: "app.js" });
@@ -322,6 +330,29 @@ state.selectedRegionId = null;
 state.selectedReviewItem = null;
 renderInspector();
 `;
+
+test("an interrupted run offers resume and refuses pause/cancel", async () => {
+  const h = createHarness();
+  await h.ready();
+  h.evalIn(`state.selectedRunId = "run-1"; state.selectedRun = { id: "run-1", job_id: "job-1", status: "interrupted", config_snapshot_json: "" }; state.selectedJob = { id: "job-1", source_asset_id: "asset-1", target_language: "vi" };`);
+  h.evalIn("renderSelectedRun();");
+  // The RuntimeHost accepts POST /runs/{id}/resume for an interrupted run and re-drains the
+  // queue from the incomplete stage, so a console that greys Resume out leaves a real operator
+  // with no way to recover a fail-closed run.
+  assert.equal(h.els.runResume.disabled, false, "resume must be offered for an interrupted run");
+  assert.equal(h.els.runPause.disabled, true, "an interrupted run has nothing to pause");
+  assert.equal(h.els.runCancel.disabled, true, "an interrupted run is already stopped");
+});
+
+test("a running run offers pause/cancel and not resume", async () => {
+  const h = createHarness();
+  await h.ready();
+  h.evalIn(`state.selectedRunId = "run-1"; state.selectedRun = { id: "run-1", job_id: "job-1", status: "running", config_snapshot_json: "" }; state.selectedJob = { id: "job-1", source_asset_id: "asset-1", target_language: "vi" };`);
+  h.evalIn("renderSelectedRun();");
+  assert.equal(h.els.runResume.disabled, true, "a running run must not be resumable");
+  assert.equal(h.els.runPause.disabled, false, "a running run can be paused");
+  assert.equal(h.els.runCancel.disabled, false, "a running run can be cancelled");
+});
 
 test("transcript row click syncs seek, selection, inspector tab and editor", async () => {
   const h = createHarness();

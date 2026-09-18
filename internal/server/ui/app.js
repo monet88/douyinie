@@ -532,9 +532,11 @@ function renderSelectedRun() {
       <div><dt>Created</dt><dd>${esc(formatDate(run?.created_at))}</dd></div>`;
   }
 
+  // `interrupted` is a recoverable state, not a terminal one: the RuntimeHost accepts a resume
+  // for it and re-drains the queue from the last incomplete stage, so the console must offer it.
   const allowed = {
     pause: ["queued", "running"],
-    resume: ["paused"],
+    resume: ["paused", "interrupted"],
     cancel: ["queued", "running", "paused"],
   };
   $$("[data-run-action]").forEach((button) => {

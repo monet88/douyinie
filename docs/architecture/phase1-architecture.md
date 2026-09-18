@@ -479,7 +479,7 @@ Douyinie Phase 1 implements **Variant A: Queue + Inspector** as its canonical op
 - **Actionable Exceptions**: The review queue surfaces only segments requiring human intervention:
   - Tight timing or duration overrun ($D_{\text{tts}} > T_{\text{source}}$).
   - Ambiguous visual text role classification or low OCR confidence.
-  - Subtitle bounding box colliding with active UI buttons or tap targets.
+  - Subtitle or overlay box colliding with another protected tracked region (UI control, tap target, brand mark): the overlay is skipped so the source text stays on screen untouched, and the collision is surfaced as a pending `visual_occlusion` item instead of aborting the stage. Collisions with scene-protected regions (faces, pipeline-declared tap targets) stay fatal for automatic localization, and a geometry the operator explicitly asked for that lands on a protected region (region correction / reclassify) is rejected outright so the edit can be corrected.
   - Pronunciation or acoustic anomaly flagged by multimodal QA.
   - Meaning-gate violations on a translated or spoken segment (facts, numbers, entity names, negation polarity) when no provider lane produced a clean candidate: the best candidate is persisted with the offending segment flagged, and the run continues.
 

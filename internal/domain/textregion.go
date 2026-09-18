@@ -22,7 +22,7 @@ var (
 )
 
 const TextRegionPlanSchemaVersion = 1
-const LocalizedVisualTrackSchemaVersion = 1
+const LocalizedVisualTrackSchemaVersion = 2
 const LocalizedSubtitleTrackSchemaVersion = 1
 
 // MinTextRegionBoxPx is the smallest canonical box dimension the domain accepts. It is the
@@ -266,6 +266,20 @@ type LocalizedSubtitleTrack struct {
 	CreatedAt      time.Time     `json:"created_at"`
 }
 
+// OcclusionReport records a tracked region whose localized overlay could not clear a
+// protected UI box. The overlay is skipped (the source text stays on screen untouched)
+// and the region is surfaced as a pending visual_occlusion review exception, so the
+// operator decides: move or reclassify the region, or accept the untouched source text.
+type OcclusionReport struct {
+	RegionID     string         `json:"region_id"`
+	Role         TextRegionRole `json:"role"`
+	SourceText   string         `json:"source_text,omitempty"`
+	OverlayBox   BoundingBox    `json:"overlay_box"`
+	ProtectedBox BoundingBox    `json:"protected_box"`
+	StartMs      int64          `json:"start_ms"`
+	EndMs        int64          `json:"end_ms"`
+}
+
 // LocalizedVisualTrack is the complete localized visual layer artifact (compact subtitles + in-place overlays).
 type LocalizedVisualTrack struct {
 	ID                 string                 `json:"id"`
@@ -279,6 +293,7 @@ type LocalizedVisualTrack struct {
 	SubtitleTrackCAS   string                 `json:"subtitle_track_cas,omitempty"`
 	Overlays           []LocalizedOverlayItem `json:"overlays"`
 	SubtitleCues       []SubtitleCue          `json:"subtitle_cues"`
+	Occlusions         []OcclusionReport      `json:"occlusions,omitempty"`
 	ProtectedRegions   []BoundingBox          `json:"protected_regions,omitempty"`
 	CASHash            string                 `json:"cas_hash,omitempty"`
 	ProvenanceHash     string                 `json:"provenance_hash,omitempty"`

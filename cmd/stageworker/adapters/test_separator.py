@@ -170,6 +170,52 @@ class TestSeparatorAdapter(unittest.TestCase):
         """Proves StageWorker does not carry unused compute_sha256; RuntimeHost is the byte authority."""
         self.assertFalse(hasattr(separator, "compute_sha256"))
         self.assertFalse(hasattr(separator, "verify_artifact_sha256"))
+    def test_uvr_stems_are_requested_at_contract_rate_and_reported_as_measured(self):
+        """Pin the audio contract: UVR must be asked for 16 kHz stems and the artifact must report the
+        rate/channels actually written. audio-separator defaults to 44100, and the audio-role analyzer
+        rejects anything but 16 kHz, so a hardcoded 16000 in the response (or a default-rate
+        Separator) dead-ends every real run at audio_role_plan while the metadata claims otherwise."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            onnx_file = os.path.join(tmp_dir, "UVR-MDX-NET-Inst_HQ_4.onnx")
+            with open(onnx_file, "wb") as f:
+                f.write(b"valid_model")
+            mdx_json = os.path.join(tmp_dir, "mdx_model_data.json")
+            with open(mdx_json, "w", encoding="utf-8") as f:
+                json.dump({separator.UVR_MDX_NET_INST_HQ_4_MD5: {"primary_stem": "Vocals", "compensate": 1.035}}, f)
+            # Stems as the pinned separator version writes them when no rate is requested.
+            drifted_wav = _make_dummy_wav(duration_ms=1000, sample_rate=44100, channels=2)
+            vocals_wav_path = os.path.join(tmp_dir, "track_Vocals.wav")
+            inst_wav_path = os.path.join(tmp_dir, "track_Instrumental.wav")
+            with open(vocals_wav_path, "wb") as vf:
+                vf.write(drifted_wav)
+            with open(inst_wav_path, "wb") as bf:
+                bf.write(drifted_wav)
+
+            mock_sep_inst = mock.MagicMock()
+            mock_sep_inst.separate.return_value = [vocals_wav_path, inst_wav_path]
+            mock_sep_mod = mock.MagicMock()
+            mock_sep_mod.Separator.return_value = mock_sep_inst
+            with mock.patch.dict("sys.modules", {"audio_separator": mock.MagicMock(), "audio_separator.separator": mock_sep_mod}):
+                res = separator.separate_uvr(
+                    "track.wav",
+                    "UVR-MDX-NET-Inst_HQ_4.onnx",
+                    "v3",
+                    model_path=tmp_dir,
+                    entrypoint_file=onnx_file,
+                    require_model_snapshot=True,
+                    metadata_file=mdx_json,
+                )
+
+            self.assertEqual(separator.CONTRACT_SAMPLE_RATE, 16000)
+            _, ctor_kwargs = mock_sep_mod.Separator.call_args
+            self.assertEqual(
+                ctor_kwargs.get("sample_rate"),
+                separator.CONTRACT_SAMPLE_RATE,
+                "the separator must be constructed at the pipeline contract rate, not its 44.1 kHz default",
+            )
+            self.assertEqual(res["sample_rate"], 44100, "the artifact must report the rate actually written")
+            self.assertEqual(res["channels"], 2, "the artifact must report the channel count actually written")
+
     def test_uvr_request_time_no_rehash(self):
         """Proves StageWorker respects #64: RuntimeHost is the byte-verification authority, so StageWorker does not re-hash on request."""
         with tempfile.TemporaryDirectory() as tmp_dir:

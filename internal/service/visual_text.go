@@ -503,18 +503,23 @@ func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, c
 
 // LocalizeVisualTrackInput defines input parameters to generate LocalizedVisualTrack and LocalizedSubtitleTrack.
 type LocalizeVisualTrackInput struct {
-	RunID                 string                           `json:"run_id"`
-	AssetID               string                           `json:"asset_id"`
-	JobID                 string                           `json:"job_id,omitempty"`
-	TargetLanguage        string                           `json:"target_language"`
-	TranslationVariantCAS string                           `json:"translation_variant_cas,omitempty"`
-	Overrides             []domain.RegionOverride          `json:"overrides,omitempty"`
-	InpaintingFallbacks   []string                         `json:"inpainting_fallbacks,omitempty"` // Region IDs where inpainting fallback is explicitly requested
-	SceneProtectedRegions []domain.SceneProtectedRegion    `json:"scene_protected_regions,omitempty"`
-	PlacementSelector     domain.SubtitlePlacementSelector `json:"-"`
-	ExecutionProfile      domain.ExecutionProfile          `json:"execution_profile,omitempty"`
-	AuthorizedCredentials []string                         `json:"authorized_credentials,omitempty"`
-	ConsentGranted        bool                             `json:"consent_granted,omitempty"`
+	RunID                 string                        `json:"run_id"`
+	AssetID               string                        `json:"asset_id"`
+	JobID                 string                        `json:"job_id,omitempty"`
+	TargetLanguage        string                        `json:"target_language"`
+	TranslationVariantCAS string                        `json:"translation_variant_cas,omitempty"`
+	Overrides             []domain.RegionOverride       `json:"overrides,omitempty"`
+	InpaintingFallbacks   []string                      `json:"inpainting_fallbacks,omitempty"` // Region IDs where inpainting fallback is explicitly requested
+	SceneProtectedRegions []domain.SceneProtectedRegion `json:"scene_protected_regions,omitempty"`
+	// FailOnProtectedOverlap is set by operator-initiated edits (region correction, reclassify):
+	// a geometry the operator asked for that collides with a protected tracked region is
+	// rejected so the edit can be corrected, instead of being skipped and surfaced as an
+	// exception the way automatic localization does.
+	FailOnProtectedOverlap bool                             `json:"fail_on_protected_overlap,omitempty"`
+	PlacementSelector      domain.SubtitlePlacementSelector `json:"-"`
+	ExecutionProfile       domain.ExecutionProfile          `json:"execution_profile,omitempty"`
+	AuthorizedCredentials  []string                         `json:"authorized_credentials,omitempty"`
+	ConsentGranted         bool                             `json:"consent_granted,omitempty"`
 }
 
 // ApplyRegionOverrides applies direct-manipulation overrides (drag/resize/reclassify/text) to a TextRegionPlan.
@@ -651,6 +656,36 @@ func ApplyRegionOverrides(plan *domain.TextRegionPlan, overrides []domain.Region
 	return &clone, nil
 }
 
+// sceneProtectedBoxes returns the boxes the pipeline itself declared protected (faces, tap
+// targets, timeline controls) that are active in the region's window. A collision with one of
+// these is not a layout the operator can accept, so it stays fail-closed.
+func sceneProtectedBoxes(in LocalizeVisualTrackInput, reg domain.TrackedTextRegion) []domain.BoundingBox {
+	return domain.GetProtectedBoxesForTimeWindow(nil, in.SceneProtectedRegions, reg.FirstSeenMs, reg.LastSeenMs, reg.ID)
+}
+
+// protectedRegionBoxes returns the boxes of other tracked regions the classifier marked
+// protected (UI controls, brand marks) that are active in the region's window. A collision
+// with one of these skips the overlay and surfaces a visual_occlusion exception instead of
+// dead-ending the run (architecture §9.1), because the operator can move or reclassify either
+// region.
+func protectedRegionBoxes(plan *domain.TextRegionPlan, reg domain.TrackedTextRegion) []domain.BoundingBox {
+	if plan == nil {
+		return nil
+	}
+	return domain.GetProtectedBoxesForTimeWindow(plan.Regions, nil, reg.FirstSeenMs, reg.LastSeenMs, reg.ID)
+}
+
+// firstProtectedOverlap returns the first protected box the overlay box overlaps, in the
+// order the caller supplied.
+func firstProtectedOverlap(box domain.BoundingBox, protected []domain.BoundingBox) (domain.BoundingBox, bool) {
+	for _, prot := range protected {
+		if domain.BoxesOverlap(box, prot) {
+			return prot, true
+		}
+	}
+	return domain.BoundingBox{}, false
+}
+
 // LocalizeVisualTrack builds the LocalizedVisualTrack (and underlying LocalizedSubtitleTrack)
 // with deterministic in-place cover/overlay, standard instructional UI terminology,
 // scale-aware compact fit-content subtitle box, and scene-aware non-occlusion.
@@ -737,6 +772,7 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 
 	// 4. Generate Overlays for semantic_text & instructional_ui_text
 	var overlays []domain.LocalizedOverlayItem
+	var occlusions []domain.OcclusionReport
 	for _, reg := range activePlan.Regions {
 		switch reg.Role {
 		case domain.TextRoleSemanticText:
@@ -756,6 +792,9 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 				ExecutionProfile:      in.ExecutionProfile,
 				AuthorizedCredentials: in.AuthorizedCredentials,
 				ConsentGranted:        in.ConsentGranted,
+				// Inline overlay text: resolved but never published as the run's canonical
+				// translation variant (the speech stages own that index).
+				Ephemeral: true,
 				Segments: []domain.TranslationInputSegment{
 					{Index: 0, SourceText: reg.Text, StartMs: reg.FirstSeenMs, EndMs: reg.LastSeenMs},
 				},
@@ -792,12 +831,30 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			repBox := domain.BoundingBox{X: baseBox.X, Y: baseBox.Y, Width: boxW, Height: boxH}
 
 			// Non-occlusion check: verify overlay does not overlap other protected obstacles during its time window
-			overlayProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, reg.FirstSeenMs, reg.LastSeenMs, reg.ID)
-			for _, prot := range overlayProtects {
-				if domain.BoxesOverlap(repBox, prot) {
+			if prot, occluded := firstProtectedOverlap(repBox, sceneProtectedBoxes(in, reg)); occluded {
+				// A face/tap target the pipeline itself declared protected is not a layout
+				// the operator can accept: fail closed, as before.
+				return nil, fmt.Errorf("%w: overlay for semantic text %q (box %+v) occludes protected region (box %+v)",
+					domain.ErrSubtitleOverlapsProtectedRegion, reg.ID, repBox, prot)
+			}
+			if prot, occluded := firstProtectedOverlap(repBox, protectedRegionBoxes(activePlan, reg)); occluded {
+				if in.FailOnProtectedOverlap {
 					return nil, fmt.Errorf("%w: overlay for semantic text %q (box %+v) occludes protected region (box %+v)",
 						domain.ErrSubtitleOverlapsProtectedRegion, reg.ID, repBox, prot)
 				}
+				// Another protected tracked region (UI control, brand mark): the overlay is
+				// skipped - the source text stays on screen untouched - and the region is
+				// surfaced as a pending visual_occlusion exception (architecture 9.1).
+				occlusions = append(occlusions, domain.OcclusionReport{
+					RegionID:     reg.ID,
+					Role:         reg.Role,
+					SourceText:   reg.Text,
+					OverlayBox:   repBox,
+					ProtectedBox: prot,
+					StartMs:      reg.FirstSeenMs,
+					EndMs:        reg.LastSeenMs,
+				})
+				continue
 			}
 
 			isInpainting := inpaintSet[reg.ID] // Non-default fallback
@@ -835,6 +892,9 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 				ExecutionProfile:      in.ExecutionProfile,
 				AuthorizedCredentials: in.AuthorizedCredentials,
 				ConsentGranted:        in.ConsentGranted,
+				// Inline overlay text: resolved but never published as the run's canonical
+				// translation variant (the speech stages own that index).
+				Ephemeral: true,
 				Segments: []domain.TranslationInputSegment{
 					{Index: 0, SourceText: reg.Text, StartMs: reg.FirstSeenMs, EndMs: reg.LastSeenMs},
 				},
@@ -870,13 +930,27 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			}
 			repBox := domain.BoundingBox{X: baseBox.X, Y: baseBox.Y, Width: boxW, Height: boxH}
 
-			// Non-occlusion check: verify overlay does not overlap other protected obstacles during its time window
-			overlayProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, reg.FirstSeenMs, reg.LastSeenMs, reg.ID)
-			for _, prot := range overlayProtects {
-				if domain.BoxesOverlap(repBox, prot) {
+			// Non-occlusion check: same rule as the semantic-text branch - scene-protected
+			// obstacles still fail closed, protected tracked regions are surfaced.
+			if prot, occluded := firstProtectedOverlap(repBox, sceneProtectedBoxes(in, reg)); occluded {
+				return nil, fmt.Errorf("%w: overlay for instructional UI %q (box %+v) occludes protected region (box %+v)",
+					domain.ErrSubtitleOverlapsProtectedRegion, reg.ID, repBox, prot)
+			}
+			if prot, occluded := firstProtectedOverlap(repBox, protectedRegionBoxes(activePlan, reg)); occluded {
+				if in.FailOnProtectedOverlap {
 					return nil, fmt.Errorf("%w: overlay for instructional UI %q (box %+v) occludes protected region (box %+v)",
 						domain.ErrSubtitleOverlapsProtectedRegion, reg.ID, repBox, prot)
 				}
+				occlusions = append(occlusions, domain.OcclusionReport{
+					RegionID:     reg.ID,
+					Role:         reg.Role,
+					SourceText:   reg.Text,
+					OverlayBox:   repBox,
+					ProtectedBox: prot,
+					StartMs:      reg.FirstSeenMs,
+					EndMs:        reg.LastSeenMs,
+				})
+				continue
 			}
 
 			isInpainting := inpaintSet[reg.ID]
@@ -1168,6 +1242,7 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 		SubtitleTrackCAS:   subTrack.CASHash,
 		Overlays:           overlays,
 		SubtitleCues:       subtitleCues,
+		Occlusions:         occlusions,
 		ProtectedRegions:   allProtectedBoxes,
 		ProvenanceHash:     visProv,
 		CreatedAt:          time.Now().UTC(),

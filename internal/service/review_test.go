@@ -2982,8 +2982,12 @@ func TestReviewService_CorrectRegionGeometry_RendersPreviewFromCorrectedPlan(t *
 	}
 	assertPreviewConsumesPlan(t, db, casStore, assetID, runID, first.PreviewRenderCAS, firstPlan)
 
-	// A second correction must supersede that preview rather than leave the operator
-	// looking at the first one.
+	// A second correction must supersede the first one rather than leave the operator looking at
+	// stale geometry. What it supersedes is the localized visual track the inspector reads - the
+	// render plan itself is built from pinned subtitles and audio, so a second overlay-only edit
+	// freezes an identical recipe and legitimately resolves to the same content-addressed preview.
+	// (Freezing overlay references into the RenderPlan is tracked by architecture §4/RenderPlan;
+	// until then an overlay edit is visible in the track artifact, not in the burned preview.)
 	second, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
 		RunID:          runID,
 		AssetID:        assetID,
@@ -2995,8 +2999,8 @@ func TestReviewService_CorrectRegionGeometry_RendersPreviewFromCorrectedPlan(t *
 	if err != nil {
 		t.Fatalf("second region correction must succeed: %v", err)
 	}
-	if second.PreviewRenderCAS == first.PreviewRenderCAS {
-		t.Fatalf("the second correction reused the first preview artifact: %s", second.PreviewRenderCAS)
+	if second.LocalizedVisualTrackCAS == first.LocalizedVisualTrackCAS {
+		t.Fatalf("the second correction reused the first localized visual track: %s", second.LocalizedVisualTrackCAS)
 	}
 	secondPlan, err := db.GetRenderPlanIndexByRun(ctx, runID)
 	if err != nil || secondPlan == nil {

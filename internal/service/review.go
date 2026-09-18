@@ -905,6 +905,9 @@ func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeom
 		TargetLanguage:        in.TargetLanguage,
 		InpaintingFallbacks:   in.InpaintingFallbacks,
 		SceneProtectedRegions: in.SceneProtectedRegions,
+		// The operator asked for this geometry: a collision with a protected region is a
+		// rejected edit (and the plan is withdrawn below), not a review exception.
+		FailOnProtectedOverlap: true,
 	}
 	visTrack, err := s.visualTextSvc.LocalizeVisualTrack(ctx, visIn)
 	if err != nil {
@@ -1411,7 +1414,58 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 		}
 	}
 
-	// 3. Check TranslationVariant for meaning QA failures
+	// 3. Check the LocalizedVisualTrack for overlays skipped because they could not clear
+	// a protected UI box. The overlay is absent from the track, so the region would ship
+	// with its source text untouched unless the operator moves, reclassifies, or accepts it.
+	var visIdx *storage.LocalizedVisualTrackIndex
+	if runID != "" {
+		visIdx, err = s.db.GetLocalizedVisualTrackIndexByRun(ctx, runID)
+	} else {
+		visIdx, err = s.db.GetLocalizedVisualTrackIndex(ctx, assetID, targetLang)
+	}
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return nil, fmt.Errorf("query localized visual track index: %w", err)
+	}
+	if visIdx != nil && visIdx.CASHash != "" {
+		rc, err := s.cas.Get(visIdx.CASHash)
+		if err != nil {
+			return nil, fmt.Errorf("load localized visual track from CAS (%s): %w", visIdx.CASHash, err)
+		}
+		var vis domain.LocalizedVisualTrack
+		decodeErr := json.NewDecoder(rc).Decode(&vis)
+		rc.Close()
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode localized visual track (%s): %w", visIdx.CASHash, decodeErr)
+		}
+		createdAt := vis.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = visIdx.CreatedAt
+		}
+		for _, occ := range vis.Occlusions {
+			items = append(items, domain.ReviewItem{
+				ID:             fmt.Sprintf("rev-visual-occlusion-%s-%s", visIdx.CASHash, occ.RegionID),
+				AssetID:        assetID,
+				TargetLanguage: targetLang,
+				Type:           domain.ReviewItemTypeVisualOcclusion,
+				Stage:          "visual_text_localize",
+				RegionID:       occ.RegionID,
+				StartMs:        occ.StartMs,
+				EndMs:          occ.EndMs,
+				Severity:       "warning",
+				Reason:         "overlay_occludes_protected_region",
+				Details: map[string]any{
+					"role":          string(occ.Role),
+					"source_text":   occ.SourceText,
+					"overlay_box":   occ.OverlayBox,
+					"protected_box": occ.ProtectedBox,
+				},
+				Status:    domain.ReviewItemStatusPending,
+				CreatedAt: createdAt,
+			})
+		}
+	}
+
+	// 4. Check TranslationVariant for meaning QA failures
 	var transIdx *storage.TranslationVariantIndex
 	if runID != "" {
 		transIdx, err = s.db.GetTranslationVariantIndexByRun(ctx, runID)
@@ -1473,7 +1527,7 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 		}
 	}
 
-	// 4. Check DubSegmentsVariant for TTS overruns / unselected review items
+	// 5. Check DubSegmentsVariant for TTS overruns / unselected review items
 	var hasDubSegments bool
 	var dubSegIdx *storage.DubSegmentsVariantIndex
 	if runID != "" {
@@ -1569,7 +1623,7 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 		}
 	}
 
-	// 5. Check DubScriptVariant for spoken adaptation QA failures or unresolved timing flags
+	// 6. Check DubScriptVariant for spoken adaptation QA failures or unresolved timing flags
 	var dubScriptIdx *storage.DubScriptVariantIndex
 	if runID != "" {
 		dubScriptIdx, err = s.db.GetDubScriptVariantIndexByRun(ctx, runID)
@@ -1632,7 +1686,7 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 		}
 	}
 
-	// 6. Check QualityResults for multimodal QC records (both auto_pass records and flagged issues)
+	// 7. Check QualityResults for multimodal QC records (both auto_pass records and flagged issues)
 	var qualityResults []domain.QualityResult
 	if runID != "" {
 		qualityResults, err = s.db.GetQualityResultsByRun(ctx, runID)

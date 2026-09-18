@@ -161,7 +161,7 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 							}
 							cachedVariant.ProvenanceHash = cachedIdx.ProvenanceHash
 
-							if s.db != nil {
+							if s.db != nil && !in.Ephemeral {
 								_ = s.db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
 									ID:             cachedVariant.ID,
 									AssetID:        in.AssetID,
@@ -257,7 +257,7 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 		variant.CASHash = obj.SHA256
 	}
 
-	if s.db != nil {
+	if s.db != nil && !in.Ephemeral {
 		idx := storage.TranslationVariantIndex{
 			ID:             variant.ID,
 			AssetID:        variant.AssetID,
@@ -276,7 +276,8 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 			return nil, fmt.Errorf("save translation variant index in DB: %w", err)
 		}
 
-		// Update stage execution if present
+		// Record the stage only for canonical translations: an ephemeral inline translation did
+		// not run the translation stage, so it must not append a success row for it.
 		now := time.Now().UTC()
 		stageExec := domain.StageExecution{
 			ID:             uuid.NewString(),
@@ -289,7 +290,9 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 			CreatedAt:      variant.CreatedAt,
 			UpdatedAt:      now,
 		}
-		_ = s.db.CreateStageExecution(ctx, stageExec)
+		if !in.Ephemeral {
+			_ = s.db.CreateStageExecution(ctx, stageExec)
+		}
 	}
 
 	return variant, nil

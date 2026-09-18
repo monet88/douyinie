@@ -1639,3 +1639,251 @@ func TestVisualTextService_LocalizeVisualTrack_ForwardsRoutingContextToTranslati
 		}
 	}
 }
+
+// TestVisualTextService_LocalizeVisualTrack_ProtectedOverlapSurfacesAsException pins the
+// operator-review contract for a collision with another protected tracked region
+// (architecture §9.1): the overlay is skipped (the source text stays on screen untouched),
+// the collision is reported in the artifact, and the region is projected as a pending
+// visual_occlusion exception instead of aborting the stage and dead-ending the run.
+// A collision with a scene-protected region (face / tap target) still fails closed, which
+// TestVisualTextService_LocalizeVisualTrack_And_Overrides covers.
+func TestVisualTextService_LocalizeVisualTrack_ProtectedOverlapSurfacesAsException(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	setupTestTranslationService(db, casStore, svc)
+
+	ctx := context.Background()
+
+	detected, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:   "run-occlusion",
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+	if len(detected.Regions) < 2 {
+		t.Fatalf("expected at least 2 detected regions, got %d", len(detected.Regions))
+	}
+
+	// Publish a plan where a protected control (the brand mark region) sits exactly on the
+	// box of the largest overlay-producing region: that neighbour's overlay can never clear
+	// it, which is the live failure this test pins (two tracked UI controls sharing screen
+	// space).
+	plan := *detected
+	regions := make([]domain.TrackedTextRegion, len(detected.Regions))
+	copy(regions, detected.Regions)
+	guardIdx, victim, victimArea := -1, -1, 0
+	for i, reg := range regions {
+		if len(reg.Keyframes) == 0 {
+			continue
+		}
+		if reg.ProtectedMetadata.IsProtected {
+			if guardIdx < 0 {
+				guardIdx = i
+			}
+			continue
+		}
+		if reg.Role != domain.TextRoleSemanticText && reg.Role != domain.TextRoleInstructionalUIText {
+			continue
+		}
+		if area := reg.Keyframes[0].Box.Width * reg.Keyframes[0].Box.Height; area > victimArea {
+			victim, victimArea = i, area
+		}
+	}
+	if guardIdx < 0 || victim < 0 {
+		t.Fatalf("fixture needs one protected region and one overlay-producing region: guard=%d victim=%d", guardIdx, victim)
+	}
+	victimReg := regions[victim]
+	guard := regions[guardIdx]
+	guard.FirstSeenMs = victimReg.FirstSeenMs
+	guard.LastSeenMs = victimReg.LastSeenMs
+	guard.Keyframes = []domain.RegionKeyframe{{TimestampMs: victimReg.FirstSeenMs, Box: victimReg.Keyframes[0].Box}}
+	regions[guardIdx] = guard
+	plan.Regions = regions
+	plan.ProvenanceHash = "prov-occlusion-guard"
+	plan.ID = "plan-occlusion-guard"
+	plan.CreatedAt = time.Now().UTC()
+
+	planBytes, _ := json.Marshal(plan)
+	planObj, err := casStore.Put(bytes.NewReader(planBytes))
+	if err != nil {
+		t.Fatalf("put plan in CAS: %v", err)
+	}
+	if err := db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             plan.ID,
+		AssetID:        assetID,
+		CASHash:        planObj.SHA256,
+		ProvenanceHash: plan.ProvenanceHash,
+		CreatedAt:      plan.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save plan index: %v", err)
+	}
+
+	vis, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-occlusion",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err != nil {
+		t.Fatalf("protected-region collision must surface for review, not fail the stage: %v", err)
+	}
+	if len(vis.Occlusions) == 0 {
+		t.Fatal("expected occlusion reports for regions colliding with the protected control, got none")
+	}
+	if vis.Occlusions[0].RegionID != victimReg.ID {
+		t.Fatalf("expected %s (the region whose overlay cannot clear the protected control) to be reported, got %+v", victimReg.ID, vis.Occlusions)
+	}
+	occluded := make(map[string]domain.OcclusionReport, len(vis.Occlusions))
+	for _, occ := range vis.Occlusions {
+		if occ.RegionID == "" {
+			t.Error("occlusion report without a region id")
+		}
+		if occ.RegionID == guard.ID {
+			t.Errorf("the protected control itself must not be reported as occluded")
+		}
+		occluded[occ.RegionID] = occ
+	}
+	for _, ov := range vis.Overlays {
+		if _, skip := occluded[ov.RegionID]; skip {
+			t.Errorf("occluded region %s must not carry an overlay", ov.RegionID)
+		}
+	}
+
+	// The persisted artifact carries the report (the overlay is absent from it).
+	rc, err := casStore.Get(vis.CASHash)
+	if err != nil {
+		t.Fatalf("read persisted visual track: %v", err)
+	}
+	var persisted domain.LocalizedVisualTrack
+	decodeErr := json.NewDecoder(rc).Decode(&persisted)
+	rc.Close()
+	if decodeErr != nil {
+		t.Fatalf("decode persisted visual track: %v", decodeErr)
+	}
+	if len(persisted.Occlusions) != len(vis.Occlusions) {
+		t.Fatalf("persisted track lost its occlusion reports: %d != %d", len(persisted.Occlusions), len(vis.Occlusions))
+	}
+
+	// ...and the operator sees one pending exception per skipped overlay.
+	reviewSvc := service.NewReviewService(db, casStore)
+	items, err := reviewSvc.ProjectReviewItemsForRun(ctx, assetID, "vi", "run-occlusion")
+	if err != nil {
+		t.Fatalf("project review items: %v", err)
+	}
+	projected := make(map[string]bool)
+	for _, item := range items {
+		if item.Type != domain.ReviewItemTypeVisualOcclusion {
+			continue
+		}
+		projected[item.RegionID] = true
+		if item.Status != domain.ReviewItemStatusPending {
+			t.Errorf("expected a pending occlusion item, got %s", item.Status)
+		}
+		if item.Stage != "visual_text_localize" {
+			t.Errorf("expected stage visual_text_localize, got %s", item.Stage)
+		}
+	}
+	for regionID := range occluded {
+		if !projected[regionID] {
+			t.Fatalf("expected a visual_occlusion exception for %s, got %+v", regionID, items)
+		}
+	}
+}
+
+// TestVisualTextService_LocalizeVisualTrack_OverlayTranslationsStayEphemeral pins the ownership
+// boundary between the visual lane and the run's canonical translation: translating overlay text
+// is an inline lookup, so it must not republish the run-scoped TranslationVariant index nor
+// append a `translation` stage row. Publishing it makes every artifact that pins the canonical
+// CAS (DubScriptVariant.TranslationVariantCAS) fail closed on the next visual_text_localize.
+func TestVisualTextService_LocalizeVisualTrack_OverlayTranslationsStayEphemeral(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	setupTestTranslationService(db, casStore, svc)
+
+	ctx := context.Background()
+
+	detected, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:   "run-ephemeral",
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+	if len(detected.Regions) == 0 {
+		t.Fatal("expected detected regions")
+	}
+
+	// The speech stages already published the canonical translation for this run.
+	canonical := domain.TranslationVariant{
+		ID:             "trans-canonical",
+		AssetID:        assetID,
+		RunID:          "run-ephemeral",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "第一步:准备好所有新鲜食材。", TargetText: "Buoc 1: Chuan bi nguyen lieu.", StartMs: 0, EndMs: 3000},
+		},
+		CreatedAt: time.Now().UTC().Add(-time.Hour),
+	}
+	canonicalBytes, _ := json.Marshal(canonical)
+	canonicalObj, err := casStore.Put(bytes.NewReader(canonicalBytes))
+	if err != nil {
+		t.Fatalf("put canonical translation in CAS: %v", err)
+	}
+	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             canonical.ID,
+		AssetID:        assetID,
+		RunID:          canonical.RunID,
+		TargetLanguage: "vi",
+		CASHash:        canonicalObj.SHA256,
+		ProvenanceHash: "prov-canonical",
+		CreatedAt:      canonical.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save canonical translation index: %v", err)
+	}
+
+	before, err := db.GetTranslationVariantIndexByRun(ctx, "run-ephemeral")
+	if err != nil || before == nil {
+		t.Fatalf("read canonical translation index before localize: %v", err)
+	}
+	beforeStages, err := db.ListStageExecutions(ctx, "run-ephemeral")
+	if err != nil {
+		t.Fatalf("list stage executions before localize: %v", err)
+	}
+	translationStagesBefore := 0
+	for _, se := range beforeStages {
+		if se.Stage == "translation" {
+			translationStagesBefore++
+		}
+	}
+
+	// Localize runs the overlay translation path (the fixture's semantic-text region).
+	if _, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-ephemeral",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	}); err != nil {
+		t.Fatalf("localize visual track failed: %v", err)
+	}
+
+	after, err := db.GetTranslationVariantIndexByRun(ctx, "run-ephemeral")
+	if err != nil || after == nil {
+		t.Fatalf("read canonical translation index after localize: %v", err)
+	}
+	if after.CASHash != before.CASHash {
+		t.Fatalf("overlay translation republished the run's canonical translation:\n before=%s\n after=%s", before.CASHash, after.CASHash)
+	}
+	afterStages, err := db.ListStageExecutions(ctx, "run-ephemeral")
+	if err != nil {
+		t.Fatalf("list stage executions after localize: %v", err)
+	}
+	translationStagesAfter := 0
+	for _, se := range afterStages {
+		if se.Stage == "translation" {
+			translationStagesAfter++
+		}
+	}
+	if translationStagesAfter != translationStagesBefore {
+		t.Fatalf("overlay translation appended %d translation stage row(s); the visual lane did not run the translation stage",
+			translationStagesAfter-translationStagesBefore)
+	}
+}
