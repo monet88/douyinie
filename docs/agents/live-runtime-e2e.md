@@ -151,6 +151,31 @@ hash. Probe media with `ffprobe` before believing any metadata column.
 Terminal states: `completed` (final render done), `review_required` on the **job** + `interrupted` on the
 **run** when the final-render handoff is blocked by pending review exceptions (by design).
 
+### What the finished video must show
+
+`completed` means the file was written, not that it is right. These three checks are cheap and each one
+names a defect that shipped in run `4f86657f` and is now pinned by tests, so a recurrence is a regression:
+
+1. **No source caption left visible.** Covers are the tracked `speech_subtitle` boxes, so a black bar must
+   sit exactly on the caption band for the window the source caption was up. `GET
+   /api/v1/assets/<asset>/localized-visual-track` → `covers[]` must tile the timeline with no gap, and
+   `ffmpeg -ss <t> -i <output> -frames:v 1` at each cover edge must show no source glyphs.
+2. **One or two lines per Vietnamese cue, never a block.** `GET /api/v1/assets/<asset>/render/final` →
+   `consumed_plan.subtitle_plan.cue_count`: a segment longer than two readable lines must appear as several
+   cues (the splitter breaks at word boundaries, preferring sentence ends), and each cue's box stays in the
+   caption band rather than growing to the frame width.
+3. **No garbled label drawn on the video.** Overlays come from `semantic_text` / `instructional_ui_text`
+   regions that cleared the classifier's evidence gates. When junk text is drawn anyway, read
+   `GET /api/v1/assets/<asset>/text-region-plan` and the region's `review_reason` before blaming the OCR:
+   `spatially_unstable_label_noise` (readings of one label wandering across the frame),
+   `spatio_temporal_ocr_instability_noise` (readings of one box disagreeing with each other) and
+   `unreadable_caption_low_confidence` (a caption held for review instead of dropped) are the three
+   deliberate outcomes.
+
+A plan is cached by provenance, so a classifier change alone will not re-run detection: clear the derived
+rows (`text_region_plans`, `localized_visual_tracks`, `localized_subtitle_tracks`, `render_plans`,
+`render_artifacts`) in the scratch data dir or bump `TextRegionClassifierVersion`.
+
 ## 6. Blocks and flags you will meet on real media
 
 The meaning-first QA gate **reports, it does not block**: a violation still marks the provider attempt
