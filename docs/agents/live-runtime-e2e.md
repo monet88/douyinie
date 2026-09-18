@@ -94,6 +94,26 @@ are the only stable handle (the DOM ids change with the view).
 Trap: **switching views clears the file input.** If you navigate to another tab between attach and submit,
 the submit is a silent no-op (no toast, no job). Re-attach immediately before clicking.
 
+### Working the exception queue (03 Review Workspace)
+
+1. Each pending exception is one button in the Inspector's `Exceptions` tab; clicking it loads the detail
+   card (stage, region/segment, and the fix-type tabs `Accept` / `Sửa text` / `Đổi voice` / `Chỉnh region`).
+2. `Accept` shows the audit form: fill `Lý do chấp nhận` (`#accept-reason`) and submit
+   `Chấp nhận có audit`. The item leaves the queue and the decision is appended to the audit trail with the
+   operator name from `Tên operator`.
+
+Traps:
+
+- **The a11y click does not submit this form.** `orca click --element <ref>` on `Chấp nhận có audit`
+  reports success but no request is sent (the pending count does not move). Dispatch the DOM click instead:
+  `orca eval --expression "(()=>{[...document.querySelectorAll('button')].find(b=>b.textContent.includes('Chấp nhận có audit')).click();return 'ok'})()"`.
+  Buttons that call a handler directly (list items, nav, `Làm mới dữ liệu`) work fine with `orca click`.
+- **The view does not auto-refresh after an override.** Pending counts stay stale until `Làm mới dữ liệu`
+  (or a reload); confirm the real state with
+  `GET /api/v1/runs/<run>/review-items?include_resolved=true`.
+- A run that is `interrupted` shows `Pause`/`Resume`/`Cancel` disabled — the UI offers no resume for a
+  terminal run; recovery is `POST /api/v1/runs/<id>/resume` (see §6).
+
 ## 5. Read the run back
 
 ```bash
@@ -132,6 +152,7 @@ final-render handoff, which waits for the operator.
 | `translation QA gate flagged segment N: name/brand 'XX' missing from target` in `provider_attempts` | entity gate vs OCR'd short tokens; same rule — the candidate is kept and flagged |
 | `dub script QA gate flagged segment N` (pending `meaning_corrupted` item) | the spoken text drifted from the meaning text and the unshortened fallback did not clear it; correct the segment or accept it |
 | `conditional diarization failed … DIARIZER_EXEC_FAILED` | wrong interpreter for the diarizer family (§2) |
+| `subtitle or overlay overlaps protected region: overlay for instructional UI "region-NNN" (box {…}) occludes protected region (box {…})` | the tracked UI element sits next to another protected UI element (`GetProtectedBoxesForTimeWindow`) and the localized overlay cannot clear it, so `visual_text_localize` aborts the run. Recover in `03 Review Workspace` → `Chỉnh region` (drag/resize the region so the overlay clears the protected box, or reclassify the region to a non-overlay role such as `brand_keep` / `ignore/noise`), then resume the run |
 | `final render handoff blocked: N pending review exceptions` | correct gate: resolve the queue in `03 Review Workspace`, then re-check the handoff in `04 Kết quả` |
 
 Workaround to keep a run moving while `audio_role_plan` is blocked: seed an operator plan, then resume.
