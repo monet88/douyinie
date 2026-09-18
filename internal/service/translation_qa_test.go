@@ -46,6 +46,48 @@ func TestMeaningFirstQAGate_ValidPairs(t *testing.T) {
 			srcLang: "zh",
 			tgtLang: "en",
 		},
+		{
+			name:    "Lexical compound 不 (不透明度) does not require target negation",
+			source:  "点击不透明度，拉到一百",
+			target:  "nhấn vào Độ mờ, kéo lên 100",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "Lexical compound 不 (不锈钢) does not require target negation",
+			source:  "这个是不锈钢材质",
+			target:  "cái này là chất liệu inox",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "Lexical compound 不 (不一定) translated without target negation",
+			source:  "明天不一定下雨",
+			target:  "Ngày mai có lẽ mưa",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "Lexical compound 不 (不可避免) translated as affirmative word",
+			source:  "这是不可避免的",
+			target:  "Điều này là tất yếu",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "Short OCR non-word token TM dropped without penalty",
+			source:  "最新款式 TM",
+			target:  "Kiểu dáng mới nhất",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "Long alphanumeric code dropped without penalty",
+			source:  "型号SO50L207",
+			target:  "Model 50 207",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
 	}
 
 	for _, tt := range tests {
@@ -171,6 +213,17 @@ func TestMeaningFirstQAGate_NegationInversion(t *testing.T) {
 		t.Errorf("expected ErrNegationInverted, got: %v", res1.Err)
 	}
 
+	// Genuine sentence-level prohibition inverted
+	srcProhibit := "务必别打开窗户"
+	tgtProhibit := "Hãy mở cửa sổ" // "Don't open" -> "Please open"
+	resProhibit := qa.ValidateSegment(srcProhibit, tgtProhibit, "zh", "vi")
+	if resProhibit.Passed {
+		t.Fatalf("expected QA gate to reject dropped prohibition, but it passed")
+	}
+	if !errors.Is(resProhibit.Err, domain.ErrNegationInverted) {
+		t.Errorf("expected ErrNegationInverted, got: %v", resProhibit.Err)
+	}
+
 	// 2. Source affirmative -> Target negative (inverted)
 	src2 := "我们去公园散步吧。"
 	tgt2 := "We should not go to the park." // Affirmative -> Negative
@@ -286,37 +339,37 @@ func TestMeaningFirstQAGate_AllCapsLexicalWordsNotProtected(t *testing.T) {
 	qa := service.NewMeaningFirstQAGate()
 
 	// "TOTAL DAMAGE CAE" translated naturally to Vietnamese where TOTAL and DAMAGE
-	// are translated as "Tổng thiệt hại" but short acronym CAE is preserved.
-	source := "TOTAL DAMAGE CAE"
-	naturalTarget := "Tổng thiệt hại CAE"
+	// are translated as "Tổng thiệt hại" but the brand SUPOR is preserved.
+	source := "TOTAL DAMAGE SUPOR"
+	naturalTarget := "Tổng thiệt hại SUPOR"
 
 	res := qa.ValidateSegment(source, naturalTarget, "en", "vi")
 	if !res.Passed {
-		t.Fatalf("expected natural translation of 'TOTAL DAMAGE CAE' to pass, but got violations: %v, err: %v", res.Violations, res.Err)
+		t.Fatalf("expected natural translation of 'TOTAL DAMAGE SUPOR' to pass, but got violations: %v, err: %v", res.Violations, res.Err)
 	}
 
-	// If the short acronym CAE is dropped/corrupted, it MUST still fail
+	// If the brand SUPOR is dropped/corrupted, it MUST still fail
 	corruptedTarget := "Tổng thiệt hại hoàn toàn"
 	resCorrupted := qa.ValidateSegment(source, corruptedTarget, "en", "vi")
 	if resCorrupted.Passed {
-		t.Fatalf("expected dropped acronym CAE to fail QA gate, but it passed")
+		t.Fatalf("expected dropped token SUPOR to fail QA gate, but it passed")
 	}
 	if !errors.Is(resCorrupted.Err, domain.ErrNameCorrupted) {
-		t.Errorf("expected ErrNameCorrupted for dropped CAE, got: %v", resCorrupted.Err)
+		t.Errorf("expected ErrNameCorrupted for dropped SUPOR, got: %v", resCorrupted.Err)
 	}
 }
 
 func TestMeaningFirstQAGate_ProtectedASCIIFormsRetained(t *testing.T) {
 	qa := service.NewMeaningFirstQAGate()
 
-	// 1. Short acronym (HD) preserved
-	resHD := qa.ValidateSegment("Video quay ở chế độ HD sắc nét.", "Video shot in HD is sharp.", "vi", "en")
-	if !resHD.Passed {
-		t.Fatalf("expected HD preserved to pass, got: %v", resHD.Err)
+	// 1. Digit-bearing token (MP4) preserved
+	resMP4 := qa.ValidateSegment("Video xuất ra định dạng MP4.", "Video exported in MP4 format.", "vi", "en")
+	if !resMP4.Passed {
+		t.Fatalf("expected MP4 preserved to pass, got: %v", resMP4.Err)
 	}
-	resHDDrop := qa.ValidateSegment("Video quay ở chế độ HD sắc nét.", "Video shot in high definition is sharp.", "vi", "en")
-	if resHDDrop.Passed {
-		t.Fatalf("expected dropped HD to fail, but passed")
+	resMP4Drop := qa.ValidateSegment("Video xuất ra định dạng MP4.", "Video exported in video format.", "vi", "en")
+	if resMP4Drop.Passed {
+		t.Fatalf("expected dropped MP4 to fail, but passed")
 	}
 
 	// 2. Digit-bearing token (4K) preserved

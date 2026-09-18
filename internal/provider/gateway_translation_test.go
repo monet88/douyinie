@@ -336,10 +336,13 @@ func TestGatewayTranslationProvider_PromptPreservesChineseClauseFinalBuAsQuestio
 		t.Fatalf("TranslateText failed: %v", err)
 	}
 
-	if !strings.Contains(capturedSystem, "clause-final 不") {
+	if !strings.Contains(capturedSystem, "clause-final interrogative") {
 		t.Fatalf("system prompt must identify clause-final 不 as a possible interrogative particle; got %q", capturedSystem)
 	}
-	if !strings.Contains(capturedSystem, "preserve it as a yes/no or tag question") {
+	if !strings.Contains(capturedSystem, "preserve the interrogative particle as a yes/no or tag question") {
 		t.Fatalf("system prompt must preserve interrogative 不 as a question instead of emitting a standalone negation; got %q", capturedSystem)
+	}
+	if !strings.Contains(capturedSystem, "lexical compound (e.g., 不透明度 opacity") {
+		t.Fatalf("system prompt must identify 不 inside lexical compounds as non-negating; got %q", capturedSystem)
 	}
 }

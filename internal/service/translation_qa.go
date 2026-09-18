@@ -190,6 +190,7 @@ var zhNegationExceptions = []string{
 	"无聊", "无论", "无论如何", "无奈", "无数", "无所谓", "无辜", "无端", "无暇", "无微不至", "无独有偶",
 	// Non-negating words containing 不
 	"不小心", "不过", "不管", "不仅", "不得了", "不由得", "不料", "不经意", "不良", "不断", "不愧", "不知不觉", "不在话下", "差不多", "并不",
+	"不透明度", "不锈钢", "不可避免", "不一定", "不禁", "不同", "不安", "不足", "不幸", "不好意思", "不客气", "不如", "不可思议", "不朽",
 	// Existing exceptions
 	"非常", "不仅", "不管", "特别", "非凡", "非洲", "无可挑剔", "是非",
 	// Non-negating words containing 没
@@ -1259,8 +1260,13 @@ func isProtectedASCIIToken(tok string) bool {
 	// Digit-bearing token with letters (e.g. 4K, MP4, H264).
 	// Exclude pure quantity+unit compounds like 3MINUTE, 20KG, 500ML which are
 	// measurements/durations rather than proprietary names/brands.
+	// Also exclude long alphanumeric codes (length > 5) like SO50L207 as they are
+	// typically model numbers or OCR noise, not mandatory entities.
 	if hasDigit && (hasUpper || hasLower) {
 		if isQuantityToken(tok) {
+			return false
+		}
+		if len(tok) > 6 {
 			return false
 		}
 		return true
@@ -1289,17 +1295,12 @@ func isProtectedASCIIToken(tok string) bool {
 	}
 
 	// All-caps tokens:
-	// Short acronyms (2-3 chars, e.g. HD, CAE, AI, 4K, 5G) are protected.
-	// Common lexical English words (e.g. SOY, TEA, ICE, RED, BIG, ONE) and ordinary
-	// all-caps words (>= 4 chars like TOTAL, DAMAGE) are not protected
-	// solely because of uppercase formatting unless listed in knownEntities (e.g. SUPOR).
+	// We no longer automatically protect short acronyms (<= 3 chars, e.g. TM, SUP) because they are
+	// frequently OCR noise from watermarks or packaging. Genuine short brands must be listed in knownEntities.
+	// Common lexical English words (e.g. SOY, TEA) and ordinary all-caps words (>= 4 chars like TOTAL, DAMAGE)
+	// are also not protected solely because of uppercase formatting.
 	if hasUpper && !hasLower && !hasDigit {
-		if len(tok) <= 3 {
-			if isCommonEnglishLexicalWord(tok) {
-				return false
-			}
-			return true
-		}
+		return false
 	}
 
 	return false
