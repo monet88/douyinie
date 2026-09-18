@@ -42,6 +42,17 @@ func TestSeam2_AudioRolePlan_EndToEndRealMedia(t *testing.T) {
 	if yamnetPath == "" {
 		yamnetPath = `D:\douyinie-ref\phase1.1-runtime\staging\yamnet_v1\yamnet.tflite`
 	}
+	// The audio_role stage fails closed (AUDIO_ROLE_MODEL_ASSET_MISSING) when the model is
+	// inaccessible, and the adapter's resolve_model_path accepts either the snapshot root
+	// directory (expecting yamnet.tflite inside it) or a direct .tflite file. The external model
+	// is not part of the repo, so its absence must skip here rather than fail downstream.
+	if fi, err := os.Stat(yamnetPath); err != nil {
+		t.Skipf("skipping real audio_role test: yamnet model not found: %s", yamnetPath)
+	} else if fi.IsDir() {
+		if _, err := os.Stat(filepath.Join(yamnetPath, "yamnet.tflite")); err != nil {
+			t.Skipf("skipping real audio_role test: yamnet.tflite not found in snapshot root: %s", yamnetPath)
+		}
+	}
 
 	// Default models for tests when snapshot path is not available or ignored
 	t.Setenv("AUDIO_SEPARATOR_MODEL_DIR", os.Getenv("AUDIO_SEPARATOR_MODEL_DIR"))
@@ -154,6 +165,17 @@ func TestSeam2_AudioRolePlan_EndToEndRealMedia(t *testing.T) {
 	if vocalsInfo.SampleRate != 16000 || vocalsInfo.NumChannels != 1 {
 		t.Errorf("measured vocals WAV: %d Hz / %d ch, expected 16000 Hz / 1 ch", vocalsInfo.SampleRate, vocalsInfo.NumChannels)
 	}
+
+	// The audio-role analyzer reads the background stem under the same contract as the vocals
+	// stem, so a stereo/44.1 kHz background must fail the end-to-end test instead of passing it.
+	bgInfo, err := media.ParseWAVHeader(bgBytes)
+	if err != nil {
+		t.Fatalf("ParseWAVHeader background WAV: %v", err)
+	}
+	if bgInfo.SampleRate != 16000 || bgInfo.NumChannels != 1 || bgInfo.BitsPerSample != 16 {
+		t.Errorf("measured background WAV: %d Hz / %d ch / %d-bit, expected 16000 Hz / 1 ch / 16-bit", bgInfo.SampleRate, bgInfo.NumChannels, bgInfo.BitsPerSample)
+	}
+
 	if declaredRate != 16000 || declaredChannels != 1 {
 		t.Errorf("separator declared %d Hz / %d ch, expected 16000 Hz / 1 ch", declaredRate, declaredChannels)
 	}

@@ -460,9 +460,8 @@ func (s *RenderService) resolveVisualTrackLayers(ctx context.Context, runID, ass
 		if ov.Box.Width <= 0 || ov.Box.Height <= 0 {
 			continue
 		}
-		// A box anchored at the frame origin cannot be positioned deterministically: the ASS
-		// renderer only emits an explicit position for a non-zero anchor.
-		if ov.Box.X <= 0 && ov.Box.Y <= 0 {
+		// Negative geometry cannot be positioned deterministically; (0,0) is an accepted origin.
+		if ov.Box.X < 0 || ov.Box.Y < 0 {
 			continue
 		}
 		covers = append(covers, domain.CoverBox{
@@ -792,6 +791,11 @@ func (s *RenderService) composeVideo(
 	// 3. Resolve ASS content / cues from SubtitlePlanArtifact
 	assContent := ""
 	cues := plan.SubtitleCues
+	fontFile := s.fontFile
+	if fontOverride != "" {
+		fontFile = fontOverride
+	}
+
 	if plan.SubtitlePlan.CASHash != "" {
 		r, err := s.casStore.Get(plan.SubtitlePlan.CASHash)
 		if err != nil {
@@ -824,10 +828,10 @@ func (s *RenderService) composeVideo(
 		cues = subArt.Cues
 		assContent = subArt.ASSContent
 		if assContent == "" && len(cues) > 0 {
-			assContent = media.GenerateASSContent(plan.Timeline, cues, fontOverride)
+			assContent = media.GenerateASSContent(plan.Timeline, cues, fontFile)
 		}
 	} else if len(cues) > 0 {
-		assContent = media.GenerateASSContent(plan.Timeline, cues, fontOverride)
+		assContent = media.GenerateASSContent(plan.Timeline, cues, fontFile)
 	}
 
 	// In-place overlay cues (localized semantic/UI text) are burned with the speech subtitles:
@@ -835,7 +839,7 @@ func (s *RenderService) composeVideo(
 	// hide the source text each overlay replaces.
 	if len(plan.OverlayCues) > 0 {
 		cues = append(cues, plan.OverlayCues...)
-		assContent = media.GenerateASSContent(plan.Timeline, cues, fontOverride)
+		assContent = media.GenerateASSContent(plan.Timeline, cues, fontFile)
 	}
 
 	// 4. Create temporary output MP4 file path
@@ -845,12 +849,6 @@ func (s *RenderService) composeVideo(
 	}
 	_ = tmpFile.Close()
 	_ = os.Remove(tmpFile.Name()) // Let ffmpeg create it
-
-	fontFile := s.fontFile
-	if fontOverride != "" {
-		fontFile = fontOverride
-	}
-
 	req := media.CompositionRequest{
 		FFmpegPath:  s.ffmpegPath,
 		SourceVideo: videoPath,

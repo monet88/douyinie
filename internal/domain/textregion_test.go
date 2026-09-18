@@ -83,6 +83,34 @@ func TestClassifyRegion(t *testing.T) {
 			wantRole:      domain.TextRoleSemanticText,
 			wantProtected: false,
 		},
+		{
+			// A multi-word ASCII caption in the band is speech the pipeline replaces, even though
+			// its words are shorter than the single-token letter-run floor.
+			name:          "multi-word ASCII caption in the bottom band stays a speech subtitle",
+			text:          "Go now",
+			box:           domain.BoundingBox{X: 300, Y: 1700, Width: 200, Height: 60},
+			confidence:    0.90,
+			wantRole:      domain.TextRoleSpeechSubtitle,
+			wantProtected: false,
+		},
+		{
+			// The single-token debris that motivated the letter-run floor (live run 4f86657f) is
+			// still rejected: in-band geometry alone does not promote it.
+			name:          "in-band single-token letter debris stays noise",
+			text:          "K2",
+			box:           domain.BoundingBox{X: 300, Y: 1700, Width: 200, Height: 60},
+			confidence:    0.90,
+			wantRole:      domain.TextRoleIgnoreNoise,
+			wantProtected: false,
+		},
+		{
+			name:          "in-band digit debris stays noise",
+			text:          "11-11",
+			box:           domain.BoundingBox{X: 300, Y: 1700, Width: 200, Height: 60},
+			confidence:    0.90,
+			wantRole:      domain.TextRoleIgnoreNoise,
+			wantProtected: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -699,5 +727,38 @@ func TestComputeCompactSubtitleBounds_WrapsLongTextIntoStackedLines(t *testing.T
 	}
 	if strings.Contains(short.Text, "\n") {
 		t.Errorf("short caption wrapped unnecessarily: %q", short.Text)
+	}
+}
+
+// A single word longer than the line cap (a run-together URL, a caption with no spaces) is chunked
+// rune-wise instead of left whole: an unbroken word makes the declared box hug a line the renderer
+// cannot draw inside it, so the replacement overflows the frame.
+func TestComputeCompactSubtitleBounds_ChunksAnOverlongSingleWord(t *testing.T) {
+	frameW, frameH := 1080, 1440
+	word := strings.Repeat("a", 150)
+
+	cue, err := domain.ComputeCompactSubtitleBounds(frameW, frameH, word, 0, 0, 0, nil)
+	if err != nil {
+		t.Fatalf("expected successful placement, got error: %v", err)
+	}
+	lines := strings.Split(cue.Text, "\n")
+	if len(lines) < 2 {
+		t.Fatalf("over-long word was left unbroken: %d line(s), %q", len(lines), cue.Text)
+	}
+	if got := strings.ReplaceAll(cue.Text, "\n", ""); got != word {
+		t.Errorf("chunking lost runes: %q != %q", got, word)
+	}
+	if cue.Width > int(float64(frameW)*0.80)+1 {
+		t.Errorf("box width %d exceeds the 80%% frame budget", cue.Width)
+	}
+	// The declared box must hold the widest line it will draw: charWidth is the same estimate the
+	// box is measured with (45% of the font size), so a box narrower than this is the overflow.
+	charWidth := int(float64(cue.FontSizePx) * 0.45)
+	widest := 0
+	for _, line := range lines {
+		widest = max(widest, len([]rune(line)))
+	}
+	if drawn := widest * charWidth; drawn > cue.Width {
+		t.Errorf("declared box %dpx cannot hold its widest %d-rune line (%dpx drawn)", cue.Width, widest, drawn)
 	}
 }

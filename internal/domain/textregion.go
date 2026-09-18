@@ -710,6 +710,11 @@ const subtitleFontScale = 0.037
 
 // wrapCaptionText breaks text into lines of at most maxChars runes at word boundaries, so a long
 // replacement stacks under itself instead of running off its box. Every word survives.
+//
+// A single word longer than the cap (a run-together URL, a caption with no spaces) is chunked
+// rune-wise rather than left whole: the box width is measured from the widest declared line, so an
+// unbroken over-long word would declare a box narrower than the line the renderer draws and the
+// replacement would run off-frame. Chunking keeps every rune and every line within the cap.
 func wrapCaptionText(text string, maxChars int) []string {
 	words := strings.Fields(text)
 	if len(words) == 0 {
@@ -721,22 +726,35 @@ func wrapCaptionText(text string, maxChars int) []string {
 	var lines []string
 	var current []string
 	length := 0
+	flush := func() {
+		if len(current) == 0 {
+			return
+		}
+		lines = append(lines, strings.Join(current, " "))
+		current, length = nil, 0
+	}
 	for _, word := range words {
-		wordLen := len([]rune(word))
+		runes := []rune(word)
+		for len(runes) > maxChars {
+			flush()
+			lines = append(lines, string(runes[:maxChars]))
+			runes = runes[maxChars:]
+		}
+		wordLen := len(runes)
 		switch {
+		case wordLen == 0:
+			continue
 		case length == 0:
-			current, length = []string{word}, wordLen
+			current, length = []string{string(runes)}, wordLen
 		case length+1+wordLen <= maxChars:
-			current = append(current, word)
+			current = append(current, string(runes))
 			length += 1 + wordLen
 		default:
-			lines = append(lines, strings.Join(current, " "))
-			current, length = []string{word}, wordLen
+			flush()
+			current, length = []string{string(runes)}, wordLen
 		}
 	}
-	if len(current) > 0 {
-		lines = append(lines, strings.Join(current, " "))
-	}
+	flush()
 	return lines
 }
 
@@ -1028,14 +1046,17 @@ func ClassifyRegionWithInstability(
 		if minRun <= 0 {
 			minRun = DefaultMinMeaningfulLetterRun
 		}
-		if longestLetterRun(trimmed) < minRun {
+		// In-band debris from live incidents was always single tokens ("T", "(", "K2", "100",
+		// "11-11", "KE", "8"). A multi-word reading positioned in the caption band is a real
+		// speech caption ("Go now", "Look up") whose words are naturally short, not an OCR
+		// fragment. Single tokens and out-of-band text still require the letter-run floor.
+		if longestLetterRun(trimmed) < minRun && !isMultiWordCaptionReading(trimmed, avgBox, cfg) {
 			return TextRoleIgnoreNoise, ProtectedRegionMetadata{IsProtected: false}, false, "ocr_text_fragment_noise"
 		}
 	}
 
 	// 5. Speech subtitle check: positioned in bottom subtitle band (lower ~35% of frame)
-	subtitleYThreshold := int(float64(cfg.FrameHeight) * cfg.SubtitleBandTopFrac)
-	if avgBox.CenterY() >= subtitleYThreshold && avgBox.Width < int(float64(cfg.FrameWidth)*0.92) {
+	if inSubtitleBand(avgBox, cfg) {
 		reviewReq := avgConfidence < cfg.MinConfidence
 		var reviewReason string
 		if reviewReq {
@@ -1242,4 +1263,30 @@ func countDistinctNormalizedTexts(texts []string) int {
 		}
 	}
 	return len(seen)
+}
+
+// inSubtitleBand reports whether a box sits in the bottom subtitle band: the single geometry rule
+// that promotes an in-band reading to a speech subtitle (rule 5) and that exempts a multi-word
+// ASCII reading from the single-token fragment floor (rule 4).
+func inSubtitleBand(box BoundingBox, cfg TextRegionClassifyConfig) bool {
+	return box.CenterY() >= int(float64(cfg.FrameHeight)*cfg.SubtitleBandTopFrac) &&
+		box.Width < int(float64(cfg.FrameWidth)*0.92)
+}
+
+// isMultiWordCaptionReading reports whether an ASCII-only reading is a multi-word caption occupying
+// the subtitle band: two or more letter-bearing words under the same geometry rule 5 uses to accept
+// a speech subtitle. It exists only to exempt such readings from the single-token letter-run floor —
+// a caption reads as several words, the OCR debris that floor was added for does not.
+func isMultiWordCaptionReading(text string, box BoundingBox, cfg TextRegionClassifyConfig) bool {
+	words := strings.Fields(text)
+	if len(words) < 2 || !inSubtitleBand(box, cfg) {
+		return false
+	}
+	letterWords := 0
+	for _, w := range words {
+		if longestLetterRun(w) > 0 {
+			letterWords++
+		}
+	}
+	return letterWords >= 2
 }

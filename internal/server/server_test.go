@@ -3,16 +3,10 @@ package server
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
-	"mime/multipart"
-	"net/http"
-	"net/http/httptest"
-	"path/filepath"
-	"strings"
-	"testing"
-	"time"
-
+	"fmt"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/media"
@@ -20,6 +14,13 @@ import (
 	"github.com/monet88/douyinie/internal/queue"
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
 )
 
 // TestProductionWriteTimeoutCoversLongOperations pins the production HTTP
@@ -948,6 +949,203 @@ func TestCompleteRunSafely_CompletesTheJobItFinished(t *testing.T) {
 	}
 	if got.Status != "completed" {
 		t.Errorf("job status after a completed run = %q, want completed", got.Status)
+	}
+}
+
+// In Review posture, the handoff only exposes 'start_final_render' and does not execute
+// a render. completeRunSafely must complete the run without marking the job 'completed',
+// leaving it open until the explicit final render succeeds.
+func TestCompleteRunSafely_ReviewPostureLeavesJobOpenUntilExplicitRender(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	db, err := storage.Open(filepath.Join(tmpDir, "review_posture_test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Now().UTC()
+	ra := domain.RightsAttestation{
+		ID:              "att-review",
+		AttestationType: "OPERATOR_CONFIRMED",
+		DeclaredBy:      "operator",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	}
+	if err := db.CreateRightsAttestation(ctx, ra); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+	asset := domain.SourceAsset{
+		ID:                  "asset-review",
+		SHA256:              strings.Repeat("3", 64),
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		OriginalFilename:    "dummy.mp4",
+		RightsAttestationID: ra.ID,
+		CASPath:             "dummy.mp4",
+		CreatedAt:           now,
+	}
+	if err := db.CreateSourceAsset(ctx, asset); err != nil {
+		t.Fatalf("save asset: %v", err)
+	}
+
+	job := domain.LocalizationJob{
+		ID:             "job-review",
+		SourceAssetID:  asset.ID,
+		TargetLanguage: domain.TargetLanguageVI,
+		Status:         "review_required",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := db.CreateJob(ctx, job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	run := domain.LocalizationRun{
+		ID:                 "run-review",
+		JobID:              job.ID,
+		Status:             domain.RunStatusRunning,
+		ConfigSnapshotJSON: `{"posture":"review"}`,
+		CreatedAt:          now,
+	}
+	if err := db.CreateRun(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	qSvc := queue.NewService(db)
+	if _, err := qSvc.Enqueue(ctx, run.ID, job.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := qSvc.MarkRunning(ctx, run.ID); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+
+	s := New(Config{Addr: "127.0.0.1:0", DB: db, QueueSvc: qSvc})
+	if err := s.completeRunSafely(ctx, run.ID); err != nil {
+		t.Fatalf("completeRunSafely: %v", err)
+	}
+
+	// Queue entry must be completed
+	entry, err := db.GetQueueEntryByRunID(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("get queue entry: %v", err)
+	}
+	if entry.Status != domain.RunStatusCompleted {
+		t.Fatalf("expected queue entry %s, got %s", domain.RunStatusCompleted, entry.Status)
+	}
+
+	// Job status must NOT be completed while explicit render is pending
+	got, err := db.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if got.Status == "completed" {
+		t.Fatalf("job status was marked completed before explicit final render")
+	}
+	if got.Status != "review_required" {
+		t.Errorf("job status = %q, want review_required", got.Status)
+	}
+
+}
+
+// If UpdateJobStatus fails, completeRunSafely must surface the error and NOT mark the
+// run or queue as completed.
+func TestCompleteRunSafely_UpdateJobStatusFailureSurfacesError(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "job_failure_test.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Now().UTC()
+	ra := domain.RightsAttestation{
+		ID:              "att-fail",
+		AttestationType: "OPERATOR_CONFIRMED",
+		DeclaredBy:      "operator",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	}
+	if err := db.CreateRightsAttestation(ctx, ra); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+	asset := domain.SourceAsset{
+		ID:                  "asset-fail",
+		SHA256:              strings.Repeat("4", 64),
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		OriginalFilename:    "dummy.mp4",
+		RightsAttestationID: ra.ID,
+		CASPath:             "dummy.mp4",
+		CreatedAt:           now,
+	}
+	if err := db.CreateSourceAsset(ctx, asset); err != nil {
+		t.Fatalf("save asset: %v", err)
+	}
+
+	job := domain.LocalizationJob{
+		ID:             "job-fail",
+		SourceAssetID:  asset.ID,
+		TargetLanguage: domain.TargetLanguageVI,
+		Status:         "pending",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := db.CreateJob(ctx, job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	run := domain.LocalizationRun{
+		ID:                 "run-fail",
+		JobID:              job.ID,
+		Status:             domain.RunStatusRunning,
+		ConfigSnapshotJSON: `{"posture":"auto"}`,
+		CreatedAt:          now,
+	}
+	if err := db.CreateRun(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	qSvc := queue.NewService(db)
+	if _, err := qSvc.Enqueue(ctx, run.ID, job.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := qSvc.MarkRunning(ctx, run.ID); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+
+	// Inject failure via SQLite trigger on localization_jobs UPDATE
+	rawDB, err := sql.Open("sqlite", fmt.Sprintf("%s?_pragma=busy_timeout(5000)", dbPath))
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer rawDB.Close()
+
+	_, err = rawDB.ExecContext(ctx, `CREATE TRIGGER fail_job_update BEFORE UPDATE ON localization_jobs BEGIN SELECT RAISE(ABORT, 'injected job update failure'); END;`)
+	if err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+
+	s := New(Config{Addr: "127.0.0.1:0", DB: db, QueueSvc: qSvc})
+	err = s.completeRunSafely(ctx, run.ID)
+	if err == nil {
+		t.Fatal("expected completeRunSafely to fail when UpdateJobStatus fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "injected job update failure") {
+		t.Errorf("expected error to contain trigger message, got: %v", err)
+	}
+
+	// Queue entry must NOT be completed
+	entry, err := db.GetQueueEntryByRunID(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("get queue entry: %v", err)
+	}
+	if entry.Status == domain.RunStatusCompleted {
+		t.Errorf("queue entry must not be marked completed when job update fails, got %s", entry.Status)
 	}
 }
 

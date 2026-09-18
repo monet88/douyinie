@@ -342,11 +342,12 @@ func TestAudioRole_SourceMixNotMappedToVocalsWhenExplicitVocalsAbsent(t *testing
 
 // writeInertFile writes a placeholder file. On Windows exec.LookPath only stats
 // an exe path, so an inert file stands in for an interpreter and the resolution
-// tests need no real venv.
+// tests need no real venv. On Unix, exec.LookPath requires the executable bit,
+// so the placeholder is created with 0755.
 func writeInertFile(t *testing.T, dir, name string) string {
 	t.Helper()
 	p := filepath.Join(dir, name)
-	if err := os.WriteFile(p, []byte("inert placeholder\n"), 0644); err != nil {
+	if err := os.WriteFile(p, []byte("inert placeholder\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
 	return p

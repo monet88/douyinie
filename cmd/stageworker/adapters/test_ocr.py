@@ -347,10 +347,6 @@ class TestOCRAdapter(unittest.TestCase):
         self.assertEqual(dets[0]["box"], {"x": 15, "y": 25, "width": 85, "height": 35})
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestOcrFrameDedup(unittest.TestCase):
     """A static shot repeats the same pixels: the OCR pass must read them once, not once per sample."""
 
@@ -479,3 +475,7 @@ class TestInkRefinement(unittest.TestCase):
             self.assertEqual(ocr.refine_box_to_ink(self._frame(), box), box)
         finally:
             os.environ.pop("DOUYINIE_OCR_INK_REFINE", None)
+
+
+if __name__ == "__main__":
+    unittest.main()

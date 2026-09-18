@@ -92,9 +92,10 @@ class TestSeparatorAdapter(unittest.TestCase):
         the audio-role analyzer that consumes these stems - is 16 kHz mono. A native-rate stem
         dead-ends audio_role_plan, the first stage of every real run, while the persisted metadata
         claims the contract rate; stems leaving the adapter must really be at the contract rate."""
-        real_run = subprocess.run
         native_wav = _make_dummy_wav(duration_ms=2000, sample_rate=44100, channels=2)
+        converted_wav = _make_dummy_wav(duration_ms=2000, sample_rate=16000, channels=1)
         calls = []
+        ffmpeg_commands = []
 
         def fake_subprocess_run(cmd, *args, **kwargs):
             if "-m" in cmd and "demucs.separate" in cmd:
@@ -112,14 +113,30 @@ class TestSeparatorAdapter(unittest.TestCase):
                 proc.stdout = b""
                 proc.stderr = b""
                 return proc
-            calls.append(cmd[0])
-            return real_run(cmd, *args, **kwargs)
+            if cmd and cmd[0] == "ffmpeg":
+                calls.append("ffmpeg")
+                ffmpeg_commands.append(list(cmd))
+                out_path = cmd[-1]
+                with open(out_path, "wb") as f:
+                    f.write(converted_wav)
+                proc = mock.MagicMock()
+                proc.returncode = 0
+                proc.stdout = b""
+                proc.stderr = b""
+                return proc
+            raise AssertionError(f"unexpected subprocess command: {cmd}")
 
         with mock.patch("subprocess.run", side_effect=fake_subprocess_run):
             res = separator.separate_audio_stems("sample_audio.wav", "htdemucs", "v4")
 
         self.assertEqual(calls[0], "demucs")
         self.assertIn("ffmpeg", calls)
+        self.assertEqual(len(ffmpeg_commands), 2, "ffmpeg must be invoked for both vocals and background stems")
+        for cmd in ffmpeg_commands:
+            self.assertEqual(cmd[:-1], [
+                "ffmpeg", "-v", "error", "-y", "-i", "pipe:0",
+                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+            ], "ffmpeg conversion argv must strictly match the pipeline contract")
         self.assertEqual(res["sample_rate"], 16000)
         self.assertEqual(res["channels"], 1)
         for key in ["vocals_data", "background_data"]:
@@ -134,6 +151,41 @@ class TestSeparatorAdapter(unittest.TestCase):
         matching the bytes the separator actually produced."""
         contract_wav = _make_dummy_wav(duration_ms=500, sample_rate=16000, channels=1)
         self.assertEqual(separator.normalize_stem_to_contract(contract_wav), contract_wav)
+
+    def test_contract_rate_stems_non_16bit_are_re_encoded(self):
+        """A 16 kHz mono stem that is not 16-bit PCM must be re-encoded to 16-bit PCM."""
+        expected_16bit = _make_dummy_wav(duration_ms=500, sample_rate=16000, channels=1)
+        # Re-pack with 24-bit width (3 bytes per sample)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(3)
+            wf.setframerate(16000)
+            wf.writeframes(b"".join(struct.pack("<i", 1000)[:3] for _ in range(8000)))
+        input_24bit = buf.getvalue()
+
+        ffmpeg_invoked = False
+        def fake_ffmpeg(cmd, *args, **kwargs):
+            nonlocal ffmpeg_invoked
+            self.assertEqual(cmd[0], "ffmpeg")
+            self.assertEqual(cmd[:-1], [
+                "ffmpeg", "-v", "error", "-y", "-i", "pipe:0",
+                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+            ])
+            ffmpeg_invoked = True
+            out_path = cmd[-1]
+            with open(out_path, "wb") as f:
+                f.write(expected_16bit)
+            proc = mock.MagicMock()
+            proc.returncode = 0
+            proc.stdout = b""
+            proc.stderr = b""
+            return proc
+
+        with mock.patch("subprocess.run", side_effect=fake_ffmpeg):
+            res = separator.normalize_stem_to_contract(input_24bit)
+        self.assertTrue(ffmpeg_invoked)
+        self.assertEqual(res, expected_16bit)
 
     def test_lane_dispatch_demucs_vs_uvr(self):
         """Verifies separate_audio_stems routes Demucs models to Demucs lane and UVR models to UVR lane."""

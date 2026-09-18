@@ -499,7 +499,7 @@ func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, 
 		return nil
 	})
 	if err != nil {
-		if bestFlagged == nil {
+		if bestFlagged == nil || !translationFlaggedFallbackAllowed(err) {
 			return nil, nil, nil, 0, err
 		}
 		// Every lane tripped the meaning gate. Ship the best of them with per-segment
@@ -513,6 +513,36 @@ func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, 
 		return nil, nil, nil, 0, fmt.Errorf("translation execution completed without a selected provider result")
 	}
 	return result, selected, validatedSegments, overallQAScore, nil
+}
+
+// translationFailClosedErrors mirrors the Router's non-transient governance / policy / provenance
+// refusals (internal/provider/router.go branch 1) that terminate execution immediately without
+// candidate retry or fallback.
+var translationFailClosedErrors = []error{
+	domain.ErrPolicyBlocked,
+	domain.ErrConsentRequired,
+	domain.ErrAuthRequired,
+	domain.ErrLicenseManifestMissing,
+	domain.ErrRawSecretForbidden,
+	domain.ErrContentUnavailable,
+	domain.ErrInvalidURL,
+	domain.ErrUnsupportedMediaType,
+	domain.ErrInconsistentProvenance,
+}
+
+// translationFlaggedFallbackAllowed confirms the terminal execution error is genuinely the
+// meaning-gate rejection (ErrQualityRejected) that the flagged fallback exists for, and not a
+// fail-closed router governance, policy, authorization, or provenance refusal.
+func translationFlaggedFallbackAllowed(err error) bool {
+	if !errors.Is(err, domain.ErrQualityRejected) {
+		return false
+	}
+	for _, failClosed := range translationFailClosedErrors {
+		if errors.Is(err, failClosed) {
+			return false
+		}
+	}
+	return true
 }
 
 // validateMeaningQA evaluates the meaning preservation QA gate for every segment.

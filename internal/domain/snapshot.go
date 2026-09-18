@@ -526,7 +526,9 @@ func ResolveTTSVoiceEntrypoint(manifest SnapshotManifest, snapshotRoot, modelNam
 		if _, err := verifySnapshotRegularFile(cleanRoot, indexEntry, "ZeroTTS voice index"); err != nil {
 			return "", err
 		}
-
+		// Voice conditioning tensors are verified per selected voice on demand: the requested preset's
+		// tensor must be declared and match its pinned digest, while other presets are validated when
+		// selected (allowing selective staging of approved presets while failing closed on any selection).
 		voiceAsset, ok := findPinnedAsset(PinnedZeroTTSVoiceAssets, strings.ToLower("voices/"+vID+"/voice.npz"))
 		if !ok {
 			return "", fmt.Errorf("%w: no pinned digest for ZeroTTS voice %q", ErrTTSVoiceAssetMissing, vID)

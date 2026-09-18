@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/monet88/douyinie/internal/domain"
@@ -62,8 +63,8 @@ func TestSeam1_Translation_QAGateFlagsSemanticFactCorruptionForReview(t *testing
 	if flagged.PassedQAGate {
 		t.Fatalf("expected the semantic fact corruption to stay flagged, got passed_qa_gate=true")
 	}
-	if flagged.ReviewReason == "" {
-		t.Errorf("expected a review reason naming the violation, got an empty reason")
+	if !strings.Contains(flagged.ReviewReason, "weather_quality") || !strings.Contains(flagged.ReviewReason, "good") || !strings.Contains(flagged.ReviewReason, "bad") {
+		t.Errorf("expected review reason to name weather_quality fact violation (good -> bad), got: %q", flagged.ReviewReason)
 	}
 
 	items := fetchRunReviewItems(t, h, runID, false)

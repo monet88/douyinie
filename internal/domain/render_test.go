@@ -46,12 +46,18 @@ func TestComputeRenderPlanProvenanceHash_Determinism(t *testing.T) {
 		CueCount:       len(cues2),
 		CueSpecHash:    cueHash2,
 	}
+	covers := []domain.CoverBox{
+		{RegionID: "region-001", Role: "speech_subtitle", X: 100, Y: 200, Width: 300, Height: 60, StartMs: 0, EndMs: 500, Color: "#000000", Opacity: 1.0},
+	}
+	overlays := []domain.SubtitleCue{
+		{ID: "overlay-0", StartMs: 600, EndMs: 1200, Text: "Độ mờ", X: 120, Y: 200, Width: 100, Height: 30, FontSizePx: 18},
+	}
 
-	h1, err := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio", timeline, subPlanRef1, nil, nil)
+	h1, err := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio", timeline, subPlanRef1, covers, overlays)
 	if err != nil {
 		t.Fatalf("compute hash 1: %v", err)
 	}
-	h2, err := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio", timeline, subPlanRef2, nil, nil)
+	h2, err := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio", timeline, subPlanRef2, covers, overlays)
 	if err != nil {
 		t.Fatalf("compute hash 2: %v", err)
 	}
@@ -63,15 +69,33 @@ func TestComputeRenderPlanProvenanceHash_Determinism(t *testing.T) {
 	// Change subtitle CAS hash -> different hash
 	subPlanModified := subPlanRef1
 	subPlanModified.CASHash = "cas-sub-hash-different"
-	h3, _ := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio", timeline, subPlanModified, nil, nil)
+	h3, _ := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio", timeline, subPlanModified, covers, overlays)
 	if h1 == h3 {
 		t.Errorf("expected different hash for modified subtitle CAS hash, got identical %s", h1)
 	}
 
 	// Change audio CAS ref -> different hash
-	h4, _ := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio-other", timeline, subPlanRef1, nil, nil)
+	h4, _ := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio-other", timeline, subPlanRef1, covers, overlays)
 	if h1 == h4 {
 		t.Errorf("expected different hash for modified audio ref, got identical %s", h1)
+	}
+
+	// Change covers -> different hash
+	coversModified := []domain.CoverBox{
+		{RegionID: "region-001", Role: "speech_subtitle", X: 100, Y: 210, Width: 300, Height: 60, StartMs: 0, EndMs: 500, Color: "#000000", Opacity: 1.0},
+	}
+	h5, _ := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio", timeline, subPlanRef1, coversModified, overlays)
+	if h1 == h5 {
+		t.Errorf("expected different hash for modified cover box, got identical %s", h1)
+	}
+
+	// Change overlays -> different hash
+	overlaysModified := []domain.SubtitleCue{
+		{ID: "overlay-0", StartMs: 600, EndMs: 1200, Text: "Độ mờ khác", X: 120, Y: 200, Width: 100, Height: 30, FontSizePx: 18},
+	}
+	h6, _ := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio", timeline, subPlanRef1, covers, overlaysModified)
+	if h1 == h6 {
+		t.Errorf("expected different hash for modified overlay cue, got identical %s", h1)
 	}
 }
 

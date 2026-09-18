@@ -240,8 +240,12 @@ func GenerateASSContent(timeline domain.RenderTimeline, cues []domain.SubtitleCu
 		// rendered text, so a top-left anchor lands the drawn box wherever the width estimate
 		// guessed; anchoring the center keeps the drawn box concentric with the geometry the
 		// plan declares, which is what the covers, the QC overlap checks and the operator see.
-		if cue.X > 0 || cue.Y > 0 {
+		// A cue with no declared size cannot be centered on its own top-left corner without
+		// shifting the text up and left, so it keeps the legacy top-left anchor (\an7).
+		if cue.Width > 0 && cue.Height > 0 {
 			tags = append(tags, fmt.Sprintf(`\an5\pos(%d,%d)`, cue.X+cue.Width/2, cue.Y+cue.Height/2))
+		} else if cue.X > 0 || cue.Y > 0 {
+			tags = append(tags, fmt.Sprintf(`\an7\pos(%d,%d)`, cue.X, cue.Y))
 		}
 
 		// Padding: when BorderStyle=3, \bord sets the padding width of the background box hugging the text.

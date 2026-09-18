@@ -29,7 +29,8 @@ var (
 )
 
 const (
-	// RenderPlanSchemaVersion 2 adds frozen CoverBoxes to the plan identity.
+	// RenderPlanSchemaVersion 2 adds frozen CoverBoxes and OverlayCues to the plan identity.
+	// Cover and overlay slices participate directly in slice order; producers emit them deterministically.
 	RenderPlanSchemaVersion    = 2
 	SubtitlePlanSchemaVersion  = 1
 	PreviewRenderSchemaVersion = 1
@@ -156,33 +157,6 @@ func ClampCoverBoxToFrame(c CoverBox, frameWidth, frameHeight int) (CoverBox, bo
 		return CoverBox{}, false
 	}
 	return c, true
-}
-
-// CoverSpecHash computes the deterministic identity of a frozen cover set.
-func CoverSpecHash(covers []CoverBox) string {
-	if len(covers) == 0 {
-		return ""
-	}
-	normalized := append([]CoverBox(nil), covers...)
-	sort.SliceStable(normalized, func(i, j int) bool {
-		a, b := normalized[i], normalized[j]
-		if a.StartMs != b.StartMs {
-			return a.StartMs < b.StartMs
-		}
-		if a.RegionID != b.RegionID {
-			return a.RegionID < b.RegionID
-		}
-		if a.X != b.X {
-			return a.X < b.X
-		}
-		return a.Y < b.Y
-	})
-	b, err := json.Marshal(normalized)
-	if err != nil {
-		return ""
-	}
-	h := sha256.Sum256(b)
-	return hex.EncodeToString(h[:])
 }
 
 // RenderPlan is the complete, deterministic composition recipe freezing exact CAS artifact references.
@@ -355,6 +329,10 @@ func ComputeSubtitlePlanProvenanceHash(assetID, targetLang string, cues []Subtit
 
 // ComputeRenderPlanProvenanceHash calculates deterministic cache identity for RenderPlan.
 // Excludes RunID and JobID per CAS identity invariant.
+//
+// Cover and overlay order participates directly in the provenance identity: the upstream visual
+// pipeline emits covers and overlay cues in a deterministic sequence from the localized visual track,
+// and the downstream video composition passes render them in that exact sequence.
 func ComputeRenderPlanProvenanceHash(
 	assetID, targetLang, sourceAssetSHA, dubMixCAS, audioCAS string,
 	timeline RenderTimeline,

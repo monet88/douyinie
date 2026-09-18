@@ -324,7 +324,11 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		if errors.Is(err, storage.ErrNotFound) {
 			// A run that replayed cached stages owns no variant row of its own; its stage
 			// execution records the artifact it consumed (see runBoundArtifactCAS).
-			if casHash := s.runBoundArtifactCAS(ctx, requestedRunID, "translation"); casHash != "" {
+			casHash, boundErr := s.runBoundArtifactCAS(ctx, requestedRunID, "translation")
+			if boundErr != nil {
+				return nil, boundErr
+			}
+			if casHash != "" {
 				transIdx = &storage.TranslationVariantIndex{
 					AssetID: in.AssetID, RunID: requestedRunID, TargetLanguage: in.TargetLanguage, CASHash: casHash,
 				}
@@ -350,7 +354,9 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		return nil, fmt.Errorf("decode translation variant (%s): %w", transIdx.CASHash, err)
 	}
 	trc.Close()
-
+	if tVar.AssetID != in.AssetID || !strings.EqualFold(tVar.TargetLanguage, in.TargetLanguage) {
+		return nil, fmt.Errorf("translation variant artifact %s belongs to asset %s (%s), expected asset %s (%s)", transIdx.CASHash, tVar.AssetID, tVar.TargetLanguage, in.AssetID, in.TargetLanguage)
+	}
 	// A segment's own index is the source speech-block index, not its position in the slice: a clip
 	// with silent stretches indexes 0,2,4,6, so indexing the slice with it rejected every correction
 	// past the first (live evidence, run eec68c8d: "segment index 6 out of bounds (total 4)").
@@ -418,6 +424,9 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		CreatedAt:      tVar.CreatedAt,
 	}); err != nil {
 		return nil, fmt.Errorf("save translation variant index: %w", err)
+	}
+	if err := s.recordCorrectionStage(ctx, in.RunID, "translation", tObj.SHA256); err != nil {
+		return nil, err
 	}
 
 	// 2. Update DubScriptVariant (spoken adaptation rerun)
@@ -487,6 +496,9 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		}
 	}
 	result.DubScriptVariantCAS = dsVar.CASHash
+	if err := s.recordCorrectionStage(ctx, in.RunID, "dub_script", dsVar.CASHash); err != nil {
+		return nil, err
+	}
 
 	// 3. Rerun TTS & DubSegments synthesis
 	voiceAssignCAS := ""
@@ -596,6 +608,11 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 			return nil, errors.New("freeze render plan produced nil render plan")
 		}
 		result.RenderPlanCAS = rPlan.CASHash
+		if err := s.recordCorrectionStage(ctx, in.RunID, "render_plan", rPlan.CASHash); err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(planErr, storage.ErrNotFound) {
+		return nil, fmt.Errorf("load text region plan index: %w", planErr)
 	}
 
 	// 7. Check if candidate auto-resolved based on honest evidence across all evaluated stages
@@ -808,6 +825,18 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 		return nil, fmt.Errorf("freeze render plan rerun failed: %w", err)
 	}
 	result.RenderPlanCAS = rPlan.CASHash
+	if err := s.recordCorrectionStage(ctx, in.RunID, "voice_assignment", result.VoiceAssignmentCAS); err != nil {
+		return nil, err
+	}
+	if err := s.recordCorrectionStage(ctx, in.RunID, "dub_synthesize", result.DubSegmentsVariantCAS); err != nil {
+		return nil, err
+	}
+	if err := s.recordCorrectionStage(ctx, in.RunID, "audio_mix", result.DubMixCAS); err != nil {
+		return nil, err
+	}
+	if err := s.recordCorrectionStage(ctx, in.RunID, "render_plan", result.RenderPlanCAS); err != nil {
+		return nil, err
+	}
 
 	// 6. Evaluate auto-resolution status
 	isResolved := dubSegsVar.OverallStatus == "PASS" && len(dubSegsVar.ReviewSegments) == 0 &&
@@ -1383,12 +1412,12 @@ func (s *ReviewService) projectReviewItems(ctx context.Context, assetID, targetL
 // run-scoped lookups find nothing and the review queue would silently stay empty for that run - hiding the
 // dub overruns that block the mix. The run's own stage execution records the artifact it consumed, so the
 // projection reads the variant through it, still pinned to this asset and language.
-func (s *ReviewService) runBoundArtifactCAS(ctx context.Context, runID, stage string) string {
+func (s *ReviewService) runBoundArtifactCAS(ctx context.Context, runID, stage string) (string, error) {
 	casHash, err := s.db.GetStageArtifactHash(ctx, runID, stage)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("load run-bound %s artifact for run %s: %w", stage, runID, err)
 	}
-	return casHash
+	return casHash, nil
 }
 
 func (s *ReviewService) ProjectAllReviewItems(ctx context.Context, assetID, targetLang string) ([]domain.ReviewItem, error) {
@@ -1502,7 +1531,11 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 	if runID != "" {
 		visIdx, err = s.db.GetLocalizedVisualTrackIndexByRun(ctx, runID)
 		if errors.Is(err, storage.ErrNotFound) {
-			if casHash := s.runBoundArtifactCAS(ctx, runID, "visual_text_localize"); casHash != "" {
+			casHash, boundErr := s.runBoundArtifactCAS(ctx, runID, "visual_text_localize")
+			if boundErr != nil {
+				return nil, boundErr
+			}
+			if casHash != "" {
 				visIdx = &storage.LocalizedVisualTrackIndex{AssetID: assetID, RunID: runID, TargetLanguage: targetLang, CASHash: casHash}
 				err = nil
 			}
@@ -1557,7 +1590,11 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 	if runID != "" {
 		transIdx, err = s.db.GetTranslationVariantIndexByRun(ctx, runID)
 		if errors.Is(err, storage.ErrNotFound) {
-			if casHash := s.runBoundArtifactCAS(ctx, runID, "translation"); casHash != "" {
+			casHash, boundErr := s.runBoundArtifactCAS(ctx, runID, "translation")
+			if boundErr != nil {
+				return nil, boundErr
+			}
+			if casHash != "" {
 				transIdx = &storage.TranslationVariantIndex{AssetID: assetID, RunID: runID, TargetLanguage: targetLang, CASHash: casHash}
 				err = nil
 			}
@@ -1626,7 +1663,11 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 	if runID != "" {
 		dubSegIdx, err = s.db.GetDubSegmentsVariantIndexByRun(ctx, runID)
 		if errors.Is(err, storage.ErrNotFound) {
-			if casHash := s.runBoundArtifactCAS(ctx, runID, "dub_synthesize"); casHash != "" {
+			casHash, boundErr := s.runBoundArtifactCAS(ctx, runID, "dub_synthesize")
+			if boundErr != nil {
+				return nil, boundErr
+			}
+			if casHash != "" {
 				dubSegIdx = &storage.DubSegmentsVariantIndex{AssetID: assetID, RunID: runID, TargetLanguage: targetLang, CASHash: casHash}
 				err = nil
 			}
@@ -1727,7 +1768,11 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 	if runID != "" {
 		dubScriptIdx, err = s.db.GetDubScriptVariantIndexByRun(ctx, runID)
 		if errors.Is(err, storage.ErrNotFound) {
-			if casHash := s.runBoundArtifactCAS(ctx, runID, "dub_script"); casHash != "" {
+			casHash, boundErr := s.runBoundArtifactCAS(ctx, runID, "dub_script")
+			if boundErr != nil {
+				return nil, boundErr
+			}
+			if casHash != "" {
 				dubScriptIdx = &storage.DubScriptVariantIndex{AssetID: assetID, RunID: runID, TargetLanguage: targetLang, CASHash: casHash}
 				err = nil
 			}

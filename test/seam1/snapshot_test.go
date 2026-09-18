@@ -1038,14 +1038,41 @@ func TestSeam1_Snapshot_TTS_RegistrationAndVerification(t *testing.T) {
 	// snapshot declares (see domain.TestSnapshot_ResolveTTSVoiceEntrypoint_ZeroTTSPinnedWeights).
 	vieneuPinned := vieneuManifest
 	vieneuPinned.Files = append([]domain.SnapshotFileEntry(nil), vieneuManifest.Files...)
+	stampedCount := 0
 	for i := range vieneuPinned.Files {
 		for _, asset := range domain.PinnedVieNeuAssets {
 			if vieneuPinned.Files[i].RelativePath == asset.RelativePath {
 				vieneuPinned.Files[i].SHA256 = asset.SHA256
+				stampedCount++
 			}
 		}
 	}
+	if stampedCount != len(domain.PinnedVieNeuAssets) {
+		t.Fatalf("expected all %d pinned VieNeu assets stamped, got %d", len(domain.PinnedVieNeuAssets), stampedCount)
+	}
 
+	// Verification assertion: the resolver probe manifest (with pinned digests) cannot be registered
+	// against these fake fixture bytes without failing closed on digest mismatch.
+	pSHA, err := domain.ComputeSnapshotManifestSHA256(&vieneuPinned)
+	if err != nil {
+		t.Fatalf("compute vieneuPinned manifest sha: %v", err)
+	}
+	vieneuPinned.SnapshotManifestSHA256 = pSHA
+	_ = licSvc.RegisterManifest(context.Background(), domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: provider.VieNeuModelID,
+		Version:        provider.VieNeuModelVersion,
+		SHA256:         pSHA,
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Local-Offline",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	})
+	if _, err := snapSvc.RegisterAndVerifySnapshot(context.Background(), vieneuPinned, vieneuDir); !errors.Is(err, domain.ErrSnapshotDigestMismatch) {
+		t.Fatalf("expected pinned manifest with fake fixture bytes to fail RegisterAndVerifySnapshot, got: %v", err)
+	}
 	// All 4 VieNeu compatibility voices resolve
 	for _, vID := range expectedVieNeu {
 		ep, epErr := domain.ResolveTTSVoiceEntrypoint(vieneuPinned, vieneuDir, provider.VieNeuModelID, vID)

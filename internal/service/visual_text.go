@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -314,16 +315,18 @@ func (s *VisualTextService) DetectAndTrackText(ctx context.Context, input Visual
 
 // stageArtifactHash returns the artifact a stage of this run recorded, i.e. what the stage actually
 // consumed or produced. A run that only reused cached artifacts has no variant index row of its own, and
-// the stage execution is what still binds it to the artifact.
-func (s *VisualTextService) stageArtifactHash(ctx context.Context, runID, stage string) string {
+// the stage execution is what still binds it to the artifact. An empty string means the stage recorded no
+// artifact (benign cache-miss or unrun stage); a database failure is returned so callers fail closed
+// instead of silently burning source text.
+func (s *VisualTextService) stageArtifactHash(ctx context.Context, runID, stage string) (string, error) {
 	if s.db == nil {
-		return ""
+		return "", nil
 	}
 	casHash, err := s.db.GetStageArtifactHash(ctx, runID, stage)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("query stage artifact for run %s stage %s: %w", runID, stage, err)
 	}
-	return casHash
+	return casHash, nil
 }
 
 // sampleSlot maps a wall-clock detection time onto the sampling grid slot the OCR pass used, so
@@ -808,36 +811,108 @@ const coverPaddingPx = 6
 // HOCHI, 面饼：107克 - all live at 4500-5500ms and drew nested boxes that clipped each other). The dominant
 // label of a colliding group wins; the loser keeps its source text untouched and goes to the operator as a
 // layout decision instead of shipping a cut-off translation.
+//
+// Every kept replacement sharing the incoming label's screen window is examined, not just the first:
+// displacing one neighbour while staying overlapped with another would leave two replacements painting
+// over each other, which is the defect this resolution exists to prevent.
 func resolveOverlayCollisions(overlays []domain.LocalizedOverlayItem) ([]domain.LocalizedOverlayItem, []domain.OcclusionReport) {
 	kept := make([]domain.LocalizedOverlayItem, 0, len(overlays))
 	var occlusions []domain.OcclusionReport
 	for _, ov := range overlays {
-		displaced := -1
-		yields := false
+		var displaced, winners []int
 		for i, other := range kept {
-			if ov.StartMs >= other.EndMs || other.StartMs >= ov.EndMs || !domain.BoxesOverlap(ov.Box, other.Box) {
+			if !overlaysShareScreen(ov, other) {
 				continue
 			}
 			if overlayDominates(ov, other) {
-				displaced = i
+				displaced = append(displaced, i)
 			} else {
-				yields = true
-				occlusions = append(occlusions, overlayCollisionReport(ov, other))
+				winners = append(winners, i)
 			}
-			break
 		}
-		switch {
-		case displaced >= 0:
-			occlusions = append(occlusions, overlayCollisionReport(kept[displaced], ov))
-			kept[displaced] = ov
-		case !yields:
+		if len(winners) > 0 {
+			// The incoming label yields to a kept label that stays on screen: it is dropped, and so is
+			// every kept label it would have displaced that still shares the screen with a survivor -
+			// otherwise the group would keep two boxes on one another.
+			strongest := winners[0]
+			for _, i := range winners[1:] {
+				if overlayDominates(kept[i], kept[strongest]) {
+					strongest = i
+				}
+			}
+			occlusions = append(occlusions, overlayCollisionReport(ov, kept[strongest]))
+			var drop []int
+			for _, i := range displaced {
+				if w := overlappingKeptOverlay(kept, winners, kept[i]); w >= 0 {
+					drop = append(drop, i)
+					occlusions = append(occlusions, overlayCollisionReport(kept[i], kept[w]))
+				}
+			}
+			kept = removeOverlays(kept, drop)
+			continue
+		}
+		if len(displaced) == 0 {
 			kept = append(kept, ov)
+			continue
 		}
+		// The incoming label dominates every kept label it collides with: it takes over their boxes and
+		// each of them becomes an operator exception instead of a cut-off translation.
+		for _, i := range displaced {
+			occlusions = append(occlusions, overlayCollisionReport(kept[i], ov))
+		}
+		kept = replaceOverlays(kept, displaced, ov)
 	}
 	if len(occlusions) == 0 {
 		return overlays, nil
 	}
 	return kept, occlusions
+}
+
+// overlaysShareScreen reports whether two in-place replacements are on screen at the same time over
+// overlapping boxes, i.e. whether compositing both would paint one over the other.
+func overlaysShareScreen(a, b domain.LocalizedOverlayItem) bool {
+	return a.StartMs < b.EndMs && b.StartMs < a.EndMs && domain.BoxesOverlap(a.Box, b.Box)
+}
+
+// overlappingKeptOverlay returns the index of the first candidate sharing the screen with probe, or -1.
+func overlappingKeptOverlay(kept []domain.LocalizedOverlayItem, candidates []int, probe domain.LocalizedOverlayItem) int {
+	for _, i := range candidates {
+		if overlaysShareScreen(kept[i], probe) {
+			return i
+		}
+	}
+	return -1
+}
+
+// removeOverlays drops the given indices, preserving the order of the rest.
+func removeOverlays(kept []domain.LocalizedOverlayItem, drop []int) []domain.LocalizedOverlayItem {
+	if len(drop) == 0 {
+		return kept
+	}
+	out := make([]domain.LocalizedOverlayItem, 0, len(kept)-len(drop))
+	for i, ov := range kept {
+		if slices.Contains(drop, i) {
+			continue
+		}
+		out = append(out, ov)
+	}
+	return out
+}
+
+// replaceOverlays removes the dominated indices and seats the incoming label at the first of them, so the
+// surviving plan keeps its original order.
+func replaceOverlays(kept []domain.LocalizedOverlayItem, displaced []int, ov domain.LocalizedOverlayItem) []domain.LocalizedOverlayItem {
+	out := make([]domain.LocalizedOverlayItem, 0, len(kept)-len(displaced)+1)
+	for i, other := range kept {
+		if slices.Contains(displaced, i) {
+			if i == displaced[0] {
+				out = append(out, ov)
+			}
+			continue
+		}
+		out = append(out, other)
+	}
+	return out
 }
 
 // overlayDominates reports whether a displaces b: the larger observed box is the dominant label of a
@@ -1165,9 +1240,28 @@ func endsSentence(word string) bool {
 	return last == '.' || last == '!' || last == '?' || last == '。' || last == '！' || last == '？'
 }
 
+// mergeCaptionPieces folds pieces into at most maxCues groups, keeping every piece's text in order,
+// so the cues stay grounded in the canonical translation.
+func mergeCaptionPieces(pieces []string, maxCues int) []string {
+	if maxCues < 1 {
+		maxCues = 1
+	}
+	if len(pieces) <= maxCues {
+		return pieces
+	}
+	merged := make([]string, 0, maxCues)
+	for i := range maxCues {
+		lo := i * len(pieces) / maxCues
+		hi := (i + 1) * len(pieces) / maxCues
+		merged = append(merged, strings.Join(pieces[lo:hi], " "))
+	}
+	return merged
+}
+
 // captionCueWindows spreads a segment's window across its pieces in proportion to the text each piece
-// carries, so a caption is on screen for roughly as long as it is spoken. A segment too short for its
-// pieces yields fewer, longer cues rather than a flicker.
+// carries, so a caption is on screen for roughly as long as it is spoken. Callers fold the pieces down
+// to at most one per millisecond of the window first (see placeSegmentCues): this function emits one
+// window per piece, so more pieces than milliseconds would mean a zero-length or reversed cue.
 func captionCueWindows(startMs, endMs int64, pieces []string) [][2]int64 {
 	windows := make([][2]int64, 0, len(pieces))
 	if len(pieces) == 0 {
@@ -1176,6 +1270,7 @@ func captionCueWindows(startMs, endMs int64, pieces []string) [][2]int64 {
 	if endMs <= startMs {
 		endMs = startMs + degenerateCaptionWindowMs
 	}
+	duration := endMs - startMs
 	totalLen := 0
 	lengths := make([]int, len(pieces))
 	for i, piece := range pieces {
@@ -1185,7 +1280,6 @@ func captionCueWindows(startMs, endMs int64, pieces []string) [][2]int64 {
 	if totalLen == 0 {
 		totalLen = 1
 	}
-	duration := endMs - startMs
 	cursor := startMs
 	for i := range pieces {
 		if i == len(pieces)-1 {
@@ -1224,6 +1318,14 @@ func (s *VisualTextService) placeSegmentCues(
 	if len(pieces) == 0 {
 		return nil, nil
 	}
+	// A cue needs at least one millisecond on screen: a segment whose text splits into more pieces
+	// than it has milliseconds collapses into fewer, longer cues rather than emitting zero-length
+	// or reversed windows the render-plan validator rejects.
+	budgetMs := endMs - startMs
+	if budgetMs <= 0 {
+		budgetMs = degenerateCaptionWindowMs
+	}
+	pieces = mergeCaptionPieces(pieces, int(budgetMs))
 	windows := captionCueWindows(startMs, endMs, pieces)
 	cues := make([]domain.SubtitleCue, 0, len(pieces))
 	for i, piece := range pieces {
@@ -1288,7 +1390,11 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 				// the visual lane finds no variant and silently burns the SOURCE caption text as the
 				// localized subtitle (live evidence, run 3adede59: a fresh run on a fully cached
 				// pipeline rendered the Chinese captions over their own covers).
-				if casHash := s.stageArtifactHash(ctx, in.RunID, "translation"); casHash != "" {
+				casHash, hashErr := s.stageArtifactHash(ctx, in.RunID, "translation")
+				if hashErr != nil {
+					return nil, hashErr
+				}
+				if casHash != "" {
 					transIdx = &storage.TranslationVariantIndex{
 						AssetID:        in.AssetID,
 						RunID:          in.RunID,
@@ -1585,7 +1691,11 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			// Same cache-hit binding as the translation index above: the dub script stage of this run
 			// recorded the artifact it consumed, even though the variant row belongs to the run that
 			// produced it.
-			if casHash := s.stageArtifactHash(ctx, in.RunID, "dub_script"); casHash != "" {
+			casHash, hashErr := s.stageArtifactHash(ctx, in.RunID, "dub_script")
+			if hashErr != nil {
+				return nil, hashErr
+			}
+			if casHash != "" {
 				dubScriptIdx = &storage.DubScriptVariantIndex{
 					AssetID:        in.AssetID,
 					RunID:          in.RunID,

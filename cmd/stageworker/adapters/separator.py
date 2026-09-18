@@ -238,7 +238,13 @@ def normalize_stem_to_contract(wav_bytes: bytes) -> bytes:
     if not wav_bytes:
         return wav_bytes
     rate, channels, _ = measure_wav_properties(wav_bytes)
-    if rate == CONTRACT_SAMPLE_RATE and channels == 1:
+    sampwidth = 0
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            sampwidth = wf.getsampwidth()
+    except Exception:
+        pass
+    if rate == CONTRACT_SAMPLE_RATE and channels == 1 and sampwidth == 2:
         return wav_bytes
     # ffmpeg is given a real output file, not a pipe: a streamed WAV cannot backfill its RIFF/data
     # sizes, and these bytes are persisted as a content-addressed artifact other readers measure.
@@ -402,63 +408,63 @@ def separate_uvr(
     # audio-separator falls back to os.getcwd() when output_dir is None, so stems were written
     # next to whatever directory the worker was launched in. Keep them in a scratch dir.
     out_dir = tempfile.mkdtemp(prefix="uvr_out_")
-    sep = (
-        Separator(model_file_dir=model_dir, output_dir=out_dir, sample_rate=CONTRACT_SAMPLE_RATE)
-        if model_dir
-        else Separator(output_dir=out_dir, sample_rate=CONTRACT_SAMPLE_RATE)
-    )
-
-    # Block all request-time network/download helpers on the Separator instance so floating network resolution is impossible
-    def _blocked_download(*args, **kwargs):
-        raise RuntimeError("NETWORK_DOWNLOAD_FORBIDDEN: UVR execution is strictly offline; download helper was reached")
-
-    sep.download_file_if_not_exists = _blocked_download
-    if hasattr(sep, "download_file_by_hash"):
-        sep.download_file_by_hash = _blocked_download
-    if hasattr(sep, "list_supported_model_files"):
-        sep.list_supported_model_files = _blocked_download
-
-    # Provide offline local model resolution: resolve strictly from verified snapshot assets
-    def _offline_download_model_files(name):
-        ep_file = entrypoint_file or (os.path.join(model_path, UVR_CANONICAL_FILENAME) if model_path else None)
-        if not ep_file or not os.path.exists(ep_file):
-            raise RuntimeError(f"SEPARATOR_MODEL_ASSET_MISSING: UVR artifact file missing from snapshot: {ep_file}")
-        return (
-            os.path.basename(ep_file),
-            "MDX",
-            "UVR-MDX-NET-Inst_HQ_4",
-            ep_file,
-            None,
+    try:
+        sep = (
+            Separator(model_file_dir=model_dir, output_dir=out_dir, sample_rate=CONTRACT_SAMPLE_RATE)
+            if model_dir
+            else Separator(output_dir=out_dir, sample_rate=CONTRACT_SAMPLE_RATE)
         )
 
-    sep.download_model_files = _offline_download_model_files
+        # Block all request-time network/download helpers on the Separator instance so floating network resolution is impossible
+        def _blocked_download(*args, **kwargs):
+            raise RuntimeError("NETWORK_DOWNLOAD_FORBIDDEN: UVR execution is strictly offline; download helper was reached")
 
-    if model_params is not None:
-        sep.load_model_data_using_hash = lambda *a, **kw: dict(model_params)
-    # Contextual guard blocking socket/urllib/requests during load and separation
-    class _OfflineNetworkGuard:
-        def __enter__(self):
-            import urllib.request
-            self._orig_urlopen = urllib.request.urlopen
-            def _blocked_urlopen(*a, **kw):
-                raise RuntimeError("NETWORK_DOWNLOAD_FORBIDDEN: HTTP/network access blocked in offline UVR execution")
-            urllib.request.urlopen = _blocked_urlopen
+        sep.download_file_if_not_exists = _blocked_download
+        if hasattr(sep, "download_file_by_hash"):
+            sep.download_file_by_hash = _blocked_download
+        if hasattr(sep, "list_supported_model_files"):
+            sep.list_supported_model_files = _blocked_download
 
-            self._orig_requests_get = None
-            if "requests" in sys.modules:
-                requests_mod = sys.modules["requests"]
-                if hasattr(requests_mod, "get"):
-                    self._orig_requests_get = requests_mod.get
-                    requests_mod.get = _blocked_download
-            return self
+        # Provide offline local model resolution: resolve strictly from verified snapshot assets
+        def _offline_download_model_files(name):
+            ep_file = entrypoint_file or (os.path.join(model_path, UVR_CANONICAL_FILENAME) if model_path else None)
+            if not ep_file or not os.path.exists(ep_file):
+                raise RuntimeError(f"SEPARATOR_MODEL_ASSET_MISSING: UVR artifact file missing from snapshot: {ep_file}")
+            return (
+                os.path.basename(ep_file),
+                "MDX",
+                "UVR-MDX-NET-Inst_HQ_4",
+                ep_file,
+                None,
+            )
 
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            import urllib.request
-            urllib.request.urlopen = self._orig_urlopen
-            if self._orig_requests_get is not None and "requests" in sys.modules:
-                sys.modules["requests"].get = self._orig_requests_get
+        sep.download_model_files = _offline_download_model_files
 
-    try:
+        if model_params is not None:
+            sep.load_model_data_using_hash = lambda *a, **kw: dict(model_params)
+        # Contextual guard blocking socket/urllib/requests during load and separation
+        class _OfflineNetworkGuard:
+            def __enter__(self):
+                import urllib.request
+                self._orig_urlopen = urllib.request.urlopen
+                def _blocked_urlopen(*a, **kw):
+                    raise RuntimeError("NETWORK_DOWNLOAD_FORBIDDEN: HTTP/network access blocked in offline UVR execution")
+                urllib.request.urlopen = _blocked_urlopen
+
+                self._orig_requests_get = None
+                if "requests" in sys.modules:
+                    requests_mod = sys.modules["requests"]
+                    if hasattr(requests_mod, "get"):
+                        self._orig_requests_get = requests_mod.get
+                        requests_mod.get = _blocked_download
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                import urllib.request
+                urllib.request.urlopen = self._orig_urlopen
+                if self._orig_requests_get is not None and "requests" in sys.modules:
+                    sys.modules["requests"].get = self._orig_requests_get
+
         with _OfflineNetworkGuard():
             sep.load_model(model_name)
             output_files = sep.separate(audio_path)

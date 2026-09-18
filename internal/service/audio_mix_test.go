@@ -611,3 +611,81 @@ func TestAudioMixService_SeparateAudio_FailClosedWhenNormalizedEvidenceMissingOr
 		t.Fatalf("expected normalized audio artifact missing/unreadable error, got %v", err)
 	}
 }
+
+func TestAudioMixService_PlaceableSegmentMissingAudio_Refused(t *testing.T) {
+	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+	assetID, runID, stemsCAS := mixFixtureWithDubEligibleSpeech(t, db, casStore)
+
+	// Segment within suppression window [0, 35000ms] whose audio is missing from CAS
+	dubSegments := domain.DubSegmentsVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubSegmentsSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		Segments: []domain.DubSegment{
+			{
+				Index:              0,
+				SpeechBlockIndices: []int{0},
+				SpeakerID:          "SPEAKER_00",
+				StartMs:            1000,
+				EndMs:              3000,
+				SlotDurationMs:     2000,
+				MeasuredDurationMs: 1800,
+				AudioSHA256:        "sha256_nonexistent_audio_clip_that_cannot_be_read",
+				FitDecision:        domain.FitActionAccept,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubBytes, _ := json.Marshal(dubSegments)
+	dubObj, _ := casStore.Put(bytes.NewReader(dubBytes))
+
+	mix, err := mixSvc.MixAudio(ctx, service.AudioMixInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		DubSegmentsCAS: dubObj.SHA256,
+		AudioStemsCAS:  stemsCAS,
+	})
+	if err == nil {
+		t.Fatalf("expected ErrMixerOverrunRefused when placeable segment audio is missing, got PASS mix: %+v", mix)
+	}
+	if !errors.Is(err, domain.ErrMixerOverrunRefused) {
+		t.Fatalf("expected ErrMixerOverrunRefused, got %v", err)
+	}
+	if mix == nil || mix.OverallStatus != "REFUSED" {
+		t.Fatalf("expected a REFUSED dub mix artifact, got %+v", mix)
+	}
+	if !strings.Contains(mix.RefusalReason, "segment 0") {
+		t.Errorf("refusal reason must name the segment index, got %q", mix.RefusalReason)
+	}
+}
+
+func TestAudioMixService_DubEligibleWithUnreadableDubSegmentsCAS_Refused(t *testing.T) {
+	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+	assetID, runID, stemsCAS := mixFixtureWithDubEligibleSpeech(t, db, casStore)
+
+	// Role plan is dub-eligible (narration dialogue [0, 35000ms]), and DubSegmentsCAS is named but unreadable in CAS
+	mix, err := mixSvc.MixAudio(ctx, service.AudioMixInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		DubSegmentsCAS: "sha256_unreadable_missing_dub_segments_cas",
+		AudioStemsCAS:  stemsCAS,
+	})
+	if err == nil {
+		t.Fatalf("expected ErrMixerOverrunRefused when dub-eligible plan has unreadable dub artifact, got PASS mix: %+v", mix)
+	}
+	if !errors.Is(err, domain.ErrMixerOverrunRefused) {
+		t.Fatalf("expected ErrMixerOverrunRefused, got %v", err)
+	}
+	if mix == nil || mix.OverallStatus != "REFUSED" {
+		t.Fatalf("expected a REFUSED dub mix artifact, got %+v", mix)
+	}
+	if !strings.Contains(mix.RefusalReason, "unreadable") {
+		t.Errorf("expected refusal reason to mention unreadable CAS, got %q", mix.RefusalReason)
+	}
+}

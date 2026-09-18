@@ -105,6 +105,19 @@ func TestGenerateASSContent_DeterministicStructureAndBoxSemantics(t *testing.T) 
 			BoxColor:   "#000000",
 			FontColor:  "yellow",
 		},
+		{
+			StartMs:    3300,
+			EndMs:      4000,
+			Text:       "Origin Cue",
+			X:          0,
+			Y:          0,
+			Width:      400,
+			Height:     60,
+			FontSizePx: 24,
+			PaddingX:   18,
+			BoxColor:   "black@0.6",
+			FontColor:  "white",
+		},
 	}
 
 	ass := media.GenerateASSContent(timeline, cues, "Arial")
@@ -128,8 +141,12 @@ func TestGenerateASSContent_DeterministicStructureAndBoxSemantics(t *testing.T) 
 	}
 
 	// Verify Dialogue lines use CompactFitBox and contain exact box tags (\bord, \3c, \4c, \3a, \4a)
-	if !strings.Contains(ass, "Dialogue: 0,0:00:00.10,0:00:01.50,CompactFitBox,,0,0,0,,{\\an5\\pos(150,300)\\bord20\\shad0\\fs28\\c&HFFFFFF&\\3c&H000000&\\4c&H000000&\\3a&H66&\\4a&H66&}Chào mừng bạn đến với Douyinie") {
-		t.Errorf("expected dialogue line with CompactFitBox style, exact coordinates and box formatting in ASS output, got: %s", ass)
+	if !strings.Contains(ass, "Dialogue: 0,0:00:00.10,0:00:01.50,CompactFitBox,,0,0,0,,{\\an7\\pos(150,300)\\bord20\\shad0\\fs28\\c&HFFFFFF&\\3c&H000000&\\4c&H000000&\\3a&H66&\\4a&H66&}Chào mừng bạn đến với Douyinie") {
+		t.Errorf("expected dialogue line with CompactFitBox style, legacy top-left anchor for zero-dimension cue in ASS output, got: %s", ass)
+	}
+	// Verify origin cue (0,0) with dimensions uses center anchor \an5\pos(W/2,H/2)
+	if !strings.Contains(ass, `\an5\pos(200,30)`) {
+		t.Errorf("expected origin cue to be positioned with \\an5\\pos(200,30), got: %s", ass)
 	}
 	// Verify line break conversion to \N
 	if !strings.Contains(ass, `Dòng 1\NDòng 2`) {
@@ -142,8 +159,10 @@ func TestGenerateASSContent_DeterministicStructureAndBoxSemantics(t *testing.T) 
 }
 
 func TestComposeNativeVideo_CoverHidesSourceRegionBeforeSubtitleBurn(t *testing.T) {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		t.Skip("ffmpeg not available on test host")
+	for _, bin := range []string{"ffmpeg", "ffprobe"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not available on test host", bin)
+		}
 	}
 	ctx := context.Background()
 	tmpDir := t.TempDir()
@@ -210,6 +229,31 @@ func TestComposeNativeVideo_CoverHidesSourceRegionBeforeSubtitleBurn(t *testing.
 			}
 			if got := samplePixel(t, coveredOut, cover.X-10, cover.Y+cover.Height/2, timeline); !withinTolerance(got, 255, 60) {
 				t.Fatalf("cover bled outside its box: pixel left of the cover reads %v, expected the untouched source", got)
+			}
+
+			// GREEN (subtitle over cover): subtitle composited after cover remains visible.
+			subOut := filepath.Join(tmpDir, tc.name+"_sub_covered.mp4")
+			subCue := domain.SubtitleCue{
+				StartMs:    0,
+				EndMs:      2000,
+				Text:       "TEST",
+				X:          cover.X,
+				Y:          cover.Y,
+				Width:      cover.Width,
+				Height:     cover.Height,
+				FontSizePx: 20,
+				FontColor:  "white",
+				BoxColor:   "white@1.0",
+			}
+			if _, err := media.ComposeNativeVideo(ctx, media.CompositionRequest{
+				FFmpegPath: "ffmpeg", SourceVideo: sourceVideo, AudioTrack: audioPath,
+				Timeline: timeline, Covers: []domain.CoverBox{cover}, Cues: []domain.SubtitleCue{subCue},
+				Profile: tc.profile, OutputPath: subOut,
+			}); err != nil {
+				t.Fatalf("compose with covers and subtitle: %v", err)
+			}
+			if got := sampleCoverPixel(t, subOut, cover, timeline); !withinTolerance(got, 255, 60) {
+				t.Fatalf("subtitle not visible above cover: read %v, expected white subtitle box/text", got)
 			}
 		})
 	}

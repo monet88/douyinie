@@ -407,6 +407,34 @@ func (s *Server) shouldContinueRun(ctx context.Context, runID string) (bool, err
 	}
 }
 
+func (s *Server) resolveRunPosture(ctx context.Context, runID string) (domain.ReviewPosture, error) {
+	run, err := s.db.GetRun(ctx, runID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get run %s: %w", runID, err)
+	}
+	if run == nil || strings.TrimSpace(run.ConfigSnapshotJSON) == "" {
+		return domain.ReviewPostureAuto, nil
+	}
+	var cfg struct {
+		Posture       domain.ReviewPosture `json:"posture"`
+		ReviewPosture domain.ReviewPosture `json:"review_posture"`
+	}
+	if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
+		return "", fmt.Errorf("malformed run config snapshot JSON: %w", err)
+	}
+	p := cfg.Posture
+	if p == "" {
+		p = cfg.ReviewPosture
+	}
+	if p != "" {
+		if p != domain.ReviewPostureAuto && p != domain.ReviewPostureReview {
+			return "", fmt.Errorf("invalid run posture: %q", p)
+		}
+		return p, nil
+	}
+	return domain.ReviewPostureAuto, nil
+}
+
 func (s *Server) completeRunSafely(ctx context.Context, runID string) error {
 	s.activeRunMu.Lock()
 	defer s.activeRunMu.Unlock()
@@ -418,17 +446,39 @@ func (s *Server) completeRunSafely(ctx context.Context, runID string) error {
 	}
 	switch entry.Status {
 	case domain.RunStatusRunning:
+		// The job's status follows the work the run actually finished, not the queue transition.
+		// In Review posture the handoff stage is a readiness gate that stops at 'start_final_render'
+		// and renders nothing, so the job must stay open until the operator's explicit render succeeds
+		// (handleRenderFinal finishes it through completeJobAfterExplicitFinalRender).
+		// In Auto posture, final render was executed automatically during the handoff, so the job is
+		// completed here.
+		//
+		// The job write comes before the queue transition so a failed write leaves the run unfinished
+		// with the error surfaced, instead of a run that reports completion while its job is left behind.
+		// If the subsequent queue transition fails, we roll back the job status to prevent divergence.
+		var priorJobStatus string
+		if entry.JobID != "" {
+			posture, err := s.resolveRunPosture(lookupCtx, runID)
+			if err != nil && !errors.Is(err, storage.ErrNotFound) {
+				return fmt.Errorf("resolve posture before completing job %s of run %s: %w", entry.JobID, runID, err)
+			}
+			if posture != domain.ReviewPostureReview {
+				if job, err := s.db.GetJob(lookupCtx, entry.JobID); err == nil && job != nil {
+					priorJobStatus = job.Status
+				}
+				if err := s.db.UpdateJobStatus(lookupCtx, entry.JobID, "completed"); err != nil {
+					return fmt.Errorf("complete job %s of run %s: %w", entry.JobID, runID, err)
+				}
+			}
+		}
 		if err := s.db.UpdateQueueStatus(lookupCtx, runID, domain.RunStatusCompleted, domain.RunStatusCompleted); err != nil {
+			if entry.JobID != "" && priorJobStatus != "" {
+				_ = s.db.UpdateJobStatus(lookupCtx, entry.JobID, priorJobStatus)
+			}
 			if failErr := s.failRun(lookupCtx, runID, "run_completion", fmt.Sprintf("failed to mark run completed: %v", err)); failErr != nil {
 				return fmt.Errorf("complete run failed: %v (failRun error: %w)", err, failErr)
 			}
 			return fmt.Errorf("complete run failed: %w", err)
-		}
-		// The job's status follows its run: a run only reaches completion through a
-		// successful final render handoff, so the job is finished too. Without this the
-		// operator sees the `review_required` a blocked handoff wrote, forever.
-		if entry.JobID != "" {
-			_ = s.db.UpdateJobStatus(lookupCtx, entry.JobID, "completed")
 		}
 		return nil
 	case domain.RunStatusPaused, domain.RunStatusCancelled, domain.RunStatusInterrupted:
@@ -436,6 +486,41 @@ func (s *Server) completeRunSafely(ctx context.Context, runID string) error {
 	default:
 		return fmt.Errorf("unexpected queue status %s before completion for run %s", entry.Status, runID)
 	}
+}
+
+// completeJobAfterExplicitFinalRender finishes the job a completed run left open for the operator's
+// explicit final render (Review posture: the handoff stage exposes 'start_final_render' and renders
+// nothing, so the run completes with its job still open). Only a run whose pipeline already reached
+// completion may be the half that was waiting: a run still executing owns its own job transition, and
+// an interrupted or failed run must not be promoted to a finished job by a manual render.
+func (s *Server) completeJobAfterExplicitFinalRender(ctx context.Context, runID string) error {
+	if strings.TrimSpace(runID) == "" || s.db == nil {
+		return nil // asset-level render: no run owns this job transition
+	}
+	entry, err := s.db.GetQueueEntryByRunID(ctx, runID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("look up run %s before completing its job: %w", runID, err)
+	}
+	if entry.Status != domain.RunStatusCompleted {
+		return nil
+	}
+	jobID := entry.JobID
+	if jobID == "" {
+		run, err := s.db.GetRun(ctx, runID)
+		if err == nil && run != nil {
+			jobID = run.JobID
+		}
+	}
+	if jobID == "" {
+		return nil
+	}
+	if err := s.db.UpdateJobStatus(ctx, jobID, "completed"); err != nil {
+		return fmt.Errorf("complete job %s after final render of run %s: %w", jobID, runID, err)
+	}
+	return nil
 }
 
 func (s *Server) drainQueue(ctx context.Context) {
@@ -532,29 +617,9 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 	}
 
 	// Validate run config snapshot and posture fail-closed
-	posture := domain.ReviewPostureAuto
-	run, err := s.db.GetRun(ctx, runID)
+	posture, err := s.resolveRunPosture(ctx, runID)
 	if err != nil {
-		return s.failRun(ctx, runID, "run_config", fmt.Sprintf("failed to get run %s: %v", runID, err))
-	}
-	if run != nil && strings.TrimSpace(run.ConfigSnapshotJSON) != "" {
-		var cfg struct {
-			Posture       domain.ReviewPosture `json:"posture"`
-			ReviewPosture domain.ReviewPosture `json:"review_posture"`
-		}
-		if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
-			return s.failRun(ctx, runID, "run_config", fmt.Sprintf("malformed run config snapshot JSON: %v", err))
-		}
-		p := cfg.Posture
-		if p == "" {
-			p = cfg.ReviewPosture
-		}
-		if p != "" {
-			if p != domain.ReviewPostureAuto && p != domain.ReviewPostureReview {
-				return s.failRun(ctx, runID, "run_config", fmt.Sprintf("invalid run posture: %q", p))
-			}
-			posture = p
-		}
+		return s.failRun(ctx, runID, "run_config", err.Error())
 	}
 	priorStages, _ := s.db.ListStageExecutions(ctx, runID)
 	latestStageMap := make(map[string]domain.StageExecution)
@@ -4024,6 +4089,13 @@ func (s *Server) handleRenderFinal(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnprocessableEntity, err.Error())
 			return
 		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// Review posture leaves the job open at the handoff: the run's pipeline finished, and this explicit
+	// render is the work the job was waiting for, so the job follows the render that just succeeded.
+	if err := s.completeJobAfterExplicitFinalRender(r.Context(), body.RunID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

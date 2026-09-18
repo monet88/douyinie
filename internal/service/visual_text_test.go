@@ -2114,3 +2114,198 @@ func TestVisualTextService_LocalizeVisualTrack_OverlayTranslationsStayEphemeral(
 			translationStagesAfter-translationStagesBefore)
 	}
 }
+
+func seedTextRegionPlan(t *testing.T, db *storage.DB, casStore *cas.Store, assetID string, regions []domain.TrackedTextRegion) domain.TextRegionPlan {
+	t.Helper()
+	now := time.Now().UTC()
+	plan := domain.TextRegionPlan{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.TextRegionPlanSchemaVersion,
+		AssetID:        assetID,
+		ProviderID:     "test_ocr",
+		ModelName:      "test_model",
+		ModelVersion:   "v1",
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		Regions:        regions,
+		ProvenanceHash: "prov-test-plan-" + uuid.NewString(),
+		CreatedAt:      now,
+	}
+	planBytes, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	planObj, err := casStore.Put(bytes.NewReader(planBytes))
+	if err != nil {
+		t.Fatalf("put plan in CAS: %v", err)
+	}
+	plan.CASHash = planObj.SHA256
+
+	err = db.SaveTextRegionPlanIndex(context.Background(), storage.TextRegionPlanIndex{
+		ID:             plan.ID,
+		AssetID:        plan.AssetID,
+		ProviderID:     plan.ProviderID,
+		ModelName:      plan.ModelName,
+		ModelVersion:   plan.ModelVersion,
+		CASHash:        plan.CASHash,
+		ProvenanceHash: plan.ProvenanceHash,
+		CreatedAt:      plan.CreatedAt,
+	})
+	if err != nil {
+		t.Fatalf("save plan index: %v", err)
+	}
+	return plan
+}
+
+// Regression test for Violation 1:
+// When one replacement overlaps multiple kept replacements, all colliding kept items must be examined.
+// Three mutually overlapping overlays where the middle one dominates one but yields to the other
+// must leave no overlapping kept pair.
+func TestVisualTextService_LocalizeVisualTrack_OverlayCollisions_NoOverlappingKeptPair(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	setupTestTranslationService(db, casStore, svc)
+	ctx := context.Background()
+
+	regions := []domain.TrackedTextRegion{
+		{
+			ID:          "region-small",
+			Role:        domain.TextRoleSemanticText,
+			Text:        "小标签",
+			FirstSeenMs: 0,
+			LastSeenMs:  1000,
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 0, Box: domain.BoundingBox{X: 100, Y: 100, Width: 100, Height: 50}, Observed: true},
+			},
+		},
+		{
+			ID:          "region-large",
+			Role:        domain.TextRoleSemanticText,
+			Text:        "大标签",
+			FirstSeenMs: 1000,
+			LastSeenMs:  2000,
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 1000, Box: domain.BoundingBox{X: 100, Y: 100, Width: 350, Height: 120}, Observed: true},
+			},
+		},
+		{
+			ID:          "region-middle",
+			Role:        domain.TextRoleSemanticText,
+			Text:        "中标签",
+			FirstSeenMs: 500,
+			LastSeenMs:  1500,
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 500, Box: domain.BoundingBox{X: 100, Y: 100, Width: 220, Height: 80}, Observed: true},
+			},
+		},
+	}
+	seedTextRegionPlan(t, db, casStore, assetID, regions)
+
+	visTrack, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-collision-test",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err != nil {
+		t.Fatalf("localize visual track failed: %v", err)
+	}
+
+	// Invariant: no two kept overlays overlap in BOTH time and space
+	for i := range visTrack.Overlays {
+		for j := i + 1; j < len(visTrack.Overlays); j++ {
+			a, b := visTrack.Overlays[i], visTrack.Overlays[j]
+			timeOverlap := a.StartMs < b.EndMs && b.StartMs < a.EndMs
+			if timeOverlap && domain.BoxesOverlap(a.Box, b.Box) {
+				t.Fatalf("found overlapping kept overlays: %s [%d-%d] and %s [%d-%d]",
+					a.RegionID, a.StartMs, a.EndMs, b.RegionID, b.StartMs, b.EndMs)
+			}
+		}
+	}
+
+	// The middle label yielded to the larger one and must not be kept
+	for _, ov := range visTrack.Overlays {
+		if ov.RegionID == "region-middle" {
+			t.Errorf("expected middle overlay to be dropped, but was kept: %+v", ov)
+		}
+	}
+}
+
+// Regression test for Violation 2:
+// When a short translation segment splits into more pieces than its duration in milliseconds,
+// pieces are merged so every emitted window is non-empty, ordered, and inside [startMs, endMs].
+func TestVisualTextService_LocalizeVisualTrack_ShortSegmentPieceCountExceedsDuration_EmitsValidWindows(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	seedTextRegionPlan(t, db, casStore, assetID, nil)
+
+	// Long text that splits into 3+ pieces (>100 runes across multiple words)
+	longText := "Đặt điện thoại lên tủ là bạn có ngay góc nhìn từ trên cao y hệt. " +
+		"Đặt điện thoại bên dưới gói mì gà cay đã cắt miệng, bạn sẽ có cảnh quay độc lạ. " +
+		"Đặt điện thoại vào trong cuộn băng dính rồi tùy ý để ở một nơi nào đó."
+
+	transVariant := domain.TranslationVariant{
+		ID:             "trans-short-window",
+		AssetID:        assetID,
+		RunID:          "run-short-window",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{
+			{
+				Index:      0,
+				SourceText: "短视频文案内容",
+				TargetText: longText,
+				StartMs:    0,
+				EndMs:      2, // 2 milliseconds available for 3+ pieces
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	transBytes, err := json.Marshal(transVariant)
+	if err != nil {
+		t.Fatalf("marshal translation: %v", err)
+	}
+	transObj, err := casStore.Put(bytes.NewReader(transBytes))
+	if err != nil {
+		t.Fatalf("put translation in CAS: %v", err)
+	}
+	err = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             transVariant.ID,
+		AssetID:        assetID,
+		RunID:          transVariant.RunID,
+		TargetLanguage: "vi",
+		CASHash:        transObj.SHA256,
+		ProvenanceHash: "prov-trans-short-window",
+		CreatedAt:      transVariant.CreatedAt,
+	})
+	if err != nil {
+		t.Fatalf("save translation variant index: %v", err)
+	}
+
+	visTrack, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:                 "run-short-window",
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: transObj.SHA256,
+	})
+	if err != nil {
+		t.Fatalf("localize visual track failed: %v", err)
+	}
+
+	if len(visTrack.SubtitleCues) == 0 {
+		t.Fatalf("expected subtitle cues to be emitted")
+	}
+
+	// Validate all emitted cue windows: must be non-empty, ordered, and within [0, 2]
+	for i, cue := range visTrack.SubtitleCues {
+		if cue.StartMs < 0 || cue.EndMs <= cue.StartMs {
+			t.Fatalf("cue %d has degenerate bounds [%d, %d]", i, cue.StartMs, cue.EndMs)
+		}
+		if cue.StartMs < 0 || cue.EndMs > 2 {
+			t.Fatalf("cue %d bounds [%d, %d] outside segment window [0, 2]", i, cue.StartMs, cue.EndMs)
+		}
+		if i > 0 && cue.StartMs < visTrack.SubtitleCues[i-1].EndMs {
+			t.Fatalf("cue %d start %d precedes previous end %d", i, cue.StartMs, visTrack.SubtitleCues[i-1].EndMs)
+		}
+	}
+}
