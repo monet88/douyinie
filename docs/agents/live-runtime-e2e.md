@@ -134,6 +134,22 @@ carries its dependencies.
 | `DOUYINIE_GATEWAY_URL`, `DOUYINIE_GATEWAY_API_KEY` | operator-supplied authorized gateway. `DOUYINIE_GATEWAY_URL` must already carry the API prefix (`https://<host>/v1`): `GatewayTranslationProvider.resolveEndpointURL` appends `/chat/completions` verbatim, so a bare host yields HTTP 404 (recorded as `quality_failed` on both gateway lanes, surfacing as `all provider candidates failed for stage translation`) |
 | `DOUYINIE_SERVICE_BASELINE_GEMINI`, `DOUYINIE_SERVICE_BASELINE_DEEPSEEK` | operator-supplied baseline ids |
 
+**The gateway pair must be present in the daemon's own environment.** They are read once at startup
+(`NewProductionSpeechRegistry`), and a daemon started without them silently registers 12 providers
+instead of 14 — `/api/v1/providers` then has no `gateway_*` lane, and every run that needs translation
+fails with `no eligible provider found satisfying policy, capability, and health`. Restarting the
+supervised process through `hub restart` keeps the original spec; a fresh `hub start` does not, so pass
+the pair explicitly (the operator shell carries them as `AI_GATEWAY_*`):
+
+```bash
+"C:/Program Files/Git/bin/bash.exe" -c 'export DOUYINIE_GATEWAY_URL="$AI_GATEWAY_URL/v1"; \
+  export DOUYINIE_GATEWAY_API_KEY="$AI_GATEWAY_API_KEY"; exec F:/douyinie-rt-scratch/runtimehost.exe \
+  -port 18099 -data-dir "F:\douyinie-rt-scratch\live-20260918\data-head"'
+```
+
+`F:\douyinie-rt-scratch\start-runtimehost.sh` carries the same bridge with the §2 venv matrix, but the
+supervisor launches Windows executables, so invoke it through Git Bash rather than directly.
+
 Notes that were learned the hard way:
 
 - **Every stem lane is normalized to the pipeline contract rate.** The UVR lane asks audio-separator for
