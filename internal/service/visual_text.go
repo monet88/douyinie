@@ -1123,7 +1123,9 @@ const maxCaptionWindowPadMs = 1000
 // compact-fit style (font 24, border 18) over a 1080 px frame. Live evidence (run 4f86657f): one
 // 12 s segment carrying four sentences rendered as a single three-line block that covered a third of
 // the frame and stayed up for the whole segment.
-const captionCueMaxChars = 84
+// captionCueMaxChars bounds one cue's text: at the live 1080x1440 scale (subtitleFontScale 0.037,
+// ~35 characters per line) it keeps every replacement within two lines of the caption block.
+const captionCueMaxChars = 68
 
 // degenerateCaptionWindowMs is the window a segment with no usable duration is given. Cues share
 // their segment's window in proportion to their text, so a segment of unknown length still yields

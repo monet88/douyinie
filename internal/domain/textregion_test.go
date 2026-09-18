@@ -2,6 +2,7 @@ package domain_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/monet88/douyinie/internal/domain"
@@ -660,5 +661,43 @@ func TestClassifyRegion_StableLatinLabelSurvivesInstabilityGate(t *testing.T) {
 	role, _, _, _ := domain.ClassifyRegionWithInstability("NET WEIGHT 100g", box, 0.95, cfg, 4, nearby, nil)
 	if role != domain.TextRoleSemanticText {
 		t.Errorf("role = %s, want %s for a stable readable label", role, domain.TextRoleSemanticText)
+	}
+}
+
+// A long replacement stacks at word boundaries and the box hugs its widest line, so the caption
+// stays inside the frame instead of running off one over-wide line.
+func TestComputeCompactSubtitleBounds_WrapsLongTextIntoStackedLines(t *testing.T) {
+	frameW, frameH := 1080, 1440
+	long := "Đặt điện thoại lên tủ bếp, bạn có góc nhìn từ trên cao và khung hình đẹp hơn hẳn mỗi ngày"
+
+	cue, err := domain.ComputeCompactSubtitleBounds(frameW, frameH, long, 0, 0, 0, nil)
+	if err != nil {
+		t.Fatalf("expected successful placement, got error: %v", err)
+	}
+	lines := strings.Split(cue.Text, "\n")
+	if len(lines) < 2 {
+		t.Fatalf("long caption stayed on one line: %q", cue.Text)
+	}
+	if got := strings.Join(strings.Fields(cue.Text), " "); got != long {
+		t.Errorf("wrapping lost words: %q != %q", got, long)
+	}
+	if cue.Width > int(float64(frameW)*0.80)+1 {
+		t.Errorf("wrapped box width %d exceeds the 80%% frame budget", cue.Width)
+	}
+	wantHeight := len(lines)*cue.FontSizePx + (len(lines)-1)*int(float64(cue.FontSizePx)*0.3) + 2*cue.PaddingY
+	if cue.Height != wantHeight {
+		t.Errorf("box height %d does not cover %d lines (want %d)", cue.Height, len(lines), wantHeight)
+	}
+	// The replacement is drawn at the visual weight of the burned-in caption it replaces.
+	if want := int(float64(frameH) * 0.037); cue.FontSizePx != want {
+		t.Errorf("font size %d, want the source-matched %d", cue.FontSizePx, want)
+	}
+
+	short, err := domain.ComputeCompactSubtitleBounds(frameW, frameH, "Bước 1: Trộn trà", 0, 0, 0, nil)
+	if err != nil {
+		t.Fatalf("expected successful placement for short text, got error: %v", err)
+	}
+	if strings.Contains(short.Text, "\n") {
+		t.Errorf("short caption wrapped unnecessarily: %q", short.Text)
 	}
 }

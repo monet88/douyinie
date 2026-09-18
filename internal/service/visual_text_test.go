@@ -1179,12 +1179,14 @@ func TestVisualTextService_LocalizeVisualTrack_CanonicalTranslationGrounding_Suc
 	if len(visTrack.SubtitleCues) != 1 {
 		t.Fatalf("expected 1 subtitle cue, got %d", len(visTrack.SubtitleCues))
 	}
-	if visTrack.SubtitleCues[0].Text != canonicalMeaningText {
+	// The cue text is the canonical meaning wrapped for rendering, so compare on the words.
+	gotCueText := strings.Join(strings.Fields(visTrack.SubtitleCues[0].Text), " ")
+	if gotCueText != canonicalMeaningText {
 		t.Errorf("subtitle text %q != canonical TranslationVariant target text %q (must not use spokenText %q)",
-			visTrack.SubtitleCues[0].Text, canonicalMeaningText, shortenedSpokenText)
+			gotCueText, canonicalMeaningText, shortenedSpokenText)
 	}
-	if visTrack.SubtitleCues[0].Text == newerMeaningText {
-		t.Fatalf("selected run localized using newer run artifact: %q", visTrack.SubtitleCues[0].Text)
+	if gotCueText == newerMeaningText {
+		t.Fatalf("selected run localized using newer run artifact: %q", gotCueText)
 	}
 }
 
@@ -1311,8 +1313,8 @@ func TestVisualTextService_LocalizeVisualTrack_ExplicitTranslationCASSurvivesRes
 	if len(visTrack.SubtitleCues) != 1 {
 		t.Fatalf("expected 1 subtitle cue, got %d", len(visTrack.SubtitleCues))
 	}
-	if visTrack.SubtitleCues[0].Text != speechMeaning {
-		t.Fatalf("subtitle text %q != explicitly pinned speech translation %q", visTrack.SubtitleCues[0].Text, speechMeaning)
+	if got := strings.Join(strings.Fields(visTrack.SubtitleCues[0].Text), " "); got != speechMeaning {
+		t.Fatalf("subtitle text %q != explicitly pinned speech translation %q", got, speechMeaning)
 	}
 }
 

@@ -551,7 +551,10 @@ func ComputeCompactSubtitleBoundsWithSelector(
 		frameHeight = 1920
 	}
 	if fontSizePx <= 0 {
-		fontSizePx = int(float64(frameHeight) * 0.018) // ~34px for 1920h
+		// Scale-aware default matched to the burned-in captions this pipeline replaces: the live
+		// 1080x1440 source caption drew 53px glyphs (run 27a758e6) while frameHeight*0.018 gave 25px,
+		// which read as a stamp inside the cover rather than a replacement subtitle.
+		fontSizePx = int(float64(frameHeight) * subtitleFontScale)
 		if fontSizePx < 20 {
 			fontSizePx = 20
 		}
@@ -574,20 +577,26 @@ func ComputeCompactSubtitleBoundsWithSelector(
 		}
 	}
 
-	// Approximate text width: rough proportional font estimation (average char width ~ 0.55 * fontSize)
-	charWidth := int(float64(fontSizePx) * 0.55)
-	textLen := len([]rune(text))
-	rawTextWidth := textLen * charWidth
-
-	// Check if multi-line needed (max width ~ 80% frame width)
+	// Approximate text width: rough proportional font estimation (average char width ~0.45 * fontSize).
+	// Measured against the rendered default font (53 Vietnamese chars at fs25 drew 534px = 0.40 *
+	// fontSize per char); the estimate stays slightly generous so a cover grown around the box still
+	// frames the drawn text.
+	charWidth := int(float64(fontSizePx) * 0.45)
 	maxAllowedWidth := int(float64(frameWidth) * 0.80)
-	boxWidth := rawTextWidth + 2*paddingX
-	boxHeight := fontSizePx + 2*paddingY
 
-	if boxWidth > maxAllowedWidth {
-		boxWidth = maxAllowedWidth
-		boxHeight = fontSizePx*2 + int(float64(fontSizePx)*0.3) + 2*paddingY
+	// Long replacements wrap at word boundaries instead of running past the box: the declared box
+	// then hugs the widest line, and its height covers every line.
+	lineCap := (maxAllowedWidth - 2*paddingX) / max(1, charWidth)
+	if lineCap < 8 {
+		lineCap = 8
 	}
+	lines := wrapCaptionText(text, lineCap)
+	lineWidth := 0
+	for _, line := range lines {
+		lineWidth = max(lineWidth, len([]rune(line))*charWidth)
+	}
+	boxWidth := min(lineWidth+2*paddingX, maxAllowedWidth)
+	boxHeight := len(lines)*fontSizePx + (len(lines)-1)*int(float64(fontSizePx)*0.3) + 2*paddingY
 
 	// Center horizontally by default, clamp inside horizontal frame margins
 	defaultX := (frameWidth - boxWidth) / 2
@@ -687,7 +696,7 @@ func ComputeCompactSubtitleBoundsWithSelector(
 	}
 
 	return SubtitleCue{
-		Text:       text,
+		Text:       strings.Join(lines, "\n"),
 		X:          chosenBox.X,
 		Y:          chosenBox.Y,
 		Width:      chosenBox.Width,
@@ -698,6 +707,43 @@ func ComputeCompactSubtitleBoundsWithSelector(
 		BoxColor:   "black@0.6",
 		FontColor:  "#FFFFFF",
 	}, nil
+}
+
+// subtitleFontScale sizes a replacement caption against the frame. The burned-in captions this
+// pipeline replaces draw their glyphs at roughly this fraction of the frame height (a live
+// 1080x1440 source caption: 53px), so the replacement is drawn at the same visual weight.
+const subtitleFontScale = 0.037
+
+// wrapCaptionText breaks text into lines of at most maxChars runes at word boundaries, so a long
+// replacement stacks under itself instead of running off its box. Every word survives.
+func wrapCaptionText(text string, maxChars int) []string {
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return nil
+	}
+	if maxChars <= 0 {
+		return []string{strings.Join(words, " ")}
+	}
+	var lines []string
+	var current []string
+	length := 0
+	for _, word := range words {
+		wordLen := len([]rune(word))
+		switch {
+		case length == 0:
+			current, length = []string{word}, wordLen
+		case length+1+wordLen <= maxChars:
+			current = append(current, word)
+			length += 1 + wordLen
+		default:
+			lines = append(lines, strings.Join(current, " "))
+			current, length = []string{word}, wordLen
+		}
+	}
+	if len(current) > 0 {
+		lines = append(lines, strings.Join(current, " "))
+	}
+	return lines
 }
 
 // ComputeCompactSubtitleBounds calculates scale-aware fit-content subtitle box coordinates and padding.

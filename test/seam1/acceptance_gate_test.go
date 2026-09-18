@@ -232,8 +232,9 @@ var acceptanceGateFixtures = []fixtureGate{
 		},
 		wantOverlays:  3, // badges/sticker only; bottom subtitle covered by cues, not overlays
 		wantProtected: 0,
-		wantCues:      6,
-		evidence:      fixtureEvidence["video3"],
+		// 7 since the cue budget (68 chars) keeps every replacement within two rendered lines.
+		wantCues: 7,
+		evidence: fixtureEvidence["video3"],
 	},
 	{
 		id:   "video4_fast_tutorial_instructional_ui_outro",
@@ -313,8 +314,9 @@ var acceptanceGateFixtures = []fixtureGate{
 		},
 		wantOverlays:  0, // brand_keep must remain untouched
 		wantProtected: 2,
-		wantCues:      2,
-		evidence:      fixtureEvidence["video5"],
+		// 3 since the cue budget (68 chars) keeps every replacement within two rendered lines.
+		wantCues: 3,
+		evidence: fixtureEvidence["video5"],
 	},
 }
 
