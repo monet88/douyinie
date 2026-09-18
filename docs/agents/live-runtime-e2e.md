@@ -1,0 +1,151 @@
+# Live RuntimeHost E2E on real media
+
+How to stand up the production RuntimeHost + StageWorker stack on this workstation, drive the Operator UI
+like a real operator, and read the run back. Use it before claiming any acceptance criterion that says
+"on real media" / "production path".
+
+Authoritative behaviour still lives in [phase1-architecture.md](../architecture/phase1-architecture.md) and
+the resolved specs on the issue tracker; this file is the runbook, not a source of truth.
+
+## 1. Build and start
+
+```bash
+cd F:/CodeBase/douyinie
+go build -o F:/douyinie-rt-scratch/stageworker.exe ./cmd/stageworker
+go build -o F:/douyinie-rt-scratch/runtimehost.exe ./cmd/runtimehost
+```
+
+Start it through the process supervisor with the §2 environment applied (readiness = log match
+`API daemon listening`, port 18099):
+
+```
+runtimehost.exe -port 18099 -data-dir F:\douyinie-rt-scratch\live-20260918\data-head
+```
+
+Health check: `curl -s http://127.0.0.1:18099/api/v1/providers | jq '.providers|length'`.
+
+## 2. Runtime matrix (per-family interpreter + binaries)
+
+The StageWorker resolves **one** `DOUYINIE_PYTHON_BIN` shared by asr / aligner / diarizer, and separate
+per-family variables for the rest. Each family needs the venv that actually carries its dependencies.
+
+| Env var | Value on this workstation |
+|---|---|
+| `DOUYINIE_STAGEWORKER_BIN` | `F:\douyinie-rt-scratch\stageworker.exe` |
+| `DOUYINIE_PYTHON_BIN` | `D:\douyinie-ref\phase1.1-runtime\venvs\asr\Scripts\python.exe` |
+| `DOUYINIE_AUDIO_ROLE_PYTHON_BIN` | `…\venvs\audio_role\Scripts\python.exe` |
+| `DOUYINIE_OCR_PYTHON_BIN` | `…\venvs\ocr\Scripts\python.exe` |
+| `DOUYINIE_SEPARATOR_PYTHON_BIN` | `…\venvs\separator\Scripts\python.exe` |
+| `DOUYINIE_TRANSLATION_PYTHON_BIN` | `…\venvs\translation\Scripts\python.exe` |
+| `DOUYINIE_TTS_PYTHON_BIN` | `…\venvs\tts-zerotts-0.1.5-47e466d\Scripts\python.exe` |
+| `DOUYINIE_GATEWAY_URL`, `DOUYINIE_GATEWAY_API_KEY` | operator-supplied authorized gateway |
+| `DOUYINIE_SERVICE_BASELINE_GEMINI`, `DOUYINIE_SERVICE_BASELINE_DEEPSEEK` | operator-supplied baseline ids |
+
+Notes that were learned the hard way:
+
+- **The diarizer has no per-family interpreter variable.** `resolvePythonBinary()` reads only
+  `DOUYINIE_PYTHON_BIN`, and `venvs\asr` has no `modelscope`/`torchaudio`, so diarization dies with
+  `DIARIZER_EXEC_FAILED` when the asr venv is the shared one. Until that gap is closed, point
+  `DOUYINIE_DIARIZER_BIN` at a small runner shim that appends the repo adapter to the diarizer venv's
+  interpreter (reference implementation: `F:/douyinie-rt-scratch/bin/runner-shim/main.go`, built as
+  `asr-runner.exe` / `aligner-runner.exe` / `diarizer-runner.exe`).
+- `DOUYINIE_<FAMILY>_BIN` is a **binary** override: the worker invokes it with the JSON request on stdin and no
+  adapter argument. Do not point it at a bare interpreter.
+- Snapshot-required routes (separator, audio_role, tts) reject arbitrary binaries/adapters that cannot
+  self-attest RC provenance — build from the repo, do not hand-roll those two.
+
+## 3. Provisioning (once per data dir)
+
+14 model lanes must be verified + licensed + allowed before any stage runs. All three registries are HTTP;
+a reference script lives at `F:/douyinie-rt-scratch/provision/provision.py`.
+
+```bash
+POST /api/v1/snapshots/verify        # per dependency + version + manifest sha
+POST /api/v1/licenses               # per dependency: CODE_LICENSE / MODEL_LICENSE / DATA_LICENSE / SERVICE_TERMS
+PUT  /api/v1/policies/{provider_id}  # {"status":"ALLOWED"}
+```
+
+Verify with `GET /api/v1/policies`, `GET /api/v1/licenses`, `GET /api/v1/snapshots`. A missing license or a
+non-ALLOWED policy surfaces as `ErrNoEligibleProvider`, not as a stage error — check the registries first.
+
+## 4. Drive the Operator UI as a real operator
+
+Browser: the Orca embedded Chromium tab (`orca tab list --json`) pointed at `http://127.0.0.1:18099/`.
+Use `orca snapshot --json` for refs and `orca click/fill/upload --element <ref>`; the accessibility refs
+are the only stable handle (the DOM ids change with the view).
+
+1. `01 Job mới` → `File local` segmented button → `#source-input` becomes `type=file`.
+2. Attach the media with `orca upload --files <path> --element <ref>`; confirm the input actually holds the
+   file (`document.getElementById('source-input').files[0].name`).
+3. Fill `Tên operator`, tick the rights attestation, click `Tạo job & đưa vào queue→`.
+4. The UI posts `/api/v1/assets/upload` → `/api/v1/jobs` → `/api/v1/jobs/{id}/runs` and selects the new run.
+
+Trap: **switching views clears the file input.** If you navigate to another tab between attach and submit,
+the submit is a silent no-op (no toast, no job). Re-attach immediately before clicking.
+
+## 5. Read the run back
+
+```bash
+curl -s http://127.0.0.1:18099/api/v1/runs/<run>/stages | jq -r '.stages[] | "\(.stage) \(.status) \(.error_message//"")"'
+curl -s http://127.0.0.1:18099/api/v1/jobs/<job>           | jq -c '.job|{status}'
+```
+
+Per-attempt provider truth (which model ran, latency, why a candidate was rejected) lives in SQLite, not in
+the API:
+
+```bash
+sqlite3 <data-dir>/douyinie.db \
+ "select stage, provider_id, model_name, status, count(*), round(avg(latency_ms))
+  from provider_attempts where run_id='<run>' group by 1,2,3,4"
+```
+
+Artifact payloads are content-addressed under `<data-dir>/cas/<aa>/<bb>/<sha256>`; the index rows
+(`translation_variants`, `dub_segments_variants`, `voice_assignments`, `transcript_artifacts`, …) carry the
+hash. Probe media with `ffprobe` before believing any metadata column.
+
+Terminal states: `completed` (final render done), `review_required` on the **job** + `interrupted` on the
+**run** when the final-render handoff is blocked by pending review exceptions (by design).
+
+## 6. Fail-closed blocks you will meet on real media
+
+| Symptom | Meaning |
+|---|---|
+| `AUDIO_ROLE_EXEC_FAILED … unsupported sample rate: 44100 Hz (expected 16000 Hz)` | separated stems are produced at the separator's native rate while the analyzer contract is 16 kHz |
+| `translation QA gate rejected segment N: negation polarity inverted` | Meaning-First gate polarity mismatch — check whether the source `不` sits inside a lexical compound before blaming the model |
+| `translation QA gate rejected segment N: name/brand 'XX' missing from target` | entity gate vs OCR'd short tokens |
+| `conditional diarization failed … DIARIZER_EXEC_FAILED` | wrong interpreter for the diarizer family (§2) |
+| `final render handoff blocked: N pending review exceptions` | correct gate: resolve the queue in `03 Review Workspace`, then re-check the handoff in `04 Kết quả` |
+
+Workaround to keep a run moving while `audio_role_plan` is blocked: seed an operator plan, then resume.
+
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"segments":[{"start_ms":0,"end_ms":<asset ms>,"role":"narration/dialogue"}]}' \
+  http://127.0.0.1:18099/api/v1/assets/<asset>/audio-role-plan
+curl -X POST -H "Content-Type: application/json" -d '{}' \
+  http://127.0.0.1:18099/api/v1/runs/<run>/resume
+```
+
+## 7. Evidence to capture
+
+- `hub logs <daemon>` (spawn order, per-stage progress lines).
+- `03 Review Workspace` and `04 Kết quả` screenshots (`orca screenshot --json`, base64 in `.result.data`).
+- The review-item list: `GET /api/v1/runs/<run>/review-items` (type, severity, reason, stage).
+- For gateway disputes: re-run the disputed segment against the authorized gateway with the shipped system
+  prompt and compare against `detectNegation` semantics before filing anything
+  (reference: `F:/douyinie-rt-scratch/live-20260918/probe_negation.py`).
+
+## 8. Windows traps
+
+- The agent shell cannot exec a relative `./thing.exe`; use an absolute path.
+- `orca snapshot` intermittently returns no `result` on a busy SPA — retry, or read state with `orca eval`.
+- Never pipe into `orca eval --stdin`; pass a one-line `--expression`.
+- Two minutes of `sleep` polling per stage is the normal cost of a real run; do not interpret a slow stage as
+  a hang until `hub logs` shows no progress line for longer than the previous stage's worst case.
+
+## 9. Reference evidence
+
+- `docs/research/issue80-audio-role-plan-smoke-evidence-2026-09-10.md` — earlier audio-role smoke.
+- `F:/douyinie-rt-scratch/live-20260918/EVIDENCE.md` and `REPORT-run-78ad6589.md` — the full live-run record
+  (stage timeline, provider ledger, real artifacts, defect reproductions) behind the first E2E run that
+  reached preview on a real Douyin video.

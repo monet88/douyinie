@@ -29,6 +29,7 @@
 | **Triage** | `docs/agents/triage-labels.md` |
 | **Domain vocabulary** | `docs/agents/domain.md` → `CONTEXT.md` + `docs/adr/` |
 | **Out-of-repo file discovery** | `docs/agents/fastctx-discovery.md` (exact-first, bounded-fallback) |
+| **Live E2E on real media** | `docs/agents/live-runtime-e2e.md` (runtime matrix, provisioning, UI drive, run read-back) |
 
 ## Agent Orchestration (summary)
 
