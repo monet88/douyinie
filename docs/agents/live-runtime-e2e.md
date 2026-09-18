@@ -54,7 +54,7 @@ Notes that were learned the hard way:
 - Snapshot-required routes (separator, audio_role, tts) reject arbitrary binaries/adapters that cannot
   self-attest RC provenance — build from the repo, do not hand-roll those two.
 
-## 3. Provisioning (once per data dir)
+## 3. Provisioning (once per data dir, and after **every** daemon restart)
 
 14 model lanes must be verified + licensed + allowed before any stage runs. All three registries are HTTP;
 a reference script lives at `F:/douyinie-rt-scratch/provision/provision.py`.
@@ -65,8 +65,19 @@ POST /api/v1/licenses               # per dependency: CODE_LICENSE / MODEL_LICEN
 PUT  /api/v1/policies/{provider_id}  # {"status":"ALLOWED"}
 ```
 
+**Snapshot bindings live in process memory, not in SQLite.** Licenses and policies persist in the DB, but
+the verified-snapshot bindings are rebuilt only by `POST /api/v1/snapshots/verify`, so a restarted daemon
+rejects every snapshot-required provider with `SNAPSHOT_UNVERIFIED` — which surfaces as
+`no eligible provider found satisfying policy, capability, and health` on the first stage (typically ASR),
+within milliseconds of the run starting. Re-run the provisioning script after each restart.
+
 Verify with `GET /api/v1/policies`, `GET /api/v1/licenses`, `GET /api/v1/snapshots`. A missing license or a
-non-ALLOWED policy surfaces as `ErrNoEligibleProvider`, not as a stage error — check the registries first.
+non-ALLOWED policy surfaces the same way; the per-candidate truth is in SQLite:
+
+```bash
+sqlite3 <data-dir>/douyinie.db \
+ "select stage, decision_reason, candidates_evaluated_json from selection_decisions order by created_at desc limit 1"
+```
 
 ## 4. Drive the Operator UI as a real operator
 

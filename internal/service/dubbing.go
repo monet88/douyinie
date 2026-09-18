@@ -1983,9 +1983,11 @@ func (s *DubbingService) resolveSpeakers(ctx context.Context, in domain.VoiceAss
 		if in.AssetID != "" && transcript.AssetID != "" && transcript.AssetID != in.AssetID {
 			return nil, fmt.Errorf("transcript artifact %s belongs to asset %q, expected %q", transCAS, transcript.AssetID, in.AssetID)
 		}
-		if in.RunID != "" && transcript.RunID != "" && transcript.RunID != in.RunID {
-			return nil, fmt.Errorf("transcript artifact %s belongs to run %q, expected %q", transCAS, transcript.RunID, in.RunID)
-		}
+		// The producer's run id is provenance metadata, not an ownership claim: the
+		// transcript is content-addressed with a run-independent provenance identity
+		// (identical inputs reuse the artifact the first run persisted), so a re-run
+		// of the same asset legitimately reads an artifact minted by an earlier run.
+		// The media itself is pinned by the asset check above.
 		for _, b := range transcript.SpeechBlocks {
 			if b.SpeakerID != "" {
 				speakerMap[b.SpeakerID] = true
@@ -2036,9 +2038,9 @@ func (s *DubbingService) resolveSpeakers(ctx context.Context, in domain.VoiceAss
 			if in.AssetID != "" && dubScript.AssetID != "" && dubScript.AssetID != in.AssetID {
 				return nil, fmt.Errorf("dub script variant %s belongs to asset %q, expected %q", dubScriptCAS, dubScript.AssetID, in.AssetID)
 			}
-			if in.RunID != "" && dubScript.RunID != "" && dubScript.RunID != in.RunID {
-				return nil, fmt.Errorf("dub script variant %s belongs to run %q, expected %q", dubScriptCAS, dubScript.RunID, in.RunID)
-			}
+			// Same rule as the transcript: the variant is an asset-scoped artifact whose
+			// identity excludes the run, so a re-run reuses the earlier run's variant.
+			// Asset and target language are the checks that pin what is being dubbed.
 			if in.TargetLanguage != "" && dubScript.TargetLanguage != "" && !strings.EqualFold(dubScript.TargetLanguage, in.TargetLanguage) {
 				return nil, fmt.Errorf("dub script variant %s target language %q does not match requested %q", dubScriptCAS, dubScript.TargetLanguage, in.TargetLanguage)
 			}

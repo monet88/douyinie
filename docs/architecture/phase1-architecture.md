@@ -542,6 +542,7 @@ Acceptance tests exercise the complete pipeline via public HTTP/WebSocket endpoi
 14. **Pre-Dub Voice Audition Artifacts**: Standalone (~5s) and contextual (~10s segment + BGM) preview synthesis artifact generation and retrieval without triggering a full video dub or final render.
 15. **Source-Relative Pacing & Inter-Turn Spacing**: Verification that dub segments satisfy both zero-overrun timing and perceptible inter-turn breathing space without run-on delivery.
 16. **Multimodal AV QC & ReviewItem Projections**: Automated projection of pronunciation anomalies, pacing issues, incomplete text cover, or UI occlusion exceptions into structured `ReviewItem` entries.
+17. **Asset-Scoped Artifact Reuse**: Stage artifacts carry a run-independent provenance identity — the producing run id is provenance metadata, never part of the identity — so a re-run of the same asset reuses the artifacts earlier runs persisted, and the artifacts handed to a run are bound to that run. Ownership checks are by asset (plus target language where the artifact is language-bound), never by run.
 
 ### 10.2 Seam 2: StageWorker Runtime Contract
 Subprocess integration tests proving IPC stability, error recovery, and OS-level resource hygiene:

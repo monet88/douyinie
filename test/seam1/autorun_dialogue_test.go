@@ -888,18 +888,33 @@ func TestSeam1_DubbingService_AssignVoices_ExplicitCAS_Validation(t *testing.T) 
 		}
 	})
 
-	t.Run("ForeignRunTranscriptCAS_FailsClosed", func(t *testing.T) {
-		_, err := dubSvc.AssignVoices(ctx, domain.VoiceAssignmentInput{
-			AssetID:               assetID,
-			RunID:                 "run-foreign",
-			TargetLanguage:        "vi",
-			TranscriptArtifactCAS: tObj.SHA256,
-		})
-		if err == nil {
-			t.Fatal("expected error on foreign run transcript CAS, got nil")
+	t.Run("CrossRunTranscriptCAS_ReusesAssetScopedArtifact", func(t *testing.T) {
+		// The transcript identity is run-independent (locked cache rule), so the second
+		// run of the same asset reads the artifact the first run persisted. Its producer
+		// run id is provenance metadata, not an ownership claim.
+		priorRunTranscript := validTranscript
+		priorRunTranscript.ID = "t-prior"
+		priorRunTranscript.RunID = "run-prior-producer"
+		priorBytes, _ := json.Marshal(priorRunTranscript)
+		priorObj, err := h.casStore.Put(bytes.NewReader(priorBytes))
+		if err != nil {
+			t.Fatalf("put prior-run transcript in CAS: %v", err)
 		}
-		if !strings.Contains(err.Error(), "belongs to run") {
-			t.Fatalf("expected run ownership error, got %v", err)
+
+		va, err := dubSvc.AssignVoices(ctx, domain.VoiceAssignmentInput{
+			AssetID:               assetID,
+			RunID:                 runID,
+			TargetLanguage:        "vi",
+			TranscriptArtifactCAS: priorObj.SHA256,
+		})
+		if err != nil {
+			t.Fatalf("expected the earlier run's transcript to be reusable, got %v", err)
+		}
+		if va == nil || va.RunID != runID {
+			t.Fatalf("expected a voice assignment bound to run %s, got %#v", runID, va)
+		}
+		if len(va.Assignments) != 2 {
+			t.Fatalf("expected the reused transcript to yield 2 speakers, got %d: %+v", len(va.Assignments), va.Assignments)
 		}
 	})
 
