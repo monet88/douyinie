@@ -7,6 +7,97 @@ like a real operator, and read the run back. Use it before claiming any acceptan
 Authoritative behaviour still lives in [phase1-architecture.md](../architecture/phase1-architecture.md) and
 the resolved specs on the issue tracker; this file is the runbook, not a source of truth.
 
+## 0. Fast path: re-run one video end to end
+
+The whole loop, in order, when someone says "test a video again". Sections 1-9 are the reference; this is
+the recipe. Budget ~25 min for a 27 s clip: ~6 min of stage work, the rest startup, provisioning, human
+review and the browser checks.
+
+```bash
+# 1. Build (rebuild after any Go change; adapters are Python, nothing to build there)
+cd F:/CodeBase/douyinie
+go build -o F:/douyinie-rt-scratch/stageworker.exe ./cmd/stageworker
+go build -o F:/douyinie-rt-scratch/runtimehost.exe ./cmd/runtimehost
+
+# 2. Start the daemon through the supervisor (the .cmd applies the whole §2 matrix)
+#    hub start name=douyinie-live application=cmd.exe args=["/c","F:\\douyinie-rt-scratch\\start-daemon.integration.cmd"]
+#    ready: log matches "API daemon listening" AND port 18099 answers
+curl -s http://127.0.0.1:18099/api/v1/providers | jq '.providers|length'
+
+# 3. Provision EVERY restart (in-memory snapshot bindings, §3)
+python F:/douyinie-rt-scratch/provision/provision.py      # expect "14/14 lanes verified"
+
+# 4. Drive the run — UI path in §4 (upload → Tạo job & đưa vào queue), or headless:
+curl -s -X POST -F "file=@<clip>.mp4" -F "declared_by=<name>" -F "terms_accepted=true" \
+     http://127.0.0.1:18099/api/v1/assets/upload                       # -> asset_id
+curl -s -X POST -H "Content-Type: application/json" \
+     -d '{"source_asset_id":"<asset>","target_language":"vi"}' \
+     http://127.0.0.1:18099/api/v1/jobs                                # -> job_id
+curl -s -X POST -H "Content-Type: application/json" -d '{}' \
+     http://127.0.0.1:18099/api/v1/jobs/<job>/runs                     # -> run_id (queued)
+curl -s http://127.0.0.1:18099/api/v1/queue | jq -c '.queue[]|{run_id,position,status}'
+curl -s http://127.0.0.1:18099/api/v1/runs/<run>/stages | jq -r '.stages[]|"\(.stage) \(.status)"'
+curl -s -X POST -H "Content-Type: application/json" -d '{}' \
+     http://127.0.0.1:18099/api/v1/runs/<run>/resume                   # re-drain after an interrupt
+
+# 5. Clear the exception queue (UI path in §4); headless form:
+curl -s http://127.0.0.1:18099/api/v1/runs/<run>/review-items | jq -r '.review_items[]|"\(.id) \(.reason)"'
+curl -s -X POST -H "Content-Type: application/json" \
+     -d '{"review_item_id":"<item_id>","asset_id":"<asset>","reason":"<why it is acceptable>","operator":"<name>"}' \
+     http://127.0.0.1:18099/api/v1/runs/<run>/review/override
+
+# 6. Freeze and render
+curl -s -X POST -H "Content-Type: application/json" -d '{"run_id":"<run>","target_language":"vi"}' \
+     http://127.0.0.1:18099/api/v1/assets/<asset>/render-plan
+curl -s -X POST -H "Content-Type: application/json" -d '{"run_id":"<run>","target_language":"vi"}' \
+     http://127.0.0.1:18099/api/v1/assets/<asset>/render/final
+curl -s http://127.0.0.1:18099/api/v1/assets/<asset>/render/final \
+  | jq -r '.final_render|"\(.overall_status) \(.output_cas_path)"'
+```
+
+Test media that has actually been through the loop (the uploaded bytes live in the CAS, so a re-upload can
+use the CAS path directly):
+
+| Clip | Dimensions / duration | Asset | Final render |
+|---|---|---|---|
+| `5.mp4` - phone-stand tips, burned-in captions and product labels | 1080x1440, 27.17 s | `41fb83c0-1e07-43f3-afaf-837cb8070ece` | `0f5cf282…` (PASS) |
+| `4.mp4` - CapCut opacity tutorial, screen recording | 1080x1920, 33.11 s | `f6e0436f-e92b-4f24-9f86-3b572abc2541` | `26bbc77f…` (PASS) |
+| the same clips as files | `F:/douyinie-rt-scratch/live-20260918/4-upload.mp4`, `…/data-head/cas/23/9a/239a21539a…` | | |
+
+Measured stage cost for the 27 s clip (run `4f86657f`, stages with real work only):
+
+| Stage | Seconds |
+|---|---|
+| `audio_role_plan` | 24 |
+| `speech_understand` (ASR + align + diarize) | 241 |
+| `translation` | 5 |
+| `dub_synthesize` (ZeroTTS) | 170 |
+| `visual_text_localize` (OCR is the slow part; a cached plan returns in ~0 s) | 64 |
+| `render_preview` / `render_final` | 3 / 11 |
+
+- **Accept review items through the RUN-scoped endpoint.** `/api/v1/review-items/{id}/override` resolves the
+  item against the asset/language pending queue and rejects a run-scoped item with
+  `not found in pending review queue for asset …`; `/api/v1/runs/{run}/review/override` takes the item id in the
+  body, records the run binding, and clears the handoff gate.
+- **`POST /runs/{id}/resume` can drop the connection** (`ConnectionResetError`) while it starts draining. That is
+  not a failure: the daemon stays up and the run goes `running` (observed, run `3adede59`). Confirm with
+  `GET /runs/{id}/stages` instead of retrying the resume.
+
+Reading traps in that ledger:
+
+- A **cache hit writes a `visual_text` row whose `started_at` is the cached plan's creation time**
+  (`4f86657f` shows `visual_text` at 39057 s). Read the row's `completed_at`, not the delta, and do not
+  treat the first line as the stage's cost.
+- `translation`, `dub_script` and `audio_mix` legitimately log `0.0 s` rows: they are cache hits of an
+  artifact the earlier attempt produced.
+- `GET /api/v1/queue` lists **every** entry the data dir ever held, so stale `interrupted` / `completed` /
+  `cancelled` rows sit at `position: 0` beside the live run. Read the `status` column: a run created through
+  `POST /api/v1/jobs/{id}/runs` lands `queued` and the queue service picks it up on its own (observed: the new
+  run jumped to `running` at `position: 1` within seconds while five old entries stayed at 0). `resume` is for
+  a run that stopped, not for a run that has not started.
+- Re-freezing does **not** re-encode: `render_plans` / `render_artifacts` are keyed by plan provenance, so
+  delete their rows in the scratch data dir when you need a fresh encode to inspect.
+
 ## 1. Build and start
 
 ```bash
@@ -164,7 +255,15 @@ names a defect that shipped in run `4f86657f` and is now pinned by tests, so a r
    `consumed_plan.subtitle_plan.cue_count`: a segment longer than two readable lines must appear as several
    cues (the splitter breaks at word boundaries, preferring sentence ends), and each cue's box stays in the
    caption band rather than growing to the frame width.
-3. **No garbled label drawn on the video.** Overlays come from `semantic_text` / `instructional_ui_text`
+3. **The subtitle text is the TRANSLATION, never the source reading.** A run that reused cached artifacts
+   (nothing to re-run, everything a cache hit) owns no variant index row of its own, so the visual lane must
+   still resolve the translation through the run's own stage executions. When it cannot, the fallback branch
+   draws `TextRegionPlan` region text - the *source* captions - as the localized subtitle, which lands the
+   Chinese on top of the covers that were hiding it. Check the frozen plan:
+   `consumed_plan.cue_count` and the cue texts (`sub-*` ids come from the fallback branch; the translated
+   branch ids are `cue-<segment>[-<part>]`). The failing shape was live run `3adede59`; the fix is
+   `VisualTextService.stageArtifactHash` binding `translation` / `dub_script` stage artifacts to the run.
+4. **No garbled label drawn on the video.** Overlays come from `semantic_text` / `instructional_ui_text`
    regions that cleared the classifier's evidence gates. When junk text is drawn anyway, read
    `GET /api/v1/assets/<asset>/text-region-plan` and the region's `review_reason` before blaming the OCR:
    `spatially_unstable_label_noise` (readings of one label wandering across the frame),
