@@ -511,11 +511,12 @@ type LocalizeVisualTrackInput struct {
 	Overrides             []domain.RegionOverride       `json:"overrides,omitempty"`
 	InpaintingFallbacks   []string                      `json:"inpainting_fallbacks,omitempty"` // Region IDs where inpainting fallback is explicitly requested
 	SceneProtectedRegions []domain.SceneProtectedRegion `json:"scene_protected_regions,omitempty"`
-	// FailOnProtectedOverlap is set by operator-initiated edits (region correction, reclassify):
-	// a geometry the operator asked for that collides with a protected tracked region is
-	// rejected so the edit can be corrected, instead of being skipped and surfaced as an
-	// exception the way automatic localization does.
-	FailOnProtectedOverlap bool                             `json:"fail_on_protected_overlap,omitempty"`
+	// StrictOverlapRegionIDs names the regions whose geometry the operator just changed. A
+	// collision on one of THESE is a rejected edit (the operator gets actionable feedback and
+	// can drag elsewhere); collisions on any other region are pre-existing layout facts and keep
+	// following the automatic path - overlay skipped, visual_occlusion exception surfaced - so a
+	// correction is not blocked by a region the operator has not touched yet.
+	StrictOverlapRegionIDs []string                         `json:"strict_overlap_region_ids,omitempty"`
 	PlacementSelector      domain.SubtitlePlacementSelector `json:"-"`
 	ExecutionProfile       domain.ExecutionProfile          `json:"execution_profile,omitempty"`
 	AuthorizedCredentials  []string                         `json:"authorized_credentials,omitempty"`
@@ -751,6 +752,10 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 	for _, id := range in.InpaintingFallbacks {
 		inpaintSet[id] = true
 	}
+	strictOverlapSet := make(map[string]bool, len(in.StrictOverlapRegionIDs))
+	for _, id := range in.StrictOverlapRegionIDs {
+		strictOverlapSet[id] = true
+	}
 
 	// Scale-aware overlay parameters
 	overlayPaddingX := int(float64(plan.FrameWidth) * 0.015) // ~16px for 1080w
@@ -838,7 +843,7 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 					domain.ErrSubtitleOverlapsProtectedRegion, reg.ID, repBox, prot)
 			}
 			if prot, occluded := firstProtectedOverlap(repBox, protectedRegionBoxes(activePlan, reg)); occluded {
-				if in.FailOnProtectedOverlap {
+				if strictOverlapSet[reg.ID] {
 					return nil, fmt.Errorf("%w: overlay for semantic text %q (box %+v) occludes protected region (box %+v)",
 						domain.ErrSubtitleOverlapsProtectedRegion, reg.ID, repBox, prot)
 				}
@@ -937,7 +942,7 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 					domain.ErrSubtitleOverlapsProtectedRegion, reg.ID, repBox, prot)
 			}
 			if prot, occluded := firstProtectedOverlap(repBox, protectedRegionBoxes(activePlan, reg)); occluded {
-				if in.FailOnProtectedOverlap {
+				if strictOverlapSet[reg.ID] {
 					return nil, fmt.Errorf("%w: overlay for instructional UI %q (box %+v) occludes protected region (box %+v)",
 						domain.ErrSubtitleOverlapsProtectedRegion, reg.ID, repBox, prot)
 				}

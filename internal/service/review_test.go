@@ -3062,3 +3062,107 @@ func assertPreviewConsumesPlan(t *testing.T, db *storage.DB, casStore *cas.Store
 		t.Errorf("the preview media the operator plays is not resolvable: %v", err)
 	}
 }
+
+// A region correction validates the geometry the operator actually changed. A collision on an
+// untouched region is a pre-existing layout fact the operator has not addressed yet: it must stay
+// a visual_occlusion exception instead of failing the whole correction, otherwise the queue can
+// never be worked one item at a time.
+func TestReviewService_CorrectRegionGeometry_UntouchedOcclusionDoesNotBlockTheEdit(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-correction-untouched-occlusion"
+	_ = bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
+
+	saveRegionCorrectionPlan(t, db, casStore, assetID, "prov-untouched-occlusion", []domain.TrackedTextRegion{
+		{
+			ID:          "reg-edited",
+			Text:        "关注",
+			Role:        domain.TextRoleSemanticText,
+			FirstSeenMs: 0,
+			LastSeenMs:  1500,
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 0, Box: domain.BoundingBox{X: 100, Y: 200, Width: 300, Height: 60}, Observed: true},
+			},
+		},
+		{
+			// A protected control the operator has not touched yet, and a protected neighbour whose
+			// box sits on top of it: its overlay can never clear the neighbour.
+			ID:          "reg-colliding",
+			Text:        "剪映",
+			Role:        domain.TextRoleInstructionalUIText,
+			FirstSeenMs: 0,
+			LastSeenMs:  1500,
+			ProtectedMetadata: domain.ProtectedRegionMetadata{
+				IsProtected: true,
+				Reason:      "instructional_ui_control",
+			},
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 0, Box: domain.BoundingBox{X: 100, Y: 1400, Width: 200, Height: 50}, Observed: true},
+			},
+		},
+		{
+			ID:          "reg-neighbour",
+			Text:        "音频",
+			Role:        domain.TextRoleBrandKeep,
+			FirstSeenMs: 0,
+			LastSeenMs:  1500,
+			ProtectedMetadata: domain.ProtectedRegionMetadata{
+				IsProtected: true,
+				Reason:      "brand_authenticity",
+			},
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 0, Box: domain.BoundingBox{X: 150, Y: 1400, Width: 120, Height: 50}, Observed: true},
+			},
+		},
+	})
+
+	result, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides:      []domain.RegionOverride{{RegionID: "reg-edited", BoxDeltaX: 30}},
+		Reason:         "operator moved the source text out of the way",
+		Operator:       "tester",
+	})
+	if err != nil {
+		t.Fatalf("a correction must not be blocked by an unrelated occluded region: %v", err)
+	}
+
+	rc, err := casStore.Get(result.LocalizedVisualTrackCAS)
+	if err != nil {
+		t.Fatalf("read localized visual track: %v", err)
+	}
+	defer rc.Close()
+	var track domain.LocalizedVisualTrack
+	if err := json.NewDecoder(rc).Decode(&track); err != nil {
+		t.Fatalf("decode localized visual track: %v", err)
+	}
+	found := false
+	for _, occ := range track.Occlusions {
+		if occ.RegionID == "reg-colliding" {
+			found = true
+		}
+		if occ.RegionID == "reg-edited" {
+			t.Errorf("the edited region %s was reported as occluded", occ.RegionID)
+		}
+	}
+	if !found {
+		t.Fatalf("the untouched collision must stay surfaced as an exception, got %+v", track.Occlusions)
+	}
+
+	// ...and it is projected for the operator rather than dropped.
+	reviewSvc := service.NewReviewService(db, casStore)
+	items, err := reviewSvc.ProjectReviewItemsForRun(ctx, assetID, "vi", runID)
+	if err != nil {
+		t.Fatalf("project review items: %v", err)
+	}
+	projected := false
+	for _, item := range items {
+		if item.Type == domain.ReviewItemTypeVisualOcclusion && item.RegionID == "reg-colliding" {
+			projected = true
+		}
+	}
+	if !projected {
+		t.Fatalf("expected a pending visual_occlusion item for reg-colliding, got %+v", items)
+	}
+}

@@ -905,9 +905,10 @@ func (s *ReviewService) CorrectRegionGeometry(ctx context.Context, in RegionGeom
 		TargetLanguage:        in.TargetLanguage,
 		InpaintingFallbacks:   in.InpaintingFallbacks,
 		SceneProtectedRegions: in.SceneProtectedRegions,
-		// The operator asked for this geometry: a collision with a protected region is a
-		// rejected edit (and the plan is withdrawn below), not a review exception.
-		FailOnProtectedOverlap: true,
+		// Only the regions the operator just changed are validated strictly: a collision on one of
+		// them is a rejected edit (and the plan is withdrawn below), while a collision on an
+		// untouched region stays a visual_occlusion exception instead of blocking the correction.
+		StrictOverlapRegionIDs: overrideRegionIDs(in.Overrides),
 	}
 	visTrack, err := s.visualTextSvc.LocalizeVisualTrack(ctx, visIn)
 	if err != nil {
@@ -1775,4 +1776,13 @@ func matchOverride(it domain.ReviewItem, overrides []domain.ReviewOverride) *dom
 		}
 	}
 	return nil
+}
+
+// overrideRegionIDs returns the region ids a correction actually touched.
+func overrideRegionIDs(overrides []domain.RegionOverride) []string {
+	ids := make([]string, 0, len(overrides))
+	for _, o := range overrides {
+		ids = append(ids, o.RegionID)
+	}
+	return ids
 }
