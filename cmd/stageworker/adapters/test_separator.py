@@ -10,6 +10,7 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -85,6 +86,54 @@ class TestSeparatorAdapter(unittest.TestCase):
             self.assertEqual(res["channels"], 1)
             self.assertEqual(len(res["vocals_data"]), len(dummy_wav))
             self.assertEqual(len(res["background_data"]), len(dummy_wav))
+
+    def test_demucs_native_rate_stems_leave_the_adapter_at_the_pipeline_contract(self):
+        """Demucs always writes its model's native 44.1 kHz stereo, but the pipeline contract - and
+        the audio-role analyzer that consumes these stems - is 16 kHz mono. A native-rate stem
+        dead-ends audio_role_plan, the first stage of every real run, while the persisted metadata
+        claims the contract rate; stems leaving the adapter must really be at the contract rate."""
+        real_run = subprocess.run
+        native_wav = _make_dummy_wav(duration_ms=2000, sample_rate=44100, channels=2)
+        calls = []
+
+        def fake_subprocess_run(cmd, *args, **kwargs):
+            if "-m" in cmd and "demucs.separate" in cmd:
+                calls.append("demucs")
+                out_dir = cmd[cmd.index("-o") + 1]
+                model_name = cmd[cmd.index("-n") + 1]
+                track_name = os.path.splitext(os.path.basename(cmd[-1]))[0]
+                target_dir = os.path.join(out_dir, model_name, track_name)
+                os.makedirs(target_dir, exist_ok=True)
+                for name in ["vocals.wav", "no_vocals.wav"]:
+                    with open(os.path.join(target_dir, name), "wb") as f:
+                        f.write(native_wav)
+                proc = mock.MagicMock()
+                proc.returncode = 0
+                proc.stdout = b""
+                proc.stderr = b""
+                return proc
+            calls.append(cmd[0])
+            return real_run(cmd, *args, **kwargs)
+
+        with mock.patch("subprocess.run", side_effect=fake_subprocess_run):
+            res = separator.separate_audio_stems("sample_audio.wav", "htdemucs", "v4")
+
+        self.assertEqual(calls[0], "demucs")
+        self.assertIn("ffmpeg", calls)
+        self.assertEqual(res["sample_rate"], 16000)
+        self.assertEqual(res["channels"], 1)
+        for key in ["vocals_data", "background_data"]:
+            rate, channels, dur_ms = separator.measure_wav_properties(res[key])
+            self.assertEqual(rate, 16000, f"{key} must really be at the contract rate")
+            self.assertEqual(channels, 1, f"{key} must be mono")
+            self.assertGreater(dur_ms, 1900, f"{key} header must declare its real length")
+            self.assertLess(dur_ms, 2100, f"{key} header must declare its real length")
+
+    def test_contract_rate_stems_are_not_re_encoded(self):
+        """Stems already at the contract rate are passed through byte-identical, so their hashes keep
+        matching the bytes the separator actually produced."""
+        contract_wav = _make_dummy_wav(duration_ms=500, sample_rate=16000, channels=1)
+        self.assertEqual(separator.normalize_stem_to_contract(contract_wav), contract_wav)
 
     def test_lane_dispatch_demucs_vs_uvr(self):
         """Verifies separate_audio_stems routes Demucs models to Demucs lane and UVR models to UVR lane."""

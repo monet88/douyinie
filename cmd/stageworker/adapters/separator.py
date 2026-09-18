@@ -226,6 +226,64 @@ def measure_wav_properties(wav_bytes: bytes) -> tuple:
         return wf.getframerate(), wf.getnchannels(), int((wf.getnframes() * 1000) / wf.getframerate())
 
 
+def normalize_stem_to_contract(wav_bytes: bytes) -> bytes:
+    """Return the stem payload resampled to the pipeline contract rate (16 kHz 16-bit mono).
+
+    The UVR lane requests the contract rate from audio-separator, but Demucs always writes its
+    model's native 44.1 kHz stereo, and the audio-role analyzer rejects anything but 16 kHz mono -
+    so a native-rate stem dead-ends `audio_role_plan`, the first stage of every real run. Enforcing
+    the contract per stem keeps one invariant for every consumer instead of pushing a resample into
+    each one; a conversion failure fails closed rather than persisting an unusable stem.
+    """
+    if not wav_bytes:
+        return wav_bytes
+    rate, channels, _ = measure_wav_properties(wav_bytes)
+    if rate == CONTRACT_SAMPLE_RATE and channels == 1:
+        return wav_bytes
+    # ffmpeg is given a real output file, not a pipe: a streamed WAV cannot backfill its RIFF/data
+    # sizes, and these bytes are persisted as a content-addressed artifact other readers measure.
+    fd, out_path = tempfile.mkstemp(prefix="stem_contract_", suffix=".wav")
+    os.close(fd)
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-y", "-i", "pipe:0",
+                "-ar", str(CONTRACT_SAMPLE_RATE), "-ac", "1", "-c:a", "pcm_s16le", out_path,
+            ],
+            input=wav_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0 or not os.path.exists(out_path):
+            raise RuntimeError(
+                f"STEM_CONTRACT_RATE_FAILED: {rate} Hz/{channels} ch stem to {CONTRACT_SAMPLE_RATE} Hz mono: "
+                + proc.stderr.decode("utf-8", "replace").strip()[-300:]
+            )
+        with open(out_path, "rb") as f:
+            converted = f.read()
+        if not converted:
+            raise RuntimeError(f"STEM_CONTRACT_RATE_FAILED: empty {CONTRACT_SAMPLE_RATE} Hz stem")
+        return converted
+    finally:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+
+
+def enforce_contract_rate(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a separation result whose stems - and the format they report - honour the contract."""
+    for key in ["vocals_data", "background_data"]:
+        data = result.get(key) or b""
+        if data:
+            result[key] = normalize_stem_to_contract(data)
+    rate, channels, _ = measure_wav_properties(result.get("vocals_data") or b"")
+    if not rate:
+        rate, channels, _ = measure_wav_properties(result.get("background_data") or b"")
+    if rate:
+        result["sample_rate"] = rate
+        result["channels"] = channels
+    return result
+
+
 def generate_synthetic_pcm_wav(sample_rate: int = 16000, channels: int = 1, duration_ms: int = 5000) -> bytes:
     """Generate standard 16-bit PCM WAV bytes."""
     num_samples = int((sample_rate * duration_ms) / 1000)
@@ -598,6 +656,29 @@ def separate_demucs(
 
 
 def separate_audio_stems(
+    audio_path: str,
+    model_name: str,
+    model_version: str,
+    model_path: Optional[str] = None,
+    entrypoint_file: Optional[str] = None,
+    require_model_snapshot: bool = False,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Separate stems and return them at the pipeline contract rate (16 kHz 16-bit mono)."""
+    return enforce_contract_rate(
+        _dispatch_audio_stems(
+            audio_path,
+            model_name,
+            model_version,
+            model_path=model_path,
+            entrypoint_file=entrypoint_file,
+            require_model_snapshot=require_model_snapshot,
+            **kwargs,
+        )
+    )
+
+
+def _dispatch_audio_stems(
     audio_path: str,
     model_name: str,
     model_version: str,

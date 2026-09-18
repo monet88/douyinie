@@ -43,7 +43,15 @@ per-family variables for the rest. Each family needs the venv that actually carr
 
 Notes that were learned the hard way:
 
-- **Stems are requested at the pipeline contract rate.** The separator adapter constructs `Separator(..., sample_rate=16000)` and reports the rate/channels it measured from the produced WAV instead of a hardcoded 16 kHz/1 ch. audio-separator defaults to 44.1 kHz and the audio-role analyzer rejects anything but 16 kHz, so a default-rate separator dead-ends `audio_role_plan`, the first stage of every real run, while the persisted stem metadata claims otherwise.
+- **Every stem lane is normalized to the pipeline contract rate.** The UVR lane asks audio-separator for
+  `sample_rate=16000`, but Demucs always writes its model's native 44.1 kHz stereo, and the audio-role
+  analyzer rejects anything but 16 kHz mono — so `separate_audio_stems` passes both lanes through
+  `enforce_contract_rate`, which resamples each stem with ffmpeg (file output, not a pipe: a streamed WAV
+  cannot backfill its RIFF sizes) and replaces the reported rate/channels with what it measured. Without it a
+  default-rate separator dead-ends `audio_role_plan`, the first stage of every real run, while the persisted
+  stem metadata claims the contract rate. Caveat: an already-persisted stems artifact keeps the rate it was
+  produced at — audio-role reuse serves it as-is and the analyzer still fails closed on it, so a lane fix only
+  takes effect for stems separated after it.
 - **The diarizer has no per-family interpreter variable.** `resolvePythonBinary()` reads only
   `DOUYINIE_PYTHON_BIN`, and `venvs\asr` has no `modelscope`/`torchaudio`, so diarization dies with
   `DIARIZER_EXEC_FAILED` when the asr venv is the shared one. Until that gap is closed, point
