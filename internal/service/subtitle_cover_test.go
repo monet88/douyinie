@@ -87,6 +87,77 @@ func TestBuildSubtitleCovers_CoversUnionOfObservedKeyframes(t *testing.T) {
 	}
 }
 
+// Two consecutive captions in the same band must not draw two bars at once, and the handover between them
+// must stay covered: their padded windows overlap on the sampling step, and each box alone leaves the other
+// caption's line exposed (live evidence, live-20260918: region-002 x=305 [0,2000] over region-004 x=231
+// [1500,3500] drew a ragged doubled bar, and covering each box alone exposed 你 / 角 outside the bar at 1.6s).
+// The contested span gets one union bar; each caption keeps its own box outside it.
+func TestBuildSubtitleCovers_SequentialCaptionsHandOverThroughUnionBar(t *testing.T) {
+	first := subtitleRegion("region-a", domain.BoundingBox{X: 305, Y: 946, Width: 453, Height: 76}, 0, 1500)
+	second := subtitleRegion("region-b", domain.BoundingBox{X: 231, Y: 948, Width: 603, Height: 72}, 2000, 3000)
+	plan := coverTestPlan(first, second)
+
+	covers, _ := buildSubtitleCovers(plan, LocalizeVisualTrackInput{})
+	if len(covers) != 3 {
+		t.Fatalf("expected both caption covers plus one handover bar, got %d: %+v", len(covers), covers)
+	}
+	// Exactly one bar is composited at any instant.
+	for i := range covers {
+		for j := i + 1; j < len(covers); j++ {
+			if covers[i].StartMs < covers[j].EndMs && covers[j].StartMs < covers[i].EndMs {
+				t.Fatalf("covers %s [%d,%d] and %s [%d,%d] are composited together",
+					covers[i].RegionID, covers[i].StartMs, covers[i].EndMs, covers[j].RegionID, covers[j].StartMs, covers[j].EndMs)
+			}
+		}
+	}
+	// Region A carries no pad of its own (its 1500ms grid step exceeds the pad cap), B pads 1000ms, so the
+	// contested span is [1000,1500] and both pads survive on the outside of it.
+	byID := map[string]domain.CoverBox{}
+	for _, c := range covers {
+		byID[c.RegionID] = c
+	}
+	a, b, handover := byID["region-a"], byID["region-b"], byID["handover-region-a-region-b"]
+	if a.RegionID == "" || b.RegionID == "" || handover.RegionID == "" {
+		t.Fatalf("expected two caption covers and one handover bar, got %+v", covers)
+	}
+	if a.StartMs != 0 || a.EndMs != 1000 {
+		t.Errorf("expected region-a to keep its own span [0,1000], got %+v", a)
+	}
+	if handover.StartMs != 1000 || handover.EndMs != 1500 {
+		t.Errorf("expected the handover bar over the contested [1000,1500], got %+v", handover)
+	}
+	if b.StartMs != 1500 || b.EndMs != 4000 {
+		t.Errorf("expected region-b to keep its own span [1500,4000], got %+v", b)
+	}
+	// The handover bar is the union of both caption boxes: neither line can peek out of it.
+	wantX, wantRight := 231-coverPaddingPx, 231+603+coverPaddingPx
+	if handover.X != wantX || handover.X+handover.Width != wantRight {
+		t.Errorf("expected the handover to span both boxes [%d,%d], got [%d,%d]", wantX, wantRight, handover.X, handover.X+handover.Width)
+	}
+	wantTop, wantBottom := 946-coverPaddingPx, 946+76+coverPaddingPx
+	if handover.Y != wantTop || handover.Y+handover.Height != wantBottom {
+		t.Errorf("expected the handover to span both bands vertically [%d,%d], got [%d,%d]", wantTop, wantBottom, handover.Y, handover.Y+handover.Height)
+	}
+}
+
+// Captions that were genuinely on screen together keep their overlapping covers: splitting them would
+// leave one caption's source text exposed while its replacement is drawn next to it.
+func TestBuildSubtitleCovers_SimultaneousCaptionsKeepOverlappingCovers(t *testing.T) {
+	left := subtitleRegion("region-l", domain.BoundingBox{X: 100, Y: 900, Width: 400, Height: 80}, 1000, 4000)
+	right := subtitleRegion("region-r", domain.BoundingBox{X: 460, Y: 900, Width: 300, Height: 80}, 1000, 4000)
+	plan := coverTestPlan(left, right)
+
+	covers, _ := buildSubtitleCovers(plan, LocalizeVisualTrackInput{})
+	if len(covers) != 2 {
+		t.Fatalf("expected two covers, got %d", len(covers))
+	}
+	for _, c := range covers {
+		if c.StartMs != 1000 || c.EndMs != 4000 {
+			t.Errorf("simultaneous caption cover %s must keep its observed window, got [%d,%d]", c.RegionID, c.StartMs, c.EndMs)
+		}
+	}
+}
+
 // Only speech_subtitle regions are covered by this pass; semantic/instructional replacements
 // belong to the in-place overlay lane.
 func TestBuildSubtitleCovers_IgnoresNonSubtitleRoles(t *testing.T) {

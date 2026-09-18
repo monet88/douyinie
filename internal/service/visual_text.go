@@ -800,6 +800,74 @@ func firstProtectedOverlap(box domain.BoundingBox, protected []domain.BoundingBo
 // not leave a one-pixel halo of the original text behind.
 const coverPaddingPx = 6
 
+// resolveOverlayCollisions drops in-place replacements that would land on another replacement sharing the
+// screen, and reports each dropped region as an occlusion exception.
+//
+// Compositing two replacements over one another paints one black box across the other's translated text
+// (live evidence, live-20260918: the four semantic_text regions of the ramen pack - 净含量：面饼, 辣鸡肉味拌面,
+// HOCHI, 面饼：107克 - all live at 4500-5500ms and drew nested boxes that clipped each other). The dominant
+// label of a colliding group wins; the loser keeps its source text untouched and goes to the operator as a
+// layout decision instead of shipping a cut-off translation.
+func resolveOverlayCollisions(overlays []domain.LocalizedOverlayItem) ([]domain.LocalizedOverlayItem, []domain.OcclusionReport) {
+	kept := make([]domain.LocalizedOverlayItem, 0, len(overlays))
+	var occlusions []domain.OcclusionReport
+	for _, ov := range overlays {
+		displaced := -1
+		yields := false
+		for i, other := range kept {
+			if ov.StartMs >= other.EndMs || other.StartMs >= ov.EndMs || !overlayBoxesIntersect(ov.Box, other.Box) {
+				continue
+			}
+			if overlayDominates(ov, other) {
+				displaced = i
+			} else {
+				yields = true
+				occlusions = append(occlusions, overlayCollisionReport(ov, other))
+			}
+			break
+		}
+		switch {
+		case displaced >= 0:
+			occlusions = append(occlusions, overlayCollisionReport(kept[displaced], ov))
+			kept[displaced] = ov
+		case !yields:
+			kept = append(kept, ov)
+		}
+	}
+	if len(occlusions) == 0 {
+		return overlays, nil
+	}
+	return kept, occlusions
+}
+
+// overlayDominates reports whether a displaces b: the larger observed box is the dominant label of a
+// colliding group, and the region ID breaks ties so the outcome never depends on plan order.
+func overlayDominates(a, b domain.LocalizedOverlayItem) bool {
+	areaA, areaB := a.Box.Width*a.Box.Height, b.Box.Width*b.Box.Height
+	if areaA != areaB {
+		return areaA > areaB
+	}
+	return a.RegionID < b.RegionID
+}
+
+// overlayCollisionReport names the replacement that won the box, so the operator sees what their dropped
+// region collided with instead of an unexplained missing translation.
+func overlayCollisionReport(dropped, winner domain.LocalizedOverlayItem) domain.OcclusionReport {
+	return domain.OcclusionReport{
+		RegionID:     dropped.RegionID,
+		Role:         dropped.Role,
+		SourceText:   dropped.SourceText,
+		OverlayBox:   dropped.Box,
+		ProtectedBox: winner.Box,
+		StartMs:      dropped.StartMs,
+		EndMs:        dropped.EndMs,
+	}
+}
+
+func overlayBoxesIntersect(a, b domain.BoundingBox) bool {
+	return a.X < b.X+b.Width && b.X < a.X+a.Width && a.Y < b.Y+b.Height && b.Y < a.Y+a.Height
+}
+
 // buildSubtitleCovers derives the opaque cover set that hides source burned-in captions.
 //
 // The cover of a speech_subtitle region is the region's own tracked box (grown by a small padding
@@ -821,6 +889,9 @@ func buildSubtitleCovers(
 	}
 	var covers []domain.CoverBox
 	var occlusions []domain.OcclusionReport
+	// The observed window of each emitted cover, kept beside it so the padded windows of captions that
+	// never shared the screen can be split apart again (see splitSequentialCoverWindows).
+	var observed [][2]int64
 
 	for _, reg := range plan.Regions {
 		if reg.Role != domain.TextRoleSpeechSubtitle {
@@ -877,8 +948,80 @@ func buildSubtitleCovers(
 			continue
 		}
 		covers = append(covers, cover)
+		observed = append(observed, [2]int64{reg.FirstSeenMs, reg.LastSeenMs})
 	}
-	return covers, occlusions
+	return resolveSequentialCoverOverlaps(covers, observed), occlusions
+}
+
+// resolveSequentialCoverOverlaps makes the padded cover windows of *different* captions disjoint while
+// leaving every one of them fully covered.
+//
+// A cover is padded by the sampling step on each side so the caption is hidden across the whole interval it
+// could have been on screen, and two consecutive captions' padded windows then overlap on that step. Drawing
+// both bars there leaves a ragged doubled bar with a strip sticking out (live evidence, live-20260918:
+// region-002 [0,2000] x=305 over region-004 [1500,3500] x=231); splitting the overlap and drawing each box
+// only over its own span instead exposed the incoming caption, whose line is wider than the outgoing one
+// (the same live clip at 1.6s showed 你 / 角 outside the bar). The handover is genuinely ambiguous, so the
+// contested span gets ONE bar over the union of both boxes: exactly one bar is composited at any instant and
+// no source text is left visible. Captions whose observed windows actually met keep their own overlapping
+// covers - they were on screen together.
+func resolveSequentialCoverOverlaps(covers []domain.CoverBox, observed [][2]int64) []domain.CoverBox {
+	if len(covers) != len(observed) || len(covers) < 2 {
+		return covers
+	}
+	resolved := append([]domain.CoverBox(nil), covers...)
+	var handovers []domain.CoverBox
+	for i := range covers {
+		for j := i + 1; j < len(covers); j++ {
+			// Observed together: both captions were on screen, both keep their covers.
+			if observed[i][1] > observed[j][0] && observed[j][1] > observed[i][0] {
+				continue
+			}
+			if !coverBoxesIntersect(covers[i], covers[j]) {
+				continue
+			}
+			earlier, later := i, j
+			if observed[i][0] > observed[j][0] {
+				earlier, later = j, i
+			}
+			handoverStart := max(resolved[earlier].StartMs, resolved[later].StartMs)
+			handoverEnd := min(resolved[earlier].EndMs, resolved[later].EndMs)
+			if handoverStart >= handoverEnd {
+				continue
+			}
+			handover := domain.CoverBox{
+				RegionID: fmt.Sprintf("handover-%s-%s", covers[earlier].RegionID, covers[later].RegionID),
+				Role:     covers[earlier].Role,
+				X:        min(covers[earlier].X, covers[later].X),
+				Y:        min(covers[earlier].Y, covers[later].Y),
+				Width:    max(covers[earlier].X+covers[earlier].Width, covers[later].X+covers[later].Width) - min(covers[earlier].X, covers[later].X),
+				Height:   max(covers[earlier].Y+covers[earlier].Height, covers[later].Y+covers[later].Height) - min(covers[earlier].Y, covers[later].Y),
+				StartMs:  handoverStart,
+				EndMs:    handoverEnd,
+				Color:    covers[earlier].Color,
+				Opacity:  covers[earlier].Opacity,
+			}
+			resolved[earlier].EndMs = handoverStart
+			resolved[later].StartMs = handoverEnd
+			handovers = append(handovers, handover)
+		}
+	}
+	if len(handovers) == 0 {
+		return covers
+	}
+	out := append(resolved, handovers...)
+	sort.Slice(out, func(a, b int) bool {
+		if out[a].StartMs != out[b].StartMs {
+			return out[a].StartMs < out[b].StartMs
+		}
+		return out[a].RegionID < out[b].RegionID
+	})
+	return out
+}
+
+// coverBoxesIntersect reports whether two composited covers share any pixel.
+func coverBoxesIntersect(a, b domain.CoverBox) bool {
+	return a.X < b.X+b.Width && b.X < a.X+a.Width && a.Y < b.Y+b.Height && b.Y < a.Y+a.Height
 }
 
 // captionWindowPadMs is how far a caption's cover window extends beyond its first and last
@@ -1363,6 +1506,10 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			})
 		}
 	}
+
+	// 4b. Resolve in-place replacement collisions before anything is composited.
+	overlays, overlayCollisions := resolveOverlayCollisions(overlays)
+	occlusions = append(occlusions, overlayCollisions...)
 
 	// 5. Generate Subtitle Cues grounded in canonical TranslationVariant
 	var subtitleCues []domain.SubtitleCue
