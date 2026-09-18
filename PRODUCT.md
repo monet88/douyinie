@@ -1,10 +1,69 @@
-# Douyinie — Product Charter
+# Product
 
-## Purpose & Vision
+<!-- impeccable:product-schema 1 -->
 
-Douyinie is an automated, policy-gated video localization pipeline that transforms Chinese short-form videos (Douyin) into natural, timeline-constrained localized versions in **Vietnamese and English (VI/EN)**.
+## Platform
 
-The system is designed for unattended execution by default, surfacing only genuine low-confidence, timing, cover, or policy exceptions to a human operator via an exception-only review queue.
+web
+
+## Users
+
+Solo creator and local video operator translating high volumes of short-form Chinese videos (Douyin) into Vietnamese and English (VI/EN) for distribution on TikTok, Facebook Reels, and YouTube Shorts. Operates from a local GPU workstation with single active slot execution, stepping in only when the automated pipeline encounters flagged quality, timing, or visual exceptions.
+
+## Product Purpose
+
+Douyinie is an automated, policy-gated video localization pipeline that transforms Chinese short-form videos into natural, timeline-constrained localized versions in Vietnamese and English (VI/EN). Success means unattended end-to-end execution producing production-ready videos with natural cadence, intact original soundtrack (BGM/SFX/singing preserved), and clean in-place visual text localization, surfacing only actionable exceptions in a dedicated review workspace.
+
+## Positioning
+
+Unlike generic auto-subtitlers or blunt voice-over tools that wipe background audio and destroy source timing:
+- **Immutable Timeline & Cuts**: Zero retiming, stretching, or cutting of the original video.
+- **Stem Remix & Selective Dialogue Replacement**: Separates vocals from background audio; suppresses only spoken dialogue inside speech windows while keeping BGM, Foley effects, ambient sound, and singing intact.
+- **Fit-Content Cover & Scene-Aware Non-Occlusion**: Subtitle backgrounds hug text tightly without full-width blocking rectangles; semantic text and tutorial UI buttons are covered and localized in-place without obscuring critical demonstration areas.
+- **Meaning-First Gatekeeping**: Production translation is remote-LLM only (Gemini 3.8 Flash primary -> DeepSeek V4.1 Flash secondary) enforced by deterministic QA gates checking negation polarity, numeric precision, and entity preservation.
+
+## Operating Context
+
+- **Hardware & Runtime**: Local Windows 11 workstation with NVIDIA GPU (e.g. RTX 2060 SUPER), running a Go RuntimeHost orchestrator and specialized Python 3.10/3.11 StageWorkers (ASR, Forced Aligner, CAM++ Diarizer, ZeroTTS/CosyVoice, Demucs/UVR, PaddleOCR, YAMNet).
+- **Interface**: Local browser-based Operator Web Workspace (`http://127.0.0.1:8080/ui/`) featuring Job Queue, Stage-by-Stage Workflow Stepper, Review Workspace with interactive video player, Text Region Inspector, Voice Audition, and Final Render Gate.
+- **Execution Model**: Single active processing slot per machine; unattended by default, stopping at `review_required` only when exceptions are flagged.
+
+## Capabilities and Constraints
+
+- **Confirmed Capabilities**:
+  - Ingest and extraction of Douyin short-form video assets.
+  - Audio role separation (`narration/dialogue`, `singing/music-vocal`, `instrumental/background`, `ambience/SFX`).
+  - Speech understanding: ASR, forced word-level alignment, speaker diarization.
+  - Remote-only production translation (Gemini 3.8 Flash primary, DeepSeek V4.1 Flash secondary) with strict negation/numeric/entity QA.
+  - Speech fit adaptation: shorten-first text adaptation with zero adjacent overrun (`tts_finish <= source_end`) and natural breathing pauses.
+  - Voice assignment with AI recommendation and standalone (~5s) or contextual (~10s) voice audition.
+  - OCR text region detection, classification (`speech_subtitle`, `semantic_text`, `instructional_ui_text`, `brand_keep`, `ignore/noise`), tracking, and translation.
+  - Direct operator overrides in Review Workspace: drag/resize/reclassify text regions, edit translation text, swap voices.
+  - Video composition: compact subtitle rendering, in-place covers, audio remixing, and FFmpeg final export.
+- **Constraints & Non-Goals**:
+  - Out of scope for V1: Facial lip synchronization (LatentSync, MuseTalk) and arbitrary video editing/timeline restructuring.
+  - Compute partitioning: GPU/CPU compute reserved for local media stages; local LLM translation is banned for production runs.
+  - Single active processing slot: queue handles serial execution to prevent GPU VRAM exhaustion.
+
+## Brand Commitments
+
+- **Name**: Douyinie.
+- **Identity & Tone**: Local production workspace, utility-first, high density, dark-mode focused (`color-scheme: dark`, electric lime accent `#e7ff57`, slate/charcoal backgrounds), precision-crafted for rapid keyboard/mouse operator triage.
+
+## Evidence on Hand
+
+- **Architecture & Invariants**: `docs/architecture/phase1-architecture.md`, `CONTEXT.md`, `docs/agents/domain.md`, Wayfinder Issue #1, Implementation Spec #18.
+- **Live E2E Runbook & Real Media Corpus**: `docs/agents/live-runtime-e2e.md`, verified real Douyin runs on test assets (e.g. 4.mp4, 5.mp4).
+- **Architectural Seams**: Seam 1 (RuntimeHost localhost HTTP API) and Seam 2 (StageWorker NDJSON subprocess protocol), with complete test suites in `test/seam1/` and `test/seam2/`.
+- **Quality Benchmarks**: Quality corpus and benchmark suites in `internal/benchmark/` and `test/seam1/`.
+
+## Product Principles
+
+1. **Respect the Source Timeline**: The original video cadence and cuts are immutable anchors; dubbing and subtitles must adapt to the video, never force the video to stretch or retime.
+2. **Preserve Audio Identity**: Never replace an entire soundtrack; isolate and replace dialogue while keeping original BGM, sound effects, and musical performances intact.
+3. **Fit-Content & Scene Awareness**: Localized text must cover only what is necessary, hugging text tightly and never blinding the viewer to critical UI buttons, tap targets, or visual demonstration.
+4. **Exception-Only Human Triage**: Automate everything that meets confidence thresholds; respect the operator's time by surfacing only genuine ambiguities, timing conflicts, or quality risks.
+5. **Fail Closed on Meaning Drift**: Translations that invert negation, drop entities, or distort numerical facts must fail closed or require review rather than shipping silent hallucinations.
 
 ## Core Product Invariants
 
