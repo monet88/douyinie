@@ -312,6 +312,25 @@ func (s *VisualTextService) DetectAndTrackText(ctx context.Context, input Visual
 	return &plan, nil
 }
 
+// stageArtifactHash returns the artifact a stage of this run recorded, i.e. what the stage actually
+// consumed or produced for this run. A run that only reused cached artifacts has no variant index row
+// of its own, and the stage execution is what still binds it to the artifact.
+func (s *VisualTextService) stageArtifactHash(ctx context.Context, runID, stage string) string {
+	if s.db == nil || strings.TrimSpace(runID) == "" {
+		return ""
+	}
+	execs, err := s.db.ListStageExecutions(ctx, runID)
+	if err != nil {
+		return ""
+	}
+	for _, e := range execs {
+		if e.Stage == stage && e.Status == "succeeded" && strings.TrimSpace(e.ArtifactSHA256) != "" {
+			return e.ArtifactSHA256
+		}
+	}
+	return ""
+}
+
 // sampleSlot maps a wall-clock detection time onto the sampling grid slot the OCR pass used, so
 // keyframe interpolation stays in sampling space even though the provider numbers frames absolutely.
 func sampleSlot(timestampMs, stepMs int64) int {
@@ -1068,6 +1087,22 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			if err == nil && transIdx != nil && (transIdx.AssetID != in.AssetID || !strings.EqualFold(transIdx.TargetLanguage, in.TargetLanguage)) {
 				return nil, fmt.Errorf("translation variant run binding mismatch for run %s", in.RunID)
 			}
+			if errors.Is(err, storage.ErrNotFound) {
+				// A run that reused a cached translation owns no index row of its own; the artifact
+				// is still bound to this run by the stage execution that consumed it. Without this
+				// the visual lane finds no variant and silently burns the SOURCE caption text as the
+				// localized subtitle (live evidence, run 3adede59: a fresh run on a fully cached
+				// pipeline rendered the Chinese captions over their own covers).
+				if casHash := s.stageArtifactHash(ctx, in.RunID, "translation"); casHash != "" {
+					transIdx = &storage.TranslationVariantIndex{
+						AssetID:        in.AssetID,
+						RunID:          in.RunID,
+						TargetLanguage: in.TargetLanguage,
+						CASHash:        casHash,
+					}
+					err = nil
+				}
+			}
 		} else {
 			transIdx, err = s.db.GetTranslationVariantIndex(ctx, in.AssetID, in.TargetLanguage)
 		}
@@ -1346,6 +1381,20 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 		dubScriptIdx, err = s.db.GetDubScriptVariantIndexByRun(ctx, in.RunID)
 		if err == nil && dubScriptIdx != nil && (dubScriptIdx.AssetID != in.AssetID || !strings.EqualFold(dubScriptIdx.TargetLanguage, in.TargetLanguage)) {
 			return nil, fmt.Errorf("dub script variant run binding mismatch for run %s", in.RunID)
+		}
+		if errors.Is(err, storage.ErrNotFound) {
+			// Same cache-hit binding as the translation index above: the dub script stage of this run
+			// recorded the artifact it consumed, even though the variant row belongs to the run that
+			// produced it.
+			if casHash := s.stageArtifactHash(ctx, in.RunID, "dub_script"); casHash != "" {
+				dubScriptIdx = &storage.DubScriptVariantIndex{
+					AssetID:        in.AssetID,
+					RunID:          in.RunID,
+					TargetLanguage: in.TargetLanguage,
+					CASHash:        casHash,
+				}
+				err = nil
+			}
 		}
 	} else {
 		dubScriptIdx, err = s.db.GetDubScriptVariantIndex(ctx, in.AssetID, in.TargetLanguage)

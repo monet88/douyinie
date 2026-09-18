@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/governance"
@@ -329,6 +330,138 @@ func TestVisualTextService_InstabilityWindowIsMeasuredInTime(t *testing.T) {
 	}
 	if !checked {
 		t.Fatalf("expected a BLGOK region in the plan, got %d regions", len(plan.Regions))
+	}
+}
+
+// A fresh run on an already-processed asset reuses the cached translation and dub script, so it owns no
+// variant index row of its own. Resolving only by run id left the visual lane with no localization
+// artifact at all, and the fallback branch then burned the SOURCE caption text as the "localized"
+// subtitle - live evidence, run 3adede59: a replay run rendered the Chinese captions on top of the
+// covers that hid them. The run is still bound to those artifacts by the stage executions it recorded.
+func TestVisualTextService_CacheHitRunRendersTranslatedCaptions(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	transSvc := service.NewTranslationService(db, casStore)
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "qwen_trans",
+			ModelVersion: "v1",
+			Segments: []domain.TranslationSegment{{
+				Index:      0,
+				SourceText: req.Segments[0].SourceText,
+				TargetText: "Xuất",
+			}},
+		}, nil
+	}
+	svc.SetTranslationService(transSvc)
+
+	sourceText := "把手机放在橱柜上"
+	meaningText := "Đặt điện thoại lên tủ là bạn có ngay góc nhìn từ trên cao."
+
+	transVariant := domain.TranslationVariant{
+		ID:             "trans-origin",
+		AssetID:        assetID,
+		RunID:          "run-origin",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{{
+			Index:      0,
+			SourceText: sourceText,
+			TargetText: meaningText,
+			StartMs:    0,
+			EndMs:      3000,
+		}},
+		CreatedAt: time.Now().UTC(),
+	}
+	transBytes, _ := json.Marshal(transVariant)
+	transObj, err := casStore.Put(bytes.NewReader(transBytes))
+	if err != nil {
+		t.Fatalf("put translation in CAS: %v", err)
+	}
+	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID: "trans-origin", AssetID: assetID, RunID: "run-origin", TargetLanguage: "vi",
+		CASHash: transObj.SHA256, ProvenanceHash: "prov-trans-origin", CreatedAt: transVariant.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save translation variant index: %v", err)
+	}
+
+	dubVariant := domain.DubScriptVariant{
+		ID: "dub-origin", AssetID: assetID, RunID: "run-origin", TargetLanguage: "vi",
+		TranslationVariantCAS: transObj.SHA256,
+		Segments: []domain.DubScriptSegment{{
+			Index:       0,
+			SourceText:  sourceText,
+			MeaningText: meaningText,
+			SpokenText:  meaningText,
+			StartMs:     0,
+			EndMs:       3000,
+		}},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubBytes, _ := json.Marshal(dubVariant)
+	dubObj, err := casStore.Put(bytes.NewReader(dubBytes))
+	if err != nil {
+		t.Fatalf("put dub script in CAS: %v", err)
+	}
+	if err := db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID: "dub-origin", AssetID: assetID, RunID: "run-origin", TargetLanguage: "vi",
+		CASHash: dubObj.SHA256, ProvenanceHash: "prov-dub-origin", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("save dub script index: %v", err)
+	}
+
+	// The replay run consumed both artifacts without producing index rows of its own.
+	replayJob := domain.LocalizationJob{
+		ID: uuid.NewString(), SourceAssetID: assetID, TargetLanguage: "vi",
+		Status: "review_required", CreatedAt: time.Now().UTC(),
+	}
+	if err := db.CreateJob(ctx, replayJob); err != nil {
+		t.Fatalf("create replay job: %v", err)
+	}
+	replayRun := domain.LocalizationRun{
+		ID: "run-replay", JobID: replayJob.ID, Status: "running",
+		ConfigSnapshotJSON: "{}", CreatedAt: time.Now().UTC(),
+	}
+	if err := db.CreateRun(ctx, replayRun); err != nil {
+		t.Fatalf("create replay run: %v", err)
+	}
+	for _, st := range []struct{ stage, hash string }{
+		{"translation", transObj.SHA256},
+		{"dub_script", dubObj.SHA256},
+	} {
+		now := time.Now().UTC()
+		if err := db.CreateStageExecution(ctx, domain.StageExecution{
+			ID: uuid.NewString(), RunID: "run-replay", Stage: st.stage, Status: "succeeded",
+			ArtifactSHA256: st.hash, StartedAt: &now, CompletedAt: &now, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create %s stage execution: %v", st.stage, err)
+		}
+	}
+
+	if _, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID: "run-replay", AssetID: assetID,
+	}); err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+
+	track, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID: "run-replay", AssetID: assetID, TargetLanguage: "vi",
+	})
+	if err != nil {
+		t.Fatalf("localize visual track failed: %v", err)
+	}
+	if len(track.SubtitleCues) == 0 {
+		t.Fatalf("expected subtitle cues for the replayed run")
+	}
+	for _, cue := range track.SubtitleCues {
+		if !strings.Contains(cue.Text, "Đặt điện thoại lên tủ") {
+			t.Fatalf("cue %s carries %q: a replay run must render the translated caption, not the source reading", cue.ID, cue.Text)
+		}
+	}
+	if strings.Contains(track.SubtitleCues[0].Text, sourceText) {
+		t.Fatalf("cue %s carries the raw source text", track.SubtitleCues[0].ID)
 	}
 }
 
