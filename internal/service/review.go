@@ -238,6 +238,38 @@ type RegionGeometryCorrectionResult struct {
 	Message                 string                  `json:"message"`
 }
 
+// recordCorrectionStage appends a succeeded stage execution for an artifact a correction just produced,
+// so a resumed run reuses what the correction built instead of the pre-correction artifact recorded when
+// the run first passed through that stage. Nothing else moves the run's stage rows.
+func (s *ReviewService) recordCorrectionStage(ctx context.Context, runID, stage, casHash string) error {
+	if runID == "" || casHash == "" {
+		return nil
+	}
+	// A legacy asset-scoped correction runs under a synthetic "corr-run-…" id with no run row, and stage
+	// rows are run-bound: there is nothing to attach such a correction's artifacts to.
+	if _, err := s.db.GetRun(ctx, runID); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("look up run %s for %s stage record: %w", runID, stage, err)
+	}
+	now := time.Now().UTC()
+	if err := s.db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          stage,
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: casHash,
+		StartedAt:      &now,
+		CompletedAt:    &now,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		return fmt.Errorf("record %s stage for run %s: %w", stage, runID, err)
+	}
+	return nil
+}
+
 // CorrectTargetText updates target text for a segment and triggers targeted rerun of only declared downstream descendants:
 // TTS -> DubSegment -> DubMix -> LocalizedSubtitleTrack -> Render.
 // Invariant: Source-derived artifacts (source media, audio stems, transcript alignment, text regions) are strictly REUSED.
@@ -484,6 +516,13 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		return nil, errors.New("synthesize and fit produced nil dub segments variant")
 	}
 	result.DubSegmentsVariantCAS = dubSegsVar.CASHash
+	// The corrected variant replaces this run's dub_synthesize output: record it, or a resumed run
+	// replays the pre-correction segments it started from and the mixer refuses them again (live
+	// evidence: run 27a758e6 resumed from `segment 0 measured 13280ms exceeds slot 12400ms` after all
+	// three segments had been shortened to fit).
+	if err := s.recordCorrectionStage(ctx, in.RunID, "dub_synthesize", dubSegsVar.CASHash); err != nil {
+		return nil, err
+	}
 
 	// 4. Rerun Audio Mix (dialogue suppression + soundtrack preservation)
 	mixIn := AudioMixInput{
@@ -504,42 +543,56 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		return nil, errors.New("audio mix produced nil dub mix artifact")
 	}
 	result.DubMixCAS = dubMix.CASHash
+	if err := s.recordCorrectionStage(ctx, in.RunID, "audio_mix", dubMix.CASHash); err != nil {
+		return nil, err
+	}
 
-	// 5. Rerun Visual Text Localized Subtitle / Visual Track
-	visIn := LocalizeVisualTrackInput{
-		RunID:                 in.RunID,
-		JobID:                 in.JobID,
-		AssetID:               in.AssetID,
-		TargetLanguage:        in.TargetLanguage,
-		TranslationVariantCAS: tObj.SHA256,
-	}
-	visTrack, err := s.visualTextSvc.LocalizeVisualTrack(ctx, visIn)
-	if err != nil {
-		return nil, fmt.Errorf("localize visual track rerun failed: %w", err)
-	}
-	if visTrack == nil {
-		return nil, errors.New("localize visual track produced nil visual track")
-	}
-	// Invariant: result.LocalizedSubtitleCAS is the actual LocalizedSubtitleTrack CAS.
-	result.LocalizedSubtitleCAS = visTrack.SubtitleTrackCAS
+	// 5. Rerun Visual Text Localized Subtitle / Visual Track, but only once a text region plan exists.
+	// A run reaches review before its visual stage ran whenever the mixer refuses a dub that cannot fit
+	// its immutable slots: text_detection and visual_text_localize run AFTER audio_mix, so the plan this
+	// rerun resolves does not exist yet (live evidence: run 27a758e6, whose three tts_overrun corrections
+	// all failed with `text region plan not found: record not found`, leaving the operator no way to
+	// shorten the text that the refusal was asking about). The resumed pipeline localizes and freezes the
+	// render plan after the mix passes, exactly as a first pass would.
+	if _, planErr := s.db.GetTextRegionPlanIndex(ctx, in.AssetID); planErr == nil {
+		visIn := LocalizeVisualTrackInput{
+			RunID:                 in.RunID,
+			JobID:                 in.JobID,
+			AssetID:               in.AssetID,
+			TargetLanguage:        in.TargetLanguage,
+			TranslationVariantCAS: tObj.SHA256,
+		}
+		visTrack, err := s.visualTextSvc.LocalizeVisualTrack(ctx, visIn)
+		if err != nil {
+			return nil, fmt.Errorf("localize visual track rerun failed: %w", err)
+		}
+		if visTrack == nil {
+			return nil, errors.New("localize visual track produced nil visual track")
+		}
+		// Invariant: result.LocalizedSubtitleCAS is the actual LocalizedSubtitleTrack CAS.
+		result.LocalizedSubtitleCAS = visTrack.SubtitleTrackCAS
+		if err := s.recordCorrectionStage(ctx, in.RunID, "visual_text_localize", visTrack.CASHash); err != nil {
+			return nil, err
+		}
 
-	// 6. Refreeze RenderPlan: pins explicit new DubMixCAS and newly produced subtitle cues/render inputs
-	planIn := RenderPlanInput{
-		RunID:          in.RunID,
-		JobID:          in.JobID,
-		AssetID:        in.AssetID,
-		TargetLanguage: in.TargetLanguage,
-		DubMixCAS:      result.DubMixCAS,
-		SubtitleCues:   visTrack.SubtitleCues,
+		// 6. Refreeze RenderPlan: pins explicit new DubMixCAS and newly produced subtitle cues/render inputs
+		planIn := RenderPlanInput{
+			RunID:          in.RunID,
+			JobID:          in.JobID,
+			AssetID:        in.AssetID,
+			TargetLanguage: in.TargetLanguage,
+			DubMixCAS:      result.DubMixCAS,
+			SubtitleCues:   visTrack.SubtitleCues,
+		}
+		rPlan, err := s.renderSvc.FreezeRenderPlan(ctx, planIn)
+		if err != nil {
+			return nil, fmt.Errorf("freeze render plan rerun failed: %w", err)
+		}
+		if rPlan == nil {
+			return nil, errors.New("freeze render plan produced nil render plan")
+		}
+		result.RenderPlanCAS = rPlan.CASHash
 	}
-	rPlan, err := s.renderSvc.FreezeRenderPlan(ctx, planIn)
-	if err != nil {
-		return nil, fmt.Errorf("freeze render plan rerun failed: %w", err)
-	}
-	if rPlan == nil {
-		return nil, errors.New("freeze render plan produced nil render plan")
-	}
-	result.RenderPlanCAS = rPlan.CASHash
 
 	// 7. Check if candidate auto-resolved based on honest evidence across all evaluated stages
 	isResolved := true
