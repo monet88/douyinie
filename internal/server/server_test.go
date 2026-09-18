@@ -867,6 +867,90 @@ func TestExecuteRun_StageFailureRecordsEvidenceAndInterrupts(t *testing.T) {
 	}
 }
 
+// A run leaves `review_required` behind when a blocked final render handoff interrupts it.
+// Once the operator clears the queue and the handoff passes, the job must follow its run.
+func TestCompleteRunSafely_CompletesTheJobItFinished(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	db, err := storage.Open(filepath.Join(tmpDir, "complete_run_test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Now().UTC()
+	ra := domain.RightsAttestation{
+		ID:              "att-complete",
+		AttestationType: "OPERATOR_CONFIRMED",
+		DeclaredBy:      "operator",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	}
+	if err := db.CreateRightsAttestation(ctx, ra); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+	asset := domain.SourceAsset{
+		ID:                  "test-asset-complete",
+		SHA256:              strings.Repeat("2", 64),
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		OriginalFilename:    "dummy.mp4",
+		RightsAttestationID: ra.ID,
+		CASPath:             "dummy.mp4",
+		CreatedAt:           now,
+	}
+	if err := db.CreateSourceAsset(ctx, asset); err != nil {
+		t.Fatalf("save asset: %v", err)
+	}
+
+	job := domain.LocalizationJob{
+		ID:             "test-job-complete",
+		SourceAssetID:  asset.ID,
+		TargetLanguage: domain.TargetLanguageVI,
+		Status:         "review_required",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := db.CreateJob(ctx, job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	run := domain.LocalizationRun{ID: "test-run-complete", JobID: job.ID, Status: domain.RunStatusRunning, CreatedAt: now}
+	if err := db.CreateRun(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	qSvc := queue.NewService(db)
+	if _, err := qSvc.Enqueue(ctx, run.ID, job.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := qSvc.MarkRunning(ctx, run.ID); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+
+	s := New(Config{Addr: "127.0.0.1:0", DB: db, QueueSvc: qSvc})
+	if err := s.completeRunSafely(ctx, run.ID); err != nil {
+		t.Fatalf("completeRunSafely: %v", err)
+	}
+
+	entry, err := db.GetQueueEntryByRunID(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("get queue entry: %v", err)
+	}
+	if entry.Status != domain.RunStatusCompleted {
+		t.Fatalf("expected queue entry %s, got %s", domain.RunStatusCompleted, entry.Status)
+	}
+
+	got, err := db.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if got.Status != "completed" {
+		t.Errorf("job status after a completed run = %q, want completed", got.Status)
+	}
+}
+
 func TestOperatorUIRuntimeLifecycleAndPostureContracts(t *testing.T) {
 	t.Parallel()
 

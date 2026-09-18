@@ -424,6 +424,12 @@ func (s *Server) completeRunSafely(ctx context.Context, runID string) error {
 			}
 			return fmt.Errorf("complete run failed: %w", err)
 		}
+		// The job's status follows its run: a run only reaches completion through a
+		// successful final render handoff, so the job is finished too. Without this the
+		// operator sees the `review_required` a blocked handoff wrote, forever.
+		if entry.JobID != "" {
+			_ = s.db.UpdateJobStatus(lookupCtx, entry.JobID, "completed")
+		}
 		return nil
 	case domain.RunStatusPaused, domain.RunStatusCancelled, domain.RunStatusInterrupted:
 		return nil
