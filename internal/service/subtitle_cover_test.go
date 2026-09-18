@@ -269,3 +269,80 @@ func TestBuildSubtitleCovers_DoesNotPadWithoutGridEvidence(t *testing.T) {
 			covers[0].StartMs, covers[0].EndMs)
 	}
 }
+
+// The replacement text belongs on the block that replaced the source caption, not in a lane under
+// it: one dark block per replaced caption (live evidence, run 27a758e6 at 1.6s - cover
+// [225,936,639,96] over the burned-in caption, cue [161,1080,757,45] beneath it).
+func TestSeatReplacementCuesOnCovers_DrawsTextOnTheCoverItReplaces(t *testing.T) {
+	plan := coverTestPlan(subtitleRegion("region-004", domain.BoundingBox{X: 231, Y: 942, Width: 627, Height: 84}, 1500, 3500))
+	covers, occlusions := buildSubtitleCovers(plan, LocalizeVisualTrackInput{})
+	if len(covers) != 1 || len(occlusions) != 0 {
+		t.Fatalf("expected one cover and no occlusions, got %d covers / %d occlusions", len(covers), len(occlusions))
+	}
+	cover := covers[0]
+	centerX := cover.X + cover.Width/2
+	cues := []domain.SubtitleCue{{
+		ID: "cue-0", StartMs: 0, EndMs: 2902,
+		Text: "Đặt điện thoại lên tủ bếp, bạn có góc nhìn từ trên cao.",
+		X:    161, Y: 1080, Width: 757, Height: 45, FontSizePx: 25, PaddingX: 18,
+	}}
+
+	seated, boxes := seatReplacementCuesOnCovers(cues, covers, plan, nil)
+	if len(seated) != 1 || len(boxes) != 1 {
+		t.Fatalf("expected one seated cue and one cover, got %d / %d", len(seated), len(boxes))
+	}
+	got := seated[0]
+	if got.X == cues[0].X && got.Y == cues[0].Y {
+		t.Fatalf("cue stayed in its lane at %d,%d: the replacement must sit on its cover", got.X, got.Y)
+	}
+	// Integer geometry: the seat centers the cue within a pixel of the cover's center.
+	if gotCenterX := got.X + got.Width/2; abs(gotCenterX-centerX) > 1 {
+		t.Errorf("seated cue center x = %d, want the cover center %d", gotCenterX, centerX)
+	}
+	if wantCenterY := cover.Y + cover.Height/2; abs(got.Y+got.Height/2-wantCenterY) > 1 {
+		t.Errorf("seated cue center y = %d, want the cover center %d", got.Y+got.Height/2, wantCenterY)
+	}
+	grown := domain.BoundingBox{X: boxes[0].X, Y: boxes[0].Y, Width: boxes[0].Width, Height: boxes[0].Height}
+	if !boxContains(grown, domain.BoundingBox{X: got.X, Y: got.Y, Width: got.Width, Height: got.Height}) {
+		t.Errorf("cover %v does not frame the seated cue %d,%d %dx%d", grown, got.X, got.Y, got.Width, got.Height)
+	}
+	if !boxContains(grown, domain.BoundingBox{X: cover.X, Y: cover.Y, Width: cover.Width, Height: cover.Height}) {
+		t.Errorf("grown cover %v no longer contains the source caption box", grown)
+	}
+	if got.StartMs != cues[0].StartMs || got.EndMs != cues[0].EndMs {
+		t.Errorf("seating changed the cue window to [%d,%d]", got.StartMs, got.EndMs)
+	}
+}
+
+// A seat that would occlude a protected obstacle keeps the lane placement the lane search chose.
+func TestSeatReplacementCuesOnCovers_RefusesASeatOverAProtectedObstacle(t *testing.T) {
+	plan := coverTestPlan(subtitleRegion("region-004", domain.BoundingBox{X: 231, Y: 942, Width: 627, Height: 84}, 1500, 3500))
+	covers, _ := buildSubtitleCovers(plan, LocalizeVisualTrackInput{})
+	cues := []domain.SubtitleCue{{
+		ID: "cue-0", StartMs: 0, EndMs: 2902, Text: "Đặt điện thoại lên tủ bếp",
+		X: 161, Y: 1080, Width: 757, Height: 45, FontSizePx: 25, PaddingX: 18,
+	}}
+	sceneProtected := []domain.SceneProtectedRegion{
+		{ID: "face-1", Reason: "face", StartMs: 0, EndMs: 5000, Box: domain.BoundingBox{X: 200, Y: 950, Width: 400, Height: 100}},
+	}
+
+	seated, boxes := seatReplacementCuesOnCovers(cues, covers, plan, sceneProtected)
+	if seated[0].X != cues[0].X || seated[0].Y != cues[0].Y {
+		t.Errorf("cue moved onto a seat that occludes a protected obstacle: %d,%d", seated[0].X, seated[0].Y)
+	}
+	if boxes[0] != covers[0] {
+		t.Errorf("cover changed although the seat was refused: %+v", boxes[0])
+	}
+}
+
+func abs(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func boxContains(outer domain.BoundingBox, inner domain.BoundingBox) bool {
+	return inner.X >= outer.X && inner.Y >= outer.Y &&
+		inner.X+inner.Width <= outer.X+outer.Width && inner.Y+inner.Height <= outer.Y+outer.Height
+}

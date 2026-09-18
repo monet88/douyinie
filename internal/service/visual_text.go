@@ -868,13 +868,82 @@ func overlayBoxesIntersect(a, b domain.BoundingBox) bool {
 	return a.X < b.X+b.Width && b.X < a.X+a.Width && a.Y < b.Y+b.Height && b.Y < a.Y+a.Height
 }
 
+// seatReplacementCuesOnCovers moves every replacement cue onto the cover of the source caption it
+// replaces and grows that cover around it, so one opaque block carries the localized text.
+//
+// Left in the default 75% lane, the replacement showed as a second dark box under the cover: same
+// screen, different size and offset (live evidence, run 27a758e6 at 1.6s - source cover
+// [225,936,639,96] over the burned-in caption, cue [161,1080,757,45] beneath it). A burned-in
+// caption is replaced in place, so the cue keeps its fit-content size, centers on the cover's band,
+// and the cover grows to frame it. The cover only ever grows sideways: the seated cue sits inside
+// the cover's rows, so the block stays inside the caption band it replaces.
+//
+// A seat that would occlude a protected obstacle (scene-declared face/tap target or a protected
+// tracked region) is refused and the cue keeps its lane placement, which is where the lane search
+// already put it.
+func seatReplacementCuesOnCovers(
+	cues []domain.SubtitleCue,
+	covers []domain.CoverBox,
+	plan *domain.TextRegionPlan,
+	sceneProtected []domain.SceneProtectedRegion,
+) ([]domain.SubtitleCue, []domain.CoverBox) {
+	if plan == nil || plan.FrameWidth <= 0 || plan.FrameHeight <= 0 || len(cues) == 0 || len(covers) == 0 {
+		return cues, covers
+	}
+	clamp := func(value, span, limit int) int {
+		if value < 0 {
+			return 0
+		}
+		if value+span > limit {
+			return max(0, limit-span)
+		}
+		return value
+	}
+
+	seated := append([]domain.SubtitleCue(nil), cues...)
+	boxes := append([]domain.CoverBox(nil), covers...)
+	for i := range seated {
+		cue := seated[i]
+		target := -1
+		var bestOverlap int64
+		for j := range boxes {
+			overlap := min(cue.EndMs, boxes[j].EndMs) - max(cue.StartMs, boxes[j].StartMs)
+			if overlap > bestOverlap { // strict: the earliest cover wins a tie
+				target, bestOverlap = j, overlap
+			}
+		}
+		if target < 0 {
+			continue
+		}
+		cover := boxes[target]
+		moved := cue
+		moved.X = clamp(cover.X+(cover.Width-cue.Width)/2, cue.Width, plan.FrameWidth)
+		moved.Y = clamp(cover.Y+(cover.Height-cue.Height)/2, cue.Height, plan.FrameHeight)
+
+		left := min(cover.X, moved.X) - coverPaddingPx
+		top := min(cover.Y, moved.Y) - coverPaddingPx
+		grown := domain.BoundingBox{
+			X:      max(0, left),
+			Y:      max(0, top),
+			Width:  min(plan.FrameWidth, max(cover.X+cover.Width, moved.X+moved.Width)+coverPaddingPx) - max(0, left),
+			Height: min(plan.FrameHeight, max(cover.Y+cover.Height, moved.Y+moved.Height)+coverPaddingPx) - max(0, top),
+		}
+		if _, occluded := firstProtectedOverlap(grown, domain.GetProtectedBoxesForTimeWindow(plan.Regions, sceneProtected, cue.StartMs, cue.EndMs, "")); occluded {
+			continue
+		}
+		seated[i] = moved
+		boxes[target].X, boxes[target].Y, boxes[target].Width, boxes[target].Height = grown.X, grown.Y, grown.Width, grown.Height
+	}
+	return seated, boxes
+}
+
 // buildSubtitleCovers derives the opaque cover set that hides source burned-in captions.
 //
 // The cover of a speech_subtitle region is the region's own tracked box (grown by a small padding
 // that absorbs the anti-aliased stroke edges) and is active for exactly the window the source
-// caption was on screen. It deliberately does not grow to the replacement cue's box: the
-// replacement usually fits lower and runs longer (a dub sentence can span 12s under a 1.5s
-// source caption), and blacking out video that never carried source text is not the cover's job.
+// caption was on screen. seatReplacementCuesOnCovers widens each cover afterwards to frame the
+// replacement text seated on it, because a dub sentence runs longer and wider than the source
+// caption it replaces.
 //
 // A cover that would occlude a protected obstacle (scene-declared face/tap target or a tracked
 // protected region) is not emitted: the region is surfaced as a visual_occlusion exception, the
@@ -1696,6 +1765,8 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 	// as occlusion exceptions instead of being covered.
 	covers, coverOcclusions := buildSubtitleCovers(activePlan, in)
 	occlusions = append(occlusions, coverOcclusions...)
+	// 5c. Seat every replacement on the cover it replaces: one opaque block carries the text.
+	subtitleCues, covers = seatReplacementCuesOnCovers(subtitleCues, covers, activePlan, in.SceneProtectedRegions)
 
 	// 6. Persist LocalizedSubtitleTrack
 	subTrackProv, err := domain.ComputeSubtitlePlanProvenanceHash(in.AssetID, in.TargetLanguage, subtitleCues, "compact_fit_cues")

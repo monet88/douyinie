@@ -236,9 +236,12 @@ func GenerateASSContent(timeline domain.RenderTimeline, cues []domain.SubtitleCu
 
 		var tags []string
 
-		// Positioning: exact (X, Y) uses \an7\pos(X, Y) top-left anchor.
+		// Positioning: the declared box's center anchors the text (\an5). The box hugs the
+		// rendered text, so a top-left anchor lands the drawn box wherever the width estimate
+		// guessed; anchoring the center keeps the drawn box concentric with the geometry the
+		// plan declares, which is what the covers, the QC overlap checks and the operator see.
 		if cue.X > 0 || cue.Y > 0 {
-			tags = append(tags, fmt.Sprintf(`\an7\pos(%d,%d)`, cue.X, cue.Y))
+			tags = append(tags, fmt.Sprintf(`\an5\pos(%d,%d)`, cue.X+cue.Width/2, cue.Y+cue.Height/2))
 		}
 
 		// Padding: when BorderStyle=3, \bord sets the padding width of the background box hugging the text.

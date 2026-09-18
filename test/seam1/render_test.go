@@ -650,7 +650,7 @@ func TestSeam1_Render_RedTest_RejectsDrawTextAndEnforcesLibass(t *testing.T) {
 		t.Errorf("red test failure: SubtitlePlanArtifact must contain ASS [Events], got: %s", subArt.ASSContent)
 	}
 	// Verify Dialogue line uses CompactFitBox style and contains box padding (\bord22), font color (\c&HFFFFFF&), box color (\3c&H000000&\4c&H000000&)
-	if !strings.Contains(subArt.ASSContent, "Dialogue: 0,0:00:00.00,0:00:00.60,CompactFitBox,,0,0,0,,{\\an7\\pos(120,240)\\bord22\\shad0\\fs26\\c&HFFFFFF&\\3c&H000000&\\4c&H000000&\\3a&H66&\\4a&H66&}Kiểm tra ASS libass") {
+	if !strings.Contains(subArt.ASSContent, "Dialogue: 0,0:00:00.00,0:00:00.60,CompactFitBox,,0,0,0,,{\\an5\\pos(120,240)\\bord22\\shad0\\fs26\\c&HFFFFFF&\\3c&H000000&\\4c&H000000&\\3a&H66&\\4a&H66&}Kiểm tra ASS libass") {
 		t.Errorf("red test failure: Dialogue line must use CompactFitBox and exact box tags, got: %s", subArt.ASSContent)
 	}
 

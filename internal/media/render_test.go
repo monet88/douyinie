@@ -128,7 +128,7 @@ func TestGenerateASSContent_DeterministicStructureAndBoxSemantics(t *testing.T) 
 	}
 
 	// Verify Dialogue lines use CompactFitBox and contain exact box tags (\bord, \3c, \4c, \3a, \4a)
-	if !strings.Contains(ass, "Dialogue: 0,0:00:00.10,0:00:01.50,CompactFitBox,,0,0,0,,{\\an7\\pos(150,300)\\bord20\\shad0\\fs28\\c&HFFFFFF&\\3c&H000000&\\4c&H000000&\\3a&H66&\\4a&H66&}Chào mừng bạn đến với Douyinie") {
+	if !strings.Contains(ass, "Dialogue: 0,0:00:00.10,0:00:01.50,CompactFitBox,,0,0,0,,{\\an5\\pos(150,300)\\bord20\\shad0\\fs28\\c&HFFFFFF&\\3c&H000000&\\4c&H000000&\\3a&H66&\\4a&H66&}Chào mừng bạn đến với Douyinie") {
 		t.Errorf("expected dialogue line with CompactFitBox style, exact coordinates and box formatting in ASS output, got: %s", ass)
 	}
 	// Verify line break conversion to \N
