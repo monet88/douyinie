@@ -2930,6 +2930,30 @@ func (s *DB) ListStageExecutions(ctx context.Context, runID string) ([]domain.St
 	return scanStageExecutions(rows)
 }
 
+// GetStageArtifactHash returns the artifact a run's stage recorded, i.e. what that stage actually consumed
+// or produced for the run. A run that only reused cached artifacts owns no variant index row of its own
+// (the row belongs to the run that produced it), so the stage execution is what still binds it to the
+// artifact. Returns "" when the run recorded no succeeded execution carrying an artifact for that stage.
+func (s *DB) GetStageArtifactHash(ctx context.Context, runID, stage string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if strings.TrimSpace(runID) == "" || strings.TrimSpace(stage) == "" {
+		return "", nil
+	}
+	var hash string
+	err := s.db.QueryRowContext(ctx, `SELECT artifact_sha256 FROM stage_executions
+		WHERE run_id = ? AND stage = ? AND status = 'succeeded' AND artifact_sha256 IS NOT NULL AND artifact_sha256 != ''
+		ORDER BY created_at DESC, id DESC LIMIT 1`, runID, stage).Scan(&hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("query stage artifact for %s/%s: %w", runID, stage, err)
+	}
+	return hash, nil
+}
+
 // RunStateSnapshot loads a run with its stage executions for crash recovery projection.
 func (s *DB) RunStateSnapshot(ctx context.Context, runID string) (*domain.RunStateSnapshot, error) {
 	run, err := s.GetRun(ctx, runID)

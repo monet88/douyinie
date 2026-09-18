@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/media"
@@ -541,6 +542,82 @@ func TestReviewService_CorruptCAS_ReturnsError(t *testing.T) {
 	}
 }
 
+// A replay run consumes the dub stage's artifact without owning a dub_segments_variants row of its own, so
+// a run-scoped projection found nothing and the blocker never reached the operator: the run shipped with the
+// source dialogue stripped and no voice, and the queue showed only the unrelated OCR items (live evidence,
+// run 959e8dab). The projection must read the variant through the run's own stage execution.
+func TestReviewService_ReplayRunProjectsDubOverrunFromStageArtifact(t *testing.T) {
+	svc, db, casStore, assetID := setupReviewTestHarness(t)
+	ctx := context.Background()
+	const originRun, replayRun = "run-dub-origin", "run-dub-replay"
+
+	dubSegVar := domain.DubSegmentsVariant{
+		ID:             "dub-seg-replay-1",
+		AssetID:        assetID,
+		RunID:          originRun,
+		TargetLanguage: "vi",
+		ProvenanceHash: "prov-dub-replay-1",
+		OverallStatus:  "REVIEW_REQUIRED",
+		ReviewSegments: []domain.DubSegmentReview{
+			{
+				Index:              0,
+				SpeakerID:          "SPEAKER_00",
+				StartMs:            0,
+				EndMs:              12400,
+				SlotDurationMs:     12400,
+				MeasuredDurationMs: 13520,
+				FitDecision:        domain.FitActionReview,
+				ReviewReason:       "DURATION_OVERRUN",
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubSegBytes, _ := json.Marshal(dubSegVar)
+	dubSegObj, _ := casStore.Put(bytes.NewReader(dubSegBytes))
+	if err := db.SaveDubSegmentsVariantIndex(ctx, storage.DubSegmentsVariantIndex{
+		ID:             dubSegVar.ID,
+		AssetID:        assetID,
+		RunID:          originRun,
+		TargetLanguage: "vi",
+		CASHash:        dubSegObj.SHA256,
+		ProvenanceHash: dubSegVar.ProvenanceHash,
+		OverallStatus:  "REVIEW_REQUIRED",
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("save dub segments index: %v", err)
+	}
+
+	// The replay run's own record: it ran dub_synthesize and consumed that artifact.
+	now := time.Now().UTC()
+	job := domain.LocalizationJob{ID: "job-dub-replay", SourceAssetID: assetID, TargetLanguage: "vi", Status: "running", CreatedAt: now}
+	if err := db.CreateJob(ctx, job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: replayRun, JobID: job.ID, Status: "running", ConfigSnapshotJSON: "{}", CreatedAt: now}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID: uuid.NewString(), RunID: replayRun, Stage: "dub_synthesize", Status: "succeeded",
+		ArtifactSHA256: dubSegObj.SHA256, StartedAt: &now, CompletedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create stage execution: %v", err)
+	}
+
+	items, err := svc.ProjectReviewItemsForRun(ctx, assetID, "vi", replayRun)
+	if err != nil {
+		t.Fatalf("ProjectReviewItemsForRun failed: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected the replay run to project its dub overrun, got %d item(s): %+v", len(items), items)
+	}
+	if items[0].Type != domain.ReviewItemTypeTTSOverrun || items[0].Severity != "blocker" {
+		t.Errorf("expected a blocker TTS overrun item, got type=%s severity=%s", items[0].Type, items[0].Severity)
+	}
+	if items[0].StartMs != 0 || items[0].EndMs != 12400 {
+		t.Errorf("item must carry the segment slot it names, got %d-%d", items[0].StartMs, items[0].EndMs)
+	}
+}
+
 func TestReviewService_ManualOverride_LeavesExceptionQueue(t *testing.T) {
 	svc, db, casStore, assetID := setupReviewTestHarness(t)
 	ctx := context.Background()
@@ -947,6 +1024,93 @@ func TestReviewService_CorrectTargetText_TargetedRerunAndAutoResolution(t *testi
 	}
 	if len(subArt.Cues) == 0 {
 		t.Errorf("expected subtitle plan artifact to have cues")
+	}
+}
+
+// Segment indices are the source speech-block indices, so they are sparse: a clip whose speech blocks are
+// 0 and 6 carries those two indices in a two-element slice. Resolving the correction by slice position
+// rejected the operator's edit of the overrunning segment (live evidence, run eec68c8d: "segment index 6
+// out of bounds (total 4)") and, worse, would have patched the wrong segment whenever the index happened
+// to fit.
+func TestReviewService_CorrectTargetText_ResolvesSparseSegmentIndices(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+
+	transVar := domain.TranslationVariant{
+		ID:             "trans-sparse-1",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		SourceLanguage: "zh",
+		ProvenanceHash: "prov-trans-sparse",
+		OverallQAScore: 0.5,
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "点击右上角", TargetText: "Nhấn vào góc trên bên phải của màn hình", StartMs: 0, EndMs: 1500, QAConfidence: 0.9, PassedQAGate: true},
+			{Index: 6, SourceText: "以及独特的水下景观", TargetText: "cùng cảnh quan dưới nước vô cùng độc đáo", StartMs: 21840, EndMs: 27040, QAConfidence: 0.9, PassedQAGate: true},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(transVar)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID: transVar.ID, AssetID: assetID, TargetLanguage: "vi", CASHash: tObj.SHA256,
+		ProvenanceHash: transVar.ProvenanceHash, OverallQAScore: transVar.OverallQAScore, CreatedAt: transVar.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save translation index: %v", err)
+	}
+
+	dubScriptVar := domain.DubScriptVariant{
+		ID:                    "dubscript-sparse-1",
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		SourceLanguage:        "zh",
+		TranslationVariantCAS: tObj.SHA256,
+		ProvenanceHash:        "prov-dubscript-sparse",
+		OverallQAScore:        0.5,
+		Segments: []domain.DubScriptSegment{
+			{Index: 0, SourceText: "点击右上角", MeaningText: transVar.Segments[0].TargetText, SpokenText: transVar.Segments[0].TargetText, SlotDurationMs: 1500, PassedQAGate: true, RequiresReview: true, ReviewReason: "DURATION_OVERRUN"},
+			{Index: 6, SourceText: "以及独特的水下景观", MeaningText: transVar.Segments[1].TargetText, SpokenText: transVar.Segments[1].TargetText, SlotDurationMs: 5200, PassedQAGate: true, RequiresReview: true, ReviewReason: "DURATION_OVERRUN"},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dsBytes, _ := json.Marshal(dubScriptVar)
+	dsObj, _ := casStore.Put(bytes.NewReader(dsBytes))
+	if err := db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID: dubScriptVar.ID, AssetID: assetID, TargetLanguage: "vi", CASHash: dsObj.SHA256,
+		ProvenanceHash: dubScriptVar.ProvenanceHash, OverallQAScore: dubScriptVar.OverallQAScore, CreatedAt: dubScriptVar.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save dub script index: %v", err)
+	}
+
+	res, err := svc.CorrectTargetText(ctx, service.TargetTextCorrectionInput{
+		AssetID:            assetID,
+		TargetLanguage:     "vi",
+		SegmentIndex:       6,
+		NewTargetText:      "cùng cảnh quan dưới nước độc đáo",
+		SpokenTextOverride: "cùng cảnh quan dưới nước độc đáo",
+		Reason:             "Shortened for the 5.2s slot",
+		Operator:           "editor_monet",
+	})
+	if err != nil {
+		t.Fatalf("CorrectTargetText must resolve segment index 6 to its position, got: %v", err)
+	}
+
+	rc, err := casStore.Get(res.TranslationVariantCAS)
+	if err != nil {
+		t.Fatalf("load corrected translation variant: %v", err)
+	}
+	defer rc.Close()
+	var corrected domain.TranslationVariant
+	if err := json.NewDecoder(rc).Decode(&corrected); err != nil {
+		t.Fatalf("decode corrected translation variant: %v", err)
+	}
+	if len(corrected.Segments) != 2 {
+		t.Fatalf("expected both segments preserved, got %d", len(corrected.Segments))
+	}
+	if corrected.Segments[1].Index != 6 || corrected.Segments[1].TargetText != "cùng cảnh quan dưới nước độc đáo" {
+		t.Errorf("segment 6 must carry the corrected text, got index=%d text=%q", corrected.Segments[1].Index, corrected.Segments[1].TargetText)
+	}
+	if corrected.Segments[0].TargetText != transVar.Segments[0].TargetText {
+		t.Errorf("segment 0 must stay untouched, got %q", corrected.Segments[0].TargetText)
 	}
 }
 

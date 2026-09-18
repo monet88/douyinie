@@ -313,22 +313,17 @@ func (s *VisualTextService) DetectAndTrackText(ctx context.Context, input Visual
 }
 
 // stageArtifactHash returns the artifact a stage of this run recorded, i.e. what the stage actually
-// consumed or produced for this run. A run that only reused cached artifacts has no variant index row
-// of its own, and the stage execution is what still binds it to the artifact.
+// consumed or produced. A run that only reused cached artifacts has no variant index row of its own, and
+// the stage execution is what still binds it to the artifact.
 func (s *VisualTextService) stageArtifactHash(ctx context.Context, runID, stage string) string {
-	if s.db == nil || strings.TrimSpace(runID) == "" {
+	if s.db == nil {
 		return ""
 	}
-	execs, err := s.db.ListStageExecutions(ctx, runID)
+	casHash, err := s.db.GetStageArtifactHash(ctx, runID, stage)
 	if err != nil {
 		return ""
 	}
-	for _, e := range execs {
-		if e.Stage == stage && e.Status == "succeeded" && strings.TrimSpace(e.ArtifactSHA256) != "" {
-			return e.ArtifactSHA256
-		}
-	}
-	return ""
+	return casHash
 }
 
 // sampleSlot maps a wall-clock detection time onto the sampling grid slot the OCR pass used, so
