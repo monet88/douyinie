@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -219,12 +220,12 @@ func TestTranslationService_ProviderReportedNegativeCannotOverrideLexicalNegatio
 				Index:            0,
 				SourceText:       req.Segments[0].SourceText,
 				TargetText:       "Open the window.",
-				NegationPolarity: true,
+				NegationPolarity: false, // provider self-report contradicts the source
 			}},
 		}, nil
 	}
 
-	_, err := svc.Translate(ctx, domain.TranslationJobInput{
+	variant, err := svc.Translate(ctx, domain.TranslationJobInput{
 		RunID:          runID,
 		AssetID:        assetID,
 		JobID:          jobID,
@@ -237,8 +238,21 @@ func TestTranslationService_ProviderReportedNegativeCannotOverrideLexicalNegatio
 			EndMs:      1000,
 		}},
 	})
-	if err == nil || !errors.Is(err, domain.ErrNegationInverted) {
-		t.Fatalf("expected provider self-report to be unable to override lexical negation mismatch, got: %v", err)
+	if err != nil {
+		t.Fatalf("expected the flagged candidate to be persisted for review, got: %v", err)
+	}
+	if len(variant.Segments) != 1 {
+		t.Fatalf("expected 1 persisted segment, got %d", len(variant.Segments))
+	}
+	seg := variant.Segments[0]
+	if seg.PassedQAGate {
+		t.Fatalf("expected the gate verdict to flag the inverted negation, got passed_qa_gate=true")
+	}
+	if !seg.NegationPolarity {
+		t.Errorf("expected the gate's own polarity verdict (source is negative) to override the provider self-report, got false")
+	}
+	if !strings.Contains(seg.ReviewReason, "negation polarity inverted") {
+		t.Errorf("expected the review reason to name the inverted negation, got %q", seg.ReviewReason)
 	}
 }
 
@@ -344,7 +358,7 @@ func TestTranslationService_PolicyFallbackRouting(t *testing.T) {
 	}
 }
 
-func TestTranslationService_QAGate_Rejection(t *testing.T) {
+func TestTranslationService_QAGate_FlagsInsteadOfRejecting(t *testing.T) {
 	db, casStore, router, reg := setupTranslationTestEnv(t)
 	svc := service.NewTranslationService(db, casStore)
 	svc.ConfigureRouter(router)
@@ -364,7 +378,8 @@ func TestTranslationService_QAGate_Rejection(t *testing.T) {
 	fake := prov.(*provider.FakeTranslationProvider)
 	fake.CorruptNumbers = true
 
-	// Also make fallback corrupt numbers to prevent fallback passing
+	// Also make fallback corrupt numbers: no clean lane exists, so the best flagged
+	// candidate must be persisted for operator review instead of failing the stage.
 	fbProv, _ := reg.Get("fake_local_translator_fallback")
 	fbFake := fbProv.(*provider.FakeTranslationProvider)
 	fbFake.CorruptNumbers = true
@@ -380,12 +395,39 @@ func TestTranslationService_QAGate_Rejection(t *testing.T) {
 		},
 	}
 
-	_, err := svc.Translate(ctx, input)
-	if err == nil {
-		t.Fatalf("expected translation QA gate to fail on corrupted numbers, got nil")
+	variant, err := svc.Translate(ctx, input)
+	if err != nil {
+		t.Fatalf("expected best-effort translation variant when every lane trips the QA gate, got: %v", err)
 	}
-	if !errors.Is(err, domain.ErrNumberCorrupted) {
-		t.Errorf("expected ErrNumberCorrupted in error chain, got: %v", err)
+	if len(variant.Segments) != 1 {
+		t.Fatalf("expected the flagged candidate to be persisted, got %d segments", len(variant.Segments))
+	}
+	seg := variant.Segments[0]
+	if seg.PassedQAGate {
+		t.Fatalf("expected the corrupted-number segment to stay flagged, got passed_qa_gate=true")
+	}
+	if seg.QAConfidence >= 0.6 {
+		t.Errorf("expected a low QA confidence for a flagged segment, got %f", seg.QAConfidence)
+	}
+	if !strings.Contains(seg.ReviewReason, "45") {
+		t.Errorf("expected the review reason to name the corrupted number, got %q", seg.ReviewReason)
+	}
+
+	// Provenance invariant: every lane is still recorded as quality_failed.
+	attempts, err := db.ListProviderAttempts(ctx, runID, "translation")
+	if err != nil {
+		t.Fatalf("list provider attempts: %v", err)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("expected 2 attempts recorded, got %d", len(attempts))
+	}
+	for i, att := range attempts {
+		if att.Status != "quality_failed" {
+			t.Errorf("attempt %d status must be quality_failed, got %s", i, att.Status)
+		}
+		if !strings.Contains(att.ErrorMessage, domain.ErrQualityRejected.Error()) || !strings.Contains(att.ErrorMessage, domain.ErrNumberCorrupted.Error()) {
+			t.Errorf("attempt %d must keep the specific QA reason, got %s", i, att.ErrorMessage)
+		}
 	}
 }
 

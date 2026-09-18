@@ -106,13 +106,20 @@ hash. Probe media with `ffprobe` before believing any metadata column.
 Terminal states: `completed` (final render done), `review_required` on the **job** + `interrupted` on the
 **run** when the final-render handoff is blocked by pending review exceptions (by design).
 
-## 6. Fail-closed blocks you will meet on real media
+## 6. Blocks and flags you will meet on real media
+
+The meaning-first QA gate **reports, it does not block**: a violation still marks the provider attempt
+`quality_failed` (so a clean lane is preferred), but when every lane carries the same violation the best
+candidate is persisted with the offending segment flagged, and the run continues. What stops a run is
+either a stage that cannot produce an artifact at all (sample rate, missing interpreter) or the
+final-render handoff, which waits for the operator.
 
 | Symptom | Meaning |
 |---|---|
 | `AUDIO_ROLE_EXEC_FAILED … unsupported sample rate: 44100 Hz (expected 16000 Hz)` | separated stems are produced at the separator's native rate while the analyzer contract is 16 kHz |
-| `translation QA gate rejected segment N: negation polarity inverted` | Meaning-First gate polarity mismatch — check whether the source `不` sits inside a lexical compound before blaming the model |
-| `translation QA gate rejected segment N: name/brand 'XX' missing from target` | entity gate vs OCR'd short tokens |
+| `translation QA gate flagged segment N: negation polarity inverted` in `provider_attempts` | Meaning-First gate polarity mismatch. The attempt is recorded as `quality_failed` so the ladder advances, but when no lane is clean the best candidate is still persisted with the segment flagged: **the run continues** and the exception waits in the review queue. Check whether the source `不` sits inside a lexical compound (`不透明度`) before treating it as a real inversion |
+| `translation QA gate flagged segment N: name/brand 'XX' missing from target` in `provider_attempts` | entity gate vs OCR'd short tokens; same rule — the candidate is kept and flagged |
+| `dub script QA gate flagged segment N` (pending `meaning_corrupted` item) | the spoken text drifted from the meaning text and the unshortened fallback did not clear it; correct the segment or accept it |
 | `conditional diarization failed … DIARIZER_EXEC_FAILED` | wrong interpreter for the diarizer family (§2) |
 | `final render handoff blocked: N pending review exceptions` | correct gate: resolve the queue in `03 Review Workspace`, then re-check the handoff in `04 Kết quả` |
 

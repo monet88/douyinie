@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -238,14 +239,47 @@ func TestSeam1_Translation_MeaningFirst_Preservation(t *testing.T) {
 	}
 }
 
-// TestSeam1_Translation_QAGate_Rejections verifies that the Translation QA Gate
-// rejects fact, name, number, and negation corruptions with HTTP 422 Unprocessable Entity.
-func TestSeam1_Translation_QAGate_Rejections(t *testing.T) {
+// TestSeam1_Translation_QAGate_Flags verifies that fact, name, number, and negation corruptions
+// are flagged on the persisted variant and surfaced as pending review exceptions instead of
+// failing the stage. The gate reports what is wrong; the operator corrects or accepts it.
+func TestSeam1_Translation_QAGate_Flags(t *testing.T) {
 	h := setupHarness(t)
 	assetID, runID := setupSpeechUnderstoodAsset(t, h)
 
-	t.Run("Number corruption rejected", func(t *testing.T) {
-		// Set fake providers to corrupt numbers
+	assertFlagged := func(t *testing.T, req map[string]any, wantReasons ...string) {
+		t.Helper()
+		resp, variant := runTranslation(t, h, assetID, req)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 201 Created with a flagged variant, got %d body=%s", resp.StatusCode, string(raw))
+		}
+		if variant == nil || len(variant.Segments) != 1 {
+			t.Fatalf("expected the flagged candidate to be persisted, got %#v", variant)
+		}
+		if variant.Segments[0].PassedQAGate {
+			t.Fatalf("expected the corrupted segment to stay flagged, got passed_qa_gate=true")
+		}
+		reason := strings.ToLower(variant.Segments[0].ReviewReason)
+		matched := false
+		for _, want := range wantReasons {
+			if strings.Contains(reason, strings.ToLower(want)) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Errorf("expected the review reason to name the violation (%v), got %q", wantReasons, variant.Segments[0].ReviewReason)
+		}
+		for _, item := range fetchRunReviewItems(t, h, runID, false) {
+			if item.Type == domain.ReviewItemTypeTranslationQA {
+				return
+			}
+		}
+		t.Fatalf("expected a pending translation_qa exception for the flagged segment")
+	}
+
+	t.Run("Number corruption flagged", func(t *testing.T) {
 		prov, _ := h.registry.Get("fake_llm_translator")
 		fake := prov.(*provider.FakeTranslationProvider)
 		fake.CorruptNumbers = true
@@ -256,21 +290,16 @@ func TestSeam1_Translation_QAGate_Rejections(t *testing.T) {
 		fbFake.CorruptNumbers = true
 		defer func() { fbFake.CorruptNumbers = false }()
 
-		req := map[string]any{
+		assertFlagged(t, map[string]any{
 			"run_id":          runID,
 			"target_language": "vi",
 			"segments": []domain.TranslationInputSegment{
 				{Index: 0, SourceText: "步骤1：准备抹茶粉20克，不要加糖。", StartMs: 0, EndMs: 2000},
 			},
-		}
-
-		resp, _ := runTranslation(t, h, assetID, req)
-		if resp.StatusCode != http.StatusUnprocessableEntity {
-			t.Fatalf("expected 422 Unprocessable Entity on number corruption, got %d", resp.StatusCode)
-		}
+		}, "number")
 	})
 
-	t.Run("Negation inversion rejected", func(t *testing.T) {
+	t.Run("Negation inversion flagged", func(t *testing.T) {
 		prov, _ := h.registry.Get("fake_llm_translator")
 		fake := prov.(*provider.FakeTranslationProvider)
 		fake.CorruptNegation = true
@@ -281,21 +310,18 @@ func TestSeam1_Translation_QAGate_Rejections(t *testing.T) {
 		fbFake.CorruptNegation = true
 		defer func() { fbFake.CorruptNegation = false }()
 
-		req := map[string]any{
+		assertFlagged(t, map[string]any{
 			"run_id":          runID,
 			"target_language": "vi",
 			"segments": []domain.TranslationInputSegment{
-				{Index: 0, SourceText: "请不要打开窗户。", StartMs: 0, EndMs: 2000},
+				// Deliberately free of semantic anchors, numbers and names so the
+				// negation check is the one that reports.
+				{Index: 0, SourceText: "不要忘记带伞。", StartMs: 0, EndMs: 2000},
 			},
-		}
-
-		resp, _ := runTranslation(t, h, assetID, req)
-		if resp.StatusCode != http.StatusUnprocessableEntity {
-			t.Fatalf("expected 422 Unprocessable Entity on negation inversion, got %d", resp.StatusCode)
-		}
+		}, "negation polarity inverted")
 	})
 
-	t.Run("Name corruption rejected", func(t *testing.T) {
+	t.Run("Name corruption flagged", func(t *testing.T) {
 		prov, _ := h.registry.Get("fake_llm_translator")
 		fake := prov.(*provider.FakeTranslationProvider)
 		fake.CorruptNames = true
@@ -306,18 +332,13 @@ func TestSeam1_Translation_QAGate_Rejections(t *testing.T) {
 		fbFake.CorruptNames = true
 		defer func() { fbFake.CorruptNames = false }()
 
-		req := map[string]any{
+		assertFlagged(t, map[string]any{
 			"run_id":          runID,
 			"target_language": "vi",
 			"segments": []domain.TranslationInputSegment{
 				{Index: 0, SourceText: "SUPOR电饭煲是张伟推荐的。", StartMs: 0, EndMs: 2000},
 			},
-		}
-
-		resp, _ := runTranslation(t, h, assetID, req)
-		if resp.StatusCode != http.StatusUnprocessableEntity {
-			t.Fatalf("expected 422 Unprocessable Entity on name corruption, got %d", resp.StatusCode)
-		}
+		}, "name/brand", "entity")
 	})
 }
 

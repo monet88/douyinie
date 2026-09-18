@@ -327,6 +327,7 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 	tVar.Segments[in.SegmentIndex].TargetText = in.NewTargetText
 	tVar.Segments[in.SegmentIndex].PassedQAGate = qaRes.Passed
 	tVar.Segments[in.SegmentIndex].QAConfidence = qaRes.Confidence
+	tVar.Segments[in.SegmentIndex].ReviewReason = qaReviewReason(in.SegmentIndex, qaRes)
 	tVar.Segments[in.SegmentIndex].KeyFacts = qaRes.ExtractedFacts
 	tVar.Segments[in.SegmentIndex].NegationPolarity = qaRes.NegationPolarity
 	tVar.CreatedAt = time.Now().UTC()
@@ -398,12 +399,17 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		seg.NegationPolarity = spQa.NegationPolarity
 		estMs := provider.EstimateSpokenDurationMs(in.SpokenTextOverride, in.TargetLanguage)
 		seg.EstimatedDurationMs = estMs
+		seg.RequiresReview = false
+		seg.ReviewReason = ""
+		if !spQa.Passed {
+			seg.RequiresReview = true
+			seg.ReviewReason = domain.ReviewReasonMeaningCorrupted
+		}
 		if seg.SlotDurationMs > 0 && estMs > seg.SlotDurationMs {
 			seg.RequiresReview = true
-			seg.ReviewReason = "DURATION_OVERRUN"
-		} else {
-			seg.RequiresReview = false
-			seg.ReviewReason = ""
+			if seg.ReviewReason == "" {
+				seg.ReviewReason = "DURATION_OVERRUN"
+			}
 		}
 		dsBytes, err := json.MarshalIndent(dsVar, "", "  ")
 		if err != nil {
@@ -1438,6 +1444,10 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 		}
 		for _, seg := range tVar.Segments {
 			if !seg.PassedQAGate || seg.QAConfidence < 0.6 {
+				reason := seg.ReviewReason
+				if reason == "" {
+					reason = "low_meaning_confidence"
+				}
 				items = append(items, domain.ReviewItem{
 					ID:             fmt.Sprintf("rev-trans-%s-%d", transIdx.CASHash, seg.Index),
 					RunID:          tVar.RunID,
@@ -1450,7 +1460,7 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 					StartMs:        seg.StartMs,
 					EndMs:          seg.EndMs,
 					Severity:       "warning",
-					Reason:         "low_meaning_confidence",
+					Reason:         reason,
 					Details: map[string]any{
 						"source_text":   seg.SourceText,
 						"target_text":   seg.TargetText,

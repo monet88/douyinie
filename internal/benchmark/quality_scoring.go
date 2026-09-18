@@ -676,7 +676,7 @@ func EvaluateCaseQuality(caseEv *QualityCaseEvidence, pack *ReferenceAnnotationP
 				if !dSeg.PassedQAGate {
 					criticalErrors++
 				}
-				if dSeg.RequiresReview && (dSeg.ReviewReason == "meaning_corrupted" || dSeg.ReviewReason == "fact_corrupted") {
+				if dSeg.RequiresReview && (dSeg.ReviewReason == domain.ReviewReasonMeaningCorrupted || dSeg.ReviewReason == "fact_corrupted") {
 					criticalErrors++
 				}
 			}

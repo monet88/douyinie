@@ -481,6 +481,7 @@ Douyinie Phase 1 implements **Variant A: Queue + Inspector** as its canonical op
   - Ambiguous visual text role classification or low OCR confidence.
   - Subtitle bounding box colliding with active UI buttons or tap targets.
   - Pronunciation or acoustic anomaly flagged by multimodal QA.
+  - Meaning-gate violations on a translated or spoken segment (facts, numbers, entity names, negation polarity) when no provider lane produced a clean candidate: the best candidate is persisted with the offending segment flagged, and the run continues.
 
 ### 9.2 Approval States & Semantics
 - `auto_pass`: Stage passed all automated quality gates without human input.
