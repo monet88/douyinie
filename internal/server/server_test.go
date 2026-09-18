@@ -1056,6 +1056,106 @@ func TestOperatorUIRuntimeLifecycleAndPostureContracts(t *testing.T) {
 	}
 }
 
+// #108: the console offers Cancel for an interrupted run, so the endpoint the operator's control
+// calls must accept that state instead of answering 409 for the very run they are abandoning.
+func TestCancelInterruptedRunOverHTTP(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	db, err := storage.Open(filepath.Join(root, "douyinie.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Now().UTC()
+	attestation := domain.RightsAttestation{
+		ID:              "att-cancel-interrupted",
+		AttestationType: "OPERATOR_CONFIRMED",
+		DeclaredBy:      "operator",
+		TermsAccepted:   true,
+		Notes:           "test",
+		ConfirmedAt:     now,
+	}
+	if err := db.CreateRightsAttestation(ctx, attestation); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+	asset := domain.SourceAsset{
+		ID:                  "asset-cancel-interrupted",
+		SHA256:              strings.Repeat("9", 64),
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		OriginalFilename:    "interrupted.mp4",
+		RightsAttestationID: attestation.ID,
+		CASPath:             "interrupted.mp4",
+		CreatedAt:           now,
+	}
+	if err := db.CreateSourceAsset(ctx, asset); err != nil {
+		t.Fatalf("save asset: %v", err)
+	}
+	job := domain.LocalizationJob{
+		ID:             "job-cancel-interrupted",
+		SourceAssetID:  asset.ID,
+		TargetLanguage: domain.TargetLanguageVI,
+		Status:         "pending",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := db.CreateJob(ctx, job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	run := domain.LocalizationRun{
+		ID:        "run-cancel-interrupted",
+		JobID:     job.ID,
+		Status:    domain.RunStatusRunning,
+		CreatedAt: now,
+	}
+	if err := db.CreateRun(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	qSvc := queue.NewService(db)
+	if _, err := qSvc.Enqueue(ctx, run.ID, job.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := qSvc.MarkRunning(ctx, run.ID); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+	// A fail-closed run (the final-render handoff is the normal path into this state) leaves its
+	// queue entry interrupted while the run row keeps its own interrupted status.
+	if err := db.UpdateQueueStatus(ctx, run.ID, domain.RunStatusInterrupted, domain.RunStatusInterrupted); err != nil {
+		t.Fatalf("interrupt run: %v", err)
+	}
+
+	s := New(Config{Addr: "127.0.0.1:0", DB: db, QueueSvc: qSvc})
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/runs/"+run.ID+"/cancel", strings.NewReader("{}")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cancel interrupted run status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	entry, err := db.GetQueueEntryByRunID(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("get queue entry: %v", err)
+	}
+	if entry.Status != domain.RunStatusCancelled {
+		t.Fatalf("expected queue entry %s after cancel, got %s", domain.RunStatusCancelled, entry.Status)
+	}
+	cancelled, err := db.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if cancelled.Status != domain.RunStatusCancelled {
+		t.Fatalf("expected run %s after cancel, got %s", domain.RunStatusCancelled, cancelled.Status)
+	}
+
+	// Cancelled is terminal: a second cancel must stay refused rather than silently succeeding.
+	again := httptest.NewRecorder()
+	s.Handler().ServeHTTP(again, httptest.NewRequest(http.MethodPost, "/api/v1/runs/"+run.ID+"/cancel", strings.NewReader("{}")))
+	if again.Code != http.StatusConflict {
+		t.Fatalf("re-cancel of a cancelled run status = %d, want %d", again.Code, http.StatusConflict)
+	}
+}
+
 func TestTranslationAndVoiceAssignmentRunIsolation(t *testing.T) {
 	t.Parallel()
 
