@@ -219,6 +219,19 @@ Traps:
   `POST /api/v1/runs/<id>/resume` for it and re-drains from the incomplete stage); `Pause`/`Cancel` stay
   disabled. Reload the page after changing `app.js` — the data-refresh button re-fetches state, not the script.
 
+- **A blocked dub reads as `tts_overrun` blockers (`severity: blocker`), not as OCR warnings.** When the
+  dub lane cannot fit a slot, the exception queue carries one item per affected segment with
+  `measured_duration_ms` / `slot_duration_ms`. Two ways out, both operator-visible: shorten the wording
+  (`Sửa text` → `POST /api/v1/runs/<run>/inspector/correct-text` with `new_target_text` +
+  `spoken_text_override`) or give the run a lane that can compress (below).
+- **Why the automatic fit lane may never engage.** The VI default lane (ZeroTTS) is fixed-rate: it rejects any
+  speed other than 1.0, so overrun can only go through rewrite/regroup and then the whole-speaker escalation
+  to the duration-controlled lane (`cosyvoice3_tts`, feature `measured_duration_speed_fit`). That lane is
+  route-eligible only with a license manifest **and** a verified snapshot in the data dir; in the
+  `live-20260918` data dir it has neither, so the router refuses it, no escalation happens, and the overrun
+  stays `REVIEW`. Provision that lane or shorten the text - do not expect the escalation to fire on a box
+  where its weights were never registered.
+
 ## 5. Read the run back
 
 ```bash
@@ -255,6 +268,18 @@ names a defect that shipped in run `4f86657f` and is now pinned by tests, so a r
    `consumed_plan.subtitle_plan.cue_count`: a segment longer than two readable lines must appear as several
    cues (the splitter breaks at word boundaries, preferring sentence ends), and each cue's box stays in the
    caption band rather than growing to the frame width.
+3. **The audio carries the dub.** The mix embeds the separated background stem plus the TTS clips, so a mix
+   that equals the background stem byte-for-byte is a mute replacement: the source dialogue was suppressed and
+   nothing was placed. Verify per artifact instead of trusting `overall_status`:
+   ```bash
+   ffmpeg -v error -i <dub_mix audio_cas_path> -ac 1 -ar 16000 -c:a pcm_s16le /tmp/mix.wav -y
+   ffmpeg -v error -i <background stem audio_cas_path> -ac 1 -ar 16000 -c:a pcm_s16le /tmp/bg.wav -y
+   python -c "import wave,numpy as np;r=lambda p:np.frombuffer(wave.open(p).readframes(-1),dtype=np.int16).astype(float);a,b=r('/tmp/mix.wav'),r('/tmp/bg.wav');n=min(len(a),len(b));print('corr',np.corrcoef(a[:n],b[:n])[0,1])"
+   ```
+   `corr ≈ 1.0` = no dub (the mixer now refuses that state instead of reporting PASS); `0.6-0.97` = dub present.
+4. **No doubled cover bars.** One bar per caption instant: covers of consecutive captions must not overlap in
+   time. When a frame shows two offset black bars over one caption band, the padded cover windows were not
+   split.
 3. **The subtitle text is the TRANSLATION, never the source reading.** A run that reused cached artifacts
    (nothing to re-run, everything a cache hit) owns no variant index row of its own, so the visual lane must
    still resolve the translation through the run's own stage executions. When it cannot, the fallback branch
@@ -263,7 +288,7 @@ names a defect that shipped in run `4f86657f` and is now pinned by tests, so a r
    `consumed_plan.cue_count` and the cue texts (`sub-*` ids come from the fallback branch; the translated
    branch ids are `cue-<segment>[-<part>]`). The failing shape was live run `3adede59`; the fix is
    `VisualTextService.stageArtifactHash` binding `translation` / `dub_script` stage artifacts to the run.
-4. **No garbled label drawn on the video.** Overlays come from `semantic_text` / `instructional_ui_text`
+5. **No garbled label drawn on the video.** Overlays come from `semantic_text` / `instructional_ui_text`
    regions that cleared the classifier's evidence gates. When junk text is drawn anyway, read
    `GET /api/v1/assets/<asset>/text-region-plan` and the region's `review_reason` before blaming the OCR:
    `spatially_unstable_label_noise` (readings of one label wandering across the frame),
