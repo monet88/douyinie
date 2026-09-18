@@ -280,6 +280,11 @@ names a defect that shipped in run `4f86657f` and is now pinned by tests, so a r
 4. **No doubled cover bars.** One bar per caption instant: covers of consecutive captions must not overlap in
    time. When a frame shows two offset black bars over one caption band, the padded cover windows were not
    split.
+   A single bar is not enough either: the box the OCR lane reports must bound the glyphs it names. Live
+   evidence (1080x1440 frame, caption 你就得到了同款上帝视角): PaddleOCR's polygon stopped at x=828 while the
+   glyph ink ran to 850, so the cover (+6px padding) left the last glyph's right edge on screen. The adapter
+   now grows every detection box to the ink it overlaps (`refine_box_to_ink`); a detection whose box stops
+   inside its glyphs means that lane was bypassed or disabled (`DOUYINIE_OCR_INK_REFINE=0`).
 3. **The subtitle text is the TRANSLATION, never the source reading.** A run that reused cached artifacts
    (nothing to re-run, everything a cache hit) owns no variant index row of its own, so the visual lane must
    still resolve the translation through the run's own stage executions. When it cannot, the fallback branch

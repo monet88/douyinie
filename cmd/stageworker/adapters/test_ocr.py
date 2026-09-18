@@ -422,3 +422,60 @@ class TestOcrFrameDedup(unittest.TestCase):
                 os.remove(os.path.join(d, entry))
             os.rmdir(d)
         os.remove(tmp_path)
+
+
+class TestInkRefinement(unittest.TestCase):
+    """The box a detection reports must bound the ink it names.
+
+    Live evidence (1080x1440 frame, caption 你就得到了同款上帝视角): PaddleOCR's polygon stopped at
+    x=828 while the glyph ink ran to 850, so every downstream cover built from that box (+6px padding)
+    left the last glyph's right edge on screen.
+    """
+
+    def _frame(self, ink_value: int = 235, background: int = 40) -> "np.ndarray":
+        frame = np.full((1440, 1080, 3), background, dtype=np.uint8)
+        # Nine glyph-sized strokes spanning x 239..850, y 945..1015.
+        for i in range(9):
+            gx = 239 + i * (850 - 239 - 56) // 8
+            frame[945:1015, gx:gx + 56] = ink_value
+        return frame
+
+    @unittest.skipUnless(cv2 is not None and np is not None, "cv2/numpy required")
+    def test_box_grows_to_the_glyph_ink(self):
+        box = {"x": 237, "y": 954, "width": 591, "height": 60}  # tight: right edge 828, top 954
+        refined = ocr.refine_box_to_ink(self._frame(), box)
+        self.assertLessEqual(refined["x"], 239)
+        self.assertGreaterEqual(refined["x"] + refined["width"], 850)
+        self.assertLessEqual(refined["y"], 945)
+        self.assertGreaterEqual(refined["y"] + refined["height"], 1015)
+
+    @unittest.skipUnless(cv2 is not None and np is not None, "cv2/numpy required")
+    def test_dark_ink_on_light_background_grows_too(self):
+        box = {"x": 237, "y": 954, "width": 591, "height": 60}
+        refined = ocr.refine_box_to_ink(self._frame(ink_value=25, background=240), box)
+        self.assertGreaterEqual(refined["x"] + refined["width"], 850)
+        self.assertLessEqual(refined["y"], 945)
+
+    @unittest.skipUnless(cv2 is not None and np is not None, "cv2/numpy required")
+    def test_box_without_ink_is_left_alone(self):
+        frame = np.full((1440, 1080, 3), 128, dtype=np.uint8)
+        box = {"x": 237, "y": 954, "width": 591, "height": 60}
+        self.assertEqual(ocr.refine_box_to_ink(frame, box), box)
+
+    @unittest.skipUnless(cv2 is not None and np is not None, "cv2/numpy required")
+    def test_a_large_bright_surface_is_not_text_and_growth_is_capped(self):
+        frame = self._frame()
+        frame[880:1080, 860:1080] = 255  # a blown-out surface right beside the caption band
+        box = {"x": 237, "y": 954, "width": 591, "height": 60}
+        refined = ocr.refine_box_to_ink(frame, box)
+        self.assertLessEqual(refined["width"], int(box["width"] * (1 + 2 * ocr.INK_GROW_CAP_X_RATIO)) + 1)
+        self.assertLessEqual(refined["height"], int(box["height"] * (1 + 2 * ocr.INK_GROW_CAP_Y_RATIO)) + 1)
+
+    @unittest.skipUnless(cv2 is not None and np is not None, "cv2/numpy required")
+    def test_refinement_can_be_switched_off(self):
+        box = {"x": 237, "y": 954, "width": 591, "height": 60}
+        os.environ["DOUYINIE_OCR_INK_REFINE"] = "0"
+        try:
+            self.assertEqual(ocr.refine_box_to_ink(self._frame(), box), box)
+        finally:
+            os.environ.pop("DOUYINIE_OCR_INK_REFINE", None)
