@@ -114,6 +114,31 @@ class TestOCRAdapter(unittest.TestCase):
                 os.unlink(tmp_path)
 
     @unittest.skipIf(cv2 is None or np is None, "OpenCV and numpy required for frame sampling tests")
+    def test_preprocess_for_ocr_recovers_low_contrast_and_honours_kill_switch(self):
+        """Frames handed to the detector carry contrast-boosted luma; DOUYINIE_OCR_CLAHE=0 keeps raw pixels."""
+        # A faint mid-gray stroke on a uniform background: the low-contrast case CLAHE exists for.
+        raw = np.full((120, 160, 3), 128, dtype=np.uint8)
+        raw[40:80, 40:120] = 150
+
+        previous = os.environ.get("DOUYINIE_OCR_CLAHE")
+        try:
+            os.environ.pop("DOUYINIE_OCR_CLAHE", None)
+            processed = ocr.preprocess_for_ocr(raw)
+            self.assertEqual(processed.shape, raw.shape)
+            # CLAHE output is grayscale-in-BGR, so every channel matches and the stroke stands out
+            # at least as much as it did in the source.
+            self.assertTrue(np.array_equal(processed[:, :, 0], processed[:, :, 1]))
+            self.assertGreaterEqual(int(processed[60, 80, 0]) - int(processed[10, 10, 0]), 22)
+
+            os.environ["DOUYINIE_OCR_CLAHE"] = "0"
+            self.assertTrue(np.array_equal(ocr.preprocess_for_ocr(raw), raw))
+        finally:
+            if previous is None:
+                os.environ.pop("DOUYINIE_OCR_CLAHE", None)
+            else:
+                os.environ["DOUYINIE_OCR_CLAHE"] = previous
+
+    @unittest.skipIf(cv2 is None or np is None, "OpenCV and numpy required for frame sampling tests")
     def test_sample_media_frames_synthetic_video(self):
         """
         Proves cadence 500ms at known FPS (20 FPS) yields expected source frame indices,
@@ -324,3 +349,76 @@ class TestOCRAdapter(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOcrFrameDedup(unittest.TestCase):
+    """A static shot repeats the same pixels: the OCR pass must read them once, not once per sample."""
+
+    def setUp(self):
+        ocr._OCR_MODEL_FACTORY = None
+        ocr._PADDLE_OCR_CLASS = None
+
+    def tearDown(self):
+        ocr._OCR_MODEL_FACTORY = None
+        ocr._PADDLE_OCR_CLASS = None
+
+    def test_identical_frames_are_read_once_and_replayed_with_their_own_time(self):
+        det_dir = tempfile.mkdtemp(prefix="det_snap_")
+        rec_dir = tempfile.mkdtemp(prefix="rec_snap_")
+        cls_dir = tempfile.mkdtemp(prefix="cls_snap_")
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            cv2.imwrite(f.name, np.zeros((480, 640, 3), dtype=np.uint8))
+            tmp_path = f.name
+
+        static = np.zeros((480, 640, 3), dtype=np.uint8)
+        moving = np.full((480, 640, 3), 90, dtype=np.uint8)
+        # The same bytes at 0 ms and 500 ms (a held shot) and a different frame at 1000 ms.
+        sampled = [
+            {"frame_index": 0, "timestamp_ms": 0, "image": static},
+            {"frame_index": 15, "timestamp_ms": 500, "image": static.copy()},
+            {"frame_index": 30, "timestamp_ms": 1000, "image": moving},
+        ]
+        original_sampler = ocr.sample_media_frames
+        ocr.sample_media_frames = lambda *_args, **_kwargs: (640, 480, sampled)
+
+        predicts = []
+
+        class CountingPaddleOCR:
+            def __init__(self, **kwargs):
+                pass
+
+            def predict(self, input_img, **kwargs):
+                predicts.append(int(input_img.mean()))
+                v3_res = {
+                    "input_path": "sampled_frame.png",
+                    "rec_texts": ["SUPOR"],
+                    "rec_scores": np.array([0.985]),
+                    "rec_polys": np.array([[[20, 30], [180, 30], [180, 75], [20, 75]]]),
+                }
+                return [MockV3Result(v3_res)]
+
+        ocr._PADDLE_OCR_CLASS = CountingPaddleOCR
+        try:
+            res = ocr.detect_text_paddleocr(
+                tmp_path, 500, 5, "PP-OCRv6", "v6",
+                det_model_dir=det_dir, rec_model_dir=rec_dir, cls_model_dir=cls_dir,
+            )
+        finally:
+            ocr.sample_media_frames = original_sampler
+
+        # Two distinct frames -> two model calls, not three.
+        self.assertEqual(len(predicts), 2, f"expected one read per distinct frame, got {predicts}")
+        # Every frame still reports its own detection, at its own time.
+        self.assertEqual(len(res["detections"]), 3)
+        replayed = res["detections"][1]
+        self.assertEqual(replayed["frame_index"], 15)
+        self.assertEqual(replayed["timestamp_ms"], 500)
+        self.assertEqual(replayed["text"], "SUPOR")
+        self.assertEqual(replayed["box"], {"x": 20, "y": 30, "width": 160, "height": 45})
+
+        for d in (det_dir, rec_dir, cls_dir):
+            for entry in os.listdir(d):
+                os.remove(os.path.join(d, entry))
+            os.rmdir(d)
+        os.remove(tmp_path)

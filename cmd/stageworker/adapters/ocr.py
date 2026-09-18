@@ -12,6 +12,7 @@ Contract:
 - Exit code: 0 on success, non-zero on failure
 """
 
+import hashlib
 import json
 import math
 import os
@@ -173,6 +174,26 @@ def parse_v3_result(predict_results: Any, frame_idx: int, ts_ms: int) -> List[Di
 
     return detections
 
+def preprocess_for_ocr(image):
+    """Boost local contrast before detection.
+
+    Subtitles and packaging labels are often low-contrast over busy footage; CLAHE on the luma
+    channel recovers strokes the detector otherwise drops. Disable with DOUYINIE_OCR_CLAHE=0.
+    """
+    if os.environ.get("DOUYINIE_OCR_CLAHE", "1").strip() in ("0", "false", "off"):
+        return image
+    if cv2 is None:
+        return image
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+        return cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
+    except cv2.error:
+        # A frame the color conversion cannot handle must never take the whole stage down:
+        # the raw frame is still a valid OCR input.
+        return image
+
+
 def sample_media_frames(media_path: str, frame_sample_step_ms: int = 500, max_frames: int = 0) -> Tuple[int, int, List[Dict[str, Any]]]:
     """
     Deterministically sample video/image frames at the requested cadence.
@@ -192,7 +213,7 @@ def sample_media_frames(media_path: str, frame_sample_step_ms: int = 500, max_fr
         if img is None:
             raise RuntimeError(f"Failed to read image media: {media_path}")
         h, w = img.shape[:2]
-        return w, h, [{"frame_index": 0, "timestamp_ms": 0, "image": img}]
+        return w, h, [{"frame_index": 0, "timestamp_ms": 0, "image": preprocess_for_ocr(img)}]
 
     # Video file: sample frames at cadence
     cap = cv2.VideoCapture(media_path)
@@ -230,7 +251,7 @@ def sample_media_frames(media_path: str, frame_sample_step_ms: int = 500, max_fr
             sampled.append({
                 "frame_index": target_frame_num,
                 "timestamp_ms": current_ts,
-                "image": frame,
+                "image": preprocess_for_ocr(frame),
             })
 
             current_ts += step_ms
@@ -242,7 +263,7 @@ def sample_media_frames(media_path: str, frame_sample_step_ms: int = 500, max_fr
                 sampled.append({
                     "frame_index": 0,
                     "timestamp_ms": 0,
-                    "image": frame,
+                    "image": preprocess_for_ocr(frame),
                 })
 
         return w, h, sampled
@@ -313,17 +334,31 @@ def detect_text_paddleocr(
     )
 
     detections = []
+    # Frames repeat bit-for-bit in a static shot, so the detector and recognizer would re-read the
+    # same pixels several times: hash the preprocessed frame and replay the previous frame's
+    # detections for an identical one, re-labelled with this frame's index and timestamp. The hash is
+    # over the exact bytes, so a frame that differs at all (a caption appearing, an object moving) is
+    # still read fresh - the reuse can never drop a detection the detector would have found.
+    last_hash = None
+    last_frame_detections = []
     for f in sampled_frames:
         frame_idx = f["frame_index"]
         ts_ms = f["timestamp_ms"]
         img = f["image"]
 
-        raw_res = ocr.predict(img)
-        if not raw_res:
+        frame_hash = hashlib.blake2b(img.tobytes(), digest_size=16).digest() if hasattr(img, "tobytes") else None
+        if frame_hash is not None and frame_hash == last_hash:
+            detections.extend(
+                {**d, "frame_index": frame_idx, "timestamp_ms": ts_ms}
+                for d in last_frame_detections
+            )
             continue
 
-        frame_detections = parse_v3_result(raw_res, frame_idx, ts_ms)
+        raw_res = ocr.predict(img)
+        frame_detections = parse_v3_result(raw_res, frame_idx, ts_ms) if raw_res else []
         detections.extend(frame_detections)
+        last_hash = frame_hash
+        last_frame_detections = frame_detections
     return {
         "frame_width": w,
         "frame_height": h,
