@@ -13,6 +13,8 @@
 .scratch
 .claude/
 
+# Archify pipeline architecture artifacts
+/docs/architecture/douyinie-pipeline.*
 # User-supplied root media test fixtures
 /background music + voice + subtitles.mp4
 /background music audio and subtitles.mp4
