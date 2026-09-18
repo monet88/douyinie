@@ -321,6 +321,132 @@ func TestAudioMixService_ZeroDurationSlotOverrun_Refused(t *testing.T) {
 	}
 }
 
+// A dub-eligible mix whose dub stage accepted NOTHING must refuse instead of stripping the source
+// dialogue. Live evidence: runs 264aecaf and 4f86657f placed zero clips (every candidate overran its slot
+// and stayed in ReviewSegments) yet reported PASS with dialogue_suppressed=true, and the rendered audio came
+// out bit-identical to the background stem - a video with no voice at all and no gate in the way.
+func TestAudioMixService_DubRequiredButNothingPlaceable_Refused(t *testing.T) {
+	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+	assetID, runID, stemsCAS := mixFixtureWithDubEligibleSpeech(t, db, casStore)
+
+	// The dub stage built candidates for every speech block and could not fit any of them, so Segments is
+	// empty and the candidates sit in ReviewSegments.
+	dubSegments := domain.DubSegmentsVariant{
+		ID:                uuid.NewString(),
+		SchemaVersion:     domain.DubSegmentsSchemaVersion,
+		AssetID:           assetID,
+		RunID:             runID,
+		TargetLanguage:    "vi",
+		Segments:          nil,
+		FixedRateSpeakers: []string{"SPEAKER_00"},
+		OverallStatus:     "REVIEW_REQUIRED",
+		ReviewSegments: []domain.DubSegmentReview{
+			{
+				Index:              0,
+				SpeakerID:          "SPEAKER_00",
+				StartMs:            0,
+				EndMs:              12000,
+				SlotDurationMs:     12000,
+				MeasuredDurationMs: 13520,
+				FitDecision:        domain.FitActionReview,
+				ReviewReason:       "DURATION_OVERRUN",
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubBytes, _ := json.Marshal(dubSegments)
+	dubObj, _ := casStore.Put(bytes.NewReader(dubBytes))
+
+	mix, err := mixSvc.MixAudio(ctx, service.AudioMixInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		DubSegmentsCAS: dubObj.SHA256,
+		AudioStemsCAS:  stemsCAS,
+	})
+	if !errors.Is(err, domain.ErrMixerOverrunRefused) {
+		t.Fatalf("expected ErrMixerOverrunRefused when dubbing is required but nothing is placeable, got err=%v mix=%+v", err, mix)
+	}
+	if mix == nil || mix.OverallStatus != "REFUSED" {
+		t.Fatalf("expected a REFUSED dub mix artifact, got %+v", mix)
+	}
+	if mix.DialogueSuppressed {
+		t.Errorf("refused mix must not claim the source dialogue was suppressed: %+v", mix)
+	}
+	if !strings.Contains(mix.RefusalReason, "13520") || !strings.Contains(mix.RefusalReason, "12000") {
+		t.Errorf("refusal reason must name the overrun that left nothing placeable, got %q", mix.RefusalReason)
+	}
+}
+
+// mixFixtureWithDubEligibleSpeech seeds the minimum a dub-eligible mix needs: a rights-cleared asset, a
+// preflight report, one full-length narration window, and background/vocals stems in CAS.
+func mixFixtureWithDubEligibleSpeech(t *testing.T, db *storage.DB, casStore *cas.Store) (assetID, runID, stemsCAS string) {
+	t.Helper()
+	ctx := context.Background()
+	assetID = "asset_dub_eligible_" + uuid.NewString()[:8]
+	runID = "run_test_" + uuid.NewString()[:8]
+
+	dummyMedia := media.GeneratePCM16WAV(16000, 1, 35000)
+	mediaObj, err := casStore.Put(bytes.NewReader(dummyMedia))
+	if err != nil {
+		t.Fatalf("put media in cas: %v", err)
+	}
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              attID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		RightsAttestationID: attID,
+		SHA256:              mediaObj.SHA256,
+		CASPath:             mediaObj.Path,
+		ByteSize:            int64(len(dummyMedia)),
+		CreatedAt:           time.Now().UTC(),
+	})
+	_ = db.SavePreflightReport(ctx, domain.PreflightReport{
+		ID:                     "preflight_" + assetID,
+		AssetID:                assetID,
+		DurationSec:            35.0,
+		DurationMs:             35000,
+		AudioChannels:          1,
+		AudioSampleRate:        16000,
+		ContainerValid:         true,
+		FingerprintMatch:       true,
+		NormalizedAudioSHA256:  mediaObj.SHA256,
+		NormalizedAudioCASPath: mediaObj.Path,
+		CreatedAt:              time.Now().UTC(),
+	})
+	_ = db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{
+		AssetID: assetID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 35000, Role: domain.AudioRoleNarrationDialogue},
+		},
+		CreatedAt: time.Now().UTC(),
+	})
+	stems := domain.AudioStemArtifacts{
+		ID:      uuid.NewString(),
+		AssetID: assetID,
+		Stems: []domain.AudioStem{
+			{Type: domain.StemTypeBackground, AudioCASHash: mediaObj.SHA256},
+			{Type: domain.StemTypeVocals, AudioCASHash: mediaObj.SHA256},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	stemsBytes, _ := json.Marshal(stems)
+	stemsObj, _ := casStore.Put(bytes.NewReader(stemsBytes))
+	_ = db.SaveAudioStemsArtifactIndex(ctx, storage.AudioStemsArtifactIndex{
+		ID:        stems.ID,
+		AssetID:   assetID,
+		CASHash:   stemsObj.SHA256,
+		CreatedAt: stems.CreatedAt,
+	})
+	return assetID, runID, stemsObj.SHA256
+}
+
 func TestAudioMixService_SeparateAudio_UsesNormalizedPreflightAudio_NotRawMP4(t *testing.T) {
 	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
 	ctx := context.Background()

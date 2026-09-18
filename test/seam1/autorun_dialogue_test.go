@@ -563,7 +563,10 @@ func TestSeam1_AutoRun_Dialogue_TerminalQC_FailClosed(t *testing.T) {
 		h := setupAutoRunHarness(t)
 		configureDialogueTranslationGateway(t, h)
 
-		defaultVITTSFake(t, h).DurationMs = 800
+		// The dub must fit every slot: a candidate that overruns its immutable slot is refused by the mixer
+		// (AudioMixService's dub-coverage invariant), which stops the run before the terminal QC gate these
+		// subtests are about.
+		defaultVITTSFake(t, h).DurationMs = 250
 
 		assetID1 := ingestSyntheticAssetWithFrequency(t, h.server.URL, h.dir, "qc_fail_1.mp4", 2.0, 2500)
 
@@ -612,7 +615,10 @@ func TestSeam1_AutoRun_Dialogue_TerminalQC_FailClosed(t *testing.T) {
 		h := setupAutoRunHarness(t)
 		configureDialogueTranslationGateway(t, h)
 
-		defaultVITTSFake(t, h).DurationMs = 800
+		// The dub must fit every slot: a candidate that overruns its immutable slot is refused by the mixer
+		// (AudioMixService's dub-coverage invariant), which stops the run before the terminal QC gate these
+		// subtests are about.
+		defaultVITTSFake(t, h).DurationMs = 250
 
 		// Disable ReviewService to simulate unconfigured terminal QC service
 		h.srv.SetReviewService(nil)
