@@ -26,13 +26,15 @@ Health check: `curl -s http://127.0.0.1:18099/api/v1/providers | jq '.providers|
 
 ## 2. Runtime matrix (per-family interpreter + binaries)
 
-The StageWorker resolves **one** `DOUYINIE_PYTHON_BIN` shared by asr / aligner / diarizer, and separate
-per-family variables for the rest. Each family needs the venv that actually carries its dependencies.
+The StageWorker resolves **one** `DOUYINIE_PYTHON_BIN` shared by asr / aligner, and a separate
+per-family variable for every other family (diarizer included). Each family needs the venv that actually
+carries its dependencies.
 
 | Env var | Value on this workstation |
 |---|---|
 | `DOUYINIE_STAGEWORKER_BIN` | `F:\douyinie-rt-scratch\stageworker.exe` |
-| `DOUYINIE_PYTHON_BIN` | `D:\douyinie-ref\phase1.1-runtime\venvs\asr\Scripts\python.exe` |
+| `DOUYINIE_PYTHON_BIN` | `D:\douyinie-ref\phase1.1-runtime\venvs\asr\Scripts\python.exe` (asr + aligner) |
+| `DOUYINIE_DIARIZER_PYTHON_BIN` | `…\venvs\diarizer\Scripts\python.exe` |
 | `DOUYINIE_AUDIO_ROLE_PYTHON_BIN` | `…\venvs\audio_role\Scripts\python.exe` |
 | `DOUYINIE_OCR_PYTHON_BIN` | `…\venvs\ocr\Scripts\python.exe` |
 | `DOUYINIE_SEPARATOR_PYTHON_BIN` | `…\venvs\separator\Scripts\python.exe` |
@@ -52,12 +54,14 @@ Notes that were learned the hard way:
   stem metadata claims the contract rate. Caveat: an already-persisted stems artifact keeps the rate it was
   produced at — audio-role reuse serves it as-is and the analyzer still fails closed on it, so a lane fix only
   takes effect for stems separated after it.
-- **The diarizer has no per-family interpreter variable.** `resolvePythonBinary()` reads only
-  `DOUYINIE_PYTHON_BIN`, and `venvs\asr` has no `modelscope`/`torchaudio`, so diarization dies with
-  `DIARIZER_EXEC_FAILED` when the asr venv is the shared one. Until that gap is closed, point
-  `DOUYINIE_DIARIZER_BIN` at a small runner shim that appends the repo adapter to the diarizer venv's
-  interpreter (reference implementation: `F:/douyinie-rt-scratch/bin/runner-shim/main.go`, built as
-  `asr-runner.exe` / `aligner-runner.exe` / `diarizer-runner.exe`).
+- **The diarizer runs its own venv.** `venvs\asr` has no `modelscope`/`torchaudio` while
+  `venvs\diarizer` has both, so set `DOUYINIE_DIARIZER_PYTHON_BIN` to the diarizer venv's interpreter
+  (`resolveDiarizerPythonBinary`); asr and aligner keep resolving the shared `DOUYINIE_PYTHON_BIN`, and the
+  two can differ in one session. The variable is fail-closed: a value that is not a usable interpreter
+  aborts the stage with `DIARIZER_RUNTIME_MISSING` naming the variable and the path — it never falls back
+  to another interpreter, which is what produced the opaque `DIARIZER_EXEC_FAILED`. No runner shim is
+  needed any more, so drop every `DOUYINIE_{ASR,ALIGNER,DIARIZER}_BIN` override; a stale
+  `DOUYINIE_DIARIZER_BIN` still wins over the new variable.
 - `DOUYINIE_<FAMILY>_BIN` is a **binary** override: the worker invokes it with the JSON request on stdin and no
   adapter argument. Do not point it at a bare interpreter.
 - Snapshot-required routes (separator, audio_role, tts) reject arbitrary binaries/adapters that cannot
