@@ -1,0 +1,316 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Douyinie End-to-End Localization Pipeline",
+    "output": "docs/architecture/douyinie-pipeline.html",
+    "animation": "trace",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "full-pipeline",
+        "label": "Complete Localization Flow",
+        "focus": [
+          "source_video",
+          "demucs_yamnet",
+          "qwen_asr",
+          "gemini_gateway",
+          "zerotts_dub",
+          "review_gate",
+          "ffmpeg_render",
+          "final_video"
+        ],
+        "note": "Follow the end-to-end transformation from raw Douyin Chinese MP4 to master Vietnamese MP4."
+      },
+      {
+        "id": "audio-branch",
+        "label": "Audio & Speech Track",
+        "focus": [
+          "source_video",
+          "demucs_yamnet",
+          "qwen_asr",
+          "gemini_gateway",
+          "zerotts_dub",
+          "ffmpeg_render"
+        ],
+        "note": "Stem isolation, 1.7B ASR timing anchoring, and ZeroTTS voice dubbing with BGM preservation."
+      },
+      {
+        "id": "visual-branch",
+        "label": "Visual OCR & Overlay Track",
+        "focus": [
+          "source_video",
+          "paddle_ocr",
+          "gemini_gateway",
+          "overlay_gen",
+          "review_gate",
+          "ffmpeg_render"
+        ],
+        "note": "PaddleOCR v6 region tracking, remote text translation, and in-place subtitle overlay generation."
+      },
+      {
+        "id": "governance-review",
+        "label": "Review Gate & Master Mux",
+        "focus": [
+          "zerotts_dub",
+          "overlay_gen",
+          "review_gate",
+          "ffmpeg_render",
+          "final_video"
+        ],
+        "note": "Fail-closed review gate catching timing overruns and visual occlusion exceptions before render."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "source_video",
+      "type": "external",
+      "label": "Source Video",
+      "sublabel": "Douyin MP4 (Chinese)",
+      "pos": [40, 250],
+      "size": [120, 60],
+      "tag": "SourceAsset"
+    },
+    {
+      "id": "demucs_yamnet",
+      "type": "backend",
+      "label": "Demucs & YAMNet",
+      "sublabel": "Stems + AudioRole",
+      "pos": [190, 140],
+      "size": [130, 60],
+      "tag": "16kHz Stems"
+    },
+    {
+      "id": "paddle_ocr",
+      "type": "backend",
+      "label": "PaddleOCR v6",
+      "sublabel": "Text tracking",
+      "pos": [190, 360],
+      "size": [130, 60],
+      "tag": "TextRegionPlan"
+    },
+    {
+      "id": "qwen_asr",
+      "type": "backend",
+      "label": "Qwen3-ASR & CAM++",
+      "sublabel": "1.7B ASR + 0.6B Forcer",
+      "pos": [350, 140],
+      "size": [130, 60],
+      "tag": "SpeechBlock"
+    },
+    {
+      "id": "gemini_gateway",
+      "type": "cloud",
+      "label": "Gemini 3.8 Flash",
+      "sublabel": "Spoken adaptation",
+      "pos": [504, 250],
+      "size": [144, 60],
+      "tag": "DeepSeek Backup",
+      "brand": "google-gemini"
+    },
+    {
+      "id": "zerotts_dub",
+      "type": "backend",
+      "label": "ZeroTTS 0.1.5",
+      "sublabel": "zerotts_tts_vi / Cosy3",
+      "pos": [670, 140],
+      "size": [130, 60],
+      "tag": "tts <= source_end"
+    },
+    {
+      "id": "overlay_gen",
+      "type": "backend",
+      "label": "Text Overlay Gen",
+      "sublabel": "Subtitle boxes",
+      "pos": [670, 360],
+      "size": [130, 60],
+      "tag": "Deterministic Fit"
+    },
+    {
+      "id": "review_gate",
+      "type": "security",
+      "label": "Review Gate",
+      "sublabel": "Exception Gate",
+      "pos": [830, 250],
+      "size": [126, 60],
+      "tag": "Fail-Closed"
+    },
+    {
+      "id": "ffmpeg_render",
+      "type": "backend",
+      "label": "FFmpeg Engine",
+      "sublabel": "Audio mix + Burn",
+      "pos": [986, 250],
+      "size": [126, 60],
+      "tag": "render_final"
+    },
+    {
+      "id": "final_video",
+      "type": "external",
+      "label": "Localized Video",
+      "sublabel": "Vietnamese Dub MP4",
+      "pos": [1142, 250],
+      "size": [120, 60],
+      "tag": "Master Output"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Specialized Local ML Workers (StageWorker GPU/CPU)",
+      "wraps": [
+        "demucs_yamnet",
+        "paddle_ocr",
+        "qwen_asr",
+        "zerotts_dub",
+        "overlay_gen"
+      ],
+      "pad": 16
+    },
+    {
+      "kind": "security-group",
+      "label": "Authorized Remote LLM Gateway (TLS API)",
+      "wraps": ["gemini_gateway"],
+      "pad": 14
+    },
+    {
+      "kind": "region",
+      "label": "Core RuntimeHost & Master Rendering",
+      "wraps": ["review_gate", "ffmpeg_render"],
+      "pad": 16
+    }
+  ],
+  "connections": [
+    {
+      "id": "video-to-audio",
+      "from": "source_video",
+      "to": "demucs_yamnet",
+      "label": "16kHz audio",
+      "variant": "default",
+      "route": "orthogonal-h"
+    },
+    {
+      "id": "video-to-ocr",
+      "from": "source_video",
+      "to": "paddle_ocr",
+      "label": "video frames",
+      "variant": "default",
+      "route": "orthogonal-h"
+    },
+    {
+      "id": "vocals-to-asr",
+      "from": "demucs_yamnet",
+      "to": "qwen_asr",
+      "label": "isolated vocals",
+      "variant": "emphasis",
+      "route": "straight",
+      "labelDy": 60
+    },
+    {
+      "id": "asr-to-llm",
+      "from": "qwen_asr",
+      "to": "gemini_gateway",
+      "label": "SpeechBlocks (ZH)",
+      "variant": "emphasis",
+      "route": "orthogonal-h"
+    },
+    {
+      "id": "ocr-to-llm",
+      "from": "paddle_ocr",
+      "to": "gemini_gateway",
+      "label": "OCR regions",
+      "variant": "default",
+      "route": "orthogonal-h"
+    },
+    {
+      "id": "llm-to-tts",
+      "from": "gemini_gateway",
+      "to": "zerotts_dub",
+      "label": "adapted speech (VI)",
+      "variant": "emphasis",
+      "route": "orthogonal-h"
+    },
+    {
+      "id": "llm-to-overlay",
+      "from": "gemini_gateway",
+      "to": "overlay_gen",
+      "label": "translated text",
+      "variant": "default",
+      "route": "orthogonal-h"
+    },
+    {
+      "id": "tts-to-review",
+      "from": "zerotts_dub",
+      "to": "review_gate",
+      "label": "timing check",
+      "variant": "emphasis",
+      "route": "orthogonal-h"
+    },
+    {
+      "id": "overlay-to-review",
+      "from": "overlay_gen",
+      "to": "review_gate",
+      "label": "occlusion check",
+      "variant": "security",
+      "route": "orthogonal-h"
+    },
+    {
+      "id": "review-to-render",
+      "from": "review_gate",
+      "to": "ffmpeg_render",
+      "label": "approved plans",
+      "variant": "emphasis",
+      "route": "straight",
+      "labelDy": 60
+    },
+    {
+      "id": "render-to-final",
+      "from": "ffmpeg_render",
+      "to": "final_video",
+      "label": "muxed MP4",
+      "variant": "emphasis",
+      "route": "straight",
+      "labelDy": 60
+    },
+    {
+      "id": "bgm-preservation",
+      "from": "demucs_yamnet",
+      "to": "ffmpeg_render",
+      "label": "preserved BGM track",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "top",
+      "via": [[255, 60], [1049, 60]]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Specialized Local ML Stages",
+      "items": [
+        "Demucs isolates source vocals while YAMNet classifies speech vs singing vs music",
+        "Qwen3-ASR (1.7B) + Qwen3-ForcedAligner (0.6B) establish immutable timing anchors",
+        "PaddleOCR v6 tracks Chinese text boxes across frames for in-place overlay"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Remote Translation & Speech Dubbing",
+      "items": [
+        "Gemini 3.8 Flash (DeepSeek-v4.1 fallback) executes shorten-first spoken adaptation",
+        "ZeroTTS 0.1.5 (zerotts_tts_vi) dubs speech enforcing zero overrun (tts_finish <= source_end)",
+        "CosyVoice3 escalates voice quality and pitch adaptation when necessary"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Exception Review & Master Muxing",
+      "items": [
+        "Pipeline runs unattended by default; clean runs bypass manual intervention",
+        "Review Gate catches OCR visual occlusion collisions and audio duration overruns",
+        "FFmpeg ducks preserved BGM under localized dialogue and burns fitted subtitle boxes"
+      ]
+    }
+  ]
+}
