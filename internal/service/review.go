@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -350,8 +351,11 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 	}
 	trc.Close()
 
-	transPos, ok := segmentPosByIndex(tVar.Segments, in.SegmentIndex, func(s domain.TranslationSegment) int { return s.Index })
-	if !ok {
+	// A segment's own index is the source speech-block index, not its position in the slice: a clip
+	// with silent stretches indexes 0,2,4,6, so indexing the slice with it rejected every correction
+	// past the first (live evidence, run eec68c8d: "segment index 6 out of bounds (total 4)").
+	transPos := slices.IndexFunc(tVar.Segments, func(s domain.TranslationSegment) bool { return s.Index == in.SegmentIndex })
+	if transPos < 0 {
 		return nil, fmt.Errorf("segment index %d not present in the translation variant (%d segments)", in.SegmentIndex, len(tVar.Segments))
 	}
 
@@ -433,7 +437,7 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		return nil, errors.New("adapt spoken script produced nil dub script variant")
 	}
 	if in.SpokenTextOverride != "" {
-		if pos, ok := segmentPosByIndex(dsVar.Segments, in.SegmentIndex, func(s domain.DubScriptSegment) int { return s.Index }); ok {
+		if pos := slices.IndexFunc(dsVar.Segments, func(s domain.DubScriptSegment) bool { return s.Index == in.SegmentIndex }); pos >= 0 {
 			seg := &dsVar.Segments[pos]
 			seg.SpokenText = in.SpokenTextOverride
 			spQa := qaGate.ValidateSegment(seg.SourceText, in.SpokenTextOverride, tVar.SourceLanguage, in.TargetLanguage)
@@ -598,22 +602,22 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 	isResolved := true
 
 	// Meaning QA must pass
-	if tSeg, ok := findSegmentByIndex(tVar.Segments, in.SegmentIndex, func(s domain.TranslationSegment) int { return s.Index }); ok {
-		if !tSeg.PassedQAGate || tSeg.QAConfidence < 0.6 {
+	if pos := slices.IndexFunc(tVar.Segments, func(s domain.TranslationSegment) bool { return s.Index == in.SegmentIndex }); pos >= 0 {
+		if tSeg := tVar.Segments[pos]; !tSeg.PassedQAGate || tSeg.QAConfidence < 0.6 {
 			isResolved = false
 		}
 	}
 
 	// Spoken adaptation QA and timing must pass
-	if dsSeg, ok := findSegmentByIndex(dsVar.Segments, in.SegmentIndex, func(s domain.DubScriptSegment) int { return s.Index }); ok {
-		if !dsSeg.PassedQAGate || dsSeg.RequiresReview {
+	if pos := slices.IndexFunc(dsVar.Segments, func(s domain.DubScriptSegment) bool { return s.Index == in.SegmentIndex }); pos >= 0 {
+		if dsSeg := dsVar.Segments[pos]; !dsSeg.PassedQAGate || dsSeg.RequiresReview {
 			isResolved = false
 		}
 	}
 
 	// DubSegments candidate must fit without overrun
-	if seg, ok := findSegmentByIndex(dubSegsVar.Segments, in.SegmentIndex, func(s domain.DubSegment) int { return s.Index }); ok {
-		if seg.RequiresReview || seg.FitDecision == domain.FitActionReview || (seg.SlotDurationMs > 0 && seg.MeasuredDurationMs > seg.SlotDurationMs) {
+	if pos := slices.IndexFunc(dubSegsVar.Segments, func(s domain.DubSegment) bool { return s.Index == in.SegmentIndex }); pos >= 0 {
+		if seg := dubSegsVar.Segments[pos]; seg.RequiresReview || seg.FitDecision == domain.FitActionReview || (seg.SlotDurationMs > 0 && seg.MeasuredDurationMs > seg.SlotDurationMs) {
 			isResolved = false
 		}
 	}
@@ -1374,30 +1378,6 @@ func (s *ReviewService) projectReviewItems(ctx context.Context, assetID, targetL
 }
 
 // ProjectAllReviewItems collects all review exceptions along with their resolution status (pending, auto_pass, auto_resolved, manual_override).
-// segmentPosByIndex resolves a segment's own index - the source speech-block index the artifacts and the
-// review items carry - to its position in the variant's slice. The two differ whenever the source has
-// silent stretches between speech: a 27s clip with four speech blocks indexes 0,2,4,6, so indexing the
-// slice with the segment index rejected every correction past the first (live evidence, run eec68c8d:
-// corrections for the dub's overrunning segments 4 and 6 failed with "segment index 6 out of bounds
-// (total 4)").
-func segmentPosByIndex[T any](segs []T, index int, indexOf func(T) int) (int, bool) {
-	for i, s := range segs {
-		if indexOf(s) == index {
-			return i, true
-		}
-	}
-	return 0, false
-}
-
-// findSegmentByIndex returns the segment whose own index matches, if the variant carries it.
-func findSegmentByIndex[T any](segs []T, index int, indexOf func(T) int) (T, bool) {
-	if pos, ok := segmentPosByIndex(segs, index, indexOf); ok {
-		return segs[pos], true
-	}
-	var zero T
-	return zero, false
-}
-
 // runBoundVariantIndex resolves the variant artifact a run bound when the run owns no index row of its
 // own. A run whose stages were all cache hits consumes artifacts produced by an older run, so the
 // run-scoped lookups find nothing and the review queue would silently stay empty for that run - hiding the

@@ -815,7 +815,7 @@ func resolveOverlayCollisions(overlays []domain.LocalizedOverlayItem) ([]domain.
 		displaced := -1
 		yields := false
 		for i, other := range kept {
-			if ov.StartMs >= other.EndMs || other.StartMs >= ov.EndMs || !overlayBoxesIntersect(ov.Box, other.Box) {
+			if ov.StartMs >= other.EndMs || other.StartMs >= ov.EndMs || !domain.BoxesOverlap(ov.Box, other.Box) {
 				continue
 			}
 			if overlayDominates(ov, other) {
@@ -864,10 +864,6 @@ func overlayCollisionReport(dropped, winner domain.LocalizedOverlayItem) domain.
 	}
 }
 
-func overlayBoxesIntersect(a, b domain.BoundingBox) bool {
-	return a.X < b.X+b.Width && b.X < a.X+a.Width && a.Y < b.Y+b.Height && b.Y < a.Y+a.Height
-}
-
 // seatReplacementCuesOnCovers moves every replacement cue onto the cover of the source caption it
 // replaces and grows that cover around it, so one opaque block carries the localized text.
 //
@@ -875,8 +871,8 @@ func overlayBoxesIntersect(a, b domain.BoundingBox) bool {
 // screen, different size and offset (live evidence, run 27a758e6 at 1.6s - source cover
 // [225,936,639,96] over the burned-in caption, cue [161,1080,757,45] beneath it). A burned-in
 // caption is replaced in place, so the cue keeps its fit-content size, centers on the cover's band,
-// and the cover grows to frame it. The cover only ever grows sideways: the seated cue sits inside
-// the cover's rows, so the block stays inside the caption band it replaces.
+// and the cover grows to frame it - sideways when the replacement is wider than the source caption,
+// and vertically when a two-line cue is taller than the band it sits on.
 //
 // A seat that would occlude a protected obstacle (scene-declared face/tap target or a protected
 // tracked region) is refused and the cue keeps its lane placement, which is where the lane search
@@ -890,16 +886,6 @@ func seatReplacementCuesOnCovers(
 	if plan == nil || plan.FrameWidth <= 0 || plan.FrameHeight <= 0 || len(cues) == 0 || len(covers) == 0 {
 		return cues, covers
 	}
-	clamp := func(value, span, limit int) int {
-		if value < 0 {
-			return 0
-		}
-		if value+span > limit {
-			return max(0, limit-span)
-		}
-		return value
-	}
-
 	seated := append([]domain.SubtitleCue(nil), cues...)
 	boxes := append([]domain.CoverBox(nil), covers...)
 	for i := range seated {
@@ -917,8 +903,8 @@ func seatReplacementCuesOnCovers(
 		}
 		cover := boxes[target]
 		moved := cue
-		moved.X = clamp(cover.X+(cover.Width-cue.Width)/2, cue.Width, plan.FrameWidth)
-		moved.Y = clamp(cover.Y+(cover.Height-cue.Height)/2, cue.Height, plan.FrameHeight)
+		moved.X = max(0, min(cover.X+(cover.Width-cue.Width)/2, plan.FrameWidth-cue.Width))
+		moved.Y = max(0, min(cover.Y+(cover.Height-cue.Height)/2, plan.FrameHeight-cue.Height))
 
 		left := min(cover.X, moved.X) - coverPaddingPx
 		top := min(cover.Y, moved.Y) - coverPaddingPx

@@ -554,10 +554,7 @@ func ComputeCompactSubtitleBoundsWithSelector(
 		// Scale-aware default matched to the burned-in captions this pipeline replaces: the live
 		// 1080x1440 source caption drew 53px glyphs (run 27a758e6) while frameHeight*0.018 gave 25px,
 		// which read as a stamp inside the cover rather than a replacement subtitle.
-		fontSizePx = int(float64(frameHeight) * subtitleFontScale)
-		if fontSizePx < 20 {
-			fontSizePx = 20
-		}
+		fontSizePx = max(20, int(float64(frameHeight)*subtitleFontScale))
 	}
 	// Scale-aware reference padding guidance: ~18-28px horizontal, ~10-16px vertical
 	if paddingX <= 0 {
@@ -586,10 +583,7 @@ func ComputeCompactSubtitleBoundsWithSelector(
 
 	// Long replacements wrap at word boundaries instead of running past the box: the declared box
 	// then hugs the widest line, and its height covers every line.
-	lineCap := (maxAllowedWidth - 2*paddingX) / max(1, charWidth)
-	if lineCap < 8 {
-		lineCap = 8
-	}
+	lineCap := max(8, (maxAllowedWidth-2*paddingX)/max(1, charWidth))
 	lines := wrapCaptionText(text, lineCap)
 	lineWidth := 0
 	for _, line := range lines {
