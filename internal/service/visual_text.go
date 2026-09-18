@@ -312,10 +312,78 @@ func (s *VisualTextService) DetectAndTrackText(ctx context.Context, input Visual
 	return &plan, nil
 }
 
+// sampleSlot maps a wall-clock detection time onto the sampling grid slot the OCR pass used, so
+// keyframe interpolation stays in sampling space even though the provider numbers frames absolutely.
+func sampleSlot(timestampMs, stepMs int64) int {
+	if stepMs <= 0 {
+		return int(timestampMs)
+	}
+	return int(timestampMs / stepMs)
+}
+
 // rawDetectionCluster groups observations across frames that belong to the same on-screen text entity.
 type rawDetectionCluster struct {
-	text         string
-	observations []provider.RawTextDetection
+	text           string
+	observations   []provider.RawTextDetection
+	avgBox         domain.BoundingBox
+	meanConfidence float64
+}
+
+// recomputeAggregates refreshes the cluster's representative token (its highest-confidence reading,
+// i.e. the best guess at what the box actually says) and its mean box and confidence.
+func (c *rawDetectionCluster) recomputeAggregates() {
+	if len(c.observations) == 0 {
+		return
+	}
+	var sumX, sumY, sumW, sumH, confSum float64
+	best := c.observations[0]
+	for _, o := range c.observations {
+		sumX += float64(o.Box.X)
+		sumY += float64(o.Box.Y)
+		sumW += float64(o.Box.Width)
+		sumH += float64(o.Box.Height)
+		confSum += o.Confidence
+		if o.Confidence > best.Confidence {
+			best = o
+		}
+	}
+	n := float64(len(c.observations))
+	c.avgBox = domain.BoundingBox{
+		X: int(sumX / n), Y: int(sumY / n), Width: int(sumW / n), Height: int(sumH / n),
+	}
+	c.meanConfidence = confSum / n
+	c.text = best.Text
+}
+
+// isUnreliableReading reports whether a reading is a guess about glyphs rather than a readable
+// token. The threshold is the classifier's review threshold, i.e. the confidence above which the
+// pipeline treats a recognized token as content: below it the token is not evidence of what the box
+// says, only of where the box is.
+func isUnreliableReading(text string, confidence float64, cfg domain.TextRegionClassifyConfig) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	trust := cfg.MinConfidence
+	if trust <= 0 {
+		trust = 0.55
+	}
+	return confidence < trust
+}
+
+// boxOverlapRatio returns the intersection area relative to the smaller of the two boxes: how much
+// of the smaller box the other covers. It answers "is this the same on-screen box?" rather than
+// "do these two detections describe the same extent?" (IoU), which is what tracking needs.
+func boxOverlapRatio(a, b domain.BoundingBox) float64 {
+	ix := min(a.X+a.Width, b.X+b.Width) - max(a.X, b.X)
+	iy := min(a.Y+a.Height, b.Y+b.Height) - max(a.Y, b.Y)
+	if ix <= 0 || iy <= 0 {
+		return 0
+	}
+	smaller := min(a.Width*a.Height, b.Width*b.Height)
+	if smaller <= 0 {
+		return 0
+	}
+	return float64(ix*iy) / float64(smaller)
 }
 
 func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, cfg domain.TextRegionClassifyConfig) []domain.TrackedTextRegion {
@@ -323,27 +391,39 @@ func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, c
 		return []domain.TrackedTextRegion{}
 	}
 
-	// 1. Cluster detections by text similarity + spatial overlap
+	// 1. Cluster detections belonging to the same on-screen text entity.
+	//
+	// Text equality is the primary key, but it cannot be the only one: when the recognizer is
+	// unreliable it returns a DIFFERENT garbage token for the same physical caption on every sample
+	// (live evidence, run 4f86657f: `别品同` -> `别品` -> `济室` -> `点酒房` over 11000-12500 ms), which
+	// shatters one caption into four single-sample regions and drops it from the plan entirely.
+	// Two temporally adjacent (<= stepMs*4), spatially overlapping readings that are BOTH below the
+	// trust threshold are therefore the same box with two bad reads, not two entities.
 	var clusters []rawDetectionCluster
 	for _, d := range dets {
 		matchedIdx := -1
 		for idx, cl := range clusters {
-			if strings.EqualFold(strings.TrimSpace(cl.text), strings.TrimSpace(d.Text)) {
-				// Same text: check if temporally adjacent or spatial overlap
-				lastObs := cl.observations[len(cl.observations)-1]
-				if math.Abs(float64(d.TimestampMs-lastObs.TimestampMs)) <= float64(stepMs*4) {
-					matchedIdx = idx
-					break
-				}
+			lastObs := cl.observations[len(cl.observations)-1]
+			adjacent := math.Abs(float64(d.TimestampMs-lastObs.TimestampMs)) <= float64(stepMs*4)
+			sameText := strings.EqualFold(strings.TrimSpace(cl.text), strings.TrimSpace(d.Text))
+			switch {
+			case sameText && adjacent:
+				matchedIdx = idx
+			case adjacent && isUnreliableReading(cl.text, cl.meanConfidence, cfg) &&
+				isUnreliableReading(d.Text, d.Confidence, cfg) && boxOverlapRatio(cl.avgBox, d.Box) >= 0.5:
+				matchedIdx = idx
+			}
+			if matchedIdx >= 0 {
+				break
 			}
 		}
 		if matchedIdx >= 0 {
 			clusters[matchedIdx].observations = append(clusters[matchedIdx].observations, d)
+			clusters[matchedIdx].recomputeAggregates()
 		} else {
-			clusters = append(clusters, rawDetectionCluster{
-				text:         d.Text,
-				observations: []provider.RawTextDetection{d},
-			})
+			cl := rawDetectionCluster{text: d.Text, observations: []provider.RawTextDetection{d}}
+			cl.recomputeAggregates()
+			clusters = append(clusters, cl)
 		}
 	}
 
@@ -357,67 +437,82 @@ func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, c
 
 		// Sort observations chronologically
 		sort.Slice(cl.observations, func(i, j int) bool {
-			return cl.observations[i].FrameIndex < cl.observations[j].FrameIndex
+			return cl.observations[i].TimestampMs < cl.observations[j].TimestampMs
 		})
 
 		firstObs := cl.observations[0]
 		lastObs := cl.observations[len(cl.observations)-1]
 
-		obsByFrame := make(map[int]provider.RawTextDetection)
-		var confSum float64
+		// Keyframes live on the SAMPLING grid, not on the video frame grid. The OCR adapter reports
+		// FrameIndex as the absolute video frame number (round(timestamp_ms/1000*fps)) while
+		// timestamp_ms is the requested sample time, so keyframe slots are derived from timestamps:
+		// treating FrameIndex as a sample ordinal multiplied interpolated timestamps by fps*step/1000
+		// (live evidence, run 4f86657f: a 8500-9000 ms caption carried keyframes claiming 128000 ms).
+		obsBySlot := make(map[int]provider.RawTextDetection)
 		minConf := 1.0
-		var avgBox domain.BoundingBox
-
 		for _, obs := range cl.observations {
-			obsByFrame[obs.FrameIndex] = obs
-			confSum += obs.Confidence
+			obsBySlot[sampleSlot(obs.TimestampMs, stepMs)] = obs
 			if obs.Confidence < minConf {
 				minConf = obs.Confidence
 			}
-			avgBox.X += obs.Box.X
-			avgBox.Y += obs.Box.Y
-			avgBox.Width += obs.Box.Width
-			avgBox.Height += obs.Box.Height
 		}
 
 		obsCount := len(cl.observations)
-		avgBox.X /= obsCount
-		avgBox.Y /= obsCount
-		avgBox.Width /= obsCount
-		avgBox.Height /= obsCount
-		meanConf := confSum / float64(obsCount)
-		// Collect spatio-temporally nearby observations from other detections (adjacent frames within +/- 4 steps, spatial overlap)
+		avgBox := cl.avgBox
+		meanConf := cl.meanConfidence
+		// Collect spatio-temporally nearby observations from OTHER detections: readings of the same
+		// place within +/- 4 sampling steps. The window is measured in time, not in frame numbers -
+		// the OCR adapter numbers frames absolutely (30 fps), so a +/- 4 frame window is +/- 133 ms
+		// and would never see the neighbouring samples it exists to compare against (live evidence,
+		// run 4f86657f: "BLGOK" sat next to "CottGG"/"Cottce"/"Cott6e" 500 ms apart and stayed a
+		// semantic_text label because the window never reached them).
+		//
+		// The cluster's own observations are excluded: a region that was read differently on every
+		// sample of its own is exactly the evidence this gate needs, but a merged low-confidence
+		// caption is judged by the classifier's caption rules, not by its own misreadings.
+		ownSlots := make(map[int]bool, len(cl.observations))
+		for _, obs := range cl.observations {
+			ownSlots[sampleSlot(obs.TimestampMs, stepMs)] = true
+		}
 		var nearbyObs []domain.NearbyObservation
 		for _, d := range dets {
-			if d.FrameIndex >= firstObs.FrameIndex-4 && d.FrameIndex <= lastObs.FrameIndex+4 {
-				// Check if spatial overlap with cluster avgBox
-				expandedBox := domain.BoundingBox{
-					X:      avgBox.X - avgBox.Width/2,
-					Y:      avgBox.Y - avgBox.Height/2,
-					Width:  avgBox.Width * 2,
-					Height: avgBox.Height * 2,
-				}
-				if domain.BoxesOverlap(expandedBox, d.Box) {
-					nearbyObs = append(nearbyObs, domain.NearbyObservation{
-						Text:        d.Text,
-						TimestampMs: d.TimestampMs,
-						Box:         d.Box,
-					})
-				}
+			if d.TimestampMs < firstObs.TimestampMs-stepMs*4 || d.TimestampMs > lastObs.TimestampMs+stepMs*4 {
+				continue
+			}
+			if ownSlots[sampleSlot(d.TimestampMs, stepMs)] {
+				continue
+			}
+			expandedBox := domain.BoundingBox{
+				X:      avgBox.X - avgBox.Width/2,
+				Y:      avgBox.Y - avgBox.Height/2,
+				Width:  avgBox.Width * 2,
+				Height: avgBox.Height * 2,
+			}
+			if domain.BoxesOverlap(expandedBox, d.Box) {
+				nearbyObs = append(nearbyObs, domain.NearbyObservation{
+					Text:        d.Text,
+					TimestampMs: d.TimestampMs,
+					Box:         d.Box,
+				})
 			}
 		}
 
 		// Classify role deterministically with spatio-temporal instability tracking
-		role, protectedMeta, reviewReq, reviewReason := domain.ClassifyRegionWithInstability(cl.text, avgBox, meanConf, cfg, nearbyObs)
+		ownBoxes := make([]domain.BoundingBox, 0, len(cl.observations))
+		for _, obs := range cl.observations {
+			ownBoxes = append(ownBoxes, obs.Box)
+		}
+		role, protectedMeta, reviewReq, reviewReason := domain.ClassifyRegionWithInstability(cl.text, avgBox, meanConf, cfg, len(obsBySlot), nearbyObs, ownBoxes)
 		// Build keyframes with linear interpolation for frame gaps <= 2 steps
 		var keyframes []domain.RegionKeyframe
 		interpolatedCount := 0
 
-		for fIdx := firstObs.FrameIndex; fIdx <= lastObs.FrameIndex; fIdx++ {
-			fTimeMs := int64(fIdx) * stepMs
-			if obs, exists := obsByFrame[fIdx]; exists {
+		firstSlot, lastSlot := sampleSlot(firstObs.TimestampMs, stepMs), sampleSlot(lastObs.TimestampMs, stepMs)
+		for slot := firstSlot; slot <= lastSlot; slot++ {
+			fTimeMs := int64(slot) * stepMs
+			if obs, exists := obsBySlot[slot]; exists {
 				keyframes = append(keyframes, domain.RegionKeyframe{
-					FrameIndex:  fIdx,
+					FrameIndex:  obs.FrameIndex,
 					TimestampMs: obs.TimestampMs,
 					Box:         obs.Box,
 					Confidence:  obs.Confidence,
@@ -426,14 +521,14 @@ func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, c
 			} else {
 				// Linear interpolation between closest preceding and following observations
 				var prevObs, nextObs *provider.RawTextDetection
-				for p := fIdx - 1; p >= firstObs.FrameIndex; p-- {
-					if o, ok := obsByFrame[p]; ok {
+				for p := slot - 1; p >= firstSlot; p-- {
+					if o, ok := obsBySlot[p]; ok {
 						prevObs = &o
 						break
 					}
 				}
-				for n := fIdx + 1; n <= lastObs.FrameIndex; n++ {
-					if o, ok := obsByFrame[n]; ok {
+				for n := slot + 1; n <= lastSlot; n++ {
+					if o, ok := obsBySlot[n]; ok {
 						nextObs = &o
 						break
 					}
@@ -442,8 +537,8 @@ func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, c
 				var interpBox domain.BoundingBox
 				var interpConf float64
 				if prevObs != nil && nextObs != nil {
-					totalFrames := float64(nextObs.FrameIndex - prevObs.FrameIndex)
-					alpha := float64(fIdx-prevObs.FrameIndex) / totalFrames
+					prevSlot, nextSlot := sampleSlot(prevObs.TimestampMs, stepMs), sampleSlot(nextObs.TimestampMs, stepMs)
+					alpha := float64(slot-prevSlot) / float64(nextSlot-prevSlot)
 					interpBox = domain.BoundingBox{
 						X:      int(float64(prevObs.Box.X) + alpha*float64(nextObs.Box.X-prevObs.Box.X)),
 						Y:      int(float64(prevObs.Box.Y) + alpha*float64(nextObs.Box.Y-prevObs.Box.Y)),
@@ -464,7 +559,7 @@ func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, c
 
 				interpolatedCount++
 				keyframes = append(keyframes, domain.RegionKeyframe{
-					FrameIndex:  fIdx,
+					FrameIndex:  prevObs.FrameIndex,
 					TimestampMs: fTimeMs,
 					Box:         interpBox,
 					Confidence:  interpConf,
@@ -685,6 +780,267 @@ func firstProtectedOverlap(box domain.BoundingBox, protected []domain.BoundingBo
 		}
 	}
 	return domain.BoundingBox{}, false
+}
+
+// coverPaddingPx absorbs the anti-aliased edge of a burned-in caption so the cover box does
+// not leave a one-pixel halo of the original text behind.
+const coverPaddingPx = 6
+
+// buildSubtitleCovers derives the opaque cover set that hides source burned-in captions.
+//
+// The cover of a speech_subtitle region is the region's own tracked box (grown by a small padding
+// that absorbs the anti-aliased stroke edges) and is active for exactly the window the source
+// caption was on screen. It deliberately does not grow to the replacement cue's box: the
+// replacement usually fits lower and runs longer (a dub sentence can span 12s under a 1.5s
+// source caption), and blacking out video that never carried source text is not the cover's job.
+//
+// A cover that would occlude a protected obstacle (scene-declared face/tap target or a tracked
+// protected region) is not emitted: the region is surfaced as a visual_occlusion exception, the
+// same rule the in-place overlays follow (architecture §9.1), because the operator can move
+// either region.
+func buildSubtitleCovers(
+	plan *domain.TextRegionPlan,
+	in LocalizeVisualTrackInput,
+) ([]domain.CoverBox, []domain.OcclusionReport) {
+	if plan == nil || plan.FrameWidth <= 0 || plan.FrameHeight <= 0 {
+		return nil, nil
+	}
+	var covers []domain.CoverBox
+	var occlusions []domain.OcclusionReport
+
+	for _, reg := range plan.Regions {
+		if reg.Role != domain.TextRoleSpeechSubtitle {
+			continue
+		}
+		box, ok := reg.Bounds()
+		if !ok {
+			continue
+		}
+		startMs, endMs := reg.FirstSeenMs-captionWindowPadMs(reg), reg.LastSeenMs+captionWindowPadMs(reg)
+		if startMs < 0 {
+			startMs = 0
+		}
+		// A caption seen on exactly one sample has no grid step to bracket, and a zero-length window
+		// is not a renderable cover. Cover at least the sampling interval the detection stands for.
+		if endMs-startMs < defaultCaptionCoverMs {
+			endMs = startMs + defaultCaptionCoverMs
+		}
+
+		cover := clampCoverBox(box, plan.FrameWidth, plan.FrameHeight, coverPaddingPx)
+		cover.RegionID = reg.ID
+		cover.Role = string(reg.Role)
+		cover.StartMs = startMs
+		cover.EndMs = endMs
+		cover.Color = "#000000"
+		cover.Opacity = 1.0
+		if err := domain.ValidateCoverBox(cover, plan.FrameWidth, plan.FrameHeight); err != nil {
+			continue
+		}
+
+		coverGeom := domain.BoundingBox{X: cover.X, Y: cover.Y, Width: cover.Width, Height: cover.Height}
+		if prot, occluded := firstProtectedOverlap(coverGeom, sceneProtectedBoxes(in, reg)); occluded {
+			occlusions = append(occlusions, domain.OcclusionReport{
+				RegionID:     reg.ID,
+				Role:         reg.Role,
+				SourceText:   reg.Text,
+				OverlayBox:   coverGeom,
+				ProtectedBox: prot,
+				StartMs:      startMs,
+				EndMs:        endMs,
+			})
+			continue
+		}
+		if prot, occluded := firstProtectedOverlap(coverGeom, protectedRegionBoxes(plan, reg)); occluded {
+			occlusions = append(occlusions, domain.OcclusionReport{
+				RegionID:     reg.ID,
+				Role:         reg.Role,
+				SourceText:   reg.Text,
+				OverlayBox:   coverGeom,
+				ProtectedBox: prot,
+				StartMs:      startMs,
+				EndMs:        endMs,
+			})
+			continue
+		}
+		covers = append(covers, cover)
+	}
+	return covers, occlusions
+}
+
+// captionWindowPadMs is how far a caption's cover window extends beyond its first and last
+// detection. The OCR samples the video on a fixed grid, so a detection at t proves the caption was
+// on screen at t but not whether it appeared or vanished a moment later: live evidence (run
+// 4f86657f) has the caption detected at 11000-12500 ms while still visible at 12750 ms and already
+// visible at 10750 ms, i.e. ~0.5 s of uncovered source text at each end without the pad. The pad is
+// the detection grid step read off the region's own keyframes, so it follows the sampling cadence
+// instead of a hard-coded constant.
+func captionWindowPadMs(reg domain.TrackedTextRegion) int64 {
+	step := int64(0)
+	for i := 1; i < len(reg.Keyframes); i++ {
+		delta := reg.Keyframes[i].TimestampMs - reg.Keyframes[i-1].TimestampMs
+		if delta > 0 {
+			step = delta
+			break
+		}
+	}
+	if step <= 0 || step > maxCaptionWindowPadMs {
+		return 0
+	}
+	return step
+}
+
+// maxCaptionWindowPadMs bounds the uncertainty pad so a sparse region cannot claim a window far
+// beyond its own evidence.
+const maxCaptionWindowPadMs = 1000
+
+// captionCueMaxChars is how much caption text a single cue may carry, i.e. about two lines of the
+// compact-fit style (font 24, border 18) over a 1080 px frame. Live evidence (run 4f86657f): one
+// 12 s segment carrying four sentences rendered as a single three-line block that covered a third of
+// the frame and stayed up for the whole segment.
+const captionCueMaxChars = 84
+
+// degenerateCaptionWindowMs is the window a segment with no usable duration is given. Cues share
+// their segment's window in proportion to their text, so a segment of unknown length still yields
+// one readable cue.
+const degenerateCaptionWindowMs = 700
+
+// splitCaptionText breaks caption text into reading-sized pieces. It packs word by word up to
+// maxChars and prefers to break after sentence punctuation once a piece is at least half full, so
+// cues follow the shape of speech instead of cutting mid-thought. Every word survives, so the
+// captions stay grounded in the canonical translation text.
+func splitCaptionText(text string, maxChars int) []string {
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return nil
+	}
+	if maxChars <= 0 {
+		maxChars = captionCueMaxChars
+	}
+	var pieces []string
+	var current []string
+	currentLen := 0
+	flush := func() {
+		if len(current) > 0 {
+			pieces = append(pieces, strings.Join(current, " "))
+			current = nil
+			currentLen = 0
+		}
+	}
+	for _, w := range words {
+		wLen := len([]rune(w))
+		if currentLen > 0 && currentLen+1+wLen > maxChars {
+			flush()
+		}
+		current = append(current, w)
+		currentLen += wLen + 1
+		if endsSentence(w) && currentLen >= maxChars/2 {
+			flush()
+		}
+	}
+	flush()
+	return pieces
+}
+
+// endsSentence reports whether a word closes a sentence or clause in the target languages.
+func endsSentence(word string) bool {
+	trimmed := strings.TrimRight(word, `"'”’)`)
+	if trimmed == "" {
+		return false
+	}
+	last := []rune(trimmed)[len([]rune(trimmed))-1]
+	return last == '.' || last == '!' || last == '?' || last == '。' || last == '！' || last == '？'
+}
+
+// captionCueWindows spreads a segment's window across its pieces in proportion to the text each piece
+// carries, so a caption is on screen for roughly as long as it is spoken. A segment too short for its
+// pieces yields fewer, longer cues rather than a flicker.
+func captionCueWindows(startMs, endMs int64, pieces []string) [][2]int64 {
+	windows := make([][2]int64, 0, len(pieces))
+	if len(pieces) == 0 {
+		return windows
+	}
+	if endMs <= startMs {
+		endMs = startMs + degenerateCaptionWindowMs
+	}
+	totalLen := 0
+	lengths := make([]int, len(pieces))
+	for i, piece := range pieces {
+		lengths[i] = len([]rune(piece))
+		totalLen += lengths[i]
+	}
+	if totalLen == 0 {
+		totalLen = 1
+	}
+	duration := endMs - startMs
+	cursor := startMs
+	for i := range pieces {
+		if i == len(pieces)-1 {
+			windows = append(windows, [2]int64{cursor, endMs})
+			break
+		}
+		share := int64(lengths[i]) * duration / int64(totalLen)
+		if share < 1 {
+			share = 1
+		}
+		next := cursor + share
+		if remaining := len(pieces) - i - 1; next > endMs-int64(remaining) {
+			next = endMs - int64(remaining)
+		}
+		if next <= cursor {
+			next = cursor + 1
+		}
+		windows = append(windows, [2]int64{cursor, next})
+		cursor = next
+	}
+	return windows
+}
+
+// placeSegmentCues splits one segment's caption text into reading-sized cues and places each of them
+// in the frame with the compact-fit box semantics.
+func (s *VisualTextService) placeSegmentCues(
+	plan *domain.TextRegionPlan,
+	regions []domain.TrackedTextRegion,
+	sceneProtected []domain.SceneProtectedRegion,
+	selector domain.SubtitlePlacementSelector,
+	segmentIndex int,
+	text string,
+	startMs, endMs int64,
+) ([]domain.SubtitleCue, error) {
+	pieces := splitCaptionText(text, captionCueMaxChars)
+	if len(pieces) == 0 {
+		return nil, nil
+	}
+	windows := captionCueWindows(startMs, endMs, pieces)
+	cues := make([]domain.SubtitleCue, 0, len(pieces))
+	for i, piece := range pieces {
+		protects := domain.GetProtectedBoxesForTimeWindow(regions, sceneProtected, windows[i][0], windows[i][1], "")
+		cue, err := domain.ComputeCompactSubtitleBoundsWithSelector(
+			plan.FrameWidth, plan.FrameHeight, piece, 0, 0, 0, protects, selector,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("place subtitle cue for segment %d part %d: %w", segmentIndex, i, err)
+		}
+		cue.ID = fmt.Sprintf("cue-%d", segmentIndex)
+		if i > 0 {
+			cue.ID = fmt.Sprintf("cue-%d-%d", segmentIndex, i)
+		}
+		cue.StartMs, cue.EndMs = windows[i][0], windows[i][1]
+		cues = append(cues, cue)
+	}
+	return cues, nil
+}
+
+// defaultCaptionCoverMs is the shortest cover window: the default OCR sampling step, i.e. the
+// slice of video a single detection stands for.
+const defaultCaptionCoverMs = 500
+
+// clampCoverBox grows a box by padding and clamps it into the frame.
+func clampCoverBox(box domain.BoundingBox, frameWidth, frameHeight, padding int) domain.CoverBox {
+	x := max(0, box.X-padding)
+	y := max(0, box.Y-padding)
+	right := min(frameWidth, box.X+box.Width+padding)
+	bottom := min(frameHeight, box.Y+box.Height+padding)
+	return domain.CoverBox{X: x, Y: y, Width: right - x, Height: bottom - y}
 }
 
 // LocalizeVisualTrack builds the LocalizedVisualTrack (and underlying LocalizedSubtitleTrack)
@@ -1077,24 +1433,11 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 					endMs = tSeg.EndMs
 				}
 
-				cueProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, startMs, endMs, "")
-				cue, err := domain.ComputeCompactSubtitleBoundsWithSelector(
-					plan.FrameWidth,
-					plan.FrameHeight,
-					textToRender,
-					0,
-					0,
-					0,
-					cueProtects,
-					selector,
-				)
+				segCues, err := s.placeSegmentCues(&plan, activePlan.Regions, in.SceneProtectedRegions, selector, dSeg.Index, textToRender, startMs, endMs)
 				if err != nil {
-					return nil, fmt.Errorf("place subtitle cue for segment %d: %w", dSeg.Index, err)
+					return nil, err
 				}
-				cue.ID = fmt.Sprintf("cue-%d", dSeg.Index)
-				cue.StartMs = startMs
-				cue.EndMs = endMs
-				subtitleCues = append(subtitleCues, cue)
+				subtitleCues = append(subtitleCues, segCues...)
 			}
 		} else {
 			// A translation exists without a dub script. Use the caller-pinned CAS
@@ -1125,24 +1468,11 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 				if textToRender == "" {
 					return nil, fmt.Errorf("canonical translation target text missing for segment %d", seg.Index)
 				}
-				cueProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, seg.StartMs, seg.EndMs, "")
-				cue, err := domain.ComputeCompactSubtitleBoundsWithSelector(
-					plan.FrameWidth,
-					plan.FrameHeight,
-					textToRender,
-					0,
-					0,
-					0,
-					cueProtects,
-					selector,
-				)
+				segCues, err := s.placeSegmentCues(&plan, activePlan.Regions, in.SceneProtectedRegions, selector, seg.Index, textToRender, seg.StartMs, seg.EndMs)
 				if err != nil {
-					return nil, fmt.Errorf("place subtitle cue for translation segment %d: %w", seg.Index, err)
+					return nil, err
 				}
-				cue.ID = fmt.Sprintf("cue-%d", seg.Index)
-				cue.StartMs = seg.StartMs
-				cue.EndMs = seg.EndMs
-				subtitleCues = append(subtitleCues, cue)
+				subtitleCues = append(subtitleCues, segCues...)
 			}
 		}
 	} else {
@@ -1170,6 +1500,12 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			}
 		}
 	}
+	// 5b. Freeze the source-text covers: a burned-in source caption is only replaced visually
+	// when an opaque box hides it. Regions that collide with a protected obstacle are surfaced
+	// as occlusion exceptions instead of being covered.
+	covers, coverOcclusions := buildSubtitleCovers(activePlan, in)
+	occlusions = append(occlusions, coverOcclusions...)
+
 	// 6. Persist LocalizedSubtitleTrack
 	subTrackProv, err := domain.ComputeSubtitlePlanProvenanceHash(in.AssetID, in.TargetLanguage, subtitleCues, "compact_fit_cues")
 	if err != nil {
@@ -1229,6 +1565,7 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 		dubScriptProvStr,
 		overlays,
 		subtitleCues,
+		covers,
 		in.SceneProtectedRegions,
 	)
 	if err != nil {
@@ -1247,6 +1584,7 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 		SubtitleTrackCAS:   subTrack.CASHash,
 		Overlays:           overlays,
 		SubtitleCues:       subtitleCues,
+		Covers:             covers,
 		Occlusions:         occlusions,
 		ProtectedRegions:   allProtectedBoxes,
 		ProvenanceHash:     visProv,

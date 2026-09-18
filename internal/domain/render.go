@@ -29,7 +29,8 @@ var (
 )
 
 const (
-	RenderPlanSchemaVersion    = 1
+	// RenderPlanSchemaVersion 2 adds frozen CoverBoxes to the plan identity.
+	RenderPlanSchemaVersion    = 2
 	SubtitlePlanSchemaVersion  = 1
 	PreviewRenderSchemaVersion = 1
 	FinalRenderSchemaVersion   = 1
@@ -97,8 +98,95 @@ type RenderTimeline struct {
 	FrameRate  float64 `json:"frame_rate"`
 }
 
+// CoverBox is a frozen opaque rectangle composited over the source video before the
+// replacement subtitles are burned in.
+//
+// Invariant: a cover exists to hide source text the pipeline replaced (burned-in captions).
+// It never carries text of its own - the replacement text is drawn by the subtitle layer
+// that sits on top of it.
+type CoverBox struct {
+	RegionID string  `json:"region_id,omitempty"`
+	Role     string  `json:"role,omitempty"`
+	X        int     `json:"x"`
+	Y        int     `json:"y"`
+	Width    int     `json:"width"`
+	Height   int     `json:"height"`
+	StartMs  int64   `json:"start_ms"`
+	EndMs    int64   `json:"end_ms"`
+	Color    string  `json:"color"`   // "#RRGGBB"
+	Opacity  float64 `json:"opacity"` // 1.0 = fully opaque
+}
+
+// ValidateCoverBox rejects geometry that cannot be composited deterministically.
+func ValidateCoverBox(c CoverBox, frameWidth, frameHeight int) error {
+	if c.Width <= 0 || c.Height <= 0 {
+		return fmt.Errorf("%w: cover box %s has non-positive size %dx%d", ErrRenderPlanInvalid, c.RegionID, c.Width, c.Height)
+	}
+	if c.X < 0 || c.Y < 0 || c.X+c.Width > frameWidth || c.Y+c.Height > frameHeight {
+		return fmt.Errorf("%w: cover box %s (%+v) leaves the %dx%d frame", ErrRenderPlanInvalid, c.RegionID, c, frameWidth, frameHeight)
+	}
+	if c.EndMs <= c.StartMs {
+		return fmt.Errorf("%w: cover box %s has invalid time window [%d, %d]", ErrRenderPlanInvalid, c.RegionID, c.StartMs, c.EndMs)
+	}
+	if c.Opacity <= 0 || c.Opacity > 1 {
+		return fmt.Errorf("%w: cover box %s has opacity %.3f outside (0, 1]", ErrRenderPlanInvalid, c.RegionID, c.Opacity)
+	}
+	return nil
+}
+
+// ClampCoverBoxToFrame fits a cover into a frame, dropping it when nothing usable is left.
+//
+// Covers are authored in the text-region plan's coordinate space. When that space disagrees with
+// the render timeline (stale OCR geometry), painting the unclamped box would cover the wrong
+// pixels and failing the whole render would drop the dub and subtitles with it: the cover is a
+// quality layer, so a box with no overlap is dropped instead.
+func ClampCoverBoxToFrame(c CoverBox, frameWidth, frameHeight int) (CoverBox, bool) {
+	if frameWidth <= 0 || frameHeight <= 0 {
+		return CoverBox{}, false
+	}
+	x := max(0, c.X)
+	y := max(0, c.Y)
+	right := min(frameWidth, c.X+c.Width)
+	bottom := min(frameHeight, c.Y+c.Height)
+	c.X, c.Y, c.Width, c.Height = x, y, right-x, bottom-y
+	if c.Width <= 0 || c.Height <= 0 {
+		return CoverBox{}, false
+	}
+	if c.EndMs <= c.StartMs {
+		return CoverBox{}, false
+	}
+	return c, true
+}
+
+// CoverSpecHash computes the deterministic identity of a frozen cover set.
+func CoverSpecHash(covers []CoverBox) string {
+	if len(covers) == 0 {
+		return ""
+	}
+	normalized := append([]CoverBox(nil), covers...)
+	sort.SliceStable(normalized, func(i, j int) bool {
+		a, b := normalized[i], normalized[j]
+		if a.StartMs != b.StartMs {
+			return a.StartMs < b.StartMs
+		}
+		if a.RegionID != b.RegionID {
+			return a.RegionID < b.RegionID
+		}
+		if a.X != b.X {
+			return a.X < b.X
+		}
+		return a.Y < b.Y
+	})
+	b, err := json.Marshal(normalized)
+	if err != nil {
+		return ""
+	}
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
 // RenderPlan is the complete, deterministic composition recipe freezing exact CAS artifact references.
-// It freezes exact artifact IDs/versions for video, audio, and subtitle layout/style plans.
+// It freezes exact artifact IDs/versions for video, audio, subtitle layout/style, and source-text cover plans.
 type RenderPlan struct {
 	ID                string          `json:"id"`
 	SchemaVersion     int             `json:"schema_version"`
@@ -112,9 +200,13 @@ type RenderPlan struct {
 	Timeline          RenderTimeline  `json:"timeline"`
 	SubtitlePlan      SubtitlePlanRef `json:"subtitle_plan"`
 	SubtitleCues      []SubtitleCue   `json:"subtitle_cues,omitempty"`
-	CASHash           string          `json:"cas_hash,omitempty"`
-	ProvenanceHash    string          `json:"provenance_hash,omitempty"`
-	CreatedAt         time.Time       `json:"created_at"`
+	CoverBoxes        []CoverBox      `json:"cover_boxes,omitempty"`
+	// OverlayCues carry the in-place localized visual text (semantic labels, instructional UI)
+	// burned on top of their covers. Speech subtitles stay in the SubtitlePlan artifact.
+	OverlayCues    []SubtitleCue `json:"overlay_cues,omitempty"`
+	CASHash        string        `json:"cas_hash,omitempty"`
+	ProvenanceHash string        `json:"provenance_hash,omitempty"`
+	CreatedAt      time.Time     `json:"created_at"`
 }
 
 // EncodeProfile defines the encoding knobs for a render pass.
@@ -267,6 +359,8 @@ func ComputeRenderPlanProvenanceHash(
 	assetID, targetLang, sourceAssetSHA, dubMixCAS, audioCAS string,
 	timeline RenderTimeline,
 	subPlan SubtitlePlanRef,
+	covers []CoverBox,
+	overlayCues []SubtitleCue,
 ) (string, error) {
 	payload := struct {
 		AssetID        string          `json:"asset_id"`
@@ -276,6 +370,8 @@ func ComputeRenderPlanProvenanceHash(
 		AudioCAS       string          `json:"audio_cas"`
 		Timeline       RenderTimeline  `json:"timeline"`
 		SubtitlePlan   SubtitlePlanRef `json:"subtitle_plan"`
+		CoverBoxes     []CoverBox      `json:"cover_boxes,omitempty"`
+		OverlayCues    []SubtitleCue   `json:"overlay_cues,omitempty"`
 		SchemaVersion  int             `json:"schema_version"`
 	}{
 		AssetID:        strings.TrimSpace(assetID),
@@ -285,6 +381,8 @@ func ComputeRenderPlanProvenanceHash(
 		AudioCAS:       strings.TrimSpace(audioCAS),
 		Timeline:       timeline,
 		SubtitlePlan:   subPlan,
+		CoverBoxes:     covers,
+		OverlayCues:    overlayCues,
 		SchemaVersion:  RenderPlanSchemaVersion,
 	}
 

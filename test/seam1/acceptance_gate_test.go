@@ -415,6 +415,25 @@ func TestSeam1_AcceptanceGate_NormativeInvariants(t *testing.T) {
 // configureFixtureProviders overrides the deterministic fake TTS/OCR providers so each
 // fixture's measured durations, predicted (planning) evidence, frame geometry, and OCR
 // detection set are fixture-specific.
+// ocrObservationFrames is how many sampled frames a fixture label stays on screen. One frame is
+// not a readable label: the out-of-band classification gate requires an observation on at least
+// two samples, which is what a real 500ms cadence gives any caption a viewer could actually read.
+const ocrObservationFrames = 2
+
+// persistentDetections expands single-shot fixture detections into a short observation run.
+func persistentDetections(dets []provider.RawTextDetection) []provider.RawTextDetection {
+	out := make([]provider.RawTextDetection, 0, len(dets)*ocrObservationFrames)
+	for _, d := range dets {
+		for i := range ocrObservationFrames {
+			obs := d
+			obs.FrameIndex = d.FrameIndex + i
+			obs.TimestampMs = d.TimestampMs + int64(i)*500
+			out = append(out, obs)
+		}
+	}
+	return out
+}
+
 func configureFixtureProviders(t *testing.T, h *testHarness, fg fixtureGate) {
 	t.Helper()
 	// TTS: per-segment measured durations + a deliberately wrong predicted duration.
@@ -428,7 +447,7 @@ func configureFixtureProviders(t *testing.T, h *testHarness, fg fixtureGate) {
 	// OCR: fixture-specific detections + frame geometry (Video 5 is 3:4).
 	if p, ok := h.registry.Get("fake_paddle_ocr"); ok {
 		fake := p.(*provider.FakeOCRProvider)
-		fake.CustomDetections = fg.ocr
+		fake.CustomDetections = persistentDetections(fg.ocr)
 		fake.FrameWidth = fg.frameW
 		fake.FrameHeight = fg.frameH
 	}

@@ -47,11 +47,11 @@ func TestComputeRenderPlanProvenanceHash_Determinism(t *testing.T) {
 		CueSpecHash:    cueHash2,
 	}
 
-	h1, err := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio", timeline, subPlanRef1)
+	h1, err := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio", timeline, subPlanRef1, nil, nil)
 	if err != nil {
 		t.Fatalf("compute hash 1: %v", err)
 	}
-	h2, err := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio", timeline, subPlanRef2)
+	h2, err := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio", timeline, subPlanRef2, nil, nil)
 	if err != nil {
 		t.Fatalf("compute hash 2: %v", err)
 	}
@@ -63,13 +63,13 @@ func TestComputeRenderPlanProvenanceHash_Determinism(t *testing.T) {
 	// Change subtitle CAS hash -> different hash
 	subPlanModified := subPlanRef1
 	subPlanModified.CASHash = "cas-sub-hash-different"
-	h3, _ := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio", timeline, subPlanModified)
+	h3, _ := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio", timeline, subPlanModified, nil, nil)
 	if h1 == h3 {
 		t.Errorf("expected different hash for modified subtitle CAS hash, got identical %s", h1)
 	}
 
 	// Change audio CAS ref -> different hash
-	h4, _ := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio-other", timeline, subPlanRef1)
+	h4, _ := domain.ComputeRenderPlanProvenanceHash("asset-1", "vi", "sha-video", "cas-mix", "cas-audio-other", timeline, subPlanRef1, nil, nil)
 	if h1 == h4 {
 		t.Errorf("expected different hash for modified audio ref, got identical %s", h1)
 	}

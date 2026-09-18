@@ -68,6 +68,8 @@ type RenderPlanInput struct {
 	SubtitlePlanCAS        string               `json:"subtitle_plan_cas,omitempty"`         // optional explicit CAS hash of SubtitlePlanArtifact
 	SubtitlePlanArtifactID string               `json:"subtitle_plan_artifact_id,omitempty"` // optional artifact ID
 	SubtitleCues           []domain.SubtitleCue `json:"subtitle_cues,omitempty"`
+	CoverBoxes             []domain.CoverBox    `json:"cover_boxes,omitempty"`
+	OverlayCues            []domain.SubtitleCue `json:"overlay_cues,omitempty"`
 }
 
 // FreezeRenderPlan freezes exact artifact IDs/versions into an immutable RenderPlan.
@@ -309,7 +311,38 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 		}
 	}
 
-	// 5. Compute Provenance & Build RenderPlan
+	// 5. Resolve frozen source-text covers from the run's localized visual track.
+	// Covers are what hides a burned-in source caption; without them the source text and its
+	// replacement are both visible. Resolution is run-scoped: an earlier run's track for the same
+	// asset must never leak a cover into this plan (cross-run bleed).
+	covers := in.CoverBoxes
+	overlayCues := in.OverlayCues
+	if covers == nil && overlayCues == nil {
+		covers, overlayCues = s.resolveVisualTrackLayers(ctx, in.RunID, in.AssetID, in.TargetLanguage)
+	}
+	for i, cue := range overlayCues {
+		if cue.StartMs < 0 || cue.EndMs <= cue.StartMs {
+			return nil, fmt.Errorf("%w: overlay cue %d invalid time bounds [%d, %d]", domain.ErrRenderPlanInvalid, i, cue.StartMs, cue.EndMs)
+		}
+	}
+
+	fitted := make([]domain.CoverBox, 0, len(covers))
+	for _, c := range covers {
+		clamped, ok := domain.ClampCoverBoxToFrame(c, timeline.Width, timeline.Height)
+		if !ok {
+			continue
+		}
+		if err := domain.ValidateCoverBox(clamped, timeline.Width, timeline.Height); err != nil {
+			return nil, err
+		}
+		fitted = append(fitted, clamped)
+	}
+	if len(fitted) == 0 {
+		fitted = nil
+	}
+	covers = fitted
+
+	// 6. Compute Provenance & Build RenderPlan
 	provHash, err := domain.ComputeRenderPlanProvenanceHash(
 		in.AssetID,
 		in.TargetLanguage,
@@ -318,6 +351,8 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 		dubMix.AudioCASHash,
 		timeline,
 		subPlanRef,
+		covers,
+		overlayCues,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("compute render plan provenance: %w", err)
@@ -350,6 +385,8 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 		Timeline:          timeline,
 		SubtitlePlan:      subPlanRef,
 		SubtitleCues:      cues,
+		CoverBoxes:        covers,
+		OverlayCues:       overlayCues,
 		ProvenanceHash:    provHash,
 		CreatedAt:         time.Now().UTC(),
 	}
@@ -379,6 +416,84 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 	}
 
 	return &plan, nil
+}
+
+// resolveVisualTrackLayers loads the run's localized visual track and returns the in-place
+// layers it froze: the covers that hide replaced source text, and the overlay cues that draw the
+// localized text on top of them.
+//
+// A missing track is not a render blocker: the plan then renders exactly as it did before these
+// layers existed (source text left in place) rather than failing a run over a visual-layer
+// absence. A track that exists but cannot be decoded is likewise skipped - these layers are a
+// quality pass, not a correctness gate for the render contract.
+func (s *RenderService) resolveVisualTrackLayers(ctx context.Context, runID, assetID, targetLang string) ([]domain.CoverBox, []domain.SubtitleCue) {
+	idx, err := s.db.GetLocalizedVisualTrackIndexByRun(ctx, runID)
+	if err != nil || idx == nil {
+		return nil, nil
+	}
+	if idx.AssetID != assetID || !strings.EqualFold(idx.TargetLanguage, targetLang) {
+		// A run's visual track for a different asset/language is not this plan's evidence.
+		return nil, nil
+	}
+	r, err := s.casStore.Get(idx.CASHash)
+	if err != nil {
+		return nil, nil
+	}
+	defer r.Close()
+	var track domain.LocalizedVisualTrack
+	if err := json.NewDecoder(r).Decode(&track); err != nil {
+		return nil, nil
+	}
+
+	covers := append([]domain.CoverBox(nil), track.Covers...)
+	var overlayCues []domain.SubtitleCue
+	for i, ov := range track.Overlays {
+		text := strings.TrimSpace(ov.LocalizedText)
+		if text == "" || ov.EndMs <= ov.StartMs {
+			continue
+		}
+		// An in-place overlay only replaces source text when a cover hides it first; the
+		// inpainting fallback is not implemented by the composer, so it is not composited here.
+		if !ov.IsCoverDefault || ov.Inpainting {
+			continue
+		}
+		if ov.Box.Width <= 0 || ov.Box.Height <= 0 {
+			continue
+		}
+		// A box anchored at the frame origin cannot be positioned deterministically: the ASS
+		// renderer only emits an explicit position for a non-zero anchor.
+		if ov.Box.X <= 0 && ov.Box.Y <= 0 {
+			continue
+		}
+		covers = append(covers, domain.CoverBox{
+			RegionID: ov.RegionID,
+			Role:     string(ov.Role),
+			X:        ov.Box.X,
+			Y:        ov.Box.Y,
+			Width:    ov.Box.Width,
+			Height:   ov.Box.Height,
+			StartMs:  ov.StartMs,
+			EndMs:    ov.EndMs,
+			Color:    "#000000",
+			Opacity:  1.0,
+		})
+		overlayCues = append(overlayCues, domain.SubtitleCue{
+			ID:         fmt.Sprintf("overlay-%d", i),
+			StartMs:    ov.StartMs,
+			EndMs:      ov.EndMs,
+			Text:       text,
+			X:          ov.Box.X,
+			Y:          ov.Box.Y,
+			Width:      ov.Box.Width,
+			Height:     ov.Box.Height,
+			FontSizePx: ov.FontSizePx,
+			PaddingX:   ov.PaddingX,
+			PaddingY:   ov.PaddingY,
+			BoxColor:   ov.BoxColor,
+			FontColor:  ov.FontColor,
+		})
+	}
+	return covers, overlayCues
 }
 
 // RenderExecutionInput defines input parameters for preview or final video render.
@@ -715,6 +830,14 @@ func (s *RenderService) composeVideo(
 		assContent = media.GenerateASSContent(plan.Timeline, cues, fontOverride)
 	}
 
+	// In-place overlay cues (localized semantic/UI text) are burned with the speech subtitles:
+	// both are ASS events over the same video, and the covers freeze composited below already
+	// hide the source text each overlay replaces.
+	if len(plan.OverlayCues) > 0 {
+		cues = append(cues, plan.OverlayCues...)
+		assContent = media.GenerateASSContent(plan.Timeline, cues, fontOverride)
+	}
+
 	// 4. Create temporary output MP4 file path
 	tmpFile, err := os.CreateTemp("", fmt.Sprintf("douyinie_render_%s_*.mp4", profile.Kind))
 	if err != nil {
@@ -734,6 +857,7 @@ func (s *RenderService) composeVideo(
 		AudioTrack:  audioPath,
 		Timeline:    plan.Timeline,
 		Cues:        cues,
+		Covers:      plan.CoverBoxes,
 		ASSContent:  assContent,
 		FontFile:    fontFile,
 		Profile:     profile,

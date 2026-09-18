@@ -100,18 +100,20 @@ func TestSeam1_TextRegionPlan_DeterministicClassification(t *testing.T) {
 			if len(reg.Keyframes) < 4 {
 				t.Fatalf("expected at least 4 keyframes for subtitle, got %d", len(reg.Keyframes))
 			}
-			var frame2 *domain.RegionKeyframe
-			for _, kf := range reg.Keyframes {
-				if kf.FrameIndex == 2 {
-					frame2 = &kf
+			// The 1000 ms sample is missing in the raw OCR detections: the tracker must cover that
+			// moment with an interpolated keyframe on the sampling grid.
+			var missedSample *domain.RegionKeyframe
+			for i := range reg.Keyframes {
+				if reg.Keyframes[i].TimestampMs == 1000 {
+					missedSample = &reg.Keyframes[i]
 					break
 				}
 			}
-			if frame2 == nil {
-				t.Fatalf("expected keyframe for frame 2 (missing in raw OCR)")
+			if missedSample == nil {
+				t.Fatalf("expected an interpolated keyframe at the missed 1000 ms sample, got %+v", reg.Keyframes)
 			}
-			if frame2.Observed {
-				t.Errorf("expected frame 2 keyframe to be marked Observed=false (interpolated)")
+			if missedSample.Observed {
+				t.Errorf("expected the 1000 ms keyframe to be marked Observed=false (interpolated)")
 			}
 			if reg.ConfidenceEvidence.InterpolatedFrames != 1 {
 				t.Errorf("got %d interpolated frames, want 1", reg.ConfidenceEvidence.InterpolatedFrames)

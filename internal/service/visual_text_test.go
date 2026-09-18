@@ -118,19 +118,20 @@ func TestVisualTextService_DetectAndTrackText(t *testing.T) {
 			if len(reg.Keyframes) < 4 {
 				t.Fatalf("expected at least 4 keyframes for subtitle, got %d", len(reg.Keyframes))
 			}
-			// Frame 2 was missing in raw detections; verify it exists as interpolated
-			var frame2 *domain.RegionKeyframe
-			for _, kf := range reg.Keyframes {
-				if kf.FrameIndex == 2 {
-					frame2 = &kf
+			// The 1000 ms sample is missing in the raw detections (frames 0, 1, 3 only): the tracker
+			// must still cover that moment with an interpolated keyframe on the sampling grid.
+			var missedSample *domain.RegionKeyframe
+			for i := range reg.Keyframes {
+				if reg.Keyframes[i].TimestampMs == 1000 {
+					missedSample = &reg.Keyframes[i]
 					break
 				}
 			}
-			if frame2 == nil {
-				t.Fatalf("expected keyframe for frame 2")
+			if missedSample == nil {
+				t.Fatalf("expected an interpolated keyframe at the missed 1000 ms sample, got %+v", reg.Keyframes)
 			}
-			if frame2.Observed {
-				t.Errorf("expected frame 2 keyframe to be marked Observed=false (interpolated)")
+			if missedSample.Observed {
+				t.Errorf("expected the 1000 ms keyframe to be marked Observed=false (interpolated)")
 			}
 			if reg.ConfidenceEvidence.InterpolatedFrames != 1 {
 				t.Errorf("got %d interpolated frames, want 1", reg.ConfidenceEvidence.InterpolatedFrames)
@@ -172,7 +173,9 @@ func TestVisualTextService_SpatioTemporalOCRInstability_FilteredAsNoise(t *testi
 	// Mock OCR returning:
 	// 1. Spatio-temporal unstable pseudo-text in top-right (frames 10, 11, 12, changing gibberish, conf ~0.58)
 	// 2. Stable unknown brand in top-left (frames 10, 11, 12, "NovaBrandX", conf ~0.58)
-	// 3. Isolated single-frame unknown text in center (frame 10, "UniqueSign", conf ~0.58)
+	// 3. Isolated single-frame unknown text in center (frame 10, "UniqueSign", conf ~0.58):
+	//    an out-of-band label the viewer can read persists across samples - a single-sample hit is
+	//    OCR flicker (20 of the 26 live overlay regions in run 4f86657f were exactly that).
 	svc.OCRInvoke = func(ctx context.Context, p provider.Provider, req provider.OCRRequest) (*provider.OCRResult, error) {
 		return &provider.OCRResult{
 			ProviderID:   "fake_ppocr",
@@ -204,7 +207,7 @@ func TestVisualTextService_SpatioTemporalOCRInstability_FilteredAsNoise(t *testi
 		t.Fatalf("DetectAndTrackText failed: %v", err)
 	}
 
-	var foundUnstableAsNoise, foundStableBrandSemantic, foundIsolatedSemantic bool
+	var foundUnstableAsNoise, foundStableBrandSemantic, foundIsolatedNoise bool
 	for _, reg := range plan.Regions {
 		if reg.Text == "XybVqwer" || reg.Text == "MnoPlkjh" || reg.Text == "ZopTyuik" {
 			if reg.Role != domain.TextRoleIgnoreNoise {
@@ -221,10 +224,12 @@ func TestVisualTextService_SpatioTemporalOCRInstability_FilteredAsNoise(t *testi
 			}
 		}
 		if reg.Text == "UniqueSign" {
-			if reg.Role != domain.TextRoleSemanticText {
-				t.Errorf("expected isolated text %q to be SemanticText, got %v", reg.Text, reg.Role)
+			if reg.Role != domain.TextRoleIgnoreNoise {
+				t.Errorf("expected single-sample text %q to be IgnoreNoise, got %v", reg.Text, reg.Role)
+			} else if reg.ReviewReason != "single_sample_observation_noise" {
+				t.Errorf("expected single-sample noise reason for %q, got %q", reg.Text, reg.ReviewReason)
 			} else {
-				foundIsolatedSemantic = true
+				foundIsolatedNoise = true
 			}
 		}
 	}
@@ -235,8 +240,95 @@ func TestVisualTextService_SpatioTemporalOCRInstability_FilteredAsNoise(t *testi
 	if !foundStableBrandSemantic {
 		t.Errorf("did not find stable brand classified as SemanticText")
 	}
-	if !foundIsolatedSemantic {
-		t.Errorf("did not find isolated text classified as SemanticText")
+	if !foundIsolatedNoise {
+		t.Errorf("did not find single-sample text classified as IgnoreNoise")
+	}
+}
+
+// Live evidence (run 4f86657f): the OCR adapter reported "BLGOK" at the top-right across two
+// seconds while the same box read "CottGG"/"Cottce" on the samples around it, and the instability
+// gate never saw those neighbours to filter it - it measured its window in frame numbers, and the
+// adapter numbers frames absolutely (30 fps), so "+/- 4 frames" is +/- 133 ms rather than the four
+// 500 ms sampling steps the sampling grid actually spaces the evidence by.
+func TestVisualTextService_InstabilityWindowIsMeasuredInTime(t *testing.T) {
+	svc, db, _, assetID := setupVisualTextService(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	reg := provider.NewSeam1FakeRegistry()
+	polSvc := governance.NewPolicyService(db)
+	licSvc := governance.NewLicenseService(db)
+	initCtx := context.Background()
+	for _, p := range reg.ListAll() {
+		mName, mVer := p.ModelInfo()
+		if mName != "" {
+			_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+				DependencyName: mName,
+				Version:        mVer,
+				SHA256:         "sha256_mock_" + mName,
+				SourceRepo:     "github.com/monet88/douyinie/models/" + mName,
+				CodeLicense:    "Apache-2.0",
+				ModelLicense:   "Apache-2.0",
+				DataLicense:    "OpenData",
+				ServiceTerms:   "Standard",
+				Verified:       true,
+				CreatedAt:      time.Now().UTC(),
+			})
+		}
+	}
+	credSvc := governance.NewCredentialService(db)
+	router := provider.NewRouter(reg, polSvc, licSvc, credSvc, nil, db)
+	svc.ConfigureRouter(router)
+
+	hallucinated := domain.BoundingBox{X: 810, Y: 172, Width: 63, Height: 23}
+	svc.OCRInvoke = func(ctx context.Context, p provider.Provider, req provider.OCRRequest) (*provider.OCRResult, error) {
+		dets := []provider.RawTextDetection{
+			{FrameIndex: 345, TimestampMs: 11500, Text: "Cott66", Box: hallucinated, Confidence: 0.62},
+			{FrameIndex: 360, TimestampMs: 12000, Text: "Cottce", Box: hallucinated, Confidence: 0.57},
+		}
+		for i, ms := range []int64{12500, 13000, 13500, 14000, 14500, 15000} {
+			dets = append(dets, provider.RawTextDetection{
+				FrameIndex:  int((ms / 1000) * 30),
+				TimestampMs: ms,
+				Text:        "BLGOK",
+				Box:         hallucinated,
+				Confidence:  0.87 + float64(i)/100,
+			})
+		}
+		dets = append(dets,
+			provider.RawTextDetection{FrameIndex: 465, TimestampMs: 15500, Text: "CottGG", Box: hallucinated, Confidence: 0.57},
+			provider.RawTextDetection{FrameIndex: 480, TimestampMs: 16000, Text: "Cott6e", Box: hallucinated, Confidence: 0.55},
+		)
+		return &provider.OCRResult{
+			ProviderID:   "fake_ppocr",
+			ModelName:    "paddleocr",
+			ModelVersion: "v4",
+			FrameWidth:   1080,
+			FrameHeight:  1440,
+			Detections:   dets,
+		}, nil
+	}
+
+	plan, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:             "run-instability-window-test",
+		AssetID:           assetID,
+		FrameSampleStepMs: 500,
+	})
+	if err != nil {
+		t.Fatalf("DetectAndTrackText failed: %v", err)
+	}
+
+	var checked bool
+	for _, region := range plan.Regions {
+		if region.Text == "BLGOK" {
+			checked = true
+			if region.Role != domain.TextRoleIgnoreNoise {
+				t.Errorf("expected the hallucinated Latin label to be IgnoreNoise, got %v (reason %q)", region.Role, region.ReviewReason)
+			}
+		}
+	}
+	if !checked {
+		t.Fatalf("expected a BLGOK region in the plan, got %d regions", len(plan.Regions))
 	}
 }
 

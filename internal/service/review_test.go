@@ -2334,13 +2334,13 @@ func assertCorrectionKeepsDubScriptGrounding(
 
 	groundedProv, err := domain.ComputeLocalizedVisualTrackProvenanceHash(
 		assetID, "vi", visTrack.TextRegionPlanProv, dubIdx.ProvenanceHash,
-		visTrack.Overlays, visTrack.SubtitleCues, []domain.SceneProtectedRegion(nil))
+		visTrack.Overlays, visTrack.SubtitleCues, visTrack.Covers, []domain.SceneProtectedRegion(nil))
 	if err != nil {
 		t.Fatalf("compute dub-script-grounded visual track provenance: %v", err)
 	}
 	fallbackProv, err := domain.ComputeLocalizedVisualTrackProvenanceHash(
 		assetID, "vi", visTrack.TextRegionPlanProv, "",
-		visTrack.Overlays, visTrack.SubtitleCues, []domain.SceneProtectedRegion(nil))
+		visTrack.Overlays, visTrack.SubtitleCues, visTrack.Covers, []domain.SceneProtectedRegion(nil))
 	if err != nil {
 		t.Fatalf("compute translation-only visual track provenance: %v", err)
 	}

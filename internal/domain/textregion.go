@@ -21,8 +21,11 @@ var (
 	ErrOCRFailed = errors.New("ocr detection or tracking failed")
 )
 
-const TextRegionPlanSchemaVersion = 1
-const LocalizedVisualTrackSchemaVersion = 2
+// TextRegionPlanSchemaVersion 2: the region classifier gained the OCR plausibility gates
+// (persistence + fragment) that run before the subtitle-band promotion. The plan identity must
+// move with classification behaviour, or a cached plan keeps serving the old roles.
+const TextRegionPlanSchemaVersion = 2
+const LocalizedVisualTrackSchemaVersion = 3
 const LocalizedSubtitleTrackSchemaVersion = 1
 
 // MinTextRegionBoxPx is the smallest canonical box dimension the domain accepts. It is the
@@ -172,6 +175,38 @@ type TrackedTextRegion struct {
 	ReviewReason       string                  `json:"review_reason,omitempty"`
 }
 
+// Bounds returns the union of every observed keyframe box of the region.
+// Interpolated keyframes are skipped: they carry no independent OCR evidence.
+// The second result is false when the region has no observed geometry.
+func (r TrackedTextRegion) Bounds() (BoundingBox, bool) {
+	var u BoundingBox
+	found := false
+	for _, kf := range r.Keyframes {
+		if !kf.Observed {
+			continue
+		}
+		if kf.Box.Width <= 0 || kf.Box.Height <= 0 {
+			continue
+		}
+		if !found {
+			u = kf.Box
+			found = true
+			continue
+		}
+		u = UnionBoundingBox(u, kf.Box)
+	}
+	return u, found
+}
+
+// UnionBoundingBox returns the smallest box containing both inputs.
+func UnionBoundingBox(a, b BoundingBox) BoundingBox {
+	x := min(a.X, b.X)
+	y := min(a.Y, b.Y)
+	right := max(a.X+a.Width, b.X+b.Width)
+	bottom := max(a.Y+a.Height, b.Y+b.Height)
+	return BoundingBox{X: x, Y: y, Width: right - x, Height: bottom - y}
+}
+
 // RegionOverride defines manual or AI direct-manipulation adjustments for a tracked text region.
 // Allows changing role classification, shifting/scaling bounding box, or providing manual translation text.
 type RegionOverride struct {
@@ -293,6 +328,7 @@ type LocalizedVisualTrack struct {
 	SubtitleTrackCAS   string                 `json:"subtitle_track_cas,omitempty"`
 	Overlays           []LocalizedOverlayItem `json:"overlays"`
 	SubtitleCues       []SubtitleCue          `json:"subtitle_cues"`
+	Covers             []CoverBox             `json:"covers,omitempty"`
 	Occlusions         []OcclusionReport      `json:"occlusions,omitempty"`
 	ProtectedRegions   []BoundingBox          `json:"protected_regions,omitempty"`
 	CASHash            string                 `json:"cas_hash,omitempty"`
@@ -682,6 +718,7 @@ func ComputeLocalizedVisualTrackProvenanceHash(
 	assetID, targetLang, textRegionPlanProv, dubScriptProv string,
 	overlays []LocalizedOverlayItem,
 	cues []SubtitleCue,
+	covers []CoverBox,
 	sceneProtected ...[]SceneProtectedRegion,
 ) (string, error) {
 	cueHash := ComputeCueSpecHash(cues)
@@ -696,6 +733,7 @@ func ComputeLocalizedVisualTrackProvenanceHash(
 		DubScriptProv         string                 `json:"dub_script_prov"`
 		Overlays              []LocalizedOverlayItem `json:"overlays"`
 		CueSpecHash           string                 `json:"cue_spec_hash"`
+		CoverBoxes            []CoverBox             `json:"cover_boxes,omitempty"`
 		SceneProtectedRegions []SceneProtectedRegion `json:"scene_protected_regions,omitempty"`
 		SchemaVersion         int                    `json:"schema_version"`
 	}{
@@ -705,6 +743,7 @@ func ComputeLocalizedVisualTrackProvenanceHash(
 		DubScriptProv:         strings.TrimSpace(dubScriptProv),
 		Overlays:              overlays,
 		CueSpecHash:           cueHash,
+		CoverBoxes:            covers,
 		SceneProtectedRegions: sp,
 		SchemaVersion:         LocalizedVisualTrackSchemaVersion,
 	}
@@ -738,6 +777,13 @@ type TextRegionPlan struct {
 	CreatedAt         time.Time           `json:"created_at"`
 }
 
+// TextRegionClassifierVersion identifies the tracking + role-classification logic that turns raw OCR
+// detections into a TextRegionPlan. The plan is a pure function of the OCR evidence AND this logic,
+// so the version belongs in the plan's provenance: without it a cached plan keeps serving the roles
+// computed by an older classifier after the heuristics change. Bump this whenever tracking or the
+// role gates in this file change.
+const TextRegionClassifierVersion = "text-region-classifier-v4"
+
 // ComputeTextRegionPlanProvenanceHash computes a deterministic SHA-256 identity over the source-derived inputs.
 // Crucially, target language is NOT included: the plan is source-derived and language-reusable across VI/EN.
 func ComputeTextRegionPlanProvenanceHash(assetID, providerID, modelName, modelVersion string, sampleStepMs int64, extraIdentities ...string) (string, error) {
@@ -748,6 +794,7 @@ func ComputeTextRegionPlanProvenanceHash(assetID, providerID, modelName, modelVe
 		ModelVersion    string   `json:"model_version"`
 		SampleStepMs    int64    `json:"sample_step_ms"`
 		SchemaVer       int      `json:"schema_version"`
+		ClassifierVer   string   `json:"classifier_version"`
 		ExtraIdentities []string `json:"extra_identities,omitempty"`
 	}{
 		AssetID:         assetID,
@@ -756,6 +803,7 @@ func ComputeTextRegionPlanProvenanceHash(assetID, providerID, modelName, modelVe
 		ModelVersion:    modelVersion,
 		SampleStepMs:    sampleStepMs,
 		SchemaVer:       TextRegionPlanSchemaVersion,
+		ClassifierVer:   TextRegionClassifierVersion,
 		ExtraIdentities: extraIdentities,
 	}
 	b, err := json.Marshal(payload)
@@ -804,6 +852,16 @@ type TextRegionClassifyConfig struct {
 	BrandKeywords       []string // e.g. ["SUPOR", "Samyang", "NIKE", "ADIDAS"]
 	UIKeywords          []string // e.g. ["导出", "剪辑", "图层", "关键帧", "透明度", "滤镜", "特效", "蒙版", "画中画", "音频", "文本", "比例", "背景"]
 	NoisePatterns       []string // e.g. [".*@.*", "抖音号.*", ".*douyin.*"]
+
+	// Out-of-band semantic text must earn its role: whole-frame OCR turns packaging seams,
+	// watermarks, and compression scribble into "content labels" otherwise.
+	// MinOutOfBandSamples: an out-of-band region must be observed on at least this many sampled
+	// frames. A label the viewer can read persists; a single-sample hit is a flicker.
+	// 0 falls back to the default; a non-positive observedSamples argument skips the check.
+	MinOutOfBandSamples int
+	// MinMeaningfulLetterRun: the longest run of letters (any script) required of an
+	// ASCII-only out-of-band token before it counts as text rather than OCR debris.
+	MinMeaningfulLetterRun int
 }
 
 // DefaultTextRegionClassifyConfig returns sensible classification defaults for video frames.
@@ -819,6 +877,11 @@ func DefaultTextRegionClassifyConfig(w, h int) TextRegionClassifyConfig {
 		FrameHeight:         h,
 		SubtitleBandTopFrac: 0.65,
 		MinConfidence:       0.55,
+		// Live evidence (run 4f86657f, 1080x1440): of 26 out-of-band overlay regions, 20 were
+		// single-sample flickers ("VVV", "89", "AOM") and most survivors were OCR fragments
+		// ("SUP" cut from SUPOR, "TM", "Cott6e") rather than readable labels.
+		MinOutOfBandSamples:    2,
+		MinMeaningfulLetterRun: 5,
 		BrandKeywords: []string{
 			"SUPOR", "Samyang", "Apple", "Nike", "Adidas", "Sony", "Samsung", "Dyson", "Logitech",
 		},
@@ -844,18 +907,26 @@ type NearbyObservation struct {
 }
 
 // ClassifyRegion determines the operational role of a tracked text region deterministically.
+// observedSamples is unknown (0) here: callers that track regions pass the real count through
+// ClassifyRegionWithInstability.
 func ClassifyRegion(text string, avgBox BoundingBox, avgConfidence float64, cfg TextRegionClassifyConfig) (TextRegionRole, ProtectedRegionMetadata, bool, string) {
-	return ClassifyRegionWithInstability(text, avgBox, avgConfidence, cfg, nil)
+	return ClassifyRegionWithInstability(text, avgBox, avgConfidence, cfg, 0, nil, nil)
 }
 
 // ClassifyRegionWithInstability determines the operational role of a tracked text region deterministically,
 // incorporating spatio-temporal OCR stability across nearby observations.
+// observedSamples is how many sampled frames the region was actually detected on; 0 means the
+// caller has no tracking evidence and the single-sample gate is skipped.
+// ownBoxes are the boxes the cluster's own readings sat at, used to tell a label that stays put from
+// one the recognizer hallucinated in a different place on every sample; nil skips that gate.
 func ClassifyRegionWithInstability(
 	text string,
 	avgBox BoundingBox,
 	avgConfidence float64,
 	cfg TextRegionClassifyConfig,
+	observedSamples int,
 	nearby []NearbyObservation,
+	ownBoxes []BoundingBox,
 ) (TextRegionRole, ProtectedRegionMetadata, bool, string) {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
@@ -868,7 +939,16 @@ func ClassifyRegionWithInstability(
 			return TextRoleIgnoreNoise, ProtectedRegionMetadata{IsProtected: false}, false, "matched_noise_watermark_pattern"
 		}
 	}
-	if avgConfidence < 0.35 {
+	if avgConfidence < NoiseFloorConfidence {
+		// A caption the recognizer cannot read is still a caption. Live evidence (run 4f86657f,
+		// 1080x1440): the burned-in caption `你就得到这样的互动画面` was detected at the correct box
+		// (228,951,606,65) on four consecutive 500 ms samples while the recognizer returned garbage
+		// ("别品", "济室", "点酒房") at 0.15-0.31 confidence; the same signature lost the 2.0-3.0 s
+		// caption. The cover hides the BOX, not the text, so a stable caption-band detection keeps
+		// the caption role and is surfaced for operator review instead of being dropped as noise.
+		if observedSamples >= minOutOfBandSamples(cfg) && isCaptionBandShape(avgBox, cfg) {
+			return TextRoleSpeechSubtitle, ProtectedRegionMetadata{IsProtected: false}, true, "unreadable_caption_low_confidence"
+		}
 		return TextRoleIgnoreNoise, ProtectedRegionMetadata{IsProtected: false}, false, "confidence_below_noise_floor"
 	}
 
@@ -889,7 +969,31 @@ func ClassifyRegionWithInstability(
 		}
 	}
 
-	// 4. Speech subtitle check: positioned in bottom subtitle band (lower ~35% of frame)
+	// 4. OCR plausibility gates. These run BEFORE the subtitle-band rule because the band rule
+	// otherwise promotes every in-band glyph fragment into a caption: live evidence (run
+	// 4f86657f) shows "T", "(", "K2", "100", "11-11", "KE", "iPhone" and "岛" all landing in the
+	// caption band. A caption the viewer can read is neither a fragment nor a one-frame flicker.
+	//
+	// The persistence gate is scoped to detections that do NOT already look like a caption: it
+	// exists so out-of-band packaging labels and in-band glyph debris earn their role. Every
+	// previously-rejected in-band token in that live run was narrow (iPhone 66 px, "11-11" 49 px,
+	// "8" 25 px), so caption-shaped geometry plus a readable token is already sufficient evidence.
+	if observedSamples > 0 && !isCaptionBandShape(avgBox, cfg) {
+		if observedSamples < minOutOfBandSamples(cfg) {
+			return TextRoleIgnoreNoise, ProtectedRegionMetadata{IsProtected: false}, false, "single_sample_observation_noise"
+		}
+	}
+	if !containsCJK(trimmed) && isASCIIOnly(trimmed) {
+		minRun := cfg.MinMeaningfulLetterRun
+		if minRun <= 0 {
+			minRun = DefaultMinMeaningfulLetterRun
+		}
+		if longestLetterRun(trimmed) < minRun {
+			return TextRoleIgnoreNoise, ProtectedRegionMetadata{IsProtected: false}, false, "ocr_text_fragment_noise"
+		}
+	}
+
+	// 5. Speech subtitle check: positioned in bottom subtitle band (lower ~35% of frame)
 	subtitleYThreshold := int(float64(cfg.FrameHeight) * cfg.SubtitleBandTopFrac)
 	if avgBox.CenterY() >= subtitleYThreshold && avgBox.Width < int(float64(cfg.FrameWidth)*0.92) {
 		reviewReq := avgConfidence < cfg.MinConfidence
@@ -900,12 +1004,18 @@ func ClassifyRegionWithInstability(
 		return TextRoleSpeechSubtitle, ProtectedRegionMetadata{IsProtected: false}, reviewReq, reviewReason
 	}
 
-	// 5. Spatio-temporal OCR instability check:
-	// If an unknown text token is observed with low-to-moderate confidence (e.g. < 0.65),
-	// and there is a sequence of 3+ total observations across adjacent sampled frames whose
-	// bounding boxes are spatially nearby/overlapping, but whose text changes materially
-	// (Latin pseudo-text / background scribble hallucination), classify as IgnoreNoise.
-	if len(nearby) >= 2 && avgConfidence < 0.65 {
+	// 6. Spatio-temporal OCR instability check:
+	// A sequence of 3+ observations across adjacent sampled frames whose bounding boxes are spatially
+	// nearby/overlapping, but whose text changes materially, is Latin pseudo-text (packaging seams,
+	// logo scribble), not a label.
+	//
+	// Confidence does not rescue a disagreement. Live evidence (run 4f86657f, 1080x1440): the same
+	// package glyphs were read as "BLGOK" at 0.987, "CottGG" at 0.827, "Cottce" at 0.890 and "Cott6e"
+	// at 0.781 - all above the 0.65 the old gate required, so "BLGOK" survived as semantic_text and
+	// the pipeline printed "BLG OK" onto the milk jug. Readings of one box that disagree with each
+	// other are scribble whatever their confidence; a real label reads the same way on every sample
+	// (OCR jitter yields 1-2 spellings, not 3 mutually distinct ones).
+	if len(nearby) >= 2 {
 		var texts []string
 		texts = append(texts, trimmed)
 		allLatin := isAllLatinOrPunct(trimmed)
@@ -927,13 +1037,150 @@ func ClassifyRegionWithInstability(
 		}
 	}
 
-	// 6. Default: semantic text (titles, step badges, ingredients, floating callouts)
+	// 6b. A label whose readings wander is not a label the pipeline can name. Live evidence (run
+	// 4f86657f, 1080x1440): the mug label - Latin text printed through glass, so the recognizer read
+	// it mirrored - was read on five consecutive samples at 0.98-1.00 confidence, but at five places
+	// hundreds of pixels apart as the mug moved, spelling it "BLGOK", "CottGG", "Cottce" and
+	// "Cott6e". The adjacency rule stayed quiet (those readings never overlap each other), so the
+	// overlay printed "BLG OK" onto the milk jug - at the cluster's average box, which tracks the mug
+	// on none of those samples. Only out-of-band Latin readings are judged this way: a caption
+	// legitimately moves as it slides, and it is covered by the caption rules above.
+	//
+	// Ceiling: a readable Latin label that travels across the frame is dropped too. That is the
+	// intended trade - a fixed-position overlay cannot follow it, so the translation would be drawn
+	// in the wrong place for most of its window.
+	if isOutOfBandLatinLabel(trimmed) && len(ownBoxes) >= 2 {
+		if spread := LabelSpreadRatio(ownBoxes); spread > MaxLabelSpreadRatio {
+			return TextRoleIgnoreNoise, ProtectedRegionMetadata{IsProtected: false}, false, "spatially_unstable_label_noise"
+		}
+	}
+
+	// 7. Default: semantic text (titles, step badges, ingredients, floating callouts)
 	reviewReq := avgConfidence < cfg.MinConfidence
 	var reviewReason string
 	if reviewReq {
 		reviewReason = "low_ocr_confidence_semantic_text"
 	}
 	return TextRoleSemanticText, ProtectedRegionMetadata{IsProtected: false}, reviewReq, reviewReason
+}
+
+// MaxLabelSpreadRatio bounds how far the readings of one out-of-band Latin label may wander,
+// expressed in multiples of the label's own typical reading size. A fixed label reads the same few
+// pixels every time; a hallucinated word is read wherever unrelated pixels happen to look like it.
+const MaxLabelSpreadRatio = 2.5
+
+// LabelSpreadRatio reports the greatest distance between two of a label's readings, divided by the
+// median diagonal of those readings, so it is scale-free: 0 is a label that never moved.
+func LabelSpreadRatio(boxes []BoundingBox) float64 {
+	if len(boxes) < 2 {
+		return 0
+	}
+	diagonals := make([]float64, 0, len(boxes))
+	for _, b := range boxes {
+		diagonals = append(diagonals, math.Hypot(float64(b.Width), float64(b.Height)))
+	}
+	sort.Float64s(diagonals)
+	median := diagonals[len(diagonals)/2]
+	if median <= 0 {
+		return 0
+	}
+	largest := 0.0
+	for i := range boxes {
+		for j := i + 1; j < len(boxes); j++ {
+			dx := float64(boxes[i].CenterX() - boxes[j].CenterX())
+			dy := float64(boxes[i].CenterY() - boxes[j].CenterY())
+			if dist := math.Hypot(dx, dy); dist > largest {
+				largest = dist
+			}
+		}
+	}
+	return largest / median
+}
+
+// isOutOfBandLatinLabel reports whether a reading looks like a printed label rather than speech:
+// Latin or punctuation only, and long enough not to be glyph debris.
+func isOutOfBandLatinLabel(text string) bool {
+	return text != "" && isAllLatinOrPunct(text) && longestLetterRun(text) >= DefaultMinMeaningfulLetterRun
+}
+
+// Out-of-band semantic-text gates: see TextRegionClassifyConfig for the rationale.
+const (
+	DefaultMinOutOfBandSamples    = 2
+	DefaultMinMeaningfulLetterRun = 5
+)
+
+// NoiseFloorConfidence is the recognition-confidence floor below which a reading is treated as an
+// unreliable guess about glyphs rather than a wrong-but-readable token. It is shared by the
+// classifier (below it a region is noise unless it is a stable caption) and by the region tracker
+// (below it, two temporally adjacent readings of the same box are one entity misread twice instead
+// of two entities).
+const NoiseFloorConfidence = 0.35
+
+// minOutOfBandSamples resolves the persistence threshold a detection must clear before it earns a
+// role: a single-sample hit is a flicker, not content.
+func minOutOfBandSamples(cfg TextRegionClassifyConfig) int {
+	if cfg.MinOutOfBandSamples > 0 {
+		return cfg.MinOutOfBandSamples
+	}
+	return DefaultMinOutOfBandSamples
+}
+
+// isCaptionBandShape reports whether a box has the geometry of a burned-in caption: centered in the
+// bottom caption band, wide enough to be a line of speech, and no taller than two text lines.
+// It deliberately does not look at the recognized text, so a caption the OCR misread is still
+// recognizable as a caption by geometry alone.
+func isCaptionBandShape(box BoundingBox, cfg TextRegionClassifyConfig) bool {
+	if cfg.FrameWidth <= 0 || cfg.FrameHeight <= 0 {
+		return false
+	}
+	if float64(box.CenterY()) < float64(cfg.FrameHeight)*cfg.SubtitleBandTopFrac {
+		return false
+	}
+	width := float64(box.Width)
+	if width < 0.15*float64(cfg.FrameWidth) || width > 0.92*float64(cfg.FrameWidth) {
+		return false
+	}
+	return float64(box.Height) <= 0.15*float64(cfg.FrameHeight)
+}
+
+// containsCJK reports whether the text has any Han/Hiragana/Katakana/Hangul character, i.e. a
+// script where a short token is still a real word.
+func containsCJK(s string) bool {
+	for _, r := range s {
+		if unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) ||
+			unicode.Is(unicode.Katakana, r) || unicode.Is(unicode.Hangul, r) {
+			return true
+		}
+	}
+	return false
+}
+
+// isASCIIOnly reports whether the text is entirely ASCII, i.e. the case where short tokens are
+// suspect: "SUP", "VVV", "$", "13:09".
+func isASCIIOnly(s string) bool {
+	for _, r := range s {
+		if r > unicode.MaxASCII {
+			return false
+		}
+	}
+	return true
+}
+
+// longestLetterRun returns the length of the longest consecutive run of letters in any script.
+// Letters with diacritics count, so "Chuẩn bị" is a real word run while "Cott6e" is not.
+func longestLetterRun(s string) int {
+	longest, current := 0, 0
+	for _, r := range s {
+		if unicode.IsLetter(r) {
+			current++
+			if current > longest {
+				longest = current
+			}
+			continue
+		}
+		current = 0
+	}
+	return longest
 }
 
 func isAllLatinOrPunct(s string) bool {

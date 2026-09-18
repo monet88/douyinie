@@ -1,7 +1,11 @@
 package media_test
 
 import (
+	"context"
+	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -135,6 +139,137 @@ func TestGenerateASSContent_DeterministicStructureAndBoxSemantics(t *testing.T) 
 	if !strings.Contains(ass, `\c&H00FFFF&`) {
 		t.Errorf("expected yellow font color in second cue, got: %s", ass)
 	}
+}
+
+func TestComposeNativeVideo_CoverHidesSourceRegionBeforeSubtitleBurn(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not available on test host")
+	}
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	sourceVideo := filepath.Join(tmpDir, "white_source.mp4")
+	genCmd := exec.Command("ffmpeg", "-y",
+		"-f", "lavfi", "-i", "color=c=white:s=320x240:d=2:r=10",
+		"-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "10",
+		sourceVideo)
+	if out, err := genCmd.CombinedOutput(); err != nil {
+		t.Fatalf("generate synthetic source: %v (%s)", err, out)
+	}
+
+	audioPath := filepath.Join(tmpDir, "silence.wav")
+	if err := os.WriteFile(audioPath, media.GeneratePCM16WAV(16000, 1, 2000), 0644); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+
+	// The source region the pipeline claims to cover: the "burned-in caption" band.
+	cover := domain.CoverBox{
+		RegionID: "region-sub-1",
+		Role:     "speech_subtitle",
+		X:        80, Y: 150, Width: 140, Height: 40,
+		StartMs: 0, EndMs: 2000,
+		Color: "#000000", Opacity: 1.0,
+	}
+	timeline := domain.RenderTimeline{DurationMs: 2000, Width: 320, Height: 240, FrameRate: 10}
+
+	// Both profiles are asserted: the preview profile renders through the proxy scale filter, and a
+	// cover composited after that scale lands outside the shrunken frame and silently disappears.
+	profiles := []struct {
+		name    string
+		profile domain.EncodeProfile
+	}{
+		{"final", domain.DefaultFinalEncodeProfile()},
+		{"preview_proxy", domain.DefaultPreviewEncodeProfile()},
+	}
+
+	for _, tc := range profiles {
+		t.Run(tc.name, func(t *testing.T) {
+			// RED (control): the same plan without covers leaves the source band untouched.
+			uncoveredOut := filepath.Join(tmpDir, tc.name+"_uncovered.mp4")
+			if _, err := media.ComposeNativeVideo(ctx, media.CompositionRequest{
+				FFmpegPath: "ffmpeg", SourceVideo: sourceVideo, AudioTrack: audioPath,
+				Timeline: timeline, Profile: tc.profile, OutputPath: uncoveredOut,
+			}); err != nil {
+				t.Fatalf("compose without covers: %v", err)
+			}
+			if got := sampleCoverPixel(t, uncoveredOut, cover, timeline); !withinTolerance(got, 255, 60) {
+				t.Fatalf("control failed: source band reads %v, expected the untouched white source", got)
+			}
+
+			// GREEN: covers are composited before the subtitle burn and hide the source text.
+			coveredOut := filepath.Join(tmpDir, tc.name+"_covered.mp4")
+			if _, err := media.ComposeNativeVideo(ctx, media.CompositionRequest{
+				FFmpegPath: "ffmpeg", SourceVideo: sourceVideo, AudioTrack: audioPath,
+				Timeline: timeline, Covers: []domain.CoverBox{cover},
+				Profile: tc.profile, OutputPath: coveredOut,
+			}); err != nil {
+				t.Fatalf("compose with covers: %v", err)
+			}
+			if got := sampleCoverPixel(t, coveredOut, cover, timeline); !withinTolerance(got, 0, 60) {
+				t.Fatalf("cover did not paint the source band: read %v, expected opaque black", got)
+			}
+			if got := samplePixel(t, coveredOut, cover.X-10, cover.Y+cover.Height/2, timeline); !withinTolerance(got, 255, 60) {
+				t.Fatalf("cover bled outside its box: pixel left of the cover reads %v, expected the untouched source", got)
+			}
+		})
+	}
+}
+
+// sampleCoverPixel reads the pixel at the centre of the cover box.
+func sampleCoverPixel(t *testing.T, video string, cover domain.CoverBox, timeline domain.RenderTimeline) [3]int {
+	t.Helper()
+	return samplePixel(t, video, cover.X+cover.Width/2, cover.Y+cover.Height/2, timeline)
+}
+
+// samplePixel decodes one rendered frame and reads the pixel at timeline coordinate (x, y),
+// remapping it into the rendered frame so proxy-scaled previews are sampled correctly.
+func samplePixel(t *testing.T, video string, x, y int, timeline domain.RenderTimeline) [3]int {
+	t.Helper()
+	width, height, data := decodeRGBFrame(t, video)
+	if timeline.Width <= 0 || timeline.Height <= 0 {
+		t.Fatalf("invalid timeline geometry %dx%d", timeline.Width, timeline.Height)
+	}
+	px, py := x*width/timeline.Width, y*height/timeline.Height
+	if px < 0 || py < 0 || px >= width || py >= height {
+		t.Fatalf("sample point (%d,%d) maps outside the %dx%d rendered frame", px, py, width, height)
+	}
+	idx := (py*width + px) * 3
+	return [3]int{int(data[idx]), int(data[idx+1]), int(data[idx+2])}
+}
+
+func decodeRGBFrame(t *testing.T, video string) (int, int, []byte) {
+	t.Helper()
+	probe := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0",
+		"-show_entries", "stream=width,height", "-of", "csv=p=0", video)
+	probeOut, err := probe.Output()
+	if err != nil {
+		t.Fatalf("probe rendered video: %v", err)
+	}
+	var width, height int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(probeOut)), "%d,%d", &width, &height); err != nil {
+		t.Fatalf("parse rendered dimensions %q: %v", probeOut, err)
+	}
+
+	cmd := exec.Command("ffmpeg", "-v", "error",
+		"-ss", "1.0", "-i", video, "-frames:v", "1",
+		"-f", "rawvideo", "-pix_fmt", "rgb24", "-")
+	data, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("extract frame: %v", err)
+	}
+	if len(data) < width*height*3 {
+		t.Fatalf("frame too small: %d bytes for %dx%d", len(data), width, height)
+	}
+	return width, height, data
+}
+
+func withinTolerance(pixel [3]int, want, tol int) bool {
+	for _, c := range pixel {
+		if c < want-tol || c > want+tol {
+			return false
+		}
+	}
+	return true
 }
 
 func TestCheckFFmpegLibassCapability(t *testing.T) {
