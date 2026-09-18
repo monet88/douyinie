@@ -2,7 +2,7 @@
 
 Date: 2026-09-03
 Status: RESOLVED CONTRACT (research/design only; implementation-ready)
-Errata (2026-09-18): the gateway DeepSeek alias is now `deepseek-v4.1-flash` (no `deepseek/` prefix); ladder order and all other decisions here are unchanged.
+Errata (2026-09-18): the gateway DeepSeek alias is `deepseek-v4.1-flash` (bare alias with no namespace prefix); ladder order and all other decisions here are unchanged.
 Parent: https://github.com/monet88/douyinie/issues/53
 Issue: https://github.com/monet88/douyinie/issues/59
 Authoritative references:
@@ -205,7 +205,7 @@ Governed by Issue #56:
 - **Two Hard Release Gates**: Issue #53, Issue #54, and Issue #58 mandate that **both Local 8 GB and Hybrid are hard execution-profile release gates**. Cloud remains an optional smoke/capability check.
 - **Different Production Lanes**: Issues #60 and #62 establish that Local 8 GB and Hybrid execute materially distinct pipeline paths:
   - Local 8 GB routes translation through the offline, local Qwen3-4B GGUF adapter (`qwen3_4b_translator`) under strict 8192 MB VRAM and 5.0× RTF constraints;
-  - Hybrid routes translation through the remote gateway ladder (`gemini-3.8-flash` $\to$ `deepseek/deepseek-v4-flash-vision-exp` $\to$ local Qwen) under $\le \$0.25$/min API cost and 2.0× RTF constraints.
+  - Hybrid routes translation through the remote gateway ladder (`gemini-3.8-flash` $\to$ `deepseek-v4.1-flash` $\to$ local Qwen) under $\le \$0.25$/min API cost and 2.0× RTF constraints.
 - **Reasoning**: A Release Candidate cannot claim compliance with both hard gates without executing both paths against the full 48-case evaluation surface. If only Local 8 GB ran 48 cases, the Hybrid gateway translation lane, API cost bounds, and 2.0× RTF would remain unevidenced. Conversely, if only Hybrid ran 48 cases, the local Qwen3-4B translation quality, real 8 GB no-OOM resource behavior, and offline fail-closed posture would remain unproven across the 7 mandatory categories.
 - **Conclusion**: Executing 48 logical cases under Local 8 GB plus 48 logical cases under Hybrid ($48 \times 2 = 96$ localization runs) is a **derived requirement** of having two independent hard release gates.
 
@@ -245,7 +245,7 @@ Executing VI and EN consecutively for the same asset maximizes cache reuse of so
 1. **Routing Policy (Gateway Translation)**:
    - Translation priority ladder (Issue #62):
      1. `gemini_gateway_translator` requesting `gemini-3.8-flash` via user gateway (`https://cliproxy.monet.uno/v1`).
-     2. `deepseek_gateway_translator` requesting `deepseek/deepseek-v4-flash-vision-exp` via user gateway.
+     2. `deepseek_gateway_translator` requesting `deepseek-v4.1-flash` via user gateway.
      3. Pinned local `qwen3_4b_translator` GGUF fallback.
    - Remote Service Drift: Record `service_baseline_id`, `observed_model`, and `system_fingerprint` when returned by the gateway.
 2. **Cost Gate**:
@@ -460,7 +460,7 @@ The following domain terms are established by this contract and proposed for fut
 | **NVIDIA NVML on Windows (WDDM)** | NVIDIA NVML API Reference (`struct nvmlProcessInfo_v1_t`), URL: `https://docs.nvidia.com/deploy/nvml-api/structnvmlProcessInfo__v1__t.html` | Under Windows WDDM, per-process `usedGpuMemory` reports `NVML_VALUE_NOT_AVAILABLE`. | The benchmark must not claim per-process VRAM attribution from NVML on this host. Bind device-wide samples to stage timestamps and preserve the raw telemetry. | External Doc Fact + host observation |
 | **NVIDIA device memory telemetry** | NVIDIA NVML API Reference (`nvmlDeviceGetMemoryInfo`), URL: `https://docs.nvidia.com/deploy/nvml-api/group__nvmlDeviceQueries.html` | Reports device-wide `total`, `free`, and `used` memory. It does not isolate Douyinie from desktop/other GPU consumers under WDDM. | Record pre-run baseline, peak device-used memory, and peak-above-baseline as resource evidence. The Local hard gate is empirical completion on the 8 GB target without OOM/crash; do not mislabel whole-device `used` as exact process allocation. | External Doc Fact + derived measurement rule |
 | **Gemini 3.8 Flash** | Google DeepMind Gemini 3.8 Flash model card, URL: `https://deepmind.google/models/model-cards/gemini-3-8-flash/` | Gemini 3.8 Flash is an official Google model exposed through Gemini API channels. | `gemini-3.8-flash` is a legitimate upstream model identity. The custom gateway route still requires a live compatibility smoke and observed-response provenance. | External Doc Fact |
-| **DeepSeek V4 Flash / Vision-Flash** | DeepSeek API Docs, URL: `https://api-docs.deepseek.com/` | Official model IDs include `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp`; service model names can advance to newer backend releases without becoming immutable checkpoint hashes. | The gateway request string `deepseek/deepseek-v4-flash-vision-exp` is the user's gateway-specific namespaced route to the official upstream model family. Record requested route plus observed model/fingerprint when exposed and bind reusable remote artifacts to `service_baseline_id`. | External Doc Fact + gateway-specific contract |
+| **DeepSeek V4.1 Flash** | DeepSeek API Docs, URL: `https://api-docs.deepseek.com/` | Official model IDs include `deepseek-v4.1-flash`; service model names can advance to newer backend releases without becoming immutable checkpoint hashes. | The gateway request string `deepseek-v4.1-flash` is the user's gateway-specific route to the official upstream model family. Record requested route plus observed model/fingerprint when exposed and bind reusable remote artifacts to `service_baseline_id`. | External Doc Fact + gateway-specific contract |
 | **Gateway response metadata** | User gateway live smoke + Issue #62 contract | OpenAI compatibility does not guarantee every optional response/vendor field on every backend. | Capture `model`, `system_fingerprint`, request/response ID, and timestamps only when actually returned; absence of an optional field is not fabricated or silently filled from model memory. | Runtime evidence requirement |
 | **Acquisition CLI retry policy** | Exact installed/provisioned Jiji/F2 version, config, and upstream source/docs at implementation time | Tool-internal retry behavior is version-sensitive and separate from Router candidate attempts. | Freeze the exact adapter/tool version and retry configuration as provenance. Do not add harness-level retries and do not assume a generic upstream backoff policy without live evidence for the pinned version. | Version-sensitive implementation evidence |
 | **Local Qwen inference memory** | Qwen/Qwen3-4B-GGUF model card + pinned runtime docs (Issue #60) | Weight size alone does not determine runtime VRAM; context/batch/runtime settings materially affect memory. | Local 8 GB support is proven by the real target-hardware benchmark with the exact snapshot/runtime/config, not by model file size. | External Doc Fact + empirical gate |

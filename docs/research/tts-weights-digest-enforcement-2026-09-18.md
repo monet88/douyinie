@@ -72,7 +72,8 @@ Kokoro needed nothing: its checkpoint digest was already pinned inside the resol
 ## 3. Enforcement rule
 
 For every pinned asset: it must be declared in the snapshot manifest, the declared SHA-256 must equal
-the pinned constant, and the file must exist on disk. Undeclared → `ErrSnapshotFileCorrupted`
+the pinned constant, and the file must exist on disk (for ZeroTTS voice conditioning tensors in
+`PinnedZeroTTSVoiceAssets`, this check runs per selected voice on demand when resolved). Undeclared → `ErrSnapshotFileCorrupted`
 (voice asset → `ErrTTSVoiceAssetMissing`); digest drift → `ErrSnapshotDigestMismatch`. The
 declared→bytes link stays registration's job, so the chain is pinned constant → declared digest →
 hashed bytes, exactly the pattern UVR/Demucs already use.
@@ -91,7 +92,7 @@ declares every file it walks (54 of them).
 | Format / vet / whitespace | `gofmt -l cmd internal test`, `go vet ./...`, `git diff --check` | clean |
 | New gate, unit level | `go test ./internal/domain/ -count=1` | ok — substituted ZeroTTS graph / substituted voice tensor / substituted VieNeu weights → `ErrSnapshotDigestMismatch`; undeclared weight → `ErrSnapshotFileCorrupted`; pinned set → resolves |
 | New gate, seam 1 | `go test ./test/seam1/ -run TestSeam1_Snapshot_TTS_RegistrationAndVerification` | ok — registration accepts the fixture's bytes (self-consistent manifest), the resolver then **rejects** them as not the pinned weights |
-| New gate vs **real** provisioned bytes | `go test ./test/seam2/ -run 'TestSeam2_ZeroTTS\|TestSeam2_WorkerTTSProvider_CPUOnlyResourceContract'` | ok, 33.0 s — `TestSeam2_ZeroTTSRealPinnedRuntime` registers the staged `c2bfbd67…` snapshot (walk-all-files manifest = real SHA-256 per file) and resolves both unattended voices, so the 18 ZeroTTS constants are independently confirmed against the provisioned bytes |
+| New gate vs **real** provisioned bytes | `go test ./test/seam2/ -run 'TestSeam2_ZeroTTS|TestSeam2_WorkerTTSProvider_CPUOnlyResourceContract'` | ok, 33.0 s — `TestSeam2_ZeroTTSRealPinnedRuntime` registers the staged `c2bfbd67…` snapshot (walk-all-files manifest = real SHA-256 per file) and resolves both unattended voices (`quangminh`, `maichi`), confirming 12 ZeroTTS constants (10 model/codec pins + 2 unattended voice tensors; the remaining 6 frozen voice digests are not exercised by this fixture) |
 | Red proof (repo unmodified) | `go test -overlay <overlay> ./internal/domain/ -run TestSnapshot_ResolveTTSVoiceEntrypoint` with the two `verifyPinnedAssets` calls and the voice pin removed | **FAIL as expected**: `snapshot_test.go:488 expected ErrSnapshotDigestMismatch for substituted VieNeu weights, got: <nil>` and `:650 expected ErrSnapshotDigestMismatch for substituted ZeroTTS text encoder, got: <nil>`; same overlay turns the seam 1 assertion red at `snapshot_test.go:1034` |
 
 The red proof is the direct evidence that the gap was real: without the pin, a snapshot whose bytes

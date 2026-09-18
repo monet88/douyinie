@@ -39,7 +39,7 @@ This table supersedes the VieNeu pin block in
 | `ZEROTTS_ADAPTER_REVISION` | emitted by the probe; compared by `internal/governance/snapshot.go:416` and `internal/provider/worker_adapters.go:1106-1108` | check |
 | `ZEROTTS_MODEL_REVISION` | the adapter's model-revision gate (`tts_engine.py`, `TTS_MODEL_UNSUPPORTED`) plus binding equality | check (label, not bytes) |
 | `ZEROTTS_PACKAGE_VERSION` + `ZEROTTS_MODULE_VERSION_LITERAL` | additionally hashed into the DubSegments stage cache identity (`internal/service/dubbing.go`, `tts_runtime_identity`) so a pin bump invalidates cached segments instead of replaying old-runtime audio | check |
-| model weights of both lanes (`update/model.safetensors`, the ZeroTTS graphs/codec/tokenizer, every frozen voice tensor) | `PinnedVieNeuAssets` / `PinnedZeroTTSAssets` / `PinnedZeroTTSVoiceAssets` compared against the registered manifest's declared digests in `domain.ResolveTTSVoiceEntrypoint` (`internal/domain/snapshot.go`) | check (bytes, resolved 2026-09-18 — see `docs/research/tts-weights-digest-enforcement-2026-09-18.md`) |
+| model weights of both lanes (`update/model.safetensors`, the ZeroTTS graphs/codec/tokenizer, requested frozen voice tensor) | `PinnedVieNeuAssets` / `PinnedZeroTTSAssets` / `PinnedZeroTTSVoiceAssets` (voice tensor verified per selected voice on demand) compared against the registered manifest's declared digests in `domain.ResolveTTSVoiceEntrypoint` (`internal/domain/snapshot.go`) | check (bytes, resolved 2026-09-18 — see `docs/research/tts-weights-digest-enforcement-2026-09-18.md`) |
 | `KokoroModelCommit`, `KokoroSourceCommit` | nothing at runtime — provenance records only. | record |
 
 Label-vs-weights caveat, now closed for ZeroTTS and VieNeu (Kokoro was already pinned): the file set

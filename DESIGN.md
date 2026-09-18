@@ -163,7 +163,7 @@ The workspace utilizes a fixed, full-viewport grid tailored for desktop workstat
   - *Zone 3 (Inspector & Editor Drawer):* `minmax(320px, 1fr)` featuring exception triage tabs, transcript rows, and fail-closed region editing forms.
 - **Responsive Adaptations:**
   - `≤1200px`: Compact three-zone distribution.
-  - `≤1050px`: Collapses sidebar to an icon rail (78px), stacks dashboard grids, and splits review workspace into a 2-column layout with Zone 1 spanning the bottom.
+  - `≤1050px`: Collapses sidebar to an icon rail (78px), stacks dashboard grids, and splits the review workspace into a 2-column layout where Zone 1 (Context & Speakers) spans the full width above the Zone 2 / Zone 3 pair.
   - `≤760px`: Full single-column fluid layout with horizontal scrolling navigation.
 
 ## Elevation & Depth
