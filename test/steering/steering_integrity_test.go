@@ -31,7 +31,11 @@ func repoRoot(t *testing.T) string {
 }
 
 // steeringFiles are the always-loaded agent steering surface files.
-var steeringFiles = []string{"AGENTS.md"}
+var steeringFiles = []string{
+	"AGENTS.md",
+	"CODING_STANDARDS.md",
+	"README.md",
+}
 
 // extractRepoRelativePaths extracts repository-relative file/directory
 // pointers from markdown. It finds:
@@ -85,8 +89,12 @@ func isRepoRelativePath(p string) bool {
 	if strings.HasPrefix(p, "#") {
 		return false
 	}
-	// Skip external / home paths (e.g. ~/.agents/skills/..., .claude/skills/...)
-	if strings.HasPrefix(p, ".") || strings.HasPrefix(p, "~") {
+	// Skip external / home paths (e.g. ~/.agents/skills/..., .claude/skills/...) or root slashes (/triage, /cmd)
+	if strings.HasPrefix(p, ".") || strings.HasPrefix(p, "~") || strings.HasPrefix(p, "/") {
+		return false
+	}
+	// Skip placeholders (<repo-root>) or globs (*.go)
+	if strings.ContainsAny(p, "<>*") {
 		return false
 	}
 	// Must look like a file or directory path (contains / or has an extension or ends with /)
@@ -162,6 +170,33 @@ func TestSteeringIntegrity_NoDynamicStats(t *testing.T) {
 	}
 }
 
+// bannedCommandPattern matches command forms prohibited by repository rules:
+// runner paths (node .gitnexus/run.cjs or machine-local node D:/.../run.cjs)
+// and npx (which crashes on npm 11, issue #1939).
+var bannedCommandPattern = regexp.MustCompile(`(?:node\s+\S*run\.cjs|npx\s+gitnexus)`)
+
+// TestSteeringIntegrity_NoBannedCommands verifies that steering surfaces do not
+// instruct banned runner invocations or npx commands.
+func TestSteeringIntegrity_NoBannedCommands(t *testing.T) {
+	root := repoRoot(t)
+
+	for _, sf := range steeringFiles {
+		content, err := os.ReadFile(filepath.Join(root, sf))
+		if err != nil {
+			t.Fatalf("cannot read %s: %v", sf, err)
+		}
+		scanner := bufio.NewScanner(strings.NewReader(string(content)))
+		lineNum := 0
+		for scanner.Scan() {
+			lineNum++
+			line := scanner.Text()
+			if m := bannedCommandPattern.FindString(line); m != "" {
+				t.Errorf("%s:%d: banned command pattern %q — use bare gitnexus CLI instead", sf, lineNum, m)
+			}
+		}
+	}
+}
+
 // TestSteeringIntegrity_NegativeFixtures proves each check fails with
 // actionable diagnostics on known-bad input.
 func TestSteeringIntegrity_NegativeFixtures(t *testing.T) {
@@ -209,6 +244,19 @@ func TestSteeringIntegrity_NegativeFixtures(t *testing.T) {
 		clean := "read `gitnexus://repo/douyinie/context` for current index statistics (symbols, relationships, execution flows)"
 		if m := dynamicStatsPattern.FindString(clean); m != "" {
 			t.Errorf("should not match resource URI reference, but got %q", m)
+		}
+	})
+
+	t.Run("banned_commands_detected", func(t *testing.T) {
+		fixtures := []string{
+			"Run `node .gitnexus/run.cjs analyze` to update",
+			"Run `node D:/GitNexus/run.cjs impact` here",
+			"Bootstrap with npx gitnexus@latest analyze",
+		}
+		for _, f := range fixtures {
+			if m := bannedCommandPattern.FindString(f); m == "" {
+				t.Errorf("expected banned command match in %q", f)
+			}
 		}
 	})
 }

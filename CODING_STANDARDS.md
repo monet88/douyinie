@@ -8,7 +8,7 @@ When requirements disagree, use this order:
 
 1. [Wayfinder Issue #1](https://github.com/monet88/douyinie/issues/1) — resolved product/architecture decisions.
 2. [Implementation Spec #18](https://github.com/monet88/douyinie/issues/18) — authoritative Phase 1 implementation contract, including normative amendments.
-3. [`docs/architecture/phase1-architecture.md`](docs/architecture/phase1-architecture.md) — repo-local materialization of the locked architecture.
+3. [`docs/diagrams/douyinie-architecture.json`](docs/diagrams/douyinie-architecture.json) — repo-local materialization of the locked architecture (generated diagram set; read the JSON source, not the HTML render).
 4. [`PRODUCT.md`](PRODUCT.md) and [`CONTEXT.md`](CONTEXT.md) — product charter and domain vocabulary/invariants.
 5. [`docs/reference-repositories.md`](docs/reference-repositories.md) — reference/mining inventory only; never treat it as a dependency lockfile or architecture authority.
 
@@ -301,14 +301,14 @@ Before committing:
 
 ## 14. Completion gates
 
-A normal Go behavior change is not complete until the applicable gates are green:
+A normal Go behavior change is not complete until the applicable gates are green. Run `powershell -File scripts/gate.ps1` or run the steps individually:
 
 ```powershell
 gofmt -l <touched-go-files>
 go vet ./...
 go test ./...
 git diff --check
-gitnexus detect-changes --scope all --repo douyinie
+gitnexus detect-changes --scope all
 ```
 
 For documentation-only changes, the minimum gate is:

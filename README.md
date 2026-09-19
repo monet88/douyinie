@@ -10,7 +10,7 @@ When making architecture, provider, or implementation decisions, consult documen
 
 1. **[Wayfinder Issue #1](https://github.com/monet88/douyinie/issues/1)** — Authoritative canonical decision index.
 2. **[Implementation Spec #18](https://github.com/monet88/douyinie/issues/18)** — Authoritative Phase 1 implementation specification, including normative revalidation amendments.
-3. **[`docs/architecture/phase1-architecture.md`](docs/architecture/phase1-architecture.md)** — Canonical repo-local Phase 1 architecture synthesis of the locked #16 architecture plus authoritative #18 amendments.
+3. **[`docs/diagrams/douyinie-architecture.json`](docs/diagrams/douyinie-architecture.json)** — Canonical repo-local Phase 1 architecture materialization (generated diagram set) of the locked #16 architecture plus authoritative #18 amendments.
 4. **[`PRODUCT.md`](PRODUCT.md)** — Core product charter, user personas, capabilities, and constraints.
 5. **[`CONTEXT.md`](CONTEXT.md)** — Domain vocabulary, invariant contracts, and testing seams.
 6. **[`docs/reference-repositories.md`](docs/reference-repositories.md)** — External reference repository inventory (mining list only, **not** a dependency lockfile).

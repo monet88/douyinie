@@ -20,8 +20,8 @@ This file contains only Douyinie-specific coordination policy. The installed Orc
 ## Source of Truth and Dependency Order
 
 - GitHub Issues are the implementation tracker. Respect `blocked_by` and dependency ordering before starting implementation.
-- Before implementation, implementation planning, or architecture-sensitive review, read `AGENTS.md`, `docs/architecture/phase1-architecture.md`, and the relevant `PRODUCT.md`, `CONTEXT.md`, spec, ADR, and ticket material.
-- `docs/architecture/phase1-architecture.md` is the canonical repo-local Phase 1 architecture document and must not be silently contradicted during implementation.
+- Before implementation, implementation planning, or architecture-sensitive review, read `AGENTS.md`, `docs/diagrams/douyinie-architecture.json`, and the relevant `PRODUCT.md`, `CONTEXT.md`, spec, ADR, and ticket material.
+- `docs/diagrams/douyinie-architecture.json` is the canonical repo-local architecture materialization (generated diagram set) and must not be silently contradicted during implementation.
 - Wayfinder Issue #1 and Implementation Spec #18, including normative amendments, remain authoritative if repo-local architecture/product/context documents drift.
 
 ## Mutation and Verification Boundaries

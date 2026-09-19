@@ -4,7 +4,7 @@
   "meta": {
     "title": "Douyinie Run Lifecycle & State Transitions",
     "output": "docs/diagrams/douyinie-lifecycle.html",
-    "viewBox": [980, 680],
+    "viewBox": [1080, 570],
     "animation": "trace",
     "quality_profile": "showcase",
     "views": [
@@ -46,12 +46,12 @@
     { "id": "translating", "type": "decision", "label": "Translating", "sublabel": "gateway & QA check", "lane": "main", "col": 2, "step": "03", "tag": "remote LLM" },
     { "id": "dubbing", "type": "waiting", "label": "Dubbing", "sublabel": "timing & mix verify", "lane": "main", "col": 3, "step": "04", "tag": "zero overrun" },
     { "id": "completed", "type": "success", "label": "Completed", "sublabel": "PASS video deliverable", "lane": "main", "col": 4, "step": "05", "tag": "deliverable" },
-    { "id": "review_required", "type": "waiting", "label": "Review Required", "sublabel": "confidence / overlap", "lane": "waiting", "col": 0, "tag": "operator stop" },
-    { "id": "escalating", "type": "active", "label": "Voice Escalation", "sublabel": "CosyVoice3 fallback", "lane": "recovery", "col": 1, "tag": "speaker scope" },
-    { "id": "post_review", "type": "waiting", "label": "Final Review", "sublabel": "review posture render", "lane": "waiting", "col": 2, "tag": "operator signoff" },
-    { "id": "cancelled", "type": "failure", "label": "Cancelled", "sublabel": "operator rejected", "lane": "terminal", "col": 0, "tag": "terminal" },
-    { "id": "failed", "type": "failure", "label": "Failed", "sublabel": "overrun refused", "lane": "terminal", "col": 1, "tag": "terminal" },
-    { "id": "delivered", "type": "success", "label": "Delivered", "sublabel": "job marked completed", "lane": "terminal", "col": 2, "tag": "terminal" }
+    { "id": "review_required", "type": "waiting", "label": "Review Required", "sublabel": "confidence / overlap", "lane": "waiting", "col": 0, "tag": "operator stop", "yOffset": -20 },
+    { "id": "escalating", "type": "active", "label": "Voice Escalation", "sublabel": "CosyVoice3 fallback", "lane": "recovery", "col": 1, "tag": "speaker scope", "yOffset": -20 },
+    { "id": "post_review", "type": "waiting", "label": "Final Review", "sublabel": "review posture render", "lane": "waiting", "col": 2, "tag": "operator signoff", "yOffset": -20 },
+    { "id": "cancelled", "type": "failure", "label": "Cancelled", "sublabel": "operator rejected", "lane": "terminal", "col": 0, "tag": "terminal", "yOffset": -60 },
+    { "id": "failed", "type": "failure", "label": "Failed", "sublabel": "overrun refused", "lane": "terminal", "col": 1, "tag": "terminal", "yOffset": -60 },
+    { "id": "delivered", "type": "success", "label": "Delivered", "sublabel": "job marked completed", "lane": "terminal", "col": 2, "tag": "terminal", "yOffset": -60 }
   ],
   "transitions": [
     { "id": "t1", "from": "translating", "to": "review_required", "variant": "security", "route": "straight", "fromSide": "bottom", "toSide": "top" },
@@ -64,29 +64,20 @@
   "cards": [
     {
       "dot": "cyan",
-      "title": "Execution Rail",
+      "title": "Execution Rail & Review Gate",
       "items": [
         "Vòng đời run trải qua 5 bước tuần tự: Queued -> Extracting -> Translating -> Dubbing -> Completed",
-        "Mỗi bước tạo ra các artifact bất biến kiểm chứng được trong CAS",
-        "Single GPU Lease đảm bảo không tràn VRAM khi chuyển giao giữa các mô hình"
-      ]
-    },
-    {
-      "dot": "amber",
-      "title": "Wait & Review States",
-      "items": [
-        "Review Required: Tạm dừng khi phát hiện tự tin thấp hoặc xung đột vùng chữ",
-        "Voice Escalation: Chuyển đổi giọng cục bộ linh hoạt theo từng speaker",
-        "Post-Review: Ở posture review, job chỉ đóng khi operator thực hiện explicit final render"
+        "Single GPU Lease đảm bảo không tràn VRAM RTX 2060S khi chuyển giao giữa các StageWorkers",
+        "Review Required: Tạm dừng khi phát hiện tự tin thấp hoặc xung đột polygon (kiểm tra StrictOverlapRegionIDs)"
       ]
     },
     {
       "dot": "rose",
-      "title": "Fail-Closed Invariants",
+      "title": "Escalation & Fail-Closed Invariants",
       "items": [
-        "Không bao giờ để TTS đè qua lời thoại tiếp theo (tts_finish <= source_end)",
-        "Nếu lồng tiếng không khớp thời lượng sau retry -> Hủy và báo ErrMixerOverrunRefused",
-        "Trạng thái kết thúc Terminal (Cancelled, Failed, Delivered) là bất biến"
+        "Voice Escalation: ZeroTTS quá thời lượng tự động chuyển đổi sang CosyVoice3 theo từng speaker scope",
+        "Fail-Closed: Từ chối hòa âm (ErrMixerOverrunRefused) nếu không đặt được clip lồng tiếng hợp lệ",
+        "Review Posture: Run hoàn tất nhưng job giữ review_required cho đến khi operator duyệt explicit final render"
       ]
     }
   ]

@@ -4,7 +4,7 @@ How to stand up the production RuntimeHost + StageWorker stack on this workstati
 like a real operator, and read the run back. Use it before claiming any acceptance criterion that says
 "on real media" / "production path".
 
-Authoritative behaviour still lives in [phase1-architecture.md](../architecture/phase1-architecture.md) and
+Authoritative behaviour still lives in [douyinie-architecture.json](../diagrams/douyinie-architecture.json) and
 the resolved specs on the issue tracker; this file is the runbook, not a source of truth.
 
 ## 0. Fast path: re-run one video end to end

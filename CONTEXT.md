@@ -1,7 +1,7 @@
 # Douyinie — Domain Context & Invariant Glossary
 
 > [!IMPORTANT]
-> This document defines the canonical domain vocabulary and invariant contracts for Douyinie Phase 1. Detailed system architecture is materialized in **[`docs/architecture/phase1-architecture.md`](docs/architecture/phase1-architecture.md)**.
+> This document defines the canonical domain vocabulary and invariant contracts for Douyinie Phase 1. Detailed system architecture is materialized in the generated diagram set **[`docs/diagrams/douyinie-architecture.json`](docs/diagrams/douyinie-architecture.json)**.
 > If this document or the architecture document ever drifts from **[Implementation Spec #18](https://github.com/monet88/douyinie/issues/18)** (including normative amendment comments) or **[Wayfinder #1](https://github.com/monet88/douyinie/issues/1)**, the GitHub issues remain authoritative.
 
 ---

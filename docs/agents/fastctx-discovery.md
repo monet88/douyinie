@@ -16,7 +16,7 @@ Always inspect known locations by exact path before searching:
 | Repo agent steering | `<repo-root>/AGENTS.md` |
 | Repo context | `<repo-root>/CONTEXT.md` |
 | Repo product | `<repo-root>/PRODUCT.md` |
-| Repo architecture | `<repo-root>/docs/architecture/phase1-architecture.md` |
+| Repo architecture | `<repo-root>/docs/diagrams/douyinie-architecture.json` |
 | Repo agent docs | `<repo-root>/docs/agents/*.md` |
 
 Use `inspect_local_file` (or native `view_file`) with the exact path. A single batched call can check multiple exact paths:

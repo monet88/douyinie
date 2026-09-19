@@ -5085,7 +5085,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
       </div>
     </div>
 
-    <script id="archify-guided-views-data" type="application/json">[{"id":"full-topology","label":"Toàn cảnh hệ thống","focus":["web_ui","runtime_host","orchestrator","worker_supervisor","sqlite_db","cas_store","remote_gateway","separation_worker","asr_worker","ocr_worker","tts_worker","render_worker"],"note":"Ranh giới giữa Control Plane (RuntimeHost daemon) và Execution Plane (Seam 2 StageWorkers)."},{"id":"control-plane","label":"Control Plane","focus":["web_ui","runtime_host","orchestrator","worker_supervisor","sqlite_db","cas_store"],"note":"Quản lý FSM state, metadata SQLite, CAS artifact và điều phối tiến trình worker."},{"id":"translation-gateway","label":"Remote Translation Gateway","focus":["runtime_host","remote_gateway"],"note":"Dịch thuật ngữ nghĩa bắt buộc qua Remote LLM Gateway (Gemini 3.8 Flash -\u003e DeepSeek v4.1 Flash)."},{"id":"media-pipeline","label":"Execution Pipeline","focus":["worker_supervisor","separation_worker","asr_worker","ocr_worker","tts_worker","render_worker","cas_store"],"note":"Chuỗi pipeline xử lý tách âm thanh, nhận dạng, dịch văn bản hình ảnh, lồng tiếng và render hoàn thiện."}]</script>
+    <script id="archify-guided-views-data" type="application/json">[{"id":"full-topology","label":"Toàn cảnh kiến trúc hệ thống","focus":["web_ui","runtime_host","orchestrator","worker_supervisor","sqlite_db","cas_store","remote_gateway","separation_worker","asr_worker","ocr_worker","tts_worker","render_worker"],"note":"Ranh giới giữa Control Plane (RuntimeHost daemon - Seam 1) và Execution Plane (StageWorkers - Seam 2)."},{"id":"control-plane","label":"Control Plane (Seam 1)","focus":["web_ui","runtime_host","orchestrator","worker_supervisor","sqlite_db","cas_store"],"note":"Điều phối FSM state, metadata SQLite WAL, artifact CAS và cấp phát Single GPU Lease."},{"id":"translation-gateway","label":"Remote Translation Gateway","focus":["runtime_host","remote_gateway"],"note":"Dịch thuật ngữ nghĩa bắt buộc qua Remote LLM Gateway (Gemini 3.8 Flash -\u003e DeepSeek v4.1 Flash), fail-closed."},{"id":"media-pipeline","label":"Execution Plane (Seam 2)","focus":["worker_supervisor","separation_worker","asr_worker","ocr_worker","tts_worker","render_worker","cas_store"],"note":"Chuỗi worker chuyên biệt: tách âm Demucs/UVR, Qwen3-ASR, PaddleOCR, ZeroTTS/CosyVoice3 và FFmpeg render."}]</script>
 
     <script id="archify-i18n-data" type="application/json">{"locale":"en","messages":{"viewer.kind.frontend":"Frontend","viewer.kind.backend":"Backend","viewer.kind.database":"Database","viewer.kind.cloud":"Cloud","viewer.kind.security":"Security","viewer.kind.messagebus":"Message bus","viewer.kind.external":"External","viewer.kind.neutral":"Neutral","viewer.kind.node":"Node","viewer.kind.start":"Start","viewer.kind.active":"Active","viewer.kind.waiting":"Waiting","viewer.kind.decision":"Decision","viewer.kind.success":"Success","viewer.kind.failure":"Failure","viewer.toolbar.actions":"Diagram actions","viewer.theme.toggle.title":"Toggle theme (T)","viewer.theme.toggle":"Toggle color theme","viewer.theme.dark":"Dark","viewer.theme.light":"Light","viewer.preset.choose.title":"Choose visual style (S cycles)","viewer.preset.choose":"Choose visual style","viewer.preset.style":"Style","viewer.preset.menu":"Visual style","viewer.preset.identity":"Visual identity","viewer.preset.cycles":"S cycles","viewer.preset.classic":"Classic","viewer.preset.classic.short":"Classic","viewer.preset.classic.hint":"Stable technical default","viewer.preset.flow":"Signal Flow","viewer.preset.flow.short":"Flow","viewer.preset.flow.hint":"Motion-forward presentation","viewer.preset.blueprint":"Blueprint","viewer.preset.blueprint.hint":"Engineering review","viewer.preset.editorial":"Editorial","viewer.preset.editorial.hint":"Publication and launch notes","viewer.preset.badge.signalFlow":"SIGNAL FLOW","viewer.preset.badge.blueprint":"BLUEPRINT / REV 01","viewer.preset.badge.editorial":"EDITORIAL / FIELD NOTE","viewer.preset.badge.editorialPlate":"ARCHIFY / PLATE 04","viewer.preset.current":"Visual style: {style}. Choose visual style","viewer.motion.live":"Live","viewer.motion.still":"Still","viewer.motion.pause":"Pause motion","viewer.motion.resume":"Resume motion","viewer.motion.reduced":"Motion paused by reduced-motion preference","viewer.motion.hidden":"Motion paused while this page is hidden","viewer.motion.yielding":"Pause motion; currently yielding to {owner}","viewer.motion.yielding.title":"Live preview enabled · yielding to {owner}","viewer.owner.story":"the guided story","viewer.owner.chapter":"the active chapter","viewer.owner.chapterPreview":"the chapter delta preview","viewer.owner.handoff":"the chapter handoff","viewer.owner.route":"Route Probe","viewer.owner.lens":"Semantic Lens","viewer.owner.relationship":"Relationship Preview","viewer.owner.intent":"Intent Trace","viewer.owner.focus":"semantic focus","viewer.owner.legend":"legend preview","viewer.owner.reader":"reader interaction","viewer.present.enter":"Enter presentation stage","viewer.present.enter.title":"Presentation stage (F)","viewer.present.exit":"Exit presentation stage","viewer.present.exit.title":"Exit presentation stage (F or Escape)","viewer.present.present":"Present","viewer.present.exit.label":"Exit","viewer.export.button":"Export","viewer.export.button.title":"Export diagram (E)","viewer.export.diagram":"Export diagram","viewer.export.menu":"Export","viewer.export.subtitle":"Portable, clean outputs","viewer.export.share":"Share","viewer.export.shareCard":"Share Card","viewer.export.routeShareCard":"Route Share Card","viewer.export.reachShareCard":"Reach Share Card","viewer.export.copyShareCard":"Copy Share Card","viewer.export.copyDiagram":"Copy diagram","viewer.export.clipboardPng":"PNG to clipboard","viewer.export.raster":"Raster images","viewer.export.image":"Image","viewer.export.lossless":"Lossless image","viewer.export.compact":"Compact image","viewer.export.modern":"Modern image","viewer.export.vectorMotion":"Vector and motion","viewer.export.vectorMotion.heading":"Vector \u0026 motion","viewer.export.editable":"Editable vector","viewer.export.motion6s":"6s motion","viewer.export.unsupported":"Not supported by this browser","viewer.export.clipboardUnsupported":"Clipboard image write not supported by this browser","viewer.export.clipboardUnsupported.period":"Clipboard image write not supported by this browser.","viewer.export.clipboardUnsupported.short":"Clipboard image write not supported in this browser.","viewer.export.motionUnavailable":"Motion capture unavailable in this browser","viewer.export.webmUnavailable":"WebM unavailable in this browser","viewer.export.failed":"Export failed: {message}","viewer.export.unknownVariant":"Unknown Share Card variant: {variant}","viewer.export.routeRequired":"Trace a route before exporting a Route Share Card","viewer.export.reachRequired":"Trace authored reach before exporting a Reach Share Card","viewer.export.unknown":"unknown","viewer.export.routeFailed":"Route Share Card export failed: {message}","viewer.export.reachFailed":"Reach Share Card export failed: {message}","viewer.export.copyFailed":"Copy failed: {message}","viewer.export.copiedPng":"Copied PNG to clipboard","viewer.export.copiedShare":"Copied Share Card","viewer.export.downloadedShare":"Downloaded Share Card","viewer.export.downloadedRoute":"Downloaded Route Share Card","viewer.export.downloadedReach":"Downloaded Reach Share Card","viewer.export.downloadedWebm":"Downloaded WebM","viewer.export.recording":"Recording 6 seconds of motion…","viewer.export.card.routeSummary.one":"Route: {source} → {target} · {count} directed hop","viewer.export.card.routeSummary.other":"Route: {source} → {target} · {count} directed hops","viewer.export.card.reachSummary":"Authored {direction} from {origin} · {nodes} · {links} · max {hops}","viewer.export.card.node.one":"{count} node","viewer.export.card.node.other":"{count} nodes","viewer.export.card.link.one":"{count} link","viewer.export.card.link.other":"{count} links","viewer.export.card.hop.one":"{count} hop","viewer.export.card.hop.other":"{count} hops","viewer.export.card.routeBadge":"ARCHIFY · ROUTE · {hops}","viewer.export.card.reachBadge":"ARCHIFY · {direction} REACH","viewer.export.card.defaultBadge":"ARCHIFY · {preset} · {theme}","viewer.export.direction.upstream":"Upstream","viewer.export.direction.downstream":"Downstream","viewer.export.error.canvasUnavailable":"Canvas unavailable for {label}","viewer.export.error.contextUnavailable":"2D canvas context unavailable for {label}","viewer.export.error.toBlobUnavailable":"canvas.toBlob unavailable for {label}","viewer.export.error.toBlobNull":"canvas.toBlob returned no data for {label}","viewer.export.error.variantsCombined":"Share Card variants cannot be combined","viewer.export.error.viewerState":"Share Card export could not remove temporary viewer state","viewer.export.error.routeState":"Route Card export could not preserve the resolved route safely","viewer.export.error.reachState":"Reach Card export could not preserve authored reach safely","viewer.export.error.webmRequirements":"WebM motion export requires a trace animation and browser MediaRecorder support","viewer.export.error.mediaRecorder":"MediaRecorder failed","viewer.export.error.emptyWebm":"MediaRecorder produced an empty WebM","viewer.export.error.webmBackground":"SVG background could not be loaded for WebM export","viewer.guided.region":"Guided diagram views","viewer.guided.previous":"Previous guided view","viewer.guided.previous.title":"Previous guided view ([)","viewer.guided.next":"Next guided view","viewer.guided.next.title":"Next guided view (])","viewer.guided.views":"Guided views","viewer.guided.explore":"Explore this system","viewer.guided.intro":"Step through curated paths without changing the source diagram.","viewer.guided.trail":"Story trail","viewer.guided.beat":"Beat","viewer.guided.nextBeat":"Next","viewer.guided.play":"Play guided story","viewer.guided.play.title":"Play guided story (P)","viewer.guided.pause":"Pause guided story","viewer.guided.pause.title":"Pause guided story (P)","viewer.guided.replay":"Replay guided story","viewer.guided.replay.title":"Replay guided story (P)","viewer.guided.playStory":"Play story","viewer.guided.pauseStory":"Pause","viewer.guided.replayStory":"Replay story","viewer.guided.motionUnavailable":"Story playback unavailable while motion is Still","viewer.guided.enableMotion":"Switch motion to Live to play the guided story","viewer.guided.selectBeatLink":"Select a Story Beat to copy its exact link","viewer.guided.copyMoment":"Copy moment","viewer.guided.momentCopied":"Moment link copied","viewer.guided.momentCopyFailed":"Could not copy story moment link","viewer.guided.copied":"Copied","viewer.guided.copyFailed":"Copy failed","viewer.guided.showAll":"Show all","viewer.guided.showAll.aria":"Show entire diagram","viewer.guided.chapters":"Story chapters","viewer.guided.storyTrail":"Story trail for {label}: {count} beats","viewer.guided.chapter.open":"Open chapter {index} of {total}: {label}, {count} stops","viewer.guided.chapter.current":"Current chapter {index} of {total}: {label}, {count} stops","viewer.guided.chapter.selectedNodes":"{count} selected nodes","viewer.guided.chapter.stops":"{count} stops","viewer.guided.chapter.stop.one":"{count} stop","viewer.guided.chapter.stop.other":"{count} stops","viewer.guided.chapter.current.title":"{label} — current chapter, {count} stops","viewer.guided.chapter.delta.expanded":"{stay} stay, {enter} enter, {leave} leave","viewer.guided.chapter.delta.aria":"Open chapter {index} of {total}: {label}. Chapter focus delta: {delta}","viewer.guided.chapter.delta.title":"{label} — {delta} chapter focus","viewer.guided.handoff":"{from} → {to} · via {label}","viewer.guided.share.chapter":"Chapter {index} / {total}","viewer.guided.share.initial":"Chapter 01 / 01","viewer.guided.share.default":"Guided chapter","viewer.guided.state.ready":"Ready","viewer.guided.state.playing":"Playing","viewer.guided.state.settled":"Settled","viewer.guided.state.paused":"Paused","viewer.guided.state.pinned":"Pinned","viewer.guided.state.still":"Still","viewer.guided.share.step":"Step {index} / {total} · {label}","viewer.guided.share.staticMoment":"{step} · Static moment","viewer.guided.share.complete":"{count} steps complete · {note}","viewer.guided.share.settled":"Path settled for reading.","viewer.guided.share.staticPath":"{count} steps · Static path","viewer.guided.share.ready":"{count} steps · Ready","viewer.guided.share.aria":"{state} chapter {index} of {total}: {label}. {beat}. {route}","viewer.guided.beat.start":"Beat {index} / {total} · {label} · starting point","viewer.guided.beat.forward":"Beat {index} / {total} · {from} → {to}","viewer.guided.beat.reverse":"Beat {index} / {total} · {from} → {to} · reverse authored link","viewer.guided.beat.multiple":"Beat {index} / {total} · {from} ⇄ {to} · {count} authored links","viewer.guided.beat.group":"Beat {index} / {total} · {from} · {to} · grouped · no direct link","viewer.guided.beat.aria.prefix":"Story beat {index} of {total}: {label}. ","viewer.guided.beat.aria.start":"Starting point.","viewer.guided.beat.aria.forward":"From {from} through one authored forward relationship.","viewer.guided.beat.aria.reverse":"From {from}; the authored relationship points from {to} to {from}.","viewer.guided.beat.aria.multiple":"From {from} through {count} authored relationships; shown without arbitrary motion.","viewer.guided.beat.aria.group":"Grouped from {from} with no direct authored relationship.","viewer.guided.caption.start":"Starting point","viewer.guided.caption.grouped":"Grouped transition · no direct authored link","viewer.guided.caption.more":" +{count} more","viewer.guided.caption.reverse":"Reverse authored relationship","viewer.guided.caption.relationships":"{count} authored relationships","viewer.guided.caption.relationship":"Authored relationship","viewer.guided.caption.direction":"authored direction: {from} → {to}","viewer.guided.caption.starting":"Authored starting point","viewer.guided.beatLink":"Copy link to current story moment: Beat {index} of {total}: {label}","viewer.guided.noStory":"This diagram has no authored guided story.","viewer.guide.eyebrow":"Diagram guide","viewer.guide.close":"Close diagram guide","viewer.guide.inspecting":"Inspecting compiled semantics","viewer.guide.actions":"Diagram exploration actions","viewer.guide.find":"Find any node","viewer.guide.find.hint":"Search labels, responsibilities, kinds, and stable IDs.","viewer.guide.route":"Trace a route","viewer.guide.route.aria":"Trace a directed route","viewer.guide.route.hint":"Ask how two semantic nodes connect in authored direction.","viewer.guide.map":"See the whole system","viewer.guide.map.hint":"Open Semantic Radar with a live viewport and stable nodes.","viewer.guide.lens":"Compare semantic kinds","viewer.guide.lens.hint":"Count roles, reveal their traffic, and compare direct authored links.","viewer.guide.story":"Play the guided story","viewer.guide.story.hint":"Walk the authored chapters and real relationships.","viewer.guide.present":"Enter Presentation Stage","viewer.guide.present.hint":"Give the live diagram the viewport without changing export.","viewer.guide.shortcuts":"Additional keyboard shortcuts","viewer.guide.shortcut.export":"Export","viewer.guide.shortcut.theme":"Theme","viewer.guide.shortcut.style":"Style","viewer.guide.shortcut.reset":"Reset","viewer.guide.shortcut.zoomIn":"Zoom in","viewer.guide.shortcut.zoomOut":"Zoom out","viewer.guide.shortcut.close":"Close","viewer.guide.facts":"{nodes} · {relationships} · {views}","viewer.guide.fact.node.one":"{count} semantic node","viewer.guide.fact.node.other":"{count} semantic nodes","viewer.guide.fact.relationship.one":"{count} relationship","viewer.guide.fact.relationship.other":"{count} relationships","viewer.guide.fact.view.one":"{count} guided view","viewer.guide.fact.view.other":"{count} guided views","viewer.guide.story.available.one":"Walk {count} authored chapter and its real relationships.","viewer.guide.story.available.other":"Walk {count} authored chapters and their real relationships.","viewer.guide.story.unavailable":"No authored guided story in this diagram.","viewer.guide.open":"Open diagram guide","viewer.guide.noStory":"This diagram has no authored guided story.","viewer.finder.title":"Find a node","viewer.finder.close":"Close node finder","viewer.finder.placeholder":"Search labels or IDs","viewer.finder.search":"Search diagram nodes","viewer.finder.results":"Diagram nodes","viewer.finder.empty":"No matching nodes","viewer.finder.result.focus":"Focus {label}","viewer.finder.result.routeStart":"Choose {label} as route start","viewer.finder.result.routeTarget":"Choose {label} as route destination, {links}","viewer.finder.status.empty":"No matching nodes","viewer.finder.status.count.one":"{count} matching node","viewer.finder.status.count.other":"{count} matching nodes","viewer.finder.noun.nodes":"nodes","viewer.finder.link.one":"{count} link","viewer.finder.link.other":"{count} links","viewer.finder.result.focus.one":"Focus {label}, {count} related connection","viewer.finder.result.focus.other":"Focus {label}, {count} related connections","viewer.finder.status.filtered":"{visible} of {available} {noun}","viewer.finder.status.all":"{available} {noun}","viewer.passport.eyebrow":"Semantic passport","viewer.passport.metadata":"Node metadata","viewer.passport.evidence":"Verified source evidence","viewer.passport.verified":"Verified source","viewer.passport.verificationScope":"Verified against local Git at the pinned revision. Remote access has not been checked.","viewer.passport.reach":"Authored reach","viewer.passport.reach.trace":"Trace authored reachability","viewer.passport.upstream":"Upstream","viewer.passport.downstream":"Downstream","viewer.passport.upstream.trace":"Trace upstream authored reachability","viewer.passport.downstream.trace":"Trace downstream authored reachability","viewer.passport.close":"Close semantic passport","viewer.passport.copy":"Copy link","viewer.passport.copy.focus":"Copy link to focused node","viewer.passport.relations":"Relations","viewer.passport.relations.show":"Show connected relationships","viewer.passport.relations.hide":"Hide connected relationships","viewer.passport.relations.list":"Connected relationships","viewer.passport.copyRelation":"Copy relation","viewer.passport.copyNode":"Copy node","viewer.passport.copyPinned":"Copy link to pinned relationship","viewer.passport.copySource":"Copy link to source node","viewer.passport.copy.focused.success":"Focused node link copied","viewer.passport.copy.pinned.success":"Pinned relationship link copied","viewer.passport.copy.focused.failed":"Could not copy focused node link","viewer.passport.copy.pinned.failed":"Could not copy pinned relationship link","viewer.passport.relationship.none":"No connected relationships","viewer.passport.relationship.count.one":"{count} relation","viewer.passport.relationship.count.other":"{count} relations","viewer.passport.relationship.show.one":"Show {count} connected relationship","viewer.passport.relationship.show.other":"Show {count} connected relationships","viewer.passport.relationship.summary":"{out} outgoing · {in} incoming{loops}","viewer.passport.relationship.loops":" · {count} loop","viewer.passport.relationship.explorer":"Direct relationship explorer","viewer.passport.relationship.help":"Use arrow keys to explore relationships. Press Enter or Space to pin details; Escape clears.","viewer.passport.relationship.loopsBack":"loops back","viewer.passport.relationship.connectsTo":"connects to","viewer.passport.relationship.connectsFrom":"connects from","viewer.passport.relationship.pinned":"Pinned relationship · {from} → {to} · {label}","viewer.passport.relationship.inspect":"Inspect relationship {index} of {total}: {from} to {to}, {label}. Press Enter for details.","viewer.passport.relationship.group.out":"Outgoing","viewer.passport.relationship.group.in":"Incoming","viewer.passport.relationship.group.loop":"Self loops","viewer.passport.relationship.row":"{group}: {relationship}, {neighbor}","viewer.passport.relationship.direction.out":"OUT →","viewer.passport.relationship.direction.in":"← IN","viewer.passport.relationship.direction.loop":"LOOP","viewer.passport.sourceCount.one":"{count} verified source reference","viewer.passport.sourceCount.other":"{count} verified source references","viewer.passport.sourceMarker":"SRC","viewer.passport.beacon.one":"{count} verified source; focus this node to inspect","viewer.passport.beacon.other":"{count} verified sources; focus this node to inspect","viewer.passport.repository.open":"Open verified repository revision {revision}","viewer.passport.source.open":"Open verified source {path} at revision {revision}","viewer.passport.source.openLink":"Open ↗","viewer.passport.reach.upstream.one":"Trace {count} upstream authored node","viewer.passport.reach.upstream.other":"Trace {count} upstream authored nodes","viewer.passport.reach.downstream.one":"Trace {count} downstream authored node","viewer.passport.reach.downstream.other":"Trace {count} downstream authored nodes","viewer.passport.reach.noUpstream":"No upstream authored nodes","viewer.passport.reach.noDownstream":"No downstream authored nodes","viewer.passport.reach.status":"{direction} · {nodes} nodes · {links} links · max {hops} hops","viewer.route.eyebrow":"Route probe","viewer.route.start":"Choose a start node","viewer.route.start.find":"Find start","viewer.route.start.find.aria":"Find a route start","viewer.route.copy":"Copy link","viewer.route.copy.aria":"Copy link to traced route","viewer.route.clear":"Clear","viewer.route.clear.aria":"Clear route probe","viewer.route.traced":"Traced route","viewer.route.pickTwo":"Pick two semantic nodes on the diagram","viewer.route.pickOne":"Pick a semantic node on the diagram","viewer.route.controls":"Route journey controls","viewer.route.previous":"Previous route position","viewer.route.play":"Play route journey","viewer.route.pause":"Pause route journey","viewer.route.replay":"Replay route journey","viewer.route.next":"Next route position","viewer.route.journey":"Journey","viewer.route.pause.label":"Pause","viewer.route.replay.label":"Replay","viewer.route.overview":"Overview","viewer.route.overview.aria":"Show complete route overview","viewer.route.instructions":"Choose the source, then the destination. Direction matters.","viewer.route.destination":"Choose a destination from {label}","viewer.route.destination.find":"Find target","viewer.route.destination.find.aria":"Find a reachable route destination","viewer.route.differentDestination":"Choose a different destination","viewer.route.distinct":"A route needs two distinct semantic nodes.","viewer.route.unreachable":"No directed route to {label}","viewer.route.unreachable.detail":"{target} is not reachable from {source}. Pick a highlighted destination.","viewer.route.start.instructions":"Select the source. The next step will reveal only directed destinations.","viewer.route.copy.success":"Traced route link copied","viewer.route.copy.failed":"Could not copy traced route link","viewer.route.position":"Route position {index} of {total}: {label}","viewer.route.step":"Step {index} of {total} · {phase} · {label}","viewer.route.motionRequired":"Automatic journey requires Live motion","viewer.route.trigger.clear":"Clear traced route","viewer.route.overview.status":"{nodes} · {hops} · shortest authored route","viewer.route.overview.node.one":"{count} node","viewer.route.overview.node.other":"{count} nodes","viewer.route.overview.hop.one":"{count} directed hop","viewer.route.overview.hop.other":"{count} directed hops","viewer.route.phase.playing":"Playing","viewer.route.phase.complete":"Complete","viewer.route.phase.inspecting":"Inspecting","viewer.route.destination.count.one":"{count} directed destination available. Pick a highlighted node.","viewer.route.destination.count.other":"{count} directed destinations available. Pick a highlighted node.","viewer.route.noOutgoing":"No outgoing route starts here. Clear and choose another source.","viewer.route.result.title":"{source} to {target}","viewer.route.finder.source.title":"Choose route start","viewer.route.finder.source.placeholder":"Search route sources","viewer.route.finder.source.empty":"No matching route sources","viewer.route.finder.source.results":"Nodes that can start a route","viewer.route.finder.source.noun":"route sources","viewer.route.finder.source.badge":"start","viewer.route.finder.target.title":"Destination from {label}","viewer.route.finder.target.placeholder":"Search reachable destinations","viewer.route.finder.target.empty":"No matching reachable destinations","viewer.route.finder.target.results":"Reachable route destinations","viewer.route.finder.target.noun":"reachable destinations","viewer.route.hop.one":"{count} hop","viewer.route.hop.other":"{count} hops","viewer.lens.eyebrow":"Semantic lens","viewer.lens.title":"Compare system roles","viewer.lens.close":"Close semantic lens","viewer.lens.instruction":"Choose up to two semantic kinds. One reveals its real traffic; two compare only direct authored relationships.","viewer.lens.kinds":"Semantic kinds","viewer.lens.choose":"Choose a kind to inspect its nodes and touching relationships.","viewer.lens.copy":"Copy link to semantic lens","viewer.lens.clear":"Clear semantic lens","viewer.lens.open":"Open semantic lens","viewer.lens.openActive":"Open active semantic lens","viewer.lens.legend":"Semantic legend","viewer.lens.legend.inspect.one":"Inspect {label}, {count} node","viewer.lens.legend.inspect.other":"Inspect {label}, {count} nodes","viewer.lens.kind.count.one":"{label}, {count} node","viewer.lens.kind.count.other":"{label}, {count} nodes","viewer.lens.compare.one":"{first} → {second}: {forward} · {second} → {first}: {reverse} · {count} direct relationship","viewer.lens.compare.other":"{first} → {second}: {forward} · {second} → {first}: {reverse} · {count} direct relationships","viewer.lens.single":"{nodes} · {relationships} · connected peers remain visible","viewer.lens.node.one":"{count} {label} node","viewer.lens.node.other":"{count} {label} nodes","viewer.lens.relationship.one":"{count} touching relationship","viewer.lens.relationship.other":"{count} touching relationships","viewer.radar.title":"Semantic radar","viewer.radar.building":"Building overview","viewer.radar.openFull":"Open full semantic radar","viewer.radar.open":"Open radar","viewer.radar.close":"Close semantic radar","viewer.radar.surface":"Diagram overview. Click a node to focus it, or use arrow keys to pan.","viewer.radar.click":"Click node","viewer.radar.drag":"Drag to pan","viewer.radar.space":"Semantic radar needs more MAP space.","viewer.radar.nodes":"Semantic diagram radar nodes","viewer.radar.focus":"Focus {label} from Semantic Radar","viewer.radar.status":"{count} nodes · {viewport}","viewer.radar.fullMap":"{count} nodes · full map","viewer.radar.compacted":"Radar compacted to avoid covering the Semantic Passport or MAP controls.","viewer.radar.cancelWaiting":"Cancel semantic radar waiting for more MAP space","viewer.radar.needsSpace":"Semantic radar needs more visible MAP space","viewer.radar.viewport.full":"full map","viewer.radar.viewport.width":"{percent}% width","viewer.radar.viewport.scale":"{percent}% viewport","viewer.nav.controls":"Diagram view controls","viewer.nav.route":"Trace a directed route","viewer.nav.route.title":"Trace route (R)","viewer.nav.route.short":"PATH","viewer.nav.radar":"Open semantic radar","viewer.nav.radar.title":"Semantic radar (M)","viewer.nav.radar.short":"MAP","viewer.nav.lens":"Open semantic lens","viewer.nav.lens.title":"Semantic lens (L)","viewer.nav.lens.short":"LENS","viewer.nav.find":"Find a node","viewer.nav.find.title":"Find a node (/)","viewer.nav.guide":"Open diagram guide","viewer.nav.guide.title":"Diagram guide (?)","viewer.nav.zoomOut":"Zoom out","viewer.nav.zoomOut.title":"Zoom out (-)","viewer.nav.reset":"Reset diagram view","viewer.nav.reset.title":"Reset view (0)","viewer.nav.read":"READ","viewer.nav.zoomIn":"Zoom in","viewer.nav.zoomIn.title":"Zoom in (+)","viewer.nav.camera":"{hint}. Reset diagram view","viewer.nav.camera.title":"{semantic}{hint} · reset view (0)","viewer.nav.camera.semantic":"Semantic camera active · ","viewer.nav.level.map":"MAP","viewer.nav.level.read":"READ","viewer.nav.level.full":"FULL","viewer.nav.level.auto":"AUTO","viewer.nav.detail.map":"Zoom in to reveal relationship labels and node context","viewer.nav.detail.read":"Zoom in again to reveal tags and annotations","viewer.nav.detail.full":"Full diagram detail","viewer.intent.summary":"{label}. {out} outgoing, {in} incoming{loops}. {total} connections. Press Enter for details.","viewer.intent.loops":", {count} self loop","viewer.common.copied":"Copied","viewer.common.copyFailed":"Copy failed","viewer.common.copyLink":"Copy link","viewer.common.clear":"Clear","viewer.common.close":"Close"}}</script>
     <div class="guided-views no-print" id="guided-views" hidden aria-label="Guided diagram views">
@@ -5130,7 +5130,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
     <!-- Main Diagram -->
     <div class="diagram-container" data-detail-level="read"
          data-preset-badge-editorial-plate="ARCHIFY / PLATE 04">
-      <svg viewBox="0 0 1060 658" role="img" lang="en" aria-labelledby="archify-diagram-title archify-diagram-description" data-preset="classic" data-quality-profile="showcase">
+      <svg viewBox="0 0 1060 603" role="img" lang="en" aria-labelledby="archify-diagram-title archify-diagram-description" data-preset="classic" data-quality-profile="showcase">
         <title id="archify-diagram-title">Douyinie System Architecture</title>
         <desc id="archify-diagram-description">An architecture diagram generated by Archify.</desc>
         <!-- Definitions -->
@@ -5156,253 +5156,253 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
         <rect width="100%" height="100%" fill="url(#grid)" />
 
         <!-- Boundaries (behind everything) -->
-        <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="0" data-composition-frame-label="Control Plane (Localhost Host Environment)" x="20" y="30" width="600" height="560" rx="12" class="c-region" stroke-width="1"/>
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="0" data-composition-frame-label="Control Plane (Localhost Host Environment)" x="20" y="20" width="600" height="515" rx="12" class="c-region" stroke-width="1"/>
 
-        <rect data-graph-role="structural-frame" data-composition-frame-kind="security-group" data-composition-frame-id="1" data-composition-frame-label="Execution Plane (Seam 2 StageWorkers)" x="630" y="30" width="390" height="466" rx="8" class="c-security-group" stroke-width="1"/>
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="security-group" data-composition-frame-id="1" data-composition-frame-label="Execution Plane (Seam 2 StageWorkers)" x="630" y="20" width="390" height="431" rx="8" class="c-security-group" stroke-width="1"/>
 
         <!-- Connection paths (before components for correct z-order) -->
-        <path data-edge-from="web_ui" data-edge-to="runtime_host" data-edge-label="HTTP / WS" data-edge-key="0" data-edge-id="ui-to-host" data-composition-points="180,270;240,270" d="M 180 270 L 240 270" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="runtime_host" data-edge-to="sqlite_db" data-edge-label="metadata" data-edge-key="1" data-edge-id="host-to-db" data-composition-points="310,240;310,120" d="M 310 240 L 310 120" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="runtime_host" data-edge-to="remote_gateway" data-edge-label="translation" data-edge-key="2" data-edge-id="host-to-gateway" data-composition-points="310,300;310,420" d="M 310 300 L 310 420" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
-        <path data-edge-from="runtime_host" data-edge-to="orchestrator" data-edge-label="trigger run" data-edge-key="3" data-edge-id="host-to-orch" data-composition-points="380,270;415,270;415,180;450,180" d="M 380 270 L 407 270 Q 415 270 415 262 L 415 188 Q 415 180 423 180 L 450 180" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="orchestrator" data-edge-to="worker_supervisor" data-edge-label="stage plan" data-edge-key="4" data-edge-id="orch-to-supervisor" data-composition-points="520,210;520,330" d="M 520 210 L 520 330" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="worker_supervisor" data-edge-to="cas_store" data-edge-label="CAS lease" data-edge-key="5" data-edge-id="supervisor-to-cas" data-composition-points="520,390;520,510" d="M 520 390 L 520 510" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
-        <path data-edge-from="worker_supervisor" data-edge-to="separation_worker" data-edge-label="spawn IPC" data-edge-key="6" data-edge-id="supervisor-to-sep" data-composition-points="590,360;625,360;625,88;660,88" d="M 590 360 L 617 360 Q 625 360 625 352 L 625 96 Q 625 88 633 88 L 660 88" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="separation_worker" data-edge-to="asr_worker" data-edge-label="vocals" data-edge-key="7" data-edge-id="sep-to-asr" data-composition-points="790,88;860,88" d="M 790 88 L 860 88" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="asr_worker" data-edge-to="tts_worker" data-edge-label="dub script" data-edge-key="8" data-edge-id="asr-to-tts" data-composition-points="925,116;925,230" d="M 925 116 L 925 230" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="tts_worker" data-edge-to="render_worker" data-edge-label="dub mix" data-edge-key="9" data-edge-id="tts-to-render" data-composition-points="925,286;925,420" d="M 925 286 L 925 420" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="ocr_worker" data-edge-to="render_worker" data-edge-label="overlay plan" data-edge-key="10" data-edge-id="ocr-to-render" data-composition-points="790,358;825,358;825,448;860,448" d="M 790 358 L 817 358 Q 825 358 825 366 L 825 440 Q 825 448 833 448 L 860 448" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="render_worker" data-edge-to="cas_store" data-edge-label="final CAS" data-edge-key="11" data-edge-id="render-to-cas" data-composition-points="925,476;925,540;590,540;590,540" d="M 925 476 L 925 532 Q 925 540 917 540 L 590 540 L 590 540" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
+        <path data-edge-from="web_ui" data-edge-to="runtime_host" data-edge-label="HTTP / WS" data-edge-key="0" data-edge-id="ui-to-host" data-composition-points="180,245;240,245" d="M 180 245 L 240 245" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="runtime_host" data-edge-to="sqlite_db" data-edge-label="metadata" data-edge-key="1" data-edge-id="host-to-db" data-composition-points="310,215;310,110" d="M 310 215 L 310 110" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="runtime_host" data-edge-to="remote_gateway" data-edge-label="translation" data-edge-key="2" data-edge-id="host-to-gateway" data-composition-points="310,275;310,375" d="M 310 275 L 310 375" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="runtime_host" data-edge-to="orchestrator" data-edge-label="trigger run" data-edge-key="3" data-edge-id="host-to-orch" data-composition-points="380,245;415,245;415,165;450,165" d="M 380 245 L 407 245 Q 415 245 415 237 L 415 173 Q 415 165 423 165 L 450 165" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="orchestrator" data-edge-to="worker_supervisor" data-edge-label="stage plan" data-edge-key="4" data-edge-id="orch-to-supervisor" data-composition-points="520,195;520,295" d="M 520 195 L 520 295" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="worker_supervisor" data-edge-to="cas_store" data-edge-label="CAS lease" data-edge-key="5" data-edge-id="supervisor-to-cas" data-composition-points="520,355;520,455" d="M 520 355 L 520 455" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
+        <path data-edge-from="worker_supervisor" data-edge-to="separation_worker" data-edge-label="spawn IPC" data-edge-key="6" data-edge-id="supervisor-to-sep" data-composition-points="590,325;625,325;625,78;660,78" d="M 590 325 L 617 325 Q 625 325 625 317 L 625 86 Q 625 78 633 78 L 660 78" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="separation_worker" data-edge-to="asr_worker" data-edge-label="vocals 16k" data-edge-key="7" data-edge-id="sep-to-asr" data-composition-points="790,78;860,78" d="M 790 78 L 860 78" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="asr_worker" data-edge-to="tts_worker" data-edge-label="dub script" data-edge-key="8" data-edge-id="asr-to-tts" data-composition-points="925,106;925,215" d="M 925 106 L 925 215" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="tts_worker" data-edge-to="render_worker" data-edge-label="dub mix" data-edge-key="9" data-edge-id="tts-to-render" data-composition-points="925,271;925,375" d="M 925 271 L 925 375" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="ocr_worker" data-edge-to="render_worker" data-edge-label="overlay plan" data-edge-key="10" data-edge-id="ocr-to-render" data-composition-points="790,323;825,323;825,403;860,403" d="M 790 323 L 817 323 Q 825 323 825 331 L 825 395 Q 825 403 833 403 L 860 403" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="render_worker" data-edge-to="cas_store" data-edge-label="final CAS" data-edge-key="11" data-edge-id="render-to-cas" data-composition-points="925,431;925,485;590,485;590,485" d="M 925 431 L 925 477 Q 925 485 917 485 L 590 485 L 590 485" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
 
         <!-- Components -->
-        <g id="node-web_ui" data-node-id="web_ui" data-node-label="Operator Web UI" tabindex="0" role="button" aria-label="Focus Operator Web UI, localhost:8080, Control Plane (Localhost Host Environment)" aria-pressed="false" data-node-kind="frontend" data-node-sublabel="localhost:8080" data-node-tag="Review &amp; Audit" data-node-context="Control Plane (Localhost Host Environment)">
-          <title>Operator Web UI · localhost:8080 · Control Plane (Localhost Host Environment) · Review &amp; Audit</title>
-          <rect x="50" y="240" width="130" height="60" rx="6" class="c-mask"/>
-          <rect x="50" y="240" width="130" height="60" rx="6" class="c-frontend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="frontend" class="semantic-sigil s-frontend" transform="translate(56 246) scale(0.6875)">
+        <g id="node-web_ui" data-node-id="web_ui" data-node-label="Operator Web UI" tabindex="0" role="button" aria-label="Focus Operator Web UI, localhost:8080, Control Plane (Localhost Host Environment)" aria-pressed="false" data-node-kind="frontend" data-node-sublabel="localhost:8080" data-node-tag="Seam 1 Client" data-node-context="Control Plane (Localhost Host Environment)">
+          <title>Operator Web UI · localhost:8080 · Control Plane (Localhost Host Environment) · Seam 1 Client</title>
+          <rect x="50" y="215" width="130" height="60" rx="6" class="c-mask"/>
+          <rect x="50" y="215" width="130" height="60" rx="6" class="c-frontend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="frontend" class="semantic-sigil s-frontend" transform="translate(56 221) scale(0.6875)">
             <rect x="2" y="3" width="12" height="10" rx="2"/>
             <path d="M2 6.5h12"/>
             <circle cx="4.1" cy="4.8" r=".7" class="sigil-fill"/>
             <circle cx="6.3" cy="4.8" r=".7" class="sigil-fill"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="115" y="268" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Operator Web UI</text>
-        <text data-detail="context" x="115" y="284" class="t-muted" font-size="9" text-anchor="middle">localhost:8080</text>
-        <text data-detail="fine" x="115" y="292" class="t-frontend" font-size="7" text-anchor="middle">Review &amp; Audit</text>
+          <text data-node-label="" data-detail-anchor="" x="115" y="243" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Operator Web UI</text>
+        <text data-detail="context" x="115" y="259" class="t-muted" font-size="9" text-anchor="middle">localhost:8080</text>
+        <text data-detail="fine" x="115" y="267" class="t-frontend" font-size="7" text-anchor="middle">Seam 1 Client</text>
         </g>
 
         <g id="node-runtime_host" data-node-id="runtime_host" data-node-label="RuntimeHost Daemon" tabindex="0" role="button" aria-label="Focus RuntimeHost Daemon, Go Service Host, Control Plane (Localhost Host Environment)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="Go Service Host" data-node-tag="Seam 1 (API)" data-node-context="Control Plane (Localhost Host Environment)">
           <title>RuntimeHost Daemon · Go Service Host · Control Plane (Localhost Host Environment) · Seam 1 (API)</title>
-          <rect x="240" y="240" width="140" height="60" rx="6" class="c-mask"/>
-          <rect x="240" y="240" width="140" height="60" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(246 246) scale(0.6875)">
+          <rect x="240" y="215" width="140" height="60" rx="6" class="c-mask"/>
+          <rect x="240" y="215" width="140" height="60" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(246 221) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="310" y="268" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">RuntimeHost Daemon</text>
-        <text data-detail="context" x="310" y="284" class="t-muted" font-size="9" text-anchor="middle">Go Service Host</text>
-        <text data-detail="fine" x="310" y="292" class="t-backend" font-size="7" text-anchor="middle">Seam 1 (API)</text>
+          <text data-node-label="" data-detail-anchor="" x="310" y="243" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">RuntimeHost Daemon</text>
+        <text data-detail="context" x="310" y="259" class="t-muted" font-size="9" text-anchor="middle">Go Service Host</text>
+        <text data-detail="fine" x="310" y="267" class="t-backend" font-size="7" text-anchor="middle">Seam 1 (API)</text>
         </g>
 
-        <g id="node-sqlite_db" data-node-id="sqlite_db" data-node-label="SQLite Metadata" tabindex="0" role="button" aria-label="Focus SQLite Metadata, Runs &amp; Reviews, Control Plane (Localhost Host Environment)" aria-pressed="false" data-node-kind="database" data-node-sublabel="Runs &amp; Reviews" data-node-tag="WAL Mode" data-node-context="Control Plane (Localhost Host Environment)">
-          <title>SQLite Metadata · Runs &amp; Reviews · Control Plane (Localhost Host Environment) · WAL Mode</title>
-          <rect x="240" y="60" width="140" height="60" rx="6" class="c-mask"/>
-          <rect x="240" y="60" width="140" height="60" rx="6" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(246 66) scale(0.6875)">
+        <g id="node-sqlite_db" data-node-id="sqlite_db" data-node-label="SQLite Metadata" tabindex="0" role="button" aria-label="Focus SQLite Metadata, Runs, Jobs &amp; Reviews, Control Plane (Localhost Host Environment)" aria-pressed="false" data-node-kind="database" data-node-sublabel="Runs, Jobs &amp; Reviews" data-node-tag="WAL Mode" data-node-context="Control Plane (Localhost Host Environment)">
+          <title>SQLite Metadata · Runs, Jobs &amp; Reviews · Control Plane (Localhost Host Environment) · WAL Mode</title>
+          <rect x="240" y="50" width="140" height="60" rx="6" class="c-mask"/>
+          <rect x="240" y="50" width="140" height="60" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(246 56) scale(0.6875)">
             <ellipse cx="8" cy="4" rx="5" ry="2"/>
             <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="310" y="88" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">SQLite Metadata</text>
-        <text data-detail="context" x="310" y="104" class="t-muted" font-size="9" text-anchor="middle">Runs &amp; Reviews</text>
-        <text data-detail="fine" x="310" y="112" class="t-database" font-size="7" text-anchor="middle">WAL Mode</text>
+          <text data-node-label="" data-detail-anchor="" x="310" y="78" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">SQLite Metadata</text>
+        <text data-detail="context" x="310" y="94" class="t-muted" font-size="9" text-anchor="middle">Runs, Jobs &amp; Reviews</text>
+        <text data-detail="fine" x="310" y="102" class="t-database" font-size="7" text-anchor="middle">WAL Mode</text>
         </g>
 
-        <g id="node-remote_gateway" data-node-id="remote_gateway" data-node-label="Authorized LLM" tabindex="0" role="button" aria-label="Focus Authorized LLM, Gemini -&gt; DeepSeek, Control Plane (Localhost Host Environment)" aria-pressed="false" data-node-kind="cloud" data-node-sublabel="Gemini -&gt; DeepSeek" data-node-tag="VI/EN Translation" data-node-context="Control Plane (Localhost Host Environment)">
-          <title>Authorized LLM · Gemini -&gt; DeepSeek · Control Plane (Localhost Host Environment) · VI/EN Translation</title>
-          <rect x="240" y="420" width="140" height="60" rx="6" class="c-mask"/>
-          <rect x="240" y="420" width="140" height="60" rx="6" class="c-cloud" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="cloud" class="semantic-sigil s-cloud" transform="translate(246 426) scale(0.6875)">
+        <g id="node-remote_gateway" data-node-id="remote_gateway" data-node-label="Remote Gateway" tabindex="0" role="button" aria-label="Focus Remote Gateway, Gemini -&gt; DeepSeek, Control Plane (Localhost Host Environment)" aria-pressed="false" data-node-kind="cloud" data-node-sublabel="Gemini -&gt; DeepSeek" data-node-tag="Strictly Remote" data-node-context="Control Plane (Localhost Host Environment)">
+          <title>Remote Gateway · Gemini -&gt; DeepSeek · Control Plane (Localhost Host Environment) · Strictly Remote</title>
+          <rect x="240" y="375" width="140" height="60" rx="6" class="c-mask"/>
+          <rect x="240" y="375" width="140" height="60" rx="6" class="c-cloud" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="cloud" class="semantic-sigil s-cloud" transform="translate(246 381) scale(0.6875)">
             <path d="M4.3 12.5h7.3a2.4 2.4 0 0 0 .2-4.8 4 4 0 0 0-7.5-1.3A3.1 3.1 0 0 0 4.3 12.5Z"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="310" y="448" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Authorized LLM</text>
-        <text data-detail="context" x="310" y="464" class="t-muted" font-size="9" text-anchor="middle">Gemini -&gt; DeepSeek</text>
-        <text data-detail="fine" x="310" y="472" class="t-cloud" font-size="7" text-anchor="middle">VI/EN Translation</text>
+          <text data-node-label="" data-detail-anchor="" x="310" y="403" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Remote Gateway</text>
+        <text data-detail="context" x="310" y="419" class="t-muted" font-size="9" text-anchor="middle">Gemini -&gt; DeepSeek</text>
+        <text data-detail="fine" x="310" y="427" class="t-cloud" font-size="7" text-anchor="middle">Strictly Remote</text>
         </g>
 
         <g id="node-orchestrator" data-node-id="orchestrator" data-node-label="Pipeline Orchestrator" tabindex="0" role="button" aria-label="Focus Pipeline Orchestrator, Stage FSM &amp; DAG, Control Plane (Localhost Host Environment)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="Stage FSM &amp; DAG" data-node-tag="FSM Engine" data-node-context="Control Plane (Localhost Host Environment)">
           <title>Pipeline Orchestrator · Stage FSM &amp; DAG · Control Plane (Localhost Host Environment) · FSM Engine</title>
-          <rect x="450" y="150" width="140" height="60" rx="6" class="c-mask"/>
-          <rect x="450" y="150" width="140" height="60" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(456 156) scale(0.6875)">
+          <rect x="450" y="135" width="140" height="60" rx="6" class="c-mask"/>
+          <rect x="450" y="135" width="140" height="60" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(456 141) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="520" y="178" class="t-primary" font-size="10.4" font-weight="600" text-anchor="middle">Pipeline Orchestrator</text>
-        <text data-detail="context" x="520" y="194" class="t-muted" font-size="9" text-anchor="middle">Stage FSM &amp; DAG</text>
-        <text data-detail="fine" x="520" y="202" class="t-backend" font-size="7" text-anchor="middle">FSM Engine</text>
+          <text data-node-label="" data-detail-anchor="" x="520" y="163" class="t-primary" font-size="10.4" font-weight="600" text-anchor="middle">Pipeline Orchestrator</text>
+        <text data-detail="context" x="520" y="179" class="t-muted" font-size="9" text-anchor="middle">Stage FSM &amp; DAG</text>
+        <text data-detail="fine" x="520" y="187" class="t-backend" font-size="7" text-anchor="middle">FSM Engine</text>
         </g>
 
         <g id="node-worker_supervisor" data-node-id="worker_supervisor" data-node-label="Worker Supervisor" tabindex="0" role="button" aria-label="Focus Worker Supervisor, Process Tree &amp; Lease, Control Plane (Localhost Host Environment)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="Process Tree &amp; Lease" data-node-tag="Single GPU Lease" data-node-context="Control Plane (Localhost Host Environment)">
           <title>Worker Supervisor · Process Tree &amp; Lease · Control Plane (Localhost Host Environment) · Single GPU Lease</title>
-          <rect x="450" y="330" width="140" height="60" rx="6" class="c-mask"/>
-          <rect x="450" y="330" width="140" height="60" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(456 336) scale(0.6875)">
+          <rect x="450" y="295" width="140" height="60" rx="6" class="c-mask"/>
+          <rect x="450" y="295" width="140" height="60" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(456 301) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="520" y="358" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Worker Supervisor</text>
-        <text data-detail="context" x="520" y="374" class="t-muted" font-size="9" text-anchor="middle">Process Tree &amp; Lease</text>
-        <text data-detail="fine" x="520" y="382" class="t-backend" font-size="7" text-anchor="middle">Single GPU Lease</text>
+          <text data-node-label="" data-detail-anchor="" x="520" y="323" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Worker Supervisor</text>
+        <text data-detail="context" x="520" y="339" class="t-muted" font-size="9" text-anchor="middle">Process Tree &amp; Lease</text>
+        <text data-detail="fine" x="520" y="347" class="t-backend" font-size="7" text-anchor="middle">Single GPU Lease</text>
         </g>
 
         <g id="node-cas_store" data-node-id="cas_store" data-node-label="CAS Store" tabindex="0" role="button" aria-label="Focus CAS Store, Immutable SHA-256, Control Plane (Localhost Host Environment)" aria-pressed="false" data-node-kind="database" data-node-sublabel="Immutable SHA-256" data-node-tag="Artifacts" data-node-context="Control Plane (Localhost Host Environment)">
           <title>CAS Store · Immutable SHA-256 · Control Plane (Localhost Host Environment) · Artifacts</title>
-          <rect x="450" y="510" width="140" height="60" rx="6" class="c-mask"/>
-          <rect x="450" y="510" width="140" height="60" rx="6" class="c-database" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(456 516) scale(0.6875)">
+          <rect x="450" y="455" width="140" height="60" rx="6" class="c-mask"/>
+          <rect x="450" y="455" width="140" height="60" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(456 461) scale(0.6875)">
             <ellipse cx="8" cy="4" rx="5" ry="2"/>
             <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="520" y="538" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">CAS Store</text>
-        <text data-detail="context" x="520" y="554" class="t-muted" font-size="9" text-anchor="middle">Immutable SHA-256</text>
-        <text data-detail="fine" x="520" y="562" class="t-database" font-size="7" text-anchor="middle">Artifacts</text>
+          <text data-node-label="" data-detail-anchor="" x="520" y="483" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">CAS Store</text>
+        <text data-detail="context" x="520" y="499" class="t-muted" font-size="9" text-anchor="middle">Immutable SHA-256</text>
+        <text data-detail="fine" x="520" y="507" class="t-database" font-size="7" text-anchor="middle">Artifacts</text>
         </g>
 
         <g id="node-separation_worker" data-node-id="separation_worker" data-node-label="Audio Separation" tabindex="0" role="button" aria-label="Focus Audio Separation, Demucs / UVR, Execution Plane (Seam 2 StageWorkers)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="Demucs / UVR" data-node-tag="16kHz Mono" data-node-context="Execution Plane (Seam 2 StageWorkers)">
           <title>Audio Separation · Demucs / UVR · Execution Plane (Seam 2 StageWorkers) · 16kHz Mono</title>
-          <rect x="660" y="60" width="130" height="56" rx="6" class="c-mask"/>
-          <rect x="660" y="60" width="130" height="56" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(666 66) scale(0.6875)">
+          <rect x="660" y="50" width="130" height="56" rx="6" class="c-mask"/>
+          <rect x="660" y="50" width="130" height="56" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(666 56) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="725" y="86" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Audio Separation</text>
-        <text data-detail="context" x="725" y="102" class="t-muted" font-size="9" text-anchor="middle">Demucs / UVR</text>
-        <text data-detail="fine" x="725" y="108" class="t-backend" font-size="7" text-anchor="middle">16kHz Mono</text>
+          <text data-node-label="" data-detail-anchor="" x="725" y="76" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Audio Separation</text>
+        <text data-detail="context" x="725" y="92" class="t-muted" font-size="9" text-anchor="middle">Demucs / UVR</text>
+        <text data-detail="fine" x="725" y="98" class="t-backend" font-size="7" text-anchor="middle">16kHz Mono</text>
         </g>
 
-        <g id="node-asr_worker" data-node-id="asr_worker" data-node-label="ASR Worker" tabindex="0" role="button" aria-label="Focus ASR Worker, Qwen3-ASR &amp; Align, Execution Plane (Seam 2 StageWorkers)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="Qwen3-ASR &amp; Align" data-node-tag="Speech Blocks" data-node-context="Execution Plane (Seam 2 StageWorkers)">
-          <title>ASR Worker · Qwen3-ASR &amp; Align · Execution Plane (Seam 2 StageWorkers) · Speech Blocks</title>
-          <rect x="860" y="60" width="130" height="56" rx="6" class="c-mask"/>
-          <rect x="860" y="60" width="130" height="56" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(866 66) scale(0.6875)">
+        <g id="node-asr_worker" data-node-id="asr_worker" data-node-label="ASR &amp; Aligner" tabindex="0" role="button" aria-label="Focus ASR &amp; Aligner, Qwen3 + 3D-Speaker, Execution Plane (Seam 2 StageWorkers)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="Qwen3 + 3D-Speaker" data-node-tag="Speech Blocks" data-node-context="Execution Plane (Seam 2 StageWorkers)">
+          <title>ASR &amp; Aligner · Qwen3 + 3D-Speaker · Execution Plane (Seam 2 StageWorkers) · Speech Blocks</title>
+          <rect x="860" y="50" width="130" height="56" rx="6" class="c-mask"/>
+          <rect x="860" y="50" width="130" height="56" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(866 56) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="925" y="86" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">ASR Worker</text>
-        <text data-detail="context" x="925" y="102" class="t-muted" font-size="9" text-anchor="middle">Qwen3-ASR &amp; Align</text>
-        <text data-detail="fine" x="925" y="108" class="t-backend" font-size="7" text-anchor="middle">Speech Blocks</text>
+          <text data-node-label="" data-detail-anchor="" x="925" y="76" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">ASR &amp; Aligner</text>
+        <text data-detail="context" x="925" y="92" class="t-muted" font-size="9" text-anchor="middle">Qwen3 + 3D-Speaker</text>
+        <text data-detail="fine" x="925" y="98" class="t-backend" font-size="7" text-anchor="middle">Speech Blocks</text>
         </g>
 
-        <g id="node-ocr_worker" data-node-id="ocr_worker" data-node-label="OCR Worker" tabindex="0" role="button" aria-label="Focus OCR Worker, PaddleOCR + Refine, Execution Plane (Seam 2 StageWorkers)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="PaddleOCR + Refine" data-node-tag="Ink Refine" data-node-context="Execution Plane (Seam 2 StageWorkers)">
-          <title>OCR Worker · PaddleOCR + Refine · Execution Plane (Seam 2 StageWorkers) · Ink Refine</title>
-          <rect x="660" y="330" width="130" height="56" rx="6" class="c-mask"/>
-          <rect x="660" y="330" width="130" height="56" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(666 336) scale(0.6875)">
+        <g id="node-ocr_worker" data-node-id="ocr_worker" data-node-label="OCR &amp; Ink Refine" tabindex="0" role="button" aria-label="Focus OCR &amp; Ink Refine, PaddleOCR + Refine, Execution Plane (Seam 2 StageWorkers)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="PaddleOCR + Refine" data-node-tag="Ink Refine" data-node-context="Execution Plane (Seam 2 StageWorkers)">
+          <title>OCR &amp; Ink Refine · PaddleOCR + Refine · Execution Plane (Seam 2 StageWorkers) · Ink Refine</title>
+          <rect x="660" y="295" width="130" height="56" rx="6" class="c-mask"/>
+          <rect x="660" y="295" width="130" height="56" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(666 301) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="725" y="356" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">OCR Worker</text>
-        <text data-detail="context" x="725" y="372" class="t-muted" font-size="9" text-anchor="middle">PaddleOCR + Refine</text>
-        <text data-detail="fine" x="725" y="378" class="t-backend" font-size="7" text-anchor="middle">Ink Refine</text>
+          <text data-node-label="" data-detail-anchor="" x="725" y="321" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">OCR &amp; Ink Refine</text>
+        <text data-detail="context" x="725" y="337" class="t-muted" font-size="9" text-anchor="middle">PaddleOCR + Refine</text>
+        <text data-detail="fine" x="725" y="343" class="t-backend" font-size="7" text-anchor="middle">Ink Refine</text>
         </g>
 
-        <g id="node-tts_worker" data-node-id="tts_worker" data-node-label="TTS Worker" tabindex="0" role="button" aria-label="Focus TTS Worker, ZeroTTS / CosyVoice, Execution Plane (Seam 2 StageWorkers)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="ZeroTTS / CosyVoice" data-node-tag="Zero Overrun" data-node-context="Execution Plane (Seam 2 StageWorkers)">
-          <title>TTS Worker · ZeroTTS / CosyVoice · Execution Plane (Seam 2 StageWorkers) · Zero Overrun</title>
-          <rect x="860" y="230" width="130" height="56" rx="6" class="c-mask"/>
-          <rect x="860" y="230" width="130" height="56" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(866 236) scale(0.6875)">
+        <g id="node-tts_worker" data-node-id="tts_worker" data-node-label="TTS Worker" tabindex="0" role="button" aria-label="Focus TTS Worker, ZeroTTS / CosyVoice3, Execution Plane (Seam 2 StageWorkers)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="ZeroTTS / CosyVoice3" data-node-tag="Zero Overrun" data-node-context="Execution Plane (Seam 2 StageWorkers)">
+          <title>TTS Worker · ZeroTTS / CosyVoice3 · Execution Plane (Seam 2 StageWorkers) · Zero Overrun</title>
+          <rect x="860" y="215" width="130" height="56" rx="6" class="c-mask"/>
+          <rect x="860" y="215" width="130" height="56" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(866 221) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="925" y="256" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">TTS Worker</text>
-        <text data-detail="context" x="925" y="272" class="t-muted" font-size="9" text-anchor="middle">ZeroTTS / CosyVoice</text>
-        <text data-detail="fine" x="925" y="278" class="t-backend" font-size="7" text-anchor="middle">Zero Overrun</text>
+          <text data-node-label="" data-detail-anchor="" x="925" y="241" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">TTS Worker</text>
+        <text data-detail="context" x="925" y="257" class="t-muted" font-size="9" text-anchor="middle">ZeroTTS / CosyVoice3</text>
+        <text data-detail="fine" x="925" y="263" class="t-backend" font-size="7" text-anchor="middle">Zero Overrun</text>
         </g>
 
         <g id="node-render_worker" data-node-id="render_worker" data-node-label="Render Worker" tabindex="0" role="button" aria-label="Focus Render Worker, FFmpeg Mix &amp; Draw, Execution Plane (Seam 2 StageWorkers)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="FFmpeg Mix &amp; Draw" data-node-tag="Final Media" data-node-context="Execution Plane (Seam 2 StageWorkers)">
           <title>Render Worker · FFmpeg Mix &amp; Draw · Execution Plane (Seam 2 StageWorkers) · Final Media</title>
-          <rect x="860" y="420" width="130" height="56" rx="6" class="c-mask"/>
-          <rect x="860" y="420" width="130" height="56" rx="6" class="c-backend" stroke-width="1.5"/>
-          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(866 426) scale(0.6875)">
+          <rect x="860" y="375" width="130" height="56" rx="6" class="c-mask"/>
+          <rect x="860" y="375" width="130" height="56" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(866 381) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="925" y="446" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Render Worker</text>
-        <text data-detail="context" x="925" y="462" class="t-muted" font-size="9" text-anchor="middle">FFmpeg Mix &amp; Draw</text>
-        <text data-detail="fine" x="925" y="468" class="t-backend" font-size="7" text-anchor="middle">Final Media</text>
+          <text data-node-label="" data-detail-anchor="" x="925" y="401" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Render Worker</text>
+        <text data-detail="context" x="925" y="417" class="t-muted" font-size="9" text-anchor="middle">FFmpeg Mix &amp; Draw</text>
+        <text data-detail="fine" x="925" y="423" class="t-backend" font-size="7" text-anchor="middle">Final Media</text>
         </g>
 
         <!-- Connection labels -->
         <g data-detail="context" data-edge-from="web_ui" data-edge-to="runtime_host" data-edge-label="HTTP / WS" data-edge-key="0" data-edge-id="ui-to-host">
-          <rect x="183.4" y="250" width="53.199999999999996" height="14" rx="3" class="c-mask"/>
-          <text x="210" y="260" class="t-backend" font-size="8" text-anchor="middle">HTTP / WS</text>
+          <rect x="183.4" y="225" width="53.199999999999996" height="14" rx="3" class="c-mask"/>
+          <text x="210" y="235" class="t-backend" font-size="8" text-anchor="middle">HTTP / WS</text>
         </g>
         <g data-detail="context" data-edge-from="runtime_host" data-edge-to="sqlite_db" data-edge-label="metadata" data-edge-key="1" data-edge-id="host-to-db">
-          <rect x="320.8" y="165" width="48.4" height="14" rx="3" class="c-mask"/>
-          <text x="345" y="175" class="t-muted" font-size="8" text-anchor="middle">metadata</text>
+          <rect x="320.8" y="145" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="345" y="155" class="t-muted" font-size="8" text-anchor="middle">metadata</text>
         </g>
         <g data-detail="context" data-edge-from="runtime_host" data-edge-to="remote_gateway" data-edge-label="translation" data-edge-key="2" data-edge-id="host-to-gateway">
-          <rect x="318.6" y="345" width="62.8" height="14" rx="3" class="c-mask"/>
-          <text x="350" y="355" class="t-security" font-size="8" text-anchor="middle">translation</text>
+          <rect x="318.6" y="305" width="62.8" height="14" rx="3" class="c-mask"/>
+          <text x="350" y="315" class="t-security" font-size="8" text-anchor="middle">translation</text>
         </g>
         <g data-detail="context" data-edge-from="runtime_host" data-edge-to="orchestrator" data-edge-label="trigger run" data-edge-key="3" data-edge-id="host-to-orch">
-          <rect x="383.6" y="205" width="62.8" height="14" rx="3" class="c-mask"/>
-          <text x="415" y="215" class="t-backend" font-size="8" text-anchor="middle">trigger run</text>
+          <rect x="383.6" y="185" width="62.8" height="14" rx="3" class="c-mask"/>
+          <text x="415" y="195" class="t-backend" font-size="8" text-anchor="middle">trigger run</text>
         </g>
         <g data-detail="context" data-edge-from="orchestrator" data-edge-to="worker_supervisor" data-edge-label="stage plan" data-edge-key="4" data-edge-id="orch-to-supervisor">
-          <rect x="531" y="255" width="58" height="14" rx="3" class="c-mask"/>
-          <text x="560" y="265" class="t-muted" font-size="8" text-anchor="middle">stage plan</text>
+          <rect x="531" y="225" width="58" height="14" rx="3" class="c-mask"/>
+          <text x="560" y="235" class="t-muted" font-size="8" text-anchor="middle">stage plan</text>
         </g>
         <g data-detail="context" data-edge-from="worker_supervisor" data-edge-to="cas_store" data-edge-label="CAS lease" data-edge-key="5" data-edge-id="supervisor-to-cas">
-          <rect x="533.4" y="435" width="53.199999999999996" height="14" rx="3" class="c-mask"/>
-          <text x="560" y="445" class="t-messagebus" font-size="8" text-anchor="middle">CAS lease</text>
+          <rect x="533.4" y="385" width="53.199999999999996" height="14" rx="3" class="c-mask"/>
+          <text x="560" y="395" class="t-messagebus" font-size="8" text-anchor="middle">CAS lease</text>
         </g>
         <g data-detail="context" data-edge-from="worker_supervisor" data-edge-to="separation_worker" data-edge-label="spawn IPC" data-edge-key="6" data-edge-id="supervisor-to-sep">
-          <rect x="598.4" y="204" width="53.199999999999996" height="14" rx="3" class="c-mask"/>
-          <text x="625" y="214" class="t-muted" font-size="8" text-anchor="middle">spawn IPC</text>
+          <rect x="598.4" y="181.5" width="53.199999999999996" height="14" rx="3" class="c-mask"/>
+          <text x="625" y="191.5" class="t-muted" font-size="8" text-anchor="middle">spawn IPC</text>
         </g>
-        <g data-detail="context" data-edge-from="separation_worker" data-edge-to="asr_worker" data-edge-label="vocals" data-edge-key="7" data-edge-id="sep-to-asr">
-          <rect x="805.6" y="68" width="38.8" height="14" rx="3" class="c-mask"/>
-          <text x="825" y="78" class="t-backend" font-size="8" text-anchor="middle">vocals</text>
+        <g data-detail="context" data-edge-from="separation_worker" data-edge-to="asr_worker" data-edge-label="vocals 16k" data-edge-key="7" data-edge-id="sep-to-asr">
+          <rect x="796" y="58" width="58" height="14" rx="3" class="c-mask"/>
+          <text x="825" y="68" class="t-backend" font-size="8" text-anchor="middle">vocals 16k</text>
         </g>
         <g data-detail="context" data-edge-from="asr_worker" data-edge-to="tts_worker" data-edge-label="dub script" data-edge-key="8" data-edge-id="asr-to-tts">
-          <rect x="936" y="160" width="58" height="14" rx="3" class="c-mask"/>
-          <text x="965" y="170" class="t-backend" font-size="8" text-anchor="middle">dub script</text>
+          <rect x="936" y="140" width="58" height="14" rx="3" class="c-mask"/>
+          <text x="965" y="150" class="t-backend" font-size="8" text-anchor="middle">dub script</text>
         </g>
         <g data-detail="context" data-edge-from="tts_worker" data-edge-to="render_worker" data-edge-label="dub mix" data-edge-key="9" data-edge-id="tts-to-render">
-          <rect x="943.2" y="340" width="43.6" height="14" rx="3" class="c-mask"/>
-          <text x="965" y="350" class="t-backend" font-size="8" text-anchor="middle">dub mix</text>
+          <rect x="943.2" y="300" width="43.6" height="14" rx="3" class="c-mask"/>
+          <text x="965" y="310" class="t-backend" font-size="8" text-anchor="middle">dub mix</text>
         </g>
         <g data-detail="context" data-edge-from="ocr_worker" data-edge-to="render_worker" data-edge-label="overlay plan" data-edge-key="10" data-edge-id="ocr-to-render">
-          <rect x="756.2" y="390" width="67.6" height="14" rx="3" class="c-mask"/>
-          <text x="790" y="400" class="t-muted" font-size="8" text-anchor="middle">overlay plan</text>
+          <rect x="756.2" y="355" width="67.6" height="14" rx="3" class="c-mask"/>
+          <text x="790" y="365" class="t-muted" font-size="8" text-anchor="middle">overlay plan</text>
         </g>
         <g data-detail="context" data-edge-from="render_worker" data-edge-to="cas_store" data-edge-label="final CAS" data-edge-key="11" data-edge-id="render-to-cas">
-          <rect x="723.4" y="518" width="53.199999999999996" height="14" rx="3" class="c-mask"/>
-          <text x="750" y="528" class="t-messagebus" font-size="8" text-anchor="middle">final CAS</text>
+          <rect x="723.4" y="463" width="53.199999999999996" height="14" rx="3" class="c-mask"/>
+          <text x="750" y="473" class="t-messagebus" font-size="8" text-anchor="middle">final CAS</text>
         </g>
 
         <!-- Boundary labels (foreground masks keep routes out of titles) -->
         <g data-graph-role="structural-frame-label" data-composition-frame-id="0" data-composition-frame-kind="region" data-composition-frame-label="Control Plane (Localhost Host Environment)">
-          <rect data-graph-role="structural-frame-label-mask" x="24" y="40" width="236.79999999999998" height="16" rx="3" class="c-mask"/>
-          <text data-boundary-label="" x="28" y="53" class="t-cloud" font-size="9" font-weight="600">Control Plane (Localhost Host Environment)</text>
+          <rect data-graph-role="structural-frame-label-mask" x="24" y="30" width="236.79999999999998" height="16" rx="3" class="c-mask"/>
+          <text data-boundary-label="" x="28" y="43" class="t-cloud" font-size="9" font-weight="600">Control Plane (Localhost Host Environment)</text>
         </g>
 
         <g data-graph-role="structural-frame-label" data-composition-frame-id="1" data-composition-frame-kind="security-group" data-composition-frame-label="Execution Plane (Seam 2 StageWorkers)">
-          <rect data-graph-role="structural-frame-label-mask" x="634" y="40" width="209.79999999999998" height="16" rx="3" class="c-mask"/>
-          <text data-boundary-label="" x="638" y="53" class="t-security" font-size="9" font-weight="600">Execution Plane (Seam 2 StageWorkers)</text>
+          <rect data-graph-role="structural-frame-label-mask" x="634" y="30" width="209.79999999999998" height="16" rx="3" class="c-mask"/>
+          <text data-boundary-label="" x="638" y="43" class="t-security" font-size="9" font-weight="600">Execution Plane (Seam 2 StageWorkers)</text>
         </g>
 
         <!-- Legend -->
         <g data-legend="" data-legend-bridge="">
-          <text x="40" y="622" class="t-primary" font-size="12" font-weight="650">Legend</text>
-          <g data-legend-semantic-kind="frontend" data-legend-kind="frontend" data-legend-label="Frontend" data-legend-x="40" data-legend-baseline="642" data-legend-width="83">
-            <rect x="40" y="633" width="16" height="10" rx="2.5" class="c-frontend" stroke-width="1"/>
-            <text x="62" y="642" class="t-muted" font-size="10" font-weight="500">Frontend</text>
+          <text x="40" y="567" class="t-primary" font-size="12" font-weight="650">Legend</text>
+          <g data-legend-semantic-kind="frontend" data-legend-kind="frontend" data-legend-label="Frontend" data-legend-x="40" data-legend-baseline="587" data-legend-width="83">
+            <rect x="40" y="578" width="16" height="10" rx="2.5" class="c-frontend" stroke-width="1"/>
+            <text x="62" y="587" class="t-muted" font-size="10" font-weight="500">Frontend</text>
           </g>
-          <g data-legend-semantic-kind="backend" data-legend-kind="backend" data-legend-label="Backend" data-legend-x="145" data-legend-baseline="642" data-legend-width="78">
-            <rect x="145" y="633" width="16" height="10" rx="2.5" class="c-backend" stroke-width="1"/>
-            <text x="167" y="642" class="t-muted" font-size="10" font-weight="500">Backend</text>
+          <g data-legend-semantic-kind="backend" data-legend-kind="backend" data-legend-label="Backend" data-legend-x="145" data-legend-baseline="587" data-legend-width="78">
+            <rect x="145" y="578" width="16" height="10" rx="2.5" class="c-backend" stroke-width="1"/>
+            <text x="167" y="587" class="t-muted" font-size="10" font-weight="500">Backend</text>
           </g>
-          <g data-legend-semantic-kind="database" data-legend-kind="database" data-legend-label="Database" data-legend-x="245" data-legend-baseline="642" data-legend-width="83">
-            <rect x="245" y="633" width="16" height="10" rx="2.5" class="c-database" stroke-width="1"/>
-            <text x="267" y="642" class="t-muted" font-size="10" font-weight="500">Database</text>
+          <g data-legend-semantic-kind="database" data-legend-kind="database" data-legend-label="Database" data-legend-x="245" data-legend-baseline="587" data-legend-width="83">
+            <rect x="245" y="578" width="16" height="10" rx="2.5" class="c-database" stroke-width="1"/>
+            <text x="267" y="587" class="t-muted" font-size="10" font-weight="500">Database</text>
           </g>
-          <g data-legend-semantic-kind="cloud" data-legend-kind="cloud" data-legend-label="Cloud" data-legend-x="350" data-legend-baseline="642" data-legend-width="68">
-            <rect x="350" y="633" width="16" height="10" rx="2.5" class="c-cloud" stroke-width="1"/>
-            <text x="372" y="642" class="t-muted" font-size="10" font-weight="500">Cloud</text>
+          <g data-legend-semantic-kind="cloud" data-legend-kind="cloud" data-legend-label="Cloud" data-legend-x="350" data-legend-baseline="587" data-legend-width="68">
+            <rect x="350" y="578" width="16" height="10" rx="2.5" class="c-cloud" stroke-width="1"/>
+            <text x="372" y="587" class="t-muted" font-size="10" font-weight="500">Cloud</text>
           </g>
         </g>
       </svg>
@@ -5594,36 +5594,24 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
       <div class="card">
         <div class="card-header">
           <div class="card-dot cyan"></div>
-          <h3>Control Plane</h3>
+          <h3>Control &amp; Execution Planes (Seam 1 &amp; 2)</h3>
         </div>
         <ul>
-          <li>&bull; RuntimeHost quản lý DAG FSM và điều phối tác vụ</li>
-          <li>&bull; SQLite lưu metadata run/job/review, CAS lưu trữ artifact bất biến</li>
-          <li>&bull; Dịch thuật ngữ nghĩa bắt buộc qua Remote LLM Gateway (Gemini 3.8 Flash -&gt; DeepSeek v4.1 Flash)</li>
-        </ul>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <div class="card-dot emerald"></div>
-          <h3>Execution Plane (Seam 2)</h3>
-        </div>
-        <ul>
-          <li>&bull; StageWorker giao tiếp qua NDJSON trên stdin/stdout</li>
-          <li>&bull; Single GPU Lease quản lý chuyển giao tài nguyên giữa các worker</li>
-          <li>&bull; StageWorker chỉ trao đổi reference đường dẫn CAS, không gửi raw binary</li>
+          <li>&bull; RuntimeHost điều phối DAG FSM, SQLite WAL, CAS SHA-256 và REST/WS API tại localhost:8080 (Seam 1)</li>
+          <li>&bull; Dịch thuật VI/EN bắt buộc qua Remote LLM Gateway (Gemini 3.8 Flash -&gt; DeepSeek v4.1 Flash), không dùng local LLM</li>
+          <li>&bull; StageWorker giao tiếp qua NDJSON (Seam 2), cấp phát Single GPU Lease và trao đổi tham chiếu CAS</li>
         </ul>
       </div>
 
       <div class="card">
         <div class="card-header">
           <div class="card-dot rose"></div>
-          <h3>Quality Invariants</h3>
+          <h3>Quality &amp; Domain Invariants</h3>
         </div>
         <ul>
-          <li>&bull; Mốc thời gian video gốc (source timing) là bất biến</li>
-          <li>&bull; TTS không được overrun lời thoại kế tiếp (tts_finish &lt;= source_end)</li>
-          <li>&bull; Dữ liệu audio chuẩn hóa 16kHz mono fail-closed</li>
+          <li>&bull; SourceTimeline bất biến; thời lượng video và âm thanh bảo toàn tuyệt đối không co giãn</li>
+          <li>&bull; Zero Overrun: tts_finish &lt;= source_end; tự động escalate speaker sang CosyVoice3 nếu ZeroTTS quá thời lượng</li>
+          <li>&bull; Fail-Closed: từ chối hòa âm (ErrMixerOverrunRefused) nếu có lời thoại nhưng không có clip lồng tiếng đặt được</li>
         </ul>
       </div>
     </div>

@@ -8,43 +8,43 @@
     "views": [
       {
         "id": "full-topology",
-        "label": "Toàn cảnh hệ thống",
+        "label": "Toàn cảnh kiến trúc hệ thống",
         "focus": ["web_ui", "runtime_host", "orchestrator", "worker_supervisor", "sqlite_db", "cas_store", "remote_gateway", "separation_worker", "asr_worker", "ocr_worker", "tts_worker", "render_worker"],
-        "note": "Ranh giới giữa Control Plane (RuntimeHost daemon) và Execution Plane (Seam 2 StageWorkers)."
+        "note": "Ranh giới giữa Control Plane (RuntimeHost daemon - Seam 1) và Execution Plane (StageWorkers - Seam 2)."
       },
       {
         "id": "control-plane",
-        "label": "Control Plane",
+        "label": "Control Plane (Seam 1)",
         "focus": ["web_ui", "runtime_host", "orchestrator", "worker_supervisor", "sqlite_db", "cas_store"],
-        "note": "Quản lý FSM state, metadata SQLite, CAS artifact và điều phối tiến trình worker."
+        "note": "Điều phối FSM state, metadata SQLite WAL, artifact CAS và cấp phát Single GPU Lease."
       },
       {
         "id": "translation-gateway",
         "label": "Remote Translation Gateway",
         "focus": ["runtime_host", "remote_gateway"],
-        "note": "Dịch thuật ngữ nghĩa bắt buộc qua Remote LLM Gateway (Gemini 3.8 Flash -> DeepSeek v4.1 Flash)."
+        "note": "Dịch thuật ngữ nghĩa bắt buộc qua Remote LLM Gateway (Gemini 3.8 Flash -> DeepSeek v4.1 Flash), fail-closed."
       },
       {
         "id": "media-pipeline",
-        "label": "Execution Pipeline",
+        "label": "Execution Plane (Seam 2)",
         "focus": ["worker_supervisor", "separation_worker", "asr_worker", "ocr_worker", "tts_worker", "render_worker", "cas_store"],
-        "note": "Chuỗi pipeline xử lý tách âm thanh, nhận dạng, dịch văn bản hình ảnh, lồng tiếng và render hoàn thiện."
+        "note": "Chuỗi worker chuyên biệt: tách âm Demucs/UVR, Qwen3-ASR, PaddleOCR, ZeroTTS/CosyVoice3 và FFmpeg render."
       }
     ]
   },
   "components": [
-    { "id": "web_ui", "type": "frontend", "label": "Operator Web UI", "sublabel": "localhost:8080", "pos": [50, 240], "size": [130, 60], "tag": "Review & Audit" },
-    { "id": "runtime_host", "type": "backend", "label": "RuntimeHost Daemon", "sublabel": "Go Service Host", "pos": [240, 240], "size": [140, 60], "tag": "Seam 1 (API)" },
-    { "id": "sqlite_db", "type": "database", "label": "SQLite Metadata", "sublabel": "Runs & Reviews", "pos": [240, 60], "size": [140, 60], "tag": "WAL Mode" },
-    { "id": "remote_gateway", "type": "cloud", "label": "Authorized LLM", "sublabel": "Gemini -> DeepSeek", "pos": [240, 420], "size": [140, 60], "tag": "VI/EN Translation" },
-    { "id": "orchestrator", "type": "backend", "label": "Pipeline Orchestrator", "sublabel": "Stage FSM & DAG", "pos": [450, 150], "size": [140, 60], "tag": "FSM Engine" },
-    { "id": "worker_supervisor", "type": "backend", "label": "Worker Supervisor", "sublabel": "Process Tree & Lease", "pos": [450, 330], "size": [140, 60], "tag": "Single GPU Lease" },
-    { "id": "cas_store", "type": "database", "label": "CAS Store", "sublabel": "Immutable SHA-256", "pos": [450, 510], "size": [140, 60], "tag": "Artifacts" },
-    { "id": "separation_worker", "type": "backend", "label": "Audio Separation", "sublabel": "Demucs / UVR", "pos": [660, 60], "size": [130, 56], "tag": "16kHz Mono" },
-    { "id": "asr_worker", "type": "backend", "label": "ASR Worker", "sublabel": "Qwen3-ASR & Align", "pos": [860, 60], "size": [130, 56], "tag": "Speech Blocks" },
-    { "id": "ocr_worker", "type": "backend", "label": "OCR Worker", "sublabel": "PaddleOCR + Refine", "pos": [660, 330], "size": [130, 56], "tag": "Ink Refine" },
-    { "id": "tts_worker", "type": "backend", "label": "TTS Worker", "sublabel": "ZeroTTS / CosyVoice", "pos": [860, 230], "size": [130, 56], "tag": "Zero Overrun" },
-    { "id": "render_worker", "type": "backend", "label": "Render Worker", "sublabel": "FFmpeg Mix & Draw", "pos": [860, 420], "size": [130, 56], "tag": "Final Media" }
+    { "id": "web_ui", "type": "frontend", "label": "Operator Web UI", "sublabel": "localhost:8080", "pos": [50, 215], "size": [130, 60], "tag": "Seam 1 Client" },
+    { "id": "runtime_host", "type": "backend", "label": "RuntimeHost Daemon", "sublabel": "Go Service Host", "pos": [240, 215], "size": [140, 60], "tag": "Seam 1 (API)" },
+    { "id": "sqlite_db", "type": "database", "label": "SQLite Metadata", "sublabel": "Runs, Jobs & Reviews", "pos": [240, 50], "size": [140, 60], "tag": "WAL Mode" },
+    { "id": "remote_gateway", "type": "cloud", "label": "Remote Gateway", "sublabel": "Gemini -> DeepSeek", "pos": [240, 375], "size": [140, 60], "tag": "Strictly Remote" },
+    { "id": "orchestrator", "type": "backend", "label": "Pipeline Orchestrator", "sublabel": "Stage FSM & DAG", "pos": [450, 135], "size": [140, 60], "tag": "FSM Engine" },
+    { "id": "worker_supervisor", "type": "backend", "label": "Worker Supervisor", "sublabel": "Process Tree & Lease", "pos": [450, 295], "size": [140, 60], "tag": "Single GPU Lease" },
+    { "id": "cas_store", "type": "database", "label": "CAS Store", "sublabel": "Immutable SHA-256", "pos": [450, 455], "size": [140, 60], "tag": "Artifacts" },
+    { "id": "separation_worker", "type": "backend", "label": "Audio Separation", "sublabel": "Demucs / UVR", "pos": [660, 50], "size": [130, 56], "tag": "16kHz Mono" },
+    { "id": "asr_worker", "type": "backend", "label": "ASR & Aligner", "sublabel": "Qwen3 + 3D-Speaker", "pos": [860, 50], "size": [130, 56], "tag": "Speech Blocks" },
+    { "id": "ocr_worker", "type": "backend", "label": "OCR & Ink Refine", "sublabel": "PaddleOCR + Refine", "pos": [660, 295], "size": [130, 56], "tag": "Ink Refine" },
+    { "id": "tts_worker", "type": "backend", "label": "TTS Worker", "sublabel": "ZeroTTS / CosyVoice3", "pos": [860, 215], "size": [130, 56], "tag": "Zero Overrun" },
+    { "id": "render_worker", "type": "backend", "label": "Render Worker", "sublabel": "FFmpeg Mix & Draw", "pos": [860, 375], "size": [130, 56], "tag": "Final Media" }
   ],
   "boundaries": [
     {
@@ -60,44 +60,35 @@
   ],
   "connections": [
     { "id": "ui-to-host", "from": "web_ui", "to": "runtime_host", "label": "HTTP / WS", "variant": "emphasis" },
-    { "id": "host-to-db", "from": "runtime_host", "to": "sqlite_db", "label": "metadata", "fromSide": "top", "toSide": "bottom", "route": "straight", "labelAt": [345, 175] },
-    { "id": "host-to-gateway", "from": "runtime_host", "to": "remote_gateway", "label": "translation", "variant": "security", "fromSide": "bottom", "toSide": "top", "route": "straight", "labelAt": [350, 355] },
+    { "id": "host-to-db", "from": "runtime_host", "to": "sqlite_db", "label": "metadata", "fromSide": "top", "toSide": "bottom", "route": "straight", "labelAt": [345, 155] },
+    { "id": "host-to-gateway", "from": "runtime_host", "to": "remote_gateway", "label": "translation", "variant": "security", "fromSide": "bottom", "toSide": "top", "route": "straight", "labelAt": [350, 315] },
     { "id": "host-to-orch", "from": "runtime_host", "to": "orchestrator", "label": "trigger run", "variant": "emphasis" },
-    { "id": "orch-to-supervisor", "from": "orchestrator", "to": "worker_supervisor", "label": "stage plan", "fromSide": "bottom", "toSide": "top", "route": "straight", "labelAt": [560, 265] },
-    { "id": "supervisor-to-cas", "from": "worker_supervisor", "to": "cas_store", "label": "CAS lease", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "route": "straight", "labelAt": [560, 445] },
+    { "id": "orch-to-supervisor", "from": "orchestrator", "to": "worker_supervisor", "label": "stage plan", "fromSide": "bottom", "toSide": "top", "route": "straight", "labelAt": [560, 235] },
+    { "id": "supervisor-to-cas", "from": "worker_supervisor", "to": "cas_store", "label": "CAS lease", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "route": "straight", "labelAt": [560, 395] },
     { "id": "supervisor-to-sep", "from": "worker_supervisor", "to": "separation_worker", "label": "spawn IPC", "variant": "default" },
-    { "id": "sep-to-asr", "from": "separation_worker", "to": "asr_worker", "label": "vocals", "variant": "emphasis", "route": "straight" },
-    { "id": "asr-to-tts", "from": "asr_worker", "to": "tts_worker", "label": "dub script", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "route": "straight", "labelAt": [965, 170] },
-    { "id": "tts-to-render", "from": "tts_worker", "to": "render_worker", "label": "dub mix", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "route": "straight", "labelAt": [965, 350] },
-    { "id": "ocr-to-render", "from": "ocr_worker", "to": "render_worker", "label": "overlay plan", "variant": "default", "labelAt": [790, 400] },
-    { "id": "render-to-cas", "from": "render_worker", "to": "cas_store", "label": "final CAS", "variant": "dashed", "fromSide": "bottom", "toSide": "right", "via": [[925, 540], [590, 540]], "labelAt": [750, 528] }
+    { "id": "sep-to-asr", "from": "separation_worker", "to": "asr_worker", "label": "vocals 16k", "variant": "emphasis", "route": "straight" },
+    { "id": "asr-to-tts", "from": "asr_worker", "to": "tts_worker", "label": "dub script", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "route": "straight", "labelAt": [965, 150] },
+    { "id": "tts-to-render", "from": "tts_worker", "to": "render_worker", "label": "dub mix", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "route": "straight", "labelAt": [965, 310] },
+    { "id": "ocr-to-render", "from": "ocr_worker", "to": "render_worker", "label": "overlay plan", "variant": "default", "labelAt": [790, 365] },
+    { "id": "render-to-cas", "from": "render_worker", "to": "cas_store", "label": "final CAS", "variant": "dashed", "fromSide": "bottom", "toSide": "right", "via": [[925, 485], [590, 485]], "labelAt": [750, 473] }
   ],
   "cards": [
     {
       "dot": "cyan",
-      "title": "Control Plane",
+      "title": "Control & Execution Planes (Seam 1 & 2)",
       "items": [
-        "RuntimeHost quản lý DAG FSM và điều phối tác vụ",
-        "SQLite lưu metadata run/job/review, CAS lưu trữ artifact bất biến",
-        "Dịch thuật ngữ nghĩa bắt buộc qua Remote LLM Gateway (Gemini 3.8 Flash -> DeepSeek v4.1 Flash)"
-      ]
-    },
-    {
-      "dot": "emerald",
-      "title": "Execution Plane (Seam 2)",
-      "items": [
-        "StageWorker giao tiếp qua NDJSON trên stdin/stdout",
-        "Single GPU Lease quản lý chuyển giao tài nguyên giữa các worker",
-        "StageWorker chỉ trao đổi reference đường dẫn CAS, không gửi raw binary"
+        "RuntimeHost điều phối DAG FSM, SQLite WAL, CAS SHA-256 và REST/WS API tại localhost:8080 (Seam 1)",
+        "Dịch thuật VI/EN bắt buộc qua Remote LLM Gateway (Gemini 3.8 Flash -> DeepSeek v4.1 Flash), không dùng local LLM",
+        "StageWorker giao tiếp qua NDJSON (Seam 2), cấp phát Single GPU Lease và trao đổi tham chiếu CAS"
       ]
     },
     {
       "dot": "rose",
-      "title": "Quality Invariants",
+      "title": "Quality & Domain Invariants",
       "items": [
-        "Mốc thời gian video gốc (source timing) là bất biến",
-        "TTS không được overrun lời thoại kế tiếp (tts_finish <= source_end)",
-        "Dữ liệu audio chuẩn hóa 16kHz mono fail-closed"
+        "SourceTimeline bất biến; thời lượng video và âm thanh bảo toàn tuyệt đối không co giãn",
+        "Zero Overrun: tts_finish <= source_end; tự động escalate speaker sang CosyVoice3 nếu ZeroTTS quá thời lượng",
+        "Fail-Closed: từ chối hòa âm (ErrMixerOverrunRefused) nếu có lời thoại nhưng không có clip lồng tiếng đặt được"
       ]
     }
   ]

@@ -4,96 +4,271 @@
   "meta": {
     "title": "Douyinie Seam 1 & 2 Execution Sequence",
     "output": "docs/diagrams/douyinie-sequence.html",
-    "viewBox": [1080, 720],
+    "viewBox": [
+      1080,
+      575
+    ],
     "column_fit": "spread",
     "animation": "trace",
     "quality_profile": "showcase",
     "views": [
       {
-        "id": "job-dispatch",
-        "label": "1. Khởi tạo & Trích xuất",
-        "focus": ["ui", "host", "sqlite", "worker", "cas"],
-        "note": "Operator kích hoạt job qua Seam 1, RuntimeHost cấp phát Single GPU Lease và chạy stage đầu."
+        "id": "full-trace",
+        "label": "Toàn cảnh chuỗi thực thi",
+        "focus": [
+          "ui",
+          "host",
+          "sqlite",
+          "gateway",
+          "worker",
+          "cas"
+        ],
+        "note": "Chuỗi tương tác từ khi tiếp nhận job qua Seam 1 đến điều phối StageWorker qua Seam 2."
       },
       {
-        "id": "translation-and-dub",
+        "id": "job-intake",
+        "label": "1. Khởi tạo & Phân tích âm",
+        "focus": [
+          "ui",
+          "host",
+          "sqlite",
+          "worker",
+          "cas"
+        ],
+        "note": "Tiếp nhận media, trích xuất normalized audio và chạy audio_role_plan qua StageWorker."
+      },
+      {
+        "id": "remote-trans",
         "label": "2. Dịch thuật & Lồng tiếng",
-        "focus": ["host", "gateway", "worker", "cas"],
-        "note": "Dịch ngữ nghĩa bắt buộc qua Remote LLM Gateway trước khi StageWorker TTS tổng hợp tiếng."
+        "focus": [
+          "host",
+          "gateway",
+          "worker",
+          "cas"
+        ],
+        "note": "Dịch thuật qua Remote LLM Gateway và tổng hợp tiếng ZeroTTS với CosyVoice3 escalation."
       },
       {
-        "id": "render-and-delivery",
-        "label": "3. Hòa âm & Xuất bản",
-        "focus": ["worker", "cas", "host", "sqlite", "ui"],
-        "note": "Render ghép nối video và kiểm tra âm lượng trước khi chốt trạng thái completed."
+        "id": "render-delivery",
+        "label": "3. Render & Đóng Job",
+        "focus": [
+          "host",
+          "worker",
+          "cas",
+          "ui"
+        ],
+        "note": "Render video cuối cùng bằng FFmpeg, kiểm tra multimodal QC và trả kết quả qua WebSocket."
       }
     ]
   },
   "participants": [
-    { "id": "ui", "type": "frontend", "label": "Operator UI", "sublabel": "Browser Web UI" },
-    { "id": "host", "type": "backend", "label": "RuntimeHost", "sublabel": "Seam 1 (API)" },
-    { "id": "sqlite", "type": "database", "label": "SQLite DB", "sublabel": "Relational State" },
-    { "id": "gateway", "type": "cloud", "label": "LLM Gateway", "sublabel": "Gemini -> DeepSeek" },
-    { "id": "worker", "type": "backend", "label": "StageWorker", "sublabel": "Seam 2 (IPC)" },
-    { "id": "cas", "type": "database", "label": "CAS Store", "sublabel": "Immutable Files" }
+    {
+      "id": "ui",
+      "type": "frontend",
+      "label": "Operator UI",
+      "sublabel": "Browser Web UI"
+    },
+    {
+      "id": "host",
+      "type": "backend",
+      "label": "RuntimeHost",
+      "sublabel": "Seam 1 (API)"
+    },
+    {
+      "id": "sqlite",
+      "type": "database",
+      "label": "SQLite DB",
+      "sublabel": "Relational State"
+    },
+    {
+      "id": "gateway",
+      "type": "cloud",
+      "label": "LLM Gateway",
+      "sublabel": "Gemini -> DeepSeek"
+    },
+    {
+      "id": "worker",
+      "type": "backend",
+      "label": "StageWorker",
+      "sublabel": "Seam 2 (IPC)"
+    },
+    {
+      "id": "cas",
+      "type": "database",
+      "label": "CAS Store",
+      "sublabel": "Immutable Files"
+    }
   ],
   "segments": [
-    { "from": 150, "to": 310, "label": "Seam 1: Job Dispatch & Extraction" },
-    { "from": 320, "to": 480, "label": "Translation & TTS Synthesis" },
-    { "from": 490, "to": 650, "label": "Render & Final Verification" }
+    {
+      "from": 150,
+      "to": 290,
+      "label": "Seam 1: Job Intake & Role Plan"
+    },
+    {
+      "from": 300,
+      "to": 415,
+      "label": "Translation & TTS Synthesis"
+    },
+    {
+      "from": 420,
+      "to": 500,
+      "label": "Render & Final Delivery"
+    }
   ],
   "messages": [
-    { "id": "m1", "from": "ui", "to": "host", "y": 170, "label": "POST /api/v1/jobs (media, vi)", "variant": "emphasis" },
-    { "id": "m2", "from": "host", "to": "sqlite", "y": 205, "label": "INSERT run (queued)", "variant": "default" },
-    { "id": "m3", "from": "host", "to": "worker", "y": 240, "label": "NDJSON: start audio_role_plan", "variant": "emphasis" },
-    { "id": "m4", "from": "worker", "to": "cas", "y": 272, "label": "CAS Put: AudioRolePlan JSON", "variant": "dashed" },
-    { "id": "m5", "from": "worker", "to": "host", "y": 300, "label": "NDJSON: stage_completed", "variant": "return" },
-    { "id": "m6", "from": "host", "to": "gateway", "y": 335, "label": "POST /translate (meaning-first)", "variant": "security" },
-    { "id": "m7", "from": "gateway", "to": "host", "y": 370, "label": "TranslationVariant (VI)", "variant": "return" },
-    { "id": "m8", "from": "host", "to": "worker", "y": 405, "label": "NDJSON: start dubbing (ZeroTTS)", "variant": "emphasis" },
-    { "id": "m9", "from": "worker", "to": "cas", "y": 440, "label": "CAS Put: WAV (zero overrun)", "variant": "dashed" },
-    { "id": "m10", "from": "worker", "to": "host", "y": 470, "label": "NDJSON: dub_completed", "variant": "return" },
-    { "id": "m11", "from": "host", "to": "worker", "y": 505, "label": "NDJSON: start render_final", "variant": "emphasis" },
-    { "id": "m12", "from": "worker", "to": "cas", "y": 540, "label": "CAS Put: localized_final.mp4", "variant": "dashed" },
-    { "id": "m13", "from": "worker", "to": "host", "y": 570, "label": "NDJSON: render_completed (PASS)", "variant": "return" },
-    { "id": "m14", "from": "host", "to": "sqlite", "y": 605, "label": "UPDATE run (completed)", "variant": "default" },
-    { "id": "m15", "from": "host", "to": "ui", "y": 635, "label": "WS: run_status (completed)", "variant": "return" }
+    {
+      "id": "m1",
+      "from": "ui",
+      "to": "host",
+      "y": 165,
+      "label": "POST /api/v1/jobs (media, vi)",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m2",
+      "from": "host",
+      "to": "sqlite",
+      "y": 195,
+      "label": "INSERT run (queued)",
+      "variant": "default"
+    },
+    {
+      "id": "m3",
+      "from": "host",
+      "to": "worker",
+      "y": 225,
+      "label": "NDJSON: start audio_role_plan",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m4",
+      "from": "worker",
+      "to": "cas",
+      "y": 255,
+      "label": "CAS Put: AudioRolePlan JSON",
+      "variant": "dashed"
+    },
+    {
+      "id": "m5",
+      "from": "worker",
+      "to": "host",
+      "y": 283,
+      "label": "NDJSON: stage_succeeded",
+      "variant": "return"
+    },
+    {
+      "id": "m6",
+      "from": "host",
+      "to": "gateway",
+      "y": 312,
+      "label": "POST /translate (meaning-first)",
+      "variant": "security"
+    },
+    {
+      "id": "m7",
+      "from": "gateway",
+      "to": "host",
+      "y": 341,
+      "label": "TranslationVariant (VI)",
+      "variant": "return"
+    },
+    {
+      "id": "m8",
+      "from": "host",
+      "to": "worker",
+      "y": 370,
+      "label": "NDJSON: dub_synthesize",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m9",
+      "from": "worker",
+      "to": "cas",
+      "y": 399,
+      "label": "CAS Put: WAV (zero overrun)",
+      "variant": "dashed"
+    },
+    {
+      "id": "m10",
+      "from": "host",
+      "to": "worker",
+      "y": 428,
+      "label": "NDJSON: start render_final",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m11",
+      "from": "worker",
+      "to": "cas",
+      "y": 457,
+      "label": "CAS Put: localized_final.mp4",
+      "variant": "dashed"
+    },
+    {
+      "id": "m12",
+      "from": "host",
+      "to": "ui",
+      "y": 486,
+      "label": "WS: run_status (completed)",
+      "variant": "return"
+    }
   ],
   "activations": [
-    { "participant": "host", "from": 165, "to": 640, "type": "backend" },
-    { "participant": "sqlite", "from": 200, "to": 215, "type": "database" },
-    { "participant": "worker", "from": 235, "to": 305, "type": "backend" },
-    { "participant": "gateway", "from": 330, "to": 375, "type": "cloud" },
-    { "participant": "worker", "from": 400, "to": 475, "type": "backend" },
-    { "participant": "worker", "from": 500, "to": 575, "type": "backend" },
-    { "participant": "sqlite", "from": 600, "to": 615, "type": "database" }
+    {
+      "participant": "host",
+      "from": 160,
+      "to": 492,
+      "type": "backend"
+    },
+    {
+      "participant": "sqlite",
+      "from": 190,
+      "to": 205,
+      "type": "database"
+    },
+    {
+      "participant": "worker",
+      "from": 220,
+      "to": 288,
+      "type": "backend"
+    },
+    {
+      "participant": "gateway",
+      "from": 307,
+      "to": 346,
+      "type": "cloud"
+    },
+    {
+      "participant": "worker",
+      "from": 365,
+      "to": 405,
+      "type": "backend"
+    },
+    {
+      "participant": "worker",
+      "from": 423,
+      "to": 462,
+      "type": "backend"
+    }
   ],
   "cards": [
     {
       "dot": "cyan",
-      "title": "Seam 1 Contract",
+      "title": "Seam 1 & 2 Protocols",
       "items": [
-        "Web UI tương tác thuần túy qua REST / WebSocket trên localhost",
-        "RuntimeHost là thực thể duy nhất ghi vào SQLite metadata",
-        "Trạng thái tiến trình được phát sóng real-time qua WebSocket"
-      ]
-    },
-    {
-      "dot": "emerald",
-      "title": "Seam 2 StageWorker IPC",
-      "items": [
-        "Trao đổi metadata envelope qua NDJSON trên stdin/stdout",
-        "Dữ liệu audio/video lớn truyền hoàn toàn qua CAS hash reference",
-        "Quy chuẩn timing nghiêm ngặt: tts_finish <= source_end"
+        "Seam 1: Operator UI tương tác REST/WebSocket tại localhost:8080; RuntimeHost ghi nhận metadata SQLite",
+        "Seam 2: StageWorker giao tiếp NDJSON qua stdin/stdout; Single GPU Lease điều phối tài nguyên",
+        "Toàn bộ media và artifact lớn truyền tải qua mã băm CAS SHA-256 bất biến, không gửi raw binary"
       ]
     },
     {
       "dot": "rose",
-      "title": "Translation Gate",
+      "title": "Invariants & Remote Gateway",
       "items": [
-        "Bắt buộc dùng remote LLM gateway (Gemini 3.8 Flash -> DeepSeek v4.1 Flash)",
-        "Không dùng local general LLM cho dịch thuật sản xuất",
-        "Fail-closed nếu cả hai kênh remote đều không khả dụng"
+        "Dịch thuật sản xuất bắt buộc qua Remote LLM Gateway (Gemini 3.8 Flash -> DeepSeek v4.1 Flash), fail-closed",
+        "Quy chuẩn Zero Overrun nghiêm ngặt: tts_finish <= source_end; tự động escalate CosyVoice3 nếu quá thời lượng",
+        "Ở Review Posture, run hoàn tất nhưng job ở lại review_required chờ operator duyệt explicit render"
       ]
     }
   ]

@@ -52,7 +52,7 @@ Unlike generic auto-subtitlers or blunt voice-over tools that wipe background au
 
 ## Evidence on Hand
 
-- **Architecture & Invariants**: `docs/architecture/phase1-architecture.md`, `CONTEXT.md`, `docs/agents/domain.md`, Wayfinder Issue #1, Implementation Spec #18.
+- **Architecture & Invariants**: `docs/diagrams/douyinie-architecture.json`, `CONTEXT.md`, `docs/agents/domain.md`, Wayfinder Issue #1, Implementation Spec #18.
 - **Live E2E Runbook & Real Media Corpus**: `docs/agents/live-runtime-e2e.md`, verified real Douyin runs on test assets (e.g. 4.mp4, 5.mp4).
 - **Architectural Seams**: Seam 1 (RuntimeHost localhost HTTP API) and Seam 2 (StageWorker NDJSON subprocess protocol), with complete test suites in `test/seam1/` and `test/seam2/`.
 - **Quality Benchmarks**: Quality corpus and benchmark suites in `internal/benchmark/` and `test/seam1/`.
@@ -116,6 +116,6 @@ Unlike generic auto-subtitlers or blunt voice-over tools that wipe background au
 
 1. **[Wayfinder Issue #1](https://github.com/monet88/douyinie/issues/1)**: Authoritative architectural and product decisions.
 2. **[Implementation Spec #18](https://github.com/monet88/douyinie/issues/18)**: Authoritative implementation spec, including normative revalidation amendments.
-3. **[`docs/architecture/phase1-architecture.md`](docs/architecture/phase1-architecture.md)**: Canonical repo-local Phase 1 architecture synthesis of the locked #16 architecture plus authoritative #18 amendments.
+3. **[`docs/diagrams/douyinie-architecture.json`](docs/diagrams/douyinie-architecture.json)**: Canonical repo-local Phase 1 architecture materialization (generated diagram set) of the locked #16 architecture plus authoritative #18 amendments.
 4. **`PRODUCT.md` & `CONTEXT.md`**: Repo-local product charter and domain invariants.
 5. **`docs/reference-repositories.md`**: External mining inventory (not a dependency lockfile).

@@ -5224,8 +5224,8 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
         <text data-detail="fine" x="315" y="403" class="t-database" font-size="7" text-anchor="middle">PaddleOCR + Ink</text>
         </g>
 
-        <g id="node-transcript" data-node-id="transcript" data-node-label="Transcript" tabindex="0" role="button" aria-label="Focus Transcript, SpeechBlocks + Timing, 03 / Transcribe &amp; Translate" aria-pressed="false" data-node-kind="database" data-node-sublabel="SpeechBlocks + Timing" data-node-tag="Qwen3-ASR" data-node-context="03 / Transcribe &amp; Translate">
-          <title>Transcript · SpeechBlocks + Timing · 03 / Transcribe &amp; Translate · Qwen3-ASR</title>
+        <g id="node-transcript" data-node-id="transcript" data-node-label="Transcript" tabindex="0" role="button" aria-label="Focus Transcript, SpeechBlocks + Timing, 03 / Transcribe &amp; Translate" aria-pressed="false" data-node-kind="database" data-node-sublabel="SpeechBlocks + Timing" data-node-tag="Qwen3 + 3D-Speaker" data-node-context="03 / Transcribe &amp; Translate">
+          <title>Transcript · SpeechBlocks + Timing · 03 / Transcribe &amp; Translate · Qwen3 + 3D-Speaker</title>
           <rect x="474" y="128" width="112" height="58" rx="6" class="c-mask"/>
           <rect x="474" y="128" width="112" height="58" rx="6" class="c-database" data-animate="node" style="--step:3" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(480 134) scale(0.6875)">
@@ -5234,11 +5234,11 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
           </g>
           <text data-node-label="" data-detail-anchor="" x="530" y="149" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">Transcript</text>
           <text data-detail="context" x="530" y="165" class="t-muted" font-size="7" text-anchor="middle">SpeechBlocks + Timing</text>
-        <text data-detail="fine" x="530" y="175" class="t-database" font-size="7" text-anchor="middle">Qwen3-ASR</text>
+        <text data-detail="fine" x="530" y="175" class="t-database" font-size="7" text-anchor="middle">Qwen3 + 3D-Speaker</text>
         </g>
 
-        <g id="node-translation" data-node-id="translation" data-node-label="Translation" tabindex="0" role="button" aria-label="Focus Translation, VI Target Meaning, 03 / Transcribe &amp; Translate" aria-pressed="false" data-node-kind="cloud" data-node-sublabel="VI Target Meaning" data-node-tag="Remote LLM" data-node-context="03 / Transcribe &amp; Translate">
-          <title>Translation · VI Target Meaning · 03 / Transcribe &amp; Translate · Remote LLM</title>
+        <g id="node-translation" data-node-id="translation" data-node-label="Translation" tabindex="0" role="button" aria-label="Focus Translation, VI Target Meaning, 03 / Transcribe &amp; Translate" aria-pressed="false" data-node-kind="cloud" data-node-sublabel="VI Target Meaning" data-node-tag="Gemini -&gt; DeepSeek" data-node-context="03 / Transcribe &amp; Translate">
+          <title>Translation · VI Target Meaning · 03 / Transcribe &amp; Translate · Gemini -&gt; DeepSeek</title>
           <rect x="474" y="356" width="112" height="58" rx="6" class="c-mask"/>
           <rect x="474" y="356" width="112" height="58" rx="6" class="c-cloud" data-animate="node" style="--step:4" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="cloud" class="semantic-sigil s-cloud" transform="translate(480 362) scale(0.6875)">
@@ -5246,7 +5246,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
           </g>
           <text data-node-label="" data-detail-anchor="" x="530" y="377" class="t-primary" font-size="10" font-weight="600" text-anchor="middle">Translation</text>
           <text data-detail="context" x="530" y="393" class="t-muted" font-size="7" text-anchor="middle">VI Target Meaning</text>
-        <text data-detail="fine" x="530" y="403" class="t-cloud" font-size="7" text-anchor="middle">Remote LLM</text>
+        <text data-detail="fine" x="530" y="403" class="t-cloud" font-size="7" text-anchor="middle">Gemini -&gt; DeepSeek</text>
         </g>
 
         <g id="node-dub_segments" data-node-id="dub_segments" data-node-label="Dub Segments" tabindex="0" role="button" aria-label="Focus Dub Segments, ZeroTTS WAV Clips, 04 / Synthesis &amp; Overlays" aria-pressed="false" data-node-kind="database" data-node-sublabel="ZeroTTS WAV Clips" data-node-tag="Zero Overrun" data-node-context="04 / Synthesis &amp; Overlays">
@@ -5306,12 +5306,12 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
         <g data-detail="context" data-edge-from="text_plan" data-edge-to="translation" data-edge-label="visual text" data-edge-key="3" data-edge-id="f4">
           <rect x="389.05" y="386" width="65.9" height="27" rx="4" class="c-mask"/>
           <text x="422" y="397" class="t-muted" font-size="8" text-anchor="middle">visual text</text>
-        <text data-detail="fine" x="422" y="408" class="t-dim" font-size="7" text-anchor="middle">remote llm</text>
+        <text data-detail="fine" x="422" y="408" class="t-dim" font-size="7" text-anchor="middle">paddleocr</text>
         </g>
         <g data-detail="context" data-edge-from="transcript" data-edge-to="dub_segments" data-edge-label="dub script tts" data-edge-key="4" data-edge-id="f5">
-          <rect x="596.7" y="134" width="80.6" height="27" rx="4" class="c-mask"/>
+          <rect x="589.35" y="134" width="95.3" height="27" rx="4" class="c-mask"/>
           <text x="637" y="145" class="t-backend" font-size="8" text-anchor="middle">dub script tts</text>
-        <text data-detail="fine" x="637" y="156" class="t-dim" font-size="7" text-anchor="middle">zerotts</text>
+        <text data-detail="fine" x="637" y="156" class="t-dim" font-size="7" text-anchor="middle">zerotts/cosyvoice</text>
         </g>
         <g data-detail="context" data-edge-from="translation" data-edge-to="visual_track" data-edge-label="target labels" data-edge-key="5" data-edge-id="f6">
           <rect x="594.25" y="386" width="85.5" height="27" rx="4" class="c-mask"/>
@@ -5329,9 +5329,9 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
         <text data-detail="fine" x="865" y="339" class="t-dim" font-size="7" text-anchor="middle">ffmpeg draw</text>
         </g>
         <g data-detail="context" data-edge-from="transcript" data-edge-to="translation" data-edge-label="dialogue text" data-edge-key="8" data-edge-id="f9">
-          <rect x="537.15" y="260" width="75.7" height="27" rx="4" class="c-mask"/>
+          <rect x="532.25" y="260" width="85.5" height="27" rx="4" class="c-mask"/>
           <text x="575" y="271" class="t-backend" font-size="8" text-anchor="middle">dialogue text</text>
-        <text data-detail="fine" x="575" y="282" class="t-dim" font-size="7" text-anchor="middle">remote llm</text>
+        <text data-detail="fine" x="575" y="282" class="t-dim" font-size="7" text-anchor="middle">gemini/deepseek</text>
         </g>
 
         <!-- Legend -->
@@ -5542,21 +5542,21 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
           <h3>Artifact Invariants</h3>
         </div>
         <ul>
-          <li>&bull; Mọi artifact đều bất biến và lưu tại CAS theo mã băm SHA-256</li>
-          <li>&bull; SourceAsset lưu giữ timeline gốc bất biến (không co giãn thời lượng video)</li>
-          <li>&bull; Các stage worker tái sử dụng artifact qua CAS mà không tính toán lại</li>
+          <li>&bull; Mọi artifact đều bất biến và lưu tại CAS theo mã băm SHA-256 (Content-Addressed Storage)</li>
+          <li>&bull; SourceTimeline bất biến; thời lượng video và âm thanh bảo toàn tuyệt đối, không co giãn</li>
+          <li>&bull; Stage cache key bao gồm TTSRuntimeIdentities, tự động tái sử dụng artifact qua CAS</li>
         </ul>
       </div>
 
       <div class="card">
         <div class="card-header">
           <div class="card-dot cyan"></div>
-          <h3>Dual Track Processing</h3>
+          <h3>Dual Track Processing &amp; Mix Safety</h3>
         </div>
         <ul>
-          <li>&bull; Nhánh Speech: Bóc tách vocals -&gt; ASR -&gt; Dịch thoại -&gt; Lồng tiếng TTS</li>
-          <li>&bull; Nhánh Visual: Nhận dạng vùng chữ -&gt; Dịch chữ -&gt; Che và vẽ lớp phủ in-place</li>
-          <li>&bull; Hòa âm giữ nguyên nhạc nền (BGM) và SFX từ audio stems ban đầu</li>
+          <li>&bull; Nhánh Speech: Tách vocals 16kHz -&gt; Qwen3-ASR/Aligner -&gt; Dịch nghĩa -&gt; ZeroTTS / CosyVoice3</li>
+          <li>&bull; Nhánh Visual: PaddleOCR + refine mực -&gt; Dịch chữ -&gt; Che tight-hug và vẽ overlay in-place</li>
+          <li>&bull; Mixer Gate: Chỉ nén source dialogue trong speech window; refuse nếu không có clip hợp lệ</li>
         </ul>
       </div>
     </div>

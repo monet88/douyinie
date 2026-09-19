@@ -4,7 +4,7 @@
 
 1. **[Wayfinder Issue #1](https://github.com/monet88/douyinie/issues/1)** → resolved decisions.
 2. **[Implementation Spec #18](https://github.com/monet88/douyinie/issues/18)** → Phase 1 spec + normative amendments.
-3. **[`docs/architecture/phase1-architecture.md`](docs/architecture/phase1-architecture.md)** → canonical repo-local architecture. GitHub issues win on drift.
+3. **[`docs/diagrams/douyinie-architecture.json`](docs/diagrams/douyinie-architecture.json)** → repo-local architecture materialization (generated diagram set: architecture, dataflow, sequence, workflow, lifecycle). Read the JSON source; the `.html` files are 15k-line human renders. GitHub issues win on drift.
 4. **[`PRODUCT.md`](PRODUCT.md)** & **[`CONTEXT.md`](CONTEXT.md)** → product charter, domain invariants.
 5. **[`docs/reference-repositories.md`](docs/reference-repositories.md)** → mining inventory (not a dependency lockfile).
 
@@ -21,7 +21,7 @@
 
 | Task | Read before starting |
 |------|---------------------|
-| **Architecture / design** | `docs/architecture/phase1-architecture.md`, `CONTEXT.md`, relevant `docs/adr/` |
+| **Architecture / design** | `docs/diagrams/douyinie-architecture.json`, `CONTEXT.md`, relevant `docs/adr/` |
 | **Implementation** | Above, plus the ticket's spec, `PRODUCT.md` §invariants, `docs/agents/domain.md`, and `CODING_STANDARDS.md` §13 (pre-edit and pre-commit checklists) |
 | **Review** | Above, plus `docs/agents/orca-orchestration.md` §Mutation and Verification Boundaries |
 | **Coordination** | `docs/agents/orca-orchestration.md` (roles, workflow skills, mutation policy, continuity) |
@@ -44,12 +44,12 @@ Full policy: [`docs/agents/orca-orchestration.md`](docs/agents/orca-orchestratio
 
 This project is indexed by GitNexus as **douyinie**. For current index statistics (symbols, relationships, execution flows), read `gitnexus://repo/douyinie/context`.
 
-> Index stale? Run `node .gitnexus/run.cjs analyze --index-only` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? Bootstrap with `npx`, `bunx`, or `pnpm dlx` — e.g. `bunx gitnexus@latest analyze` (npm 11 npx crash; #1939).
+> Index stale? Run `gitnexus analyze --index-only` from the project root. No `gitnexus` CLI yet? Bootstrap with `bunx` or `pnpm dlx` — e.g. `bunx gitnexus@latest analyze` (npm 11 npx crash; #1939).
 
 ## Always Do
 
-- **MUST run impact analysis before editing.** Use `impact({target: "symbolName", direction: "upstream"})` (MCP) or `node .gitnexus/run.cjs impact "symbolName" --direction upstream --repo .` (CLI fallback); report callers, processes, and risk. Never substitute grep for graph analysis.
-- **MUST analyze graph changes before committing.** Use `detect_changes({scope: "all"})` (MCP) or `node .gitnexus/run.cjs detect-changes --scope all --repo .` (CLI fallback). `partial: true` or `truncated: true` is not a clean check — a zero means unseen, not unaffected; re-run it. For regression review: `detect_changes({scope: "compare", base_ref: "main"})` or `node .gitnexus/run.cjs detect-changes --scope compare --base-ref "main" --repo .`.
+- **MUST run impact analysis before editing.** Use `impact({target: "symbolName", direction: "upstream"})` (MCP) or `gitnexus impact "symbolName" --direction upstream` (CLI fallback); report callers, processes, and risk. Never substitute grep for graph analysis.
+- **MUST analyze graph changes before committing.** Use `detect_changes({scope: "all"})` (MCP) or `gitnexus detect-changes --scope all` (CLI fallback). `partial: true` or `truncated: true` is not a clean check — a zero means unseen, not unaffected; re-run it. For regression review: `detect_changes({scope: "compare", base_ref: "main"})` or `gitnexus detect-changes --scope compare --base-ref "main"`.
 - **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
 - **MUST treat `risk: UNKNOWN` as unresolved, not as low.** An empty caller set is not evidence the symbol is unused — it can also mean the callers are not resolvable by the index (plain-object property access, dynamic dispatch, cross-language calls). `impact` pairs `UNKNOWN` with a `riskNote` saying so. Confirm with a text search before treating the symbol as safe to change or delete; do not proceed on the strength of a zero.
 - When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
