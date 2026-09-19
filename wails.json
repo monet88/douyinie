@@ -1,0 +1,17 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "douyinie",
+  "outputfilename": "douyinie",
+  "frontend:dir": "internal/server/ui",
+  "author": {
+    "name": "Douyinie",
+    "email": "dev@douyinie.local"
+  },
+  "info": {
+    "companyName": "Douyinie",
+    "productName": "Douyinie Video Localization",
+    "productVersion": "1.0.0",
+    "copyright": "Copyright 2026",
+    "comments": "Automated video localization workspace"
+  }
+}
