@@ -173,6 +173,7 @@ type TrackedTextRegion struct {
 	ProtectedMetadata  ProtectedRegionMetadata `json:"protected_metadata"`
 	ReviewRequired     bool                    `json:"review_required"`
 	ReviewReason       string                  `json:"review_reason,omitempty"`
+	CoverColor         string                  `json:"cover_color,omitempty"`
 }
 
 // Bounds returns the union of every observed keyframe box of the region.
@@ -219,6 +220,7 @@ type RegionOverride struct {
 	BoxDeltaH   int             `json:"box_delta_h,omitempty"`
 	IsProtected *bool           `json:"is_protected,omitempty"`
 	Notes       string          `json:"notes,omitempty"`
+	CoverColor  *string         `json:"cover_color,omitempty"`
 }
 
 // ValidateRegionOverrideGeometry rejects any override whose requested geometry would leave the
