@@ -19,7 +19,7 @@ import (
 	"github.com/monet88/douyinie/internal/storage"
 )
 
-const translationMeaningContractVersion = "facts_names_numbers_negation_v3"
+const translationMeaningContractVersion = "facts_names_numbers_negation_v4"
 
 // TranslationInvokeFunc executes one translation provider attempt.
 type TranslationInvokeFunc func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error)
@@ -161,7 +161,7 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 							}
 							cachedVariant.ProvenanceHash = cachedIdx.ProvenanceHash
 
-							if s.db != nil {
+							if s.db != nil && !in.Ephemeral {
 								_ = s.db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
 									ID:             cachedVariant.ID,
 									AssetID:        in.AssetID,
@@ -257,7 +257,7 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 		variant.CASHash = obj.SHA256
 	}
 
-	if s.db != nil {
+	if s.db != nil && !in.Ephemeral {
 		idx := storage.TranslationVariantIndex{
 			ID:             variant.ID,
 			AssetID:        variant.AssetID,
@@ -276,7 +276,8 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 			return nil, fmt.Errorf("save translation variant index in DB: %w", err)
 		}
 
-		// Update stage execution if present
+		// Record the stage only for canonical translations: an ephemeral inline translation did
+		// not run the translation stage, so it must not append a success row for it.
 		now := time.Now().UTC()
 		stageExec := domain.StageExecution{
 			ID:             uuid.NewString(),
@@ -289,7 +290,9 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 			CreatedAt:      variant.CreatedAt,
 			UpdatedAt:      now,
 		}
-		_ = s.db.CreateStageExecution(ctx, stageExec)
+		if !in.Ephemeral {
+			_ = s.db.CreateStageExecution(ctx, stageExec)
+		}
 	}
 
 	return variant, nil
@@ -406,9 +409,11 @@ func (s *TranslationService) computeTranslationInputHash(in domain.TranslationJo
 }
 
 // invokeTranslationWithFallback routes and executes translation attempts with policy-checked fallback.
-// Meaning-first QA rejection runs inside the Router.ExecuteRoutedWithRetry attempt so that
-// any QA failure returns an error wrapping domain.ErrQualityRejected plus the specific QA error.
-// This ensures the Router records quality_failed for that attempt and advances to the next fallback candidate.
+// A meaning-first QA failure inside the Router.ExecuteRoutedWithRetry attempt returns an error wrapping
+// domain.ErrQualityRejected plus the specific QA error, so the Router records quality_failed for that
+// attempt and advances to the next candidate. The flagged candidate is retained: a clean lane is always
+// preferred, but when every lane carries QA flags the best of them is used and the flags travel to the
+// review queue instead of killing the stage.
 func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, in domain.TranslationJobInput, routeRes *provider.RouteResult) (*provider.TranslationResult, provider.Provider, []domain.TranslationSegment, float64, error) {
 	if s.TranslateInvoke != nil {
 		// Custom hook installed (e.g. for unit tests)
@@ -428,8 +433,11 @@ func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, 
 			return nil, nil, nil, 0, fmt.Errorf("custom translation hook returned nil result")
 		}
 		validSegs, score, qaErr := s.validateMeaningQA(in, res.Segments)
-		if qaErr != nil {
-			return nil, nil, nil, 0, qaErr
+		if len(validSegs) == 0 {
+			if qaErr != nil {
+				return nil, nil, nil, 0, qaErr
+			}
+			return nil, nil, nil, 0, fmt.Errorf("%w: custom translation hook produced no segments", domain.ErrQualityRejected)
 		}
 		return res, p, validSegs, score, nil
 	}
@@ -457,6 +465,14 @@ func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, 
 	var validatedSegments []domain.TranslationSegment
 	var overallQAScore float64
 
+	type flaggedCandidate struct {
+		result   *provider.TranslationResult
+		provider provider.Provider
+		segments []domain.TranslationSegment
+		score    float64
+	}
+	var bestFlagged *flaggedCandidate
+
 	err = s.router.ExecuteRoutedWithRetry(ctx, routeReq, routeRes, inputHash, 1, func(cand provider.Provider, _ int) error {
 		res, invokeErr := s.invokeProvider(ctx, cand, in)
 		if invokeErr != nil {
@@ -467,6 +483,13 @@ func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, 
 		}
 		validSegs, score, qaErr := s.validateMeaningQA(in, res.Segments)
 		if qaErr != nil {
+			if !qaFlagged(validSegs) {
+				// Unusable candidate (e.g. no segments at all): nothing to review.
+				return qaErr
+			}
+			if bestFlagged == nil || score > bestFlagged.score {
+				bestFlagged = &flaggedCandidate{result: res, provider: cand, segments: validSegs, score: score}
+			}
 			return qaErr
 		}
 		result = res
@@ -476,7 +499,15 @@ func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, 
 		return nil
 	})
 	if err != nil {
-		return nil, nil, nil, 0, err
+		if bestFlagged == nil || !translationFlaggedFallbackAllowed(err) {
+			return nil, nil, nil, 0, err
+		}
+		// Every lane tripped the meaning gate. Ship the best of them with per-segment
+		// flags: the review queue names the violation and the operator decides.
+		result = bestFlagged.result
+		selected = bestFlagged.provider
+		validatedSegments = bestFlagged.segments
+		overallQAScore = bestFlagged.score
 	}
 	if result == nil || selected == nil {
 		return nil, nil, nil, 0, fmt.Errorf("translation execution completed without a selected provider result")
@@ -484,32 +515,68 @@ func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, 
 	return result, selected, validatedSegments, overallQAScore, nil
 }
 
-// validateMeaningQA evaluates the meaning preservation QA gate for all segments.
-// If any segment fails QA, it returns an error wrapping domain.ErrQualityRejected
-// and the specific QA error, allowing the router to record quality_failed and
-// advance to the next fallback candidate.
+// translationFailClosedErrors mirrors the Router's non-transient governance / policy / provenance
+// refusals (internal/provider/router.go branch 1) that terminate execution immediately without
+// candidate retry or fallback.
+var translationFailClosedErrors = []error{
+	domain.ErrPolicyBlocked,
+	domain.ErrConsentRequired,
+	domain.ErrAuthRequired,
+	domain.ErrLicenseManifestMissing,
+	domain.ErrRawSecretForbidden,
+	domain.ErrContentUnavailable,
+	domain.ErrInvalidURL,
+	domain.ErrUnsupportedMediaType,
+	domain.ErrInconsistentProvenance,
+}
+
+// translationFlaggedFallbackAllowed confirms the terminal execution error is genuinely the
+// meaning-gate rejection (ErrQualityRejected) that the flagged fallback exists for, and not a
+// fail-closed router governance, policy, authorization, or provenance refusal.
+func translationFlaggedFallbackAllowed(err error) bool {
+	if !errors.Is(err, domain.ErrQualityRejected) {
+		return false
+	}
+	for _, failClosed := range translationFailClosedErrors {
+		if errors.Is(err, failClosed) {
+			return false
+		}
+	}
+	return true
+}
+
+// validateMeaningQA evaluates the meaning preservation QA gate for every segment.
+//
+// A segment that fails the gate is flagged (PassedQAGate=false plus a ReviewReason
+// naming the violation) and returned alongside the ones that passed: the artifact stays
+// usable and the operator resolves the flag in the review queue. The returned error
+// signals "this candidate carries flags" — never "discard it" — and an error with no
+// segments means the candidate is unusable (nothing to review).
 func (s *TranslationService) validateMeaningQA(in domain.TranslationJobInput, segments []domain.TranslationSegment) ([]domain.TranslationSegment, float64, error) {
 	if len(segments) == 0 {
 		return nil, 0, fmt.Errorf("%w: translation produced no segments", domain.ErrQualityRejected)
 	}
 
-	var validatedSegments []domain.TranslationSegment
+	validatedSegments := make([]domain.TranslationSegment, 0, len(segments))
 	var totalConfidence float64
+	var firstViolation error
 
 	for _, seg := range segments {
 		qaRes := s.qaGate.ValidateSegment(seg.SourceText, seg.TargetText, in.SourceLanguage, in.TargetLanguage)
-		if !qaRes.Passed {
-			qaErr := qaRes.Err
-			if qaErr == nil {
-				qaErr = domain.ErrMeaningPreservationFailed
-			}
-			return nil, 0, fmt.Errorf("%w: translation QA gate rejected segment %d: %w", domain.ErrQualityRejected, seg.Index, qaErr)
-		}
 
-		seg.PassedQAGate = true
+		seg.PassedQAGate = qaRes.Passed
 		seg.QAConfidence = qaRes.Confidence
 		seg.KeyFacts = qaRes.ExtractedFacts
 		seg.NegationPolarity = qaRes.NegationPolarity
+		if !qaRes.Passed {
+			seg.ReviewReason = qaReviewReason(seg.Index, qaRes)
+			if firstViolation == nil {
+				firstViolation = qaRes.Err
+				if firstViolation == nil {
+					firstViolation = domain.ErrMeaningPreservationFailed
+				}
+			}
+		}
 		totalConfidence += qaRes.Confidence
 
 		validatedSegments = append(validatedSegments, seg)
@@ -520,7 +587,46 @@ func (s *TranslationService) validateMeaningQA(in domain.TranslationJobInput, se
 		overallQAScore = totalConfidence / float64(len(validatedSegments))
 	}
 
+	if firstViolation != nil {
+		return validatedSegments, overallQAScore, fmt.Errorf("%w: %w", domain.ErrQualityRejected, firstViolation)
+	}
 	return validatedSegments, overallQAScore, nil
+}
+
+// qaReviewReason returns the operator-facing reason for a flagged segment, or "" when the
+// segment passed the gate. Callers use it wherever a QA verdict is (re)computed so a
+// corrected segment never keeps a stale reason.
+//
+// The reason is the meaning-gate violations for that segment, shortened to the sentence the
+// review queue shows.
+func qaReviewReason(index int, res QAResult) string {
+	if res.Passed {
+		return ""
+	}
+	const maxLen = 200
+	summary := strings.TrimSpace(strings.Join(res.Violations, "; "))
+	if summary == "" {
+		if res.Err != nil {
+			summary = res.Err.Error()
+		} else {
+			summary = domain.ErrMeaningPreservationFailed.Error()
+		}
+	}
+	if len(summary) > maxLen {
+		summary = summary[:maxLen]
+	}
+	return fmt.Sprintf("segment %d: %s", index, summary)
+}
+
+// qaFlagged reports whether a candidate carries segments the meaning gate flagged and
+// can therefore still be persisted as best effort.
+func qaFlagged(segments []domain.TranslationSegment) bool {
+	for _, seg := range segments {
+		if !seg.PassedQAGate {
+			return true
+		}
+	}
+	return false
 }
 
 func translationRouteRequest(in domain.TranslationJobInput) provider.RouteRequest {
@@ -675,7 +781,8 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 		requiresReview := adaptRes.RequiresReview
 		reviewReason := adaptRes.ReviewReason
 
-		// Run Translation QA Gate to guarantee facts/names/numbers/negation survive
+		// Run Translation QA Gate to guarantee facts/names/numbers/negation survive.
+		// A violation flags the segment for operator review; it never aborts the stage.
 		qaRes := s.qaGate.ValidateSegment(seg.SourceText, spokenText, in.SourceLanguage, in.TargetLanguage)
 		if !qaRes.Passed {
 			if isShortened {
@@ -694,10 +801,8 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 				qaRes = s.qaGate.ValidateSegment(seg.SourceText, spokenText, in.SourceLanguage, in.TargetLanguage)
 			}
 			if !qaRes.Passed {
-				if qaRes.Err != nil {
-					return nil, fmt.Errorf("dub script QA gate rejected segment %d: %w", seg.Index, qaRes.Err)
-				}
-				return nil, fmt.Errorf("dub script QA gate rejected segment %d: %w", seg.Index, domain.ErrMeaningPreservationFailed)
+				requiresReview = true
+				reviewReason = domain.ReviewReasonMeaningCorrupted
 			}
 		}
 
@@ -736,7 +841,7 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 			KeyFacts:              qaRes.ExtractedFacts,
 			NegationPolarity:      qaRes.NegationPolarity,
 			QAConfidence:          qaRes.Confidence,
-			PassedQAGate:          true,
+			PassedQAGate:          qaRes.Passed,
 		}
 		totalConfidence += qaRes.Confidence
 		dubSegments = append(dubSegments, dubSeg)

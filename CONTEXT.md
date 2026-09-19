@@ -39,7 +39,7 @@ Calculates cadence and duration adaptation for each speech segment:
 
 ### 4.1 Production Translation Routing
 - `TranslationVariant` generation for spoken VI/EN text and translatable `TextRegionPlan` regions is **remote-only in production**.
-- Provider order is `gemini-3.8-flash` first, then `deepseek/deepseek-v4-flash-vision-exp`, through the authorized OpenAI-compatible gateway.
+- Provider order is `gemini-3.8-flash` first, then `deepseek-v4.1-flash`, through the authorized OpenAI-compatible gateway.
 - Local model-backed translation adapters may remain for diagnostics, historical evidence, or isolated adapter tests, but `Router` must not select them for production translation and they are never a fallback after remote failure.
 - If both remote translation lanes are unavailable, unauthorized, policy-ineligible, or rejected by meaning-first QA, translation fails closed and may surface review; the system must not silently degrade to a weaker local LLM.
 - `ExecutionProfileLocal` is therefore **not an end-to-end localization profile**. It is used to verify local media stages such as ASR/alignment/diarization, TTS, separation, OCR/tracking, mixing, and render without requiring a local general-purpose translation model.

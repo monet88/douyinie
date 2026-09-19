@@ -3,6 +3,8 @@ package service_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -321,6 +323,132 @@ func TestAudioMixService_ZeroDurationSlotOverrun_Refused(t *testing.T) {
 	}
 }
 
+// A dub-eligible mix whose dub stage accepted NOTHING must refuse instead of stripping the source
+// dialogue. Live evidence: runs 264aecaf and 4f86657f placed zero clips (every candidate overran its slot
+// and stayed in ReviewSegments) yet reported PASS with dialogue_suppressed=true, and the rendered audio came
+// out bit-identical to the background stem - a video with no voice at all and no gate in the way.
+func TestAudioMixService_DubRequiredButNothingPlaceable_Refused(t *testing.T) {
+	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+	assetID, runID, stemsCAS := mixFixtureWithDubEligibleSpeech(t, db, casStore)
+
+	// The dub stage built candidates for every speech block and could not fit any of them, so Segments is
+	// empty and the candidates sit in ReviewSegments.
+	dubSegments := domain.DubSegmentsVariant{
+		ID:                uuid.NewString(),
+		SchemaVersion:     domain.DubSegmentsSchemaVersion,
+		AssetID:           assetID,
+		RunID:             runID,
+		TargetLanguage:    "vi",
+		Segments:          nil,
+		FixedRateSpeakers: []string{"SPEAKER_00"},
+		OverallStatus:     "REVIEW_REQUIRED",
+		ReviewSegments: []domain.DubSegmentReview{
+			{
+				Index:              0,
+				SpeakerID:          "SPEAKER_00",
+				StartMs:            0,
+				EndMs:              12000,
+				SlotDurationMs:     12000,
+				MeasuredDurationMs: 13520,
+				FitDecision:        domain.FitActionReview,
+				ReviewReason:       "DURATION_OVERRUN",
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubBytes, _ := json.Marshal(dubSegments)
+	dubObj, _ := casStore.Put(bytes.NewReader(dubBytes))
+
+	mix, err := mixSvc.MixAudio(ctx, service.AudioMixInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		DubSegmentsCAS: dubObj.SHA256,
+		AudioStemsCAS:  stemsCAS,
+	})
+	if !errors.Is(err, domain.ErrMixerOverrunRefused) {
+		t.Fatalf("expected ErrMixerOverrunRefused when dubbing is required but nothing is placeable, got err=%v mix=%+v", err, mix)
+	}
+	if mix == nil || mix.OverallStatus != "REFUSED" {
+		t.Fatalf("expected a REFUSED dub mix artifact, got %+v", mix)
+	}
+	if mix.DialogueSuppressed {
+		t.Errorf("refused mix must not claim the source dialogue was suppressed: %+v", mix)
+	}
+	if !strings.Contains(mix.RefusalReason, "13520") || !strings.Contains(mix.RefusalReason, "12000") {
+		t.Errorf("refusal reason must name the overrun that left nothing placeable, got %q", mix.RefusalReason)
+	}
+}
+
+// mixFixtureWithDubEligibleSpeech seeds the minimum a dub-eligible mix needs: a rights-cleared asset, a
+// preflight report, one full-length narration window, and background/vocals stems in CAS.
+func mixFixtureWithDubEligibleSpeech(t *testing.T, db *storage.DB, casStore *cas.Store) (assetID, runID, stemsCAS string) {
+	t.Helper()
+	ctx := context.Background()
+	assetID = "asset_dub_eligible_" + uuid.NewString()[:8]
+	runID = "run_test_" + uuid.NewString()[:8]
+
+	dummyMedia := media.GeneratePCM16WAV(16000, 1, 35000)
+	mediaObj, err := casStore.Put(bytes.NewReader(dummyMedia))
+	if err != nil {
+		t.Fatalf("put media in cas: %v", err)
+	}
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              attID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		RightsAttestationID: attID,
+		SHA256:              mediaObj.SHA256,
+		CASPath:             mediaObj.Path,
+		ByteSize:            int64(len(dummyMedia)),
+		CreatedAt:           time.Now().UTC(),
+	})
+	_ = db.SavePreflightReport(ctx, domain.PreflightReport{
+		ID:                     "preflight_" + assetID,
+		AssetID:                assetID,
+		DurationSec:            35.0,
+		DurationMs:             35000,
+		AudioChannels:          1,
+		AudioSampleRate:        16000,
+		ContainerValid:         true,
+		FingerprintMatch:       true,
+		NormalizedAudioSHA256:  mediaObj.SHA256,
+		NormalizedAudioCASPath: mediaObj.Path,
+		CreatedAt:              time.Now().UTC(),
+	})
+	_ = db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{
+		AssetID: assetID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 35000, Role: domain.AudioRoleNarrationDialogue},
+		},
+		CreatedAt: time.Now().UTC(),
+	})
+	stems := domain.AudioStemArtifacts{
+		ID:      uuid.NewString(),
+		AssetID: assetID,
+		Stems: []domain.AudioStem{
+			{Type: domain.StemTypeBackground, AudioCASHash: mediaObj.SHA256},
+			{Type: domain.StemTypeVocals, AudioCASHash: mediaObj.SHA256},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	stemsBytes, _ := json.Marshal(stems)
+	stemsObj, _ := casStore.Put(bytes.NewReader(stemsBytes))
+	_ = db.SaveAudioStemsArtifactIndex(ctx, storage.AudioStemsArtifactIndex{
+		ID:        stems.ID,
+		AssetID:   assetID,
+		CASHash:   stemsObj.SHA256,
+		CreatedAt: stems.CreatedAt,
+	})
+	return assetID, runID, stemsObj.SHA256
+}
+
 func TestAudioMixService_SeparateAudio_UsesNormalizedPreflightAudio_NotRawMP4(t *testing.T) {
 	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
 	ctx := context.Background()
@@ -483,5 +611,246 @@ func TestAudioMixService_SeparateAudio_FailClosedWhenNormalizedEvidenceMissingOr
 	})
 	if err == nil || !strings.Contains(err.Error(), "normalized audio artifact missing") {
 		t.Fatalf("expected normalized audio artifact missing/unreadable error, got %v", err)
+	}
+}
+
+func TestAudioMixService_PlaceableSegmentMissingAudio_Refused(t *testing.T) {
+	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+	assetID, runID, stemsCAS := mixFixtureWithDubEligibleSpeech(t, db, casStore)
+
+	// Segment within suppression window [0, 35000ms] whose audio is missing from CAS
+	dubSegments := domain.DubSegmentsVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubSegmentsSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		Segments: []domain.DubSegment{
+			{
+				Index:              0,
+				SpeechBlockIndices: []int{0},
+				SpeakerID:          "SPEAKER_00",
+				StartMs:            1000,
+				EndMs:              3000,
+				SlotDurationMs:     2000,
+				MeasuredDurationMs: 1800,
+				AudioSHA256:        "sha256_nonexistent_audio_clip_that_cannot_be_read",
+				FitDecision:        domain.FitActionAccept,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubBytes, _ := json.Marshal(dubSegments)
+	dubObj, _ := casStore.Put(bytes.NewReader(dubBytes))
+
+	mix, err := mixSvc.MixAudio(ctx, service.AudioMixInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		DubSegmentsCAS: dubObj.SHA256,
+		AudioStemsCAS:  stemsCAS,
+	})
+	if err == nil {
+		t.Fatalf("expected ErrMixerOverrunRefused when placeable segment audio is missing, got PASS mix: %+v", mix)
+	}
+	if !errors.Is(err, domain.ErrMixerOverrunRefused) {
+		t.Fatalf("expected ErrMixerOverrunRefused, got %v", err)
+	}
+	if mix == nil || mix.OverallStatus != "REFUSED" {
+		t.Fatalf("expected a REFUSED dub mix artifact, got %+v", mix)
+	}
+	if !strings.Contains(mix.RefusalReason, "segment 0") {
+		t.Errorf("refusal reason must name the segment index, got %q", mix.RefusalReason)
+	}
+}
+
+func TestAudioMixService_DubEligibleWithUnreadableDubSegmentsCAS_Refused(t *testing.T) {
+	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+	assetID, runID, stemsCAS := mixFixtureWithDubEligibleSpeech(t, db, casStore)
+
+	// Role plan is dub-eligible (narration dialogue [0, 35000ms]), and DubSegmentsCAS is named but unreadable in CAS
+	mix, err := mixSvc.MixAudio(ctx, service.AudioMixInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		DubSegmentsCAS: "sha256_unreadable_missing_dub_segments_cas",
+		AudioStemsCAS:  stemsCAS,
+	})
+	if err == nil {
+		t.Fatalf("expected ErrMixerOverrunRefused when dub-eligible plan has unreadable dub artifact, got PASS mix: %+v", mix)
+	}
+	if !errors.Is(err, domain.ErrMixerOverrunRefused) {
+		t.Fatalf("expected ErrMixerOverrunRefused, got %v", err)
+	}
+	if mix == nil || mix.OverallStatus != "REFUSED" {
+		t.Fatalf("expected a REFUSED dub mix artifact, got %+v", mix)
+	}
+	if !strings.Contains(mix.RefusalReason, "unreadable") {
+		t.Errorf("expected refusal reason to mention unreadable CAS, got %q", mix.RefusalReason)
+	}
+}
+
+func TestAudioMixService_DubEligibleWithUnreadableDubSegmentsIndex_Refused(t *testing.T) {
+	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+	assetID, runID, stemsCAS := mixFixtureWithDubEligibleSpeech(t, db, casStore)
+
+	unreadableCAS := "sha256_unreadable_from_db_index"
+	err := db.SaveDubSegmentsVariantIndex(ctx, storage.DubSegmentsVariantIndex{
+		ID:             "dubseg-unreadable-idx",
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        unreadableCAS,
+		ProvenanceHash: "prov-unreadable",
+		CreatedAt:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("save dub segments index: %v", err)
+	}
+
+	mix, err := mixSvc.MixAudio(ctx, service.AudioMixInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		DubSegmentsCAS: "",
+		AudioStemsCAS:  stemsCAS,
+	})
+	if err == nil {
+		t.Fatalf("expected ErrMixerOverrunRefused when dub-eligible plan has unreadable dub index CAS, got PASS mix: %+v", mix)
+	}
+	if !errors.Is(err, domain.ErrMixerOverrunRefused) {
+		t.Fatalf("expected ErrMixerOverrunRefused, got %v", err)
+	}
+	if mix == nil || mix.OverallStatus != "REFUSED" {
+		t.Fatalf("expected a REFUSED dub mix artifact, got %+v", mix)
+	}
+	if !strings.Contains(mix.RefusalReason, "unreadable") {
+		t.Errorf("expected refusal reason to mention unreadable CAS, got %q", mix.RefusalReason)
+	}
+}
+
+func computeLegacyAudioStemsProvenanceHashV1(assetID, providerID, modelName, modelVersion string) string {
+	payload := struct {
+		AssetID      string `json:"asset_id"`
+		ProviderID   string `json:"provider_id"`
+		ModelName    string `json:"model_name"`
+		ModelVersion string `json:"model_version"`
+		SchemaVer    int    `json:"schema_version"`
+	}{
+		AssetID:      assetID,
+		ProviderID:   providerID,
+		ModelName:    modelName,
+		ModelVersion: modelVersion,
+		SchemaVer:    1,
+	}
+	b, _ := json.Marshal(payload)
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+func TestAudioMixService_SeparateAudio_SchemaVersion2_BypassesLegacyV1Cache(t *testing.T) {
+	mixSvc, db, casStore, reg, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+
+	assetID := "asset_schema_bump_" + uuid.NewString()[:8]
+	runID := "run_schema_bump_" + uuid.NewString()[:8]
+
+	dummyMedia := []byte("DUMMY_AUDIO_DATA_FOR_SCHEMA_TEST")
+	mediaObj, _ := casStore.Put(bytes.NewReader(dummyMedia))
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              attID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		RightsAttestationID: attID,
+		SHA256:              mediaObj.SHA256,
+		CASPath:             mediaObj.Path,
+		ByteSize:            int64(len(dummyMedia)),
+		CreatedAt:           time.Now().UTC(),
+	})
+
+	normWAVBytes := media.GeneratePCM16WAV(16000, 1, 2000)
+	wavObj, _ := casStore.Put(bytes.NewReader(normWAVBytes))
+	_ = db.SavePreflightReport(ctx, domain.PreflightReport{
+		ID:                     "preflight_" + assetID,
+		AssetID:                assetID,
+		DurationSec:            2.0,
+		DurationMs:             2000,
+		AudioChannels:          1,
+		AudioSampleRate:        16000,
+		ContainerFormat:        "mp4",
+		ContainerValid:         true,
+		FingerprintMatch:       true,
+		NormalizedAudioSHA256:  wavObj.SHA256,
+		NormalizedAudioCASPath: wavObj.Path,
+		CreatedAt:              time.Now().UTC(),
+	})
+
+	p := reg.ListAll()[0]
+	mName, mVer := p.ModelInfo()
+	legacyProvHash := computeLegacyAudioStemsProvenanceHashV1(assetID, p.ID(), mName, mVer)
+
+	legacyArtifact := domain.AudioStemArtifacts{
+		ID:            "legacy_stems_v1",
+		SchemaVersion: 1,
+		AssetID:       assetID,
+		ProviderID:    p.ID(),
+		ModelName:     mName,
+		ModelVersion:  mVer,
+		Stems: []domain.AudioStem{
+			{
+				Type:       domain.StemTypeVocals,
+				SampleRate: 44100,
+				Channels:   2,
+				Format:     "wav",
+				DurationMs: 2000,
+			},
+			{
+				Type:       domain.StemTypeBackground,
+				SampleRate: 44100,
+				Channels:   2,
+				Format:     "wav",
+				DurationMs: 2000,
+			},
+		},
+		ProvenanceHash: legacyProvHash,
+		CreatedAt:      time.Now().UTC(),
+	}
+	legacyBytes, _ := json.Marshal(legacyArtifact)
+	legacyObj, _ := casStore.Put(bytes.NewReader(legacyBytes))
+
+	err := db.SaveAudioStemsArtifactIndex(ctx, storage.AudioStemsArtifactIndex{
+		ID:             legacyArtifact.ID,
+		AssetID:        assetID,
+		ProviderID:     p.ID(),
+		ModelName:      mName,
+		ModelVersion:   mVer,
+		CASHash:        legacyObj.SHA256,
+		ProvenanceHash: legacyProvHash,
+		CreatedAt:      legacyArtifact.CreatedAt,
+	})
+	if err != nil {
+		t.Fatalf("save legacy stems index: %v", err)
+	}
+
+	stems, err := mixSvc.SeparateAudio(ctx, service.AudioSeparationInput{
+		RunID:   runID,
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("SeparateAudio failed: %v", err)
+	}
+	if stems.SchemaVersion != 2 {
+		t.Fatalf("expected stems.SchemaVersion == 2, got %d (stale cache replayed)", stems.SchemaVersion)
+	}
+	if stems.Stems[0].SampleRate == 44100 {
+		t.Fatalf("expected contract 16000 Hz stems, got stale 44100 Hz from cache")
 	}
 }

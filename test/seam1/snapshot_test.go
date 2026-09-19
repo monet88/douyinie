@@ -989,11 +989,15 @@ func TestSeam1_Snapshot_TTS_RegistrationAndVerification(t *testing.T) {
 	}
 
 	// 2b. Register genuine VieNeu model snapshot using v3 Turbo catalog
-	vieneuDir, vieneuManifest := createSnapshotDirWithFiles(t, map[string]string{
+	vieneuFiles := map[string]string{
 		"src/vieneu/assets/voices_v3_turbo.json": `{"presets": {"Trúc Ly": {"id": "Trúc Ly"}, "Phạm Tuyên": {"id": "Phạm Tuyên"}, "Đoan Trang": {"id": "Đoan Trang"}, "Xuân Vĩnh": {"id": "Xuân Vĩnh"}}}`,
-		"model.safetensors":                      "fake_vieneu_weights_bytes_1278db00",
-		"moss_tokenizer/tokenizer.json":          "{}",
-	})
+	}
+	for _, asset := range domain.PinnedVieNeuAssets {
+		if _, ok := vieneuFiles[asset.RelativePath]; !ok {
+			vieneuFiles[asset.RelativePath] = "fixture:" + asset.RelativePath
+		}
+	}
+	vieneuDir, vieneuManifest := createSnapshotDirWithFiles(t, vieneuFiles)
 	vieneuManifest.ModelID = provider.VieNeuModelID
 	vieneuManifest.ModelVersion = provider.VieNeuModelVersion
 	vSHA, err := domain.ComputeSnapshotManifestSHA256(&vieneuManifest)
@@ -1023,9 +1027,55 @@ func TestSeam1_Snapshot_TTS_RegistrationAndVerification(t *testing.T) {
 		t.Fatalf("expected dependency name %s, got %s", provider.VieNeuModelID, vBinding.DependencyName)
 	}
 
+	// Registration above proves the declared-digest -> on-disk-bytes link for this fixture. The
+	// resolver adds the byte pin: a manifest that is self-consistent but declares different bytes
+	// for a load-bearing weight is rejected even though registration accepted it.
+	if _, err := domain.ResolveTTSVoiceEntrypoint(vieneuManifest, vieneuDir, provider.VieNeuModelID, "Trúc Ly"); !errors.Is(err, domain.ErrSnapshotDigestMismatch) {
+		t.Fatalf("expected ErrSnapshotDigestMismatch for fixture bytes that are not the pinned weights, got: %v", err)
+	}
+
+	// Resolver view of the same snapshot with the pinned digests declared, i.e. what the provisioned
+	// snapshot declares (see domain.TestSnapshot_ResolveTTSVoiceEntrypoint_ZeroTTSPinnedWeights).
+	vieneuPinned := vieneuManifest
+	vieneuPinned.Files = append([]domain.SnapshotFileEntry(nil), vieneuManifest.Files...)
+	stampedCount := 0
+	for i := range vieneuPinned.Files {
+		for _, asset := range domain.PinnedVieNeuAssets {
+			if vieneuPinned.Files[i].RelativePath == asset.RelativePath {
+				vieneuPinned.Files[i].SHA256 = asset.SHA256
+				stampedCount++
+			}
+		}
+	}
+	if stampedCount != len(domain.PinnedVieNeuAssets) {
+		t.Fatalf("expected all %d pinned VieNeu assets stamped, got %d", len(domain.PinnedVieNeuAssets), stampedCount)
+	}
+
+	// Verification assertion: the resolver probe manifest (with pinned digests) cannot be registered
+	// against these fake fixture bytes without failing closed on digest mismatch.
+	pSHA, err := domain.ComputeSnapshotManifestSHA256(&vieneuPinned)
+	if err != nil {
+		t.Fatalf("compute vieneuPinned manifest sha: %v", err)
+	}
+	vieneuPinned.SnapshotManifestSHA256 = pSHA
+	_ = licSvc.RegisterManifest(context.Background(), domain.LicenseManifestEntry{
+		ID:             uuid.NewString(),
+		DependencyName: provider.VieNeuModelID,
+		Version:        provider.VieNeuModelVersion,
+		SHA256:         pSHA,
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Local-Offline",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	})
+	if _, err := snapSvc.RegisterAndVerifySnapshot(context.Background(), vieneuPinned, vieneuDir); !errors.Is(err, domain.ErrSnapshotDigestMismatch) {
+		t.Fatalf("expected pinned manifest with fake fixture bytes to fail RegisterAndVerifySnapshot, got: %v", err)
+	}
 	// All 4 VieNeu compatibility voices resolve
 	for _, vID := range expectedVieNeu {
-		ep, epErr := domain.ResolveTTSVoiceEntrypoint(vieneuManifest, vieneuDir, provider.VieNeuModelID, vID)
+		ep, epErr := domain.ResolveTTSVoiceEntrypoint(vieneuPinned, vieneuDir, provider.VieNeuModelID, vID)
 		if epErr != nil {
 			t.Errorf("expected voice %s to resolve, got err: %v", vID, epErr)
 		}
@@ -1036,7 +1086,7 @@ func TestSeam1_Snapshot_TTS_RegistrationAndVerification(t *testing.T) {
 	}
 
 	// Unverified voice fails closed
-	if _, err := domain.ResolveTTSVoiceEntrypoint(vieneuManifest, vieneuDir, provider.VieNeuModelID, "unverified_voice"); err == nil {
+	if _, err := domain.ResolveTTSVoiceEntrypoint(vieneuPinned, vieneuDir, provider.VieNeuModelID, "unverified_voice"); err == nil {
 		t.Fatalf("expected unverified VieNeu voice to fail closed")
 	}
 	// 3. Kokoro model snapshot: synthetic fake checkpoint bytes cannot pass the pinned RC SHA-256 (fail-closed proof)

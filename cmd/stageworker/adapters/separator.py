@@ -211,6 +211,87 @@ def probe_runtime_identity(model_name: str, model_version: str = "v3") -> Dict[s
         "runtime_versions": runtime_versions,
         "adapter_revision": f"cmd/stageworker/adapters/separator.py@v{pkg_version}",
     }
+# The pipeline contract for separated stems is 16 kHz 16-bit PCM (the audio-role analyzer
+# rejects any other rate). audio-separator defaults to 44.1 kHz, so the contract rate must be
+# requested explicitly: the mix is resampled to `sample_rate` when it is loaded, so every stem
+# written downstream really is at this rate.
+CONTRACT_SAMPLE_RATE = 16000
+
+
+def measure_wav_properties(wav_bytes: bytes) -> tuple:
+    """Return (sample_rate, channels, duration_ms) of a WAV payload, or (0, 0, 0) when unreadable."""
+    if not wav_bytes:
+        return 0, 0, 0
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            return wf.getframerate(), wf.getnchannels(), int((wf.getnframes() * 1000) / wf.getframerate())
+    except Exception:
+        return 0, 0, 0
+
+def normalize_stem_to_contract(wav_bytes: bytes) -> bytes:
+    """Return the stem payload resampled to the pipeline contract rate (16 kHz 16-bit mono).
+
+    The UVR lane requests the contract rate from audio-separator, but Demucs always writes its
+    model's native 44.1 kHz stereo, and the audio-role analyzer rejects anything but 16 kHz mono -
+    so a native-rate stem dead-ends `audio_role_plan`, the first stage of every real run. Enforcing
+    the contract per stem keeps one invariant for every consumer instead of pushing a resample into
+    each one; a conversion failure fails closed rather than persisting an unusable stem.
+    """
+    if not wav_bytes:
+        return wav_bytes
+    rate, channels, _ = measure_wav_properties(wav_bytes)
+    sampwidth = 0
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            sampwidth = wf.getsampwidth()
+    except Exception:
+        pass
+    if rate == CONTRACT_SAMPLE_RATE and channels == 1 and sampwidth == 2:
+        return wav_bytes
+    # ffmpeg is given a real output file, not a pipe: a streamed WAV cannot backfill its RIFF/data
+    # sizes, and these bytes are persisted as a content-addressed artifact other readers measure.
+    fd, out_path = tempfile.mkstemp(prefix="stem_contract_", suffix=".wav")
+    os.close(fd)
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-y", "-i", "pipe:0",
+                "-ar", str(CONTRACT_SAMPLE_RATE), "-ac", "1", "-c:a", "pcm_s16le", out_path,
+            ],
+            input=wav_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0 or not os.path.exists(out_path):
+            raise RuntimeError(
+                f"STEM_CONTRACT_RATE_FAILED: {rate} Hz/{channels} ch stem to {CONTRACT_SAMPLE_RATE} Hz mono: "
+                + proc.stderr.decode("utf-8", "replace").strip()[-300:]
+            )
+        with open(out_path, "rb") as f:
+            converted = f.read()
+        if not converted:
+            raise RuntimeError(f"STEM_CONTRACT_RATE_FAILED: empty {CONTRACT_SAMPLE_RATE} Hz stem")
+        return converted
+    finally:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+
+
+def enforce_contract_rate(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a separation result whose stems - and the format they report - honour the contract."""
+    for key in ["vocals_data", "background_data"]:
+        data = result.get(key) or b""
+        if data:
+            result[key] = normalize_stem_to_contract(data)
+    rate, channels, _ = measure_wav_properties(result.get("vocals_data") or b"")
+    if not rate:
+        rate, channels, _ = measure_wav_properties(result.get("background_data") or b"")
+    if rate:
+        result["sample_rate"] = rate
+        result["channels"] = channels
+    return result
+
+
 def generate_synthetic_pcm_wav(sample_rate: int = 16000, channels: int = 1, duration_ms: int = 5000) -> bytes:
     """Generate standard 16-bit PCM WAV bytes."""
     num_samples = int((sample_rate * duration_ms) / 1000)
@@ -326,91 +407,107 @@ def separate_uvr(
     runtime_identity = f"python-audio-separator {installed_ver or PINNED_AUDIO_SEPARATOR_VERSION}{backend_info}"
 
     model_dir = model_path if model_path else None
-    sep = Separator(model_file_dir=model_dir) if model_dir else Separator()
-
-    # Block all request-time network/download helpers on the Separator instance so floating network resolution is impossible
-    def _blocked_download(*args, **kwargs):
-        raise RuntimeError("NETWORK_DOWNLOAD_FORBIDDEN: UVR execution is strictly offline; download helper was reached")
-
-    sep.download_file_if_not_exists = _blocked_download
-    if hasattr(sep, "download_file_by_hash"):
-        sep.download_file_by_hash = _blocked_download
-    if hasattr(sep, "list_supported_model_files"):
-        sep.list_supported_model_files = _blocked_download
-
-    # Provide offline local model resolution: resolve strictly from verified snapshot assets
-    def _offline_download_model_files(name):
-        ep_file = entrypoint_file or (os.path.join(model_path, UVR_CANONICAL_FILENAME) if model_path else None)
-        if not ep_file or not os.path.exists(ep_file):
-            raise RuntimeError(f"SEPARATOR_MODEL_ASSET_MISSING: UVR artifact file missing from snapshot: {ep_file}")
-        return (
-            os.path.basename(ep_file),
-            "MDX",
-            "UVR-MDX-NET-Inst_HQ_4",
-            ep_file,
-            None,
+    # audio-separator falls back to os.getcwd() when output_dir is None, so stems were written
+    # next to whatever directory the worker was launched in. Keep them in a scratch dir.
+    out_dir = tempfile.mkdtemp(prefix="uvr_out_")
+    try:
+        sep = (
+            Separator(model_file_dir=model_dir, output_dir=out_dir, sample_rate=CONTRACT_SAMPLE_RATE)
+            if model_dir
+            else Separator(output_dir=out_dir, sample_rate=CONTRACT_SAMPLE_RATE)
         )
 
-    sep.download_model_files = _offline_download_model_files
+        # Block all request-time network/download helpers on the Separator instance so floating network resolution is impossible
+        def _blocked_download(*args, **kwargs):
+            raise RuntimeError("NETWORK_DOWNLOAD_FORBIDDEN: UVR execution is strictly offline; download helper was reached")
 
-    if model_params is not None:
-        sep.load_model_data_using_hash = lambda *a, **kw: dict(model_params)
-    # Contextual guard blocking socket/urllib/requests during load and separation
-    class _OfflineNetworkGuard:
-        def __enter__(self):
-            import urllib.request
-            self._orig_urlopen = urllib.request.urlopen
-            def _blocked_urlopen(*a, **kw):
-                raise RuntimeError("NETWORK_DOWNLOAD_FORBIDDEN: HTTP/network access blocked in offline UVR execution")
-            urllib.request.urlopen = _blocked_urlopen
+        sep.download_file_if_not_exists = _blocked_download
+        if hasattr(sep, "download_file_by_hash"):
+            sep.download_file_by_hash = _blocked_download
+        if hasattr(sep, "list_supported_model_files"):
+            sep.list_supported_model_files = _blocked_download
 
-            self._orig_requests_get = None
-            if "requests" in sys.modules:
-                requests_mod = sys.modules["requests"]
-                if hasattr(requests_mod, "get"):
-                    self._orig_requests_get = requests_mod.get
-                    requests_mod.get = _blocked_download
-            return self
+        # Provide offline local model resolution: resolve strictly from verified snapshot assets
+        def _offline_download_model_files(name):
+            ep_file = entrypoint_file or (os.path.join(model_path, UVR_CANONICAL_FILENAME) if model_path else None)
+            if not ep_file or not os.path.exists(ep_file):
+                raise RuntimeError(f"SEPARATOR_MODEL_ASSET_MISSING: UVR artifact file missing from snapshot: {ep_file}")
+            return (
+                os.path.basename(ep_file),
+                "MDX",
+                "UVR-MDX-NET-Inst_HQ_4",
+                ep_file,
+                None,
+            )
 
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            import urllib.request
-            urllib.request.urlopen = self._orig_urlopen
-            if self._orig_requests_get is not None and "requests" in sys.modules:
-                sys.modules["requests"].get = self._orig_requests_get
+        sep.download_model_files = _offline_download_model_files
 
-    with _OfflineNetworkGuard():
-        sep.load_model(model_name)
-        output_files = sep.separate(audio_path)
+        if model_params is not None:
+            sep.load_model_data_using_hash = lambda *a, **kw: dict(model_params)
+        # Contextual guard blocking socket/urllib/requests during load and separation
+        class _OfflineNetworkGuard:
+            def __enter__(self):
+                import urllib.request
+                self._orig_urlopen = urllib.request.urlopen
+                def _blocked_urlopen(*a, **kw):
+                    raise RuntimeError("NETWORK_DOWNLOAD_FORBIDDEN: HTTP/network access blocked in offline UVR execution")
+                urllib.request.urlopen = _blocked_urlopen
 
-    vocals_path = None
-    bg_path = None
-    for f in output_files:
-        if "Vocals" in f or "vocals" in f:
-            vocals_path = f
-        elif "Instrumental" in f or "background" in f or "no_vocals" in f:
-            bg_path = f
+                self._orig_requests_get = None
+                if "requests" in sys.modules:
+                    requests_mod = sys.modules["requests"]
+                    if hasattr(requests_mod, "get"):
+                        self._orig_requests_get = requests_mod.get
+                        requests_mod.get = _blocked_download
+                return self
 
-    vocals_bytes = b""
-    if vocals_path and os.path.exists(vocals_path):
-        with open(vocals_path, "rb") as vf:
-            vocals_bytes = vf.read()
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                import urllib.request
+                urllib.request.urlopen = self._orig_urlopen
+                if self._orig_requests_get is not None and "requests" in sys.modules:
+                    sys.modules["requests"].get = self._orig_requests_get
 
-    bg_bytes = b""
-    if bg_path and os.path.exists(bg_path):
-        with open(bg_path, "rb") as bf:
-            bg_bytes = bf.read()
+        with _OfflineNetworkGuard():
+            sep.load_model(model_name)
+            output_files = sep.separate(audio_path)
 
-    dur_ms = 5000
-    if bg_bytes:
-        with wave.open(io.BytesIO(bg_bytes), "rb") as wf:
-            dur_ms = int((wf.getnframes() * 1000) / wf.getframerate())
+        vocals_path = None
+        bg_path = None
+        for f in output_files:
+            if "Vocals" in f or "vocals" in f:
+                vocals_path = f
+            elif "Instrumental" in f or "background" in f or "no_vocals" in f:
+                bg_path = f
+
+        vocals_bytes = b""
+        if vocals_path and os.path.exists(vocals_path):
+            with open(vocals_path, "rb") as vf:
+                vocals_bytes = vf.read()
+
+        bg_bytes = b""
+        if bg_path and os.path.exists(bg_path):
+            with open(bg_path, "rb") as bf:
+                bg_bytes = bf.read()
+
+        dur_ms = 5000
+        if bg_bytes:
+            with wave.open(io.BytesIO(bg_bytes), "rb") as wf:
+                dur_ms = int((wf.getnframes() * 1000) / wf.getframerate())
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+    # Report what was actually written, not what was requested: a stem whose rate drifted from
+    # the contract must be visible in the artifact instead of being papered over here.
+    sample_rate, channels, _ = measure_wav_properties(vocals_bytes)
+    if not sample_rate:
+        sample_rate, channels, _ = measure_wav_properties(bg_bytes)
 
     return {
         "vocals_data": vocals_bytes,
         "background_data": bg_bytes,
         "duration_ms": dur_ms,
-        "sample_rate": 16000,
-        "channels": 1,
+        "sample_rate": sample_rate,
+        "channels": channels,
         "model_name": UVR_CANONICAL_FILENAME,
         "model_version": model_version or "v3",
         "runtime_identity": runtime_identity,
@@ -548,12 +645,16 @@ def separate_demucs(
         with wave.open(io.BytesIO(bg_bytes), "rb") as wf:
             dur_ms = int((wf.getnframes() * 1000) / wf.getframerate())
 
+        sample_rate, channels, _ = measure_wav_properties(vocals_bytes)
+        if not sample_rate:
+            sample_rate, channels, _ = measure_wav_properties(bg_bytes)
+
         return {
             "vocals_data": vocals_bytes,
             "background_data": bg_bytes,
             "duration_ms": dur_ms,
-            "sample_rate": 16000,
-            "channels": 1,
+            "sample_rate": sample_rate,
+            "channels": channels,
             "model_name": "htdemucs",
             "model_version": model_version or "v4",
             "runtime_identity": runtime_identity,
@@ -563,6 +664,29 @@ def separate_demucs(
 
 
 def separate_audio_stems(
+    audio_path: str,
+    model_name: str,
+    model_version: str,
+    model_path: Optional[str] = None,
+    entrypoint_file: Optional[str] = None,
+    require_model_snapshot: bool = False,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Separate stems and return them at the pipeline contract rate (16 kHz 16-bit mono)."""
+    return enforce_contract_rate(
+        _dispatch_audio_stems(
+            audio_path,
+            model_name,
+            model_version,
+            model_path=model_path,
+            entrypoint_file=entrypoint_file,
+            require_model_snapshot=require_model_snapshot,
+            **kwargs,
+        )
+    )
+
+
+def _dispatch_audio_stems(
     audio_path: str,
     model_name: str,
     model_version: str,

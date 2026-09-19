@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -312,10 +313,94 @@ func (s *VisualTextService) DetectAndTrackText(ctx context.Context, input Visual
 	return &plan, nil
 }
 
+// stageArtifactHash returns the artifact a stage of this run recorded, i.e. what the stage actually
+// consumed or produced. A run that only reused cached artifacts has no variant index row of its own, and
+// the stage execution is what still binds it to the artifact. An empty string means the stage recorded no
+// artifact (benign cache-miss or unrun stage); a database failure is returned so callers fail closed
+// instead of silently burning source text.
+func (s *VisualTextService) stageArtifactHash(ctx context.Context, runID, stage string) (string, error) {
+	if s.db == nil {
+		return "", nil
+	}
+	casHash, err := s.db.GetStageArtifactHash(ctx, runID, stage)
+	if err != nil {
+		return "", fmt.Errorf("query stage artifact for run %s stage %s: %w", runID, stage, err)
+	}
+	return casHash, nil
+}
+
+// sampleSlot maps a wall-clock detection time onto the sampling grid slot the OCR pass used, so
+// keyframe interpolation stays in sampling space even though the provider numbers frames absolutely.
+func sampleSlot(timestampMs, stepMs int64) int {
+	if stepMs <= 0 {
+		return int(timestampMs)
+	}
+	return int(timestampMs / stepMs)
+}
+
 // rawDetectionCluster groups observations across frames that belong to the same on-screen text entity.
 type rawDetectionCluster struct {
-	text         string
-	observations []provider.RawTextDetection
+	text           string
+	observations   []provider.RawTextDetection
+	avgBox         domain.BoundingBox
+	meanConfidence float64
+}
+
+// recomputeAggregates refreshes the cluster's representative token (its highest-confidence reading,
+// i.e. the best guess at what the box actually says) and its mean box and confidence.
+func (c *rawDetectionCluster) recomputeAggregates() {
+	if len(c.observations) == 0 {
+		return
+	}
+	var sumX, sumY, sumW, sumH, confSum float64
+	best := c.observations[0]
+	for _, o := range c.observations {
+		sumX += float64(o.Box.X)
+		sumY += float64(o.Box.Y)
+		sumW += float64(o.Box.Width)
+		sumH += float64(o.Box.Height)
+		confSum += o.Confidence
+		if o.Confidence > best.Confidence {
+			best = o
+		}
+	}
+	n := float64(len(c.observations))
+	c.avgBox = domain.BoundingBox{
+		X: int(sumX / n), Y: int(sumY / n), Width: int(sumW / n), Height: int(sumH / n),
+	}
+	c.meanConfidence = confSum / n
+	c.text = best.Text
+}
+
+// isUnreliableReading reports whether a reading is a guess about glyphs rather than a readable
+// token. The threshold is the classifier's review threshold, i.e. the confidence above which the
+// pipeline treats a recognized token as content: below it the token is not evidence of what the box
+// says, only of where the box is.
+func isUnreliableReading(text string, confidence float64, cfg domain.TextRegionClassifyConfig) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	trust := cfg.MinConfidence
+	if trust <= 0 {
+		trust = 0.55
+	}
+	return confidence < trust
+}
+
+// boxOverlapRatio returns the intersection area relative to the smaller of the two boxes: how much
+// of the smaller box the other covers. It answers "is this the same on-screen box?" rather than
+// "do these two detections describe the same extent?" (IoU), which is what tracking needs.
+func boxOverlapRatio(a, b domain.BoundingBox) float64 {
+	ix := min(a.X+a.Width, b.X+b.Width) - max(a.X, b.X)
+	iy := min(a.Y+a.Height, b.Y+b.Height) - max(a.Y, b.Y)
+	if ix <= 0 || iy <= 0 {
+		return 0
+	}
+	smaller := min(a.Width*a.Height, b.Width*b.Height)
+	if smaller <= 0 {
+		return 0
+	}
+	return float64(ix*iy) / float64(smaller)
 }
 
 func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, cfg domain.TextRegionClassifyConfig) []domain.TrackedTextRegion {
@@ -323,27 +408,39 @@ func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, c
 		return []domain.TrackedTextRegion{}
 	}
 
-	// 1. Cluster detections by text similarity + spatial overlap
+	// 1. Cluster detections belonging to the same on-screen text entity.
+	//
+	// Text equality is the primary key, but it cannot be the only one: when the recognizer is
+	// unreliable it returns a DIFFERENT garbage token for the same physical caption on every sample
+	// (live evidence, run 4f86657f: `别品同` -> `别品` -> `济室` -> `点酒房` over 11000-12500 ms), which
+	// shatters one caption into four single-sample regions and drops it from the plan entirely.
+	// Two temporally adjacent (<= stepMs*4), spatially overlapping readings that are BOTH below the
+	// trust threshold are therefore the same box with two bad reads, not two entities.
 	var clusters []rawDetectionCluster
 	for _, d := range dets {
 		matchedIdx := -1
 		for idx, cl := range clusters {
-			if strings.EqualFold(strings.TrimSpace(cl.text), strings.TrimSpace(d.Text)) {
-				// Same text: check if temporally adjacent or spatial overlap
-				lastObs := cl.observations[len(cl.observations)-1]
-				if math.Abs(float64(d.TimestampMs-lastObs.TimestampMs)) <= float64(stepMs*4) {
-					matchedIdx = idx
-					break
-				}
+			lastObs := cl.observations[len(cl.observations)-1]
+			adjacent := math.Abs(float64(d.TimestampMs-lastObs.TimestampMs)) <= float64(stepMs*4)
+			sameText := strings.EqualFold(strings.TrimSpace(cl.text), strings.TrimSpace(d.Text))
+			switch {
+			case sameText && adjacent:
+				matchedIdx = idx
+			case adjacent && isUnreliableReading(cl.text, cl.meanConfidence, cfg) &&
+				isUnreliableReading(d.Text, d.Confidence, cfg) && boxOverlapRatio(cl.avgBox, d.Box) >= 0.5:
+				matchedIdx = idx
+			}
+			if matchedIdx >= 0 {
+				break
 			}
 		}
 		if matchedIdx >= 0 {
 			clusters[matchedIdx].observations = append(clusters[matchedIdx].observations, d)
+			clusters[matchedIdx].recomputeAggregates()
 		} else {
-			clusters = append(clusters, rawDetectionCluster{
-				text:         d.Text,
-				observations: []provider.RawTextDetection{d},
-			})
+			cl := rawDetectionCluster{text: d.Text, observations: []provider.RawTextDetection{d}}
+			cl.recomputeAggregates()
+			clusters = append(clusters, cl)
 		}
 	}
 
@@ -357,67 +454,82 @@ func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, c
 
 		// Sort observations chronologically
 		sort.Slice(cl.observations, func(i, j int) bool {
-			return cl.observations[i].FrameIndex < cl.observations[j].FrameIndex
+			return cl.observations[i].TimestampMs < cl.observations[j].TimestampMs
 		})
 
 		firstObs := cl.observations[0]
 		lastObs := cl.observations[len(cl.observations)-1]
 
-		obsByFrame := make(map[int]provider.RawTextDetection)
-		var confSum float64
+		// Keyframes live on the SAMPLING grid, not on the video frame grid. The OCR adapter reports
+		// FrameIndex as the absolute video frame number (round(timestamp_ms/1000*fps)) while
+		// timestamp_ms is the requested sample time, so keyframe slots are derived from timestamps:
+		// treating FrameIndex as a sample ordinal multiplied interpolated timestamps by fps*step/1000
+		// (live evidence, run 4f86657f: a 8500-9000 ms caption carried keyframes claiming 128000 ms).
+		obsBySlot := make(map[int]provider.RawTextDetection)
 		minConf := 1.0
-		var avgBox domain.BoundingBox
-
 		for _, obs := range cl.observations {
-			obsByFrame[obs.FrameIndex] = obs
-			confSum += obs.Confidence
+			obsBySlot[sampleSlot(obs.TimestampMs, stepMs)] = obs
 			if obs.Confidence < minConf {
 				minConf = obs.Confidence
 			}
-			avgBox.X += obs.Box.X
-			avgBox.Y += obs.Box.Y
-			avgBox.Width += obs.Box.Width
-			avgBox.Height += obs.Box.Height
 		}
 
 		obsCount := len(cl.observations)
-		avgBox.X /= obsCount
-		avgBox.Y /= obsCount
-		avgBox.Width /= obsCount
-		avgBox.Height /= obsCount
-		meanConf := confSum / float64(obsCount)
-		// Collect spatio-temporally nearby observations from other detections (adjacent frames within +/- 4 steps, spatial overlap)
+		avgBox := cl.avgBox
+		meanConf := cl.meanConfidence
+		// Collect spatio-temporally nearby observations from OTHER detections: readings of the same
+		// place within +/- 4 sampling steps. The window is measured in time, not in frame numbers -
+		// the OCR adapter numbers frames absolutely (30 fps), so a +/- 4 frame window is +/- 133 ms
+		// and would never see the neighbouring samples it exists to compare against (live evidence,
+		// run 4f86657f: "BLGOK" sat next to "CottGG"/"Cottce"/"Cott6e" 500 ms apart and stayed a
+		// semantic_text label because the window never reached them).
+		//
+		// The cluster's own observations are excluded: a region that was read differently on every
+		// sample of its own is exactly the evidence this gate needs, but a merged low-confidence
+		// caption is judged by the classifier's caption rules, not by its own misreadings.
+		ownSlots := make(map[int]bool, len(cl.observations))
+		for _, obs := range cl.observations {
+			ownSlots[sampleSlot(obs.TimestampMs, stepMs)] = true
+		}
 		var nearbyObs []domain.NearbyObservation
 		for _, d := range dets {
-			if d.FrameIndex >= firstObs.FrameIndex-4 && d.FrameIndex <= lastObs.FrameIndex+4 {
-				// Check if spatial overlap with cluster avgBox
-				expandedBox := domain.BoundingBox{
-					X:      avgBox.X - avgBox.Width/2,
-					Y:      avgBox.Y - avgBox.Height/2,
-					Width:  avgBox.Width * 2,
-					Height: avgBox.Height * 2,
-				}
-				if domain.BoxesOverlap(expandedBox, d.Box) {
-					nearbyObs = append(nearbyObs, domain.NearbyObservation{
-						Text:        d.Text,
-						TimestampMs: d.TimestampMs,
-						Box:         d.Box,
-					})
-				}
+			if d.TimestampMs < firstObs.TimestampMs-stepMs*4 || d.TimestampMs > lastObs.TimestampMs+stepMs*4 {
+				continue
+			}
+			if ownSlots[sampleSlot(d.TimestampMs, stepMs)] {
+				continue
+			}
+			expandedBox := domain.BoundingBox{
+				X:      avgBox.X - avgBox.Width/2,
+				Y:      avgBox.Y - avgBox.Height/2,
+				Width:  avgBox.Width * 2,
+				Height: avgBox.Height * 2,
+			}
+			if domain.BoxesOverlap(expandedBox, d.Box) {
+				nearbyObs = append(nearbyObs, domain.NearbyObservation{
+					Text:        d.Text,
+					TimestampMs: d.TimestampMs,
+					Box:         d.Box,
+				})
 			}
 		}
 
 		// Classify role deterministically with spatio-temporal instability tracking
-		role, protectedMeta, reviewReq, reviewReason := domain.ClassifyRegionWithInstability(cl.text, avgBox, meanConf, cfg, nearbyObs)
+		ownBoxes := make([]domain.BoundingBox, 0, len(cl.observations))
+		for _, obs := range cl.observations {
+			ownBoxes = append(ownBoxes, obs.Box)
+		}
+		role, protectedMeta, reviewReq, reviewReason := domain.ClassifyRegionWithInstability(cl.text, avgBox, meanConf, cfg, len(obsBySlot), nearbyObs, ownBoxes)
 		// Build keyframes with linear interpolation for frame gaps <= 2 steps
 		var keyframes []domain.RegionKeyframe
 		interpolatedCount := 0
 
-		for fIdx := firstObs.FrameIndex; fIdx <= lastObs.FrameIndex; fIdx++ {
-			fTimeMs := int64(fIdx) * stepMs
-			if obs, exists := obsByFrame[fIdx]; exists {
+		firstSlot, lastSlot := sampleSlot(firstObs.TimestampMs, stepMs), sampleSlot(lastObs.TimestampMs, stepMs)
+		for slot := firstSlot; slot <= lastSlot; slot++ {
+			fTimeMs := int64(slot) * stepMs
+			if obs, exists := obsBySlot[slot]; exists {
 				keyframes = append(keyframes, domain.RegionKeyframe{
-					FrameIndex:  fIdx,
+					FrameIndex:  obs.FrameIndex,
 					TimestampMs: obs.TimestampMs,
 					Box:         obs.Box,
 					Confidence:  obs.Confidence,
@@ -426,14 +538,14 @@ func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, c
 			} else {
 				// Linear interpolation between closest preceding and following observations
 				var prevObs, nextObs *provider.RawTextDetection
-				for p := fIdx - 1; p >= firstObs.FrameIndex; p-- {
-					if o, ok := obsByFrame[p]; ok {
+				for p := slot - 1; p >= firstSlot; p-- {
+					if o, ok := obsBySlot[p]; ok {
 						prevObs = &o
 						break
 					}
 				}
-				for n := fIdx + 1; n <= lastObs.FrameIndex; n++ {
-					if o, ok := obsByFrame[n]; ok {
+				for n := slot + 1; n <= lastSlot; n++ {
+					if o, ok := obsBySlot[n]; ok {
 						nextObs = &o
 						break
 					}
@@ -442,8 +554,8 @@ func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, c
 				var interpBox domain.BoundingBox
 				var interpConf float64
 				if prevObs != nil && nextObs != nil {
-					totalFrames := float64(nextObs.FrameIndex - prevObs.FrameIndex)
-					alpha := float64(fIdx-prevObs.FrameIndex) / totalFrames
+					prevSlot, nextSlot := sampleSlot(prevObs.TimestampMs, stepMs), sampleSlot(nextObs.TimestampMs, stepMs)
+					alpha := float64(slot-prevSlot) / float64(nextSlot-prevSlot)
 					interpBox = domain.BoundingBox{
 						X:      int(float64(prevObs.Box.X) + alpha*float64(nextObs.Box.X-prevObs.Box.X)),
 						Y:      int(float64(prevObs.Box.Y) + alpha*float64(nextObs.Box.Y-prevObs.Box.Y)),
@@ -464,7 +576,7 @@ func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, c
 
 				interpolatedCount++
 				keyframes = append(keyframes, domain.RegionKeyframe{
-					FrameIndex:  fIdx,
+					FrameIndex:  prevObs.FrameIndex,
 					TimestampMs: fTimeMs,
 					Box:         interpBox,
 					Confidence:  interpConf,
@@ -503,18 +615,24 @@ func buildAndInterpolateTracks(dets []provider.RawTextDetection, stepMs int64, c
 
 // LocalizeVisualTrackInput defines input parameters to generate LocalizedVisualTrack and LocalizedSubtitleTrack.
 type LocalizeVisualTrackInput struct {
-	RunID                 string                           `json:"run_id"`
-	AssetID               string                           `json:"asset_id"`
-	JobID                 string                           `json:"job_id,omitempty"`
-	TargetLanguage        string                           `json:"target_language"`
-	TranslationVariantCAS string                           `json:"translation_variant_cas,omitempty"`
-	Overrides             []domain.RegionOverride          `json:"overrides,omitempty"`
-	InpaintingFallbacks   []string                         `json:"inpainting_fallbacks,omitempty"` // Region IDs where inpainting fallback is explicitly requested
-	SceneProtectedRegions []domain.SceneProtectedRegion    `json:"scene_protected_regions,omitempty"`
-	PlacementSelector     domain.SubtitlePlacementSelector `json:"-"`
-	ExecutionProfile      domain.ExecutionProfile          `json:"execution_profile,omitempty"`
-	AuthorizedCredentials []string                         `json:"authorized_credentials,omitempty"`
-	ConsentGranted        bool                             `json:"consent_granted,omitempty"`
+	RunID                 string                        `json:"run_id"`
+	AssetID               string                        `json:"asset_id"`
+	JobID                 string                        `json:"job_id,omitempty"`
+	TargetLanguage        string                        `json:"target_language"`
+	TranslationVariantCAS string                        `json:"translation_variant_cas,omitempty"`
+	Overrides             []domain.RegionOverride       `json:"overrides,omitempty"`
+	InpaintingFallbacks   []string                      `json:"inpainting_fallbacks,omitempty"` // Region IDs where inpainting fallback is explicitly requested
+	SceneProtectedRegions []domain.SceneProtectedRegion `json:"scene_protected_regions,omitempty"`
+	// StrictOverlapRegionIDs names the regions whose geometry the operator just changed. A
+	// collision on one of THESE is a rejected edit (the operator gets actionable feedback and
+	// can drag elsewhere); collisions on any other region are pre-existing layout facts and keep
+	// following the automatic path - overlay skipped, visual_occlusion exception surfaced - so a
+	// correction is not blocked by a region the operator has not touched yet.
+	StrictOverlapRegionIDs []string                         `json:"strict_overlap_region_ids,omitempty"`
+	PlacementSelector      domain.SubtitlePlacementSelector `json:"-"`
+	ExecutionProfile       domain.ExecutionProfile          `json:"execution_profile,omitempty"`
+	AuthorizedCredentials  []string                         `json:"authorized_credentials,omitempty"`
+	ConsentGranted         bool                             `json:"consent_granted,omitempty"`
 }
 
 // ApplyRegionOverrides applies direct-manipulation overrides (drag/resize/reclassify/text) to a TextRegionPlan.
@@ -651,6 +769,602 @@ func ApplyRegionOverrides(plan *domain.TextRegionPlan, overrides []domain.Region
 	return &clone, nil
 }
 
+// sceneProtectedBoxes returns the boxes the pipeline itself declared protected (faces, tap
+// targets, timeline controls) that are active in the region's window. A collision with one of
+// these is not a layout the operator can accept, so it stays fail-closed.
+func sceneProtectedBoxes(in LocalizeVisualTrackInput, reg domain.TrackedTextRegion) []domain.BoundingBox {
+	return domain.GetProtectedBoxesForTimeWindow(nil, in.SceneProtectedRegions, reg.FirstSeenMs, reg.LastSeenMs, reg.ID)
+}
+
+// protectedRegionBoxes returns the boxes of other tracked regions the classifier marked
+// protected (UI controls, brand marks) that are active in the region's window. A collision
+// with one of these skips the overlay and surfaces a visual_occlusion exception instead of
+// dead-ending the run (architecture §9.1), because the operator can move or reclassify either
+// region.
+func protectedRegionBoxes(plan *domain.TextRegionPlan, reg domain.TrackedTextRegion) []domain.BoundingBox {
+	if plan == nil {
+		return nil
+	}
+	return domain.GetProtectedBoxesForTimeWindow(plan.Regions, nil, reg.FirstSeenMs, reg.LastSeenMs, reg.ID)
+}
+
+// firstProtectedOverlap returns the first protected box the overlay box overlaps, in the
+// order the caller supplied.
+func firstProtectedOverlap(box domain.BoundingBox, protected []domain.BoundingBox) (domain.BoundingBox, bool) {
+	for _, prot := range protected {
+		if domain.BoxesOverlap(box, prot) {
+			return prot, true
+		}
+	}
+	return domain.BoundingBox{}, false
+}
+
+// coverPaddingPx absorbs the anti-aliased edge of a burned-in caption so the cover box does
+// not leave a one-pixel halo of the original text behind.
+const coverPaddingPx = 6
+
+// resolveOverlayCollisions drops in-place replacements that would land on another replacement sharing the
+// screen, and reports each dropped region as an occlusion exception.
+//
+// Compositing two replacements over one another paints one black box across the other's translated text
+// (live evidence, live-20260918: the four semantic_text regions of the ramen pack - 净含量：面饼, 辣鸡肉味拌面,
+// HOCHI, 面饼：107克 - all live at 4500-5500ms and drew nested boxes that clipped each other). The dominant
+// label of a colliding group wins; the loser keeps its source text untouched and goes to the operator as a
+// layout decision instead of shipping a cut-off translation.
+//
+// Every kept replacement sharing the incoming label's screen window is examined, not just the first:
+// displacing one neighbour while staying overlapped with another would leave two replacements painting
+// over each other, which is the defect this resolution exists to prevent.
+func resolveOverlayCollisions(overlays []domain.LocalizedOverlayItem) ([]domain.LocalizedOverlayItem, []domain.OcclusionReport) {
+	kept := make([]domain.LocalizedOverlayItem, 0, len(overlays))
+	var occlusions []domain.OcclusionReport
+	for _, ov := range overlays {
+		var displaced, winners []int
+		for i, other := range kept {
+			if !overlaysShareScreen(ov, other) {
+				continue
+			}
+			if overlayDominates(ov, other) {
+				displaced = append(displaced, i)
+			} else {
+				winners = append(winners, i)
+			}
+		}
+		if len(winners) > 0 {
+			// The incoming label yields to a kept label that stays on screen: it is dropped, and so is
+			// every kept label it would have displaced that still shares the screen with a survivor -
+			// otherwise the group would keep two boxes on one another.
+			strongest := winners[0]
+			for _, i := range winners[1:] {
+				if overlayDominates(kept[i], kept[strongest]) {
+					strongest = i
+				}
+			}
+			occlusions = append(occlusions, overlayCollisionReport(ov, kept[strongest]))
+			var drop []int
+			for _, i := range displaced {
+				if w := overlappingKeptOverlay(kept, winners, kept[i]); w >= 0 {
+					drop = append(drop, i)
+					occlusions = append(occlusions, overlayCollisionReport(kept[i], kept[w]))
+				}
+			}
+			kept = removeOverlays(kept, drop)
+			continue
+		}
+		if len(displaced) == 0 {
+			kept = append(kept, ov)
+			continue
+		}
+		// The incoming label dominates every kept label it collides with: it takes over their boxes and
+		// each of them becomes an operator exception instead of a cut-off translation.
+		for _, i := range displaced {
+			occlusions = append(occlusions, overlayCollisionReport(kept[i], ov))
+		}
+		kept = replaceOverlays(kept, displaced, ov)
+	}
+	if len(occlusions) == 0 {
+		return overlays, nil
+	}
+	return kept, occlusions
+}
+
+// overlaysShareScreen reports whether two in-place replacements are on screen at the same time over
+// overlapping boxes, i.e. whether compositing both would paint one over the other.
+func overlaysShareScreen(a, b domain.LocalizedOverlayItem) bool {
+	return a.StartMs < b.EndMs && b.StartMs < a.EndMs && domain.BoxesOverlap(a.Box, b.Box)
+}
+
+// overlappingKeptOverlay returns the index of the first candidate sharing the screen with probe, or -1.
+func overlappingKeptOverlay(kept []domain.LocalizedOverlayItem, candidates []int, probe domain.LocalizedOverlayItem) int {
+	for _, i := range candidates {
+		if overlaysShareScreen(kept[i], probe) {
+			return i
+		}
+	}
+	return -1
+}
+
+// removeOverlays drops the given indices, preserving the order of the rest.
+func removeOverlays(kept []domain.LocalizedOverlayItem, drop []int) []domain.LocalizedOverlayItem {
+	if len(drop) == 0 {
+		return kept
+	}
+	out := make([]domain.LocalizedOverlayItem, 0, len(kept)-len(drop))
+	for i, ov := range kept {
+		if slices.Contains(drop, i) {
+			continue
+		}
+		out = append(out, ov)
+	}
+	return out
+}
+
+// replaceOverlays removes the dominated indices and seats the incoming label at the first of them, so the
+// surviving plan keeps its original order.
+func replaceOverlays(kept []domain.LocalizedOverlayItem, displaced []int, ov domain.LocalizedOverlayItem) []domain.LocalizedOverlayItem {
+	out := make([]domain.LocalizedOverlayItem, 0, len(kept)-len(displaced)+1)
+	for i, other := range kept {
+		if slices.Contains(displaced, i) {
+			if i == displaced[0] {
+				out = append(out, ov)
+			}
+			continue
+		}
+		out = append(out, other)
+	}
+	return out
+}
+
+// overlayDominates reports whether a displaces b: the larger observed box is the dominant label of a
+// colliding group, and the region ID breaks ties so the outcome never depends on plan order.
+func overlayDominates(a, b domain.LocalizedOverlayItem) bool {
+	areaA, areaB := a.Box.Width*a.Box.Height, b.Box.Width*b.Box.Height
+	if areaA != areaB {
+		return areaA > areaB
+	}
+	return a.RegionID < b.RegionID
+}
+
+// overlayCollisionReport names the replacement that won the box, so the operator sees what their dropped
+// region collided with instead of an unexplained missing translation.
+func overlayCollisionReport(dropped, winner domain.LocalizedOverlayItem) domain.OcclusionReport {
+	return domain.OcclusionReport{
+		RegionID:     dropped.RegionID,
+		Role:         dropped.Role,
+		SourceText:   dropped.SourceText,
+		OverlayBox:   dropped.Box,
+		ProtectedBox: winner.Box,
+		StartMs:      dropped.StartMs,
+		EndMs:        dropped.EndMs,
+	}
+}
+
+// seatReplacementCuesOnCovers moves every replacement cue onto the cover of the source caption it
+// replaces and grows that cover around it, so one opaque block carries the localized text.
+//
+// Left in the default 75% lane, the replacement showed as a second dark box under the cover: same
+// screen, different size and offset (live evidence, run 27a758e6 at 1.6s - source cover
+// [225,936,639,96] over the burned-in caption, cue [161,1080,757,45] beneath it). A burned-in
+// caption is replaced in place, so the cue keeps its fit-content size, centers on the cover's band,
+// and the cover grows to frame it - sideways when the replacement is wider than the source caption,
+// and vertically when a two-line cue is taller than the band it sits on.
+//
+// A seat that would occlude a protected obstacle (scene-declared face/tap target or a protected
+// tracked region) is refused and the cue keeps its lane placement, which is where the lane search
+// already put it.
+func seatReplacementCuesOnCovers(
+	cues []domain.SubtitleCue,
+	covers []domain.CoverBox,
+	plan *domain.TextRegionPlan,
+	sceneProtected []domain.SceneProtectedRegion,
+) ([]domain.SubtitleCue, []domain.CoverBox) {
+	if plan == nil || plan.FrameWidth <= 0 || plan.FrameHeight <= 0 || len(cues) == 0 || len(covers) == 0 {
+		return cues, covers
+	}
+	seated := append([]domain.SubtitleCue(nil), cues...)
+	boxes := append([]domain.CoverBox(nil), covers...)
+	for i := range seated {
+		cue := seated[i]
+		target := -1
+		var bestOverlap int64
+		for j := range boxes {
+			overlap := min(cue.EndMs, boxes[j].EndMs) - max(cue.StartMs, boxes[j].StartMs)
+			if overlap > bestOverlap { // strict: the earliest cover wins a tie
+				target, bestOverlap = j, overlap
+			}
+		}
+		if target < 0 {
+			continue
+		}
+		cover := boxes[target]
+		moved := cue
+		moved.X = max(0, min(cover.X+(cover.Width-cue.Width)/2, plan.FrameWidth-cue.Width))
+		moved.Y = max(0, min(cover.Y+(cover.Height-cue.Height)/2, plan.FrameHeight-cue.Height))
+
+		left := min(cover.X, moved.X) - coverPaddingPx
+		top := min(cover.Y, moved.Y) - coverPaddingPx
+		grown := domain.BoundingBox{
+			X:      max(0, left),
+			Y:      max(0, top),
+			Width:  min(plan.FrameWidth, max(cover.X+cover.Width, moved.X+moved.Width)+coverPaddingPx) - max(0, left),
+			Height: min(plan.FrameHeight, max(cover.Y+cover.Height, moved.Y+moved.Height)+coverPaddingPx) - max(0, top),
+		}
+		if _, occluded := firstProtectedOverlap(grown, domain.GetProtectedBoxesForTimeWindow(plan.Regions, sceneProtected, cue.StartMs, cue.EndMs, "")); occluded {
+			continue
+		}
+		seated[i] = moved
+		boxes[target].X, boxes[target].Y, boxes[target].Width, boxes[target].Height = grown.X, grown.Y, grown.Width, grown.Height
+	}
+	return seated, boxes
+}
+
+// buildSubtitleCovers derives the opaque cover set that hides source burned-in captions.
+//
+// The cover of a speech_subtitle region is the region's own tracked box (grown by a small padding
+// that absorbs the anti-aliased stroke edges) and is active for exactly the window the source
+// caption was on screen. seatReplacementCuesOnCovers widens each cover afterwards to frame the
+// replacement text seated on it, because a dub sentence runs longer and wider than the source
+// caption it replaces.
+//
+// A cover that would occlude a protected obstacle (scene-declared face/tap target or a tracked
+// protected region) is not emitted: the region is surfaced as a visual_occlusion exception, the
+// same rule the in-place overlays follow (architecture §9.1), because the operator can move
+// either region.
+func buildSubtitleCovers(
+	plan *domain.TextRegionPlan,
+	in LocalizeVisualTrackInput,
+) ([]domain.CoverBox, []domain.OcclusionReport) {
+	if plan == nil || plan.FrameWidth <= 0 || plan.FrameHeight <= 0 {
+		return nil, nil
+	}
+	var covers []domain.CoverBox
+	var occlusions []domain.OcclusionReport
+	// The observed window of each emitted cover, kept beside it so the padded windows of captions that
+	// never shared the screen can be split apart again (see splitSequentialCoverWindows).
+	var observed [][2]int64
+
+	for _, reg := range plan.Regions {
+		if reg.Role != domain.TextRoleSpeechSubtitle {
+			continue
+		}
+		box, ok := reg.Bounds()
+		if !ok {
+			continue
+		}
+		startMs, endMs := reg.FirstSeenMs-captionWindowPadMs(reg), reg.LastSeenMs+captionWindowPadMs(reg)
+		if startMs < 0 {
+			startMs = 0
+		}
+		// A caption seen on exactly one sample has no grid step to bracket, and a zero-length window
+		// is not a renderable cover. Cover at least the sampling interval the detection stands for.
+		if endMs-startMs < defaultCaptionCoverMs {
+			endMs = startMs + defaultCaptionCoverMs
+		}
+
+		cover := clampCoverBox(box, plan.FrameWidth, plan.FrameHeight, coverPaddingPx)
+		cover.RegionID = reg.ID
+		cover.Role = string(reg.Role)
+		cover.StartMs = startMs
+		cover.EndMs = endMs
+		cover.Color = "#000000"
+		cover.Opacity = 1.0
+		if err := domain.ValidateCoverBox(cover, plan.FrameWidth, plan.FrameHeight); err != nil {
+			continue
+		}
+
+		coverGeom := domain.BoundingBox{X: cover.X, Y: cover.Y, Width: cover.Width, Height: cover.Height}
+		if prot, occluded := firstProtectedOverlap(coverGeom, sceneProtectedBoxes(in, reg)); occluded {
+			occlusions = append(occlusions, domain.OcclusionReport{
+				RegionID:     reg.ID,
+				Role:         reg.Role,
+				SourceText:   reg.Text,
+				OverlayBox:   coverGeom,
+				ProtectedBox: prot,
+				StartMs:      startMs,
+				EndMs:        endMs,
+			})
+			continue
+		}
+		if prot, occluded := firstProtectedOverlap(coverGeom, protectedRegionBoxes(plan, reg)); occluded {
+			occlusions = append(occlusions, domain.OcclusionReport{
+				RegionID:     reg.ID,
+				Role:         reg.Role,
+				SourceText:   reg.Text,
+				OverlayBox:   coverGeom,
+				ProtectedBox: prot,
+				StartMs:      startMs,
+				EndMs:        endMs,
+			})
+			continue
+		}
+		covers = append(covers, cover)
+		observed = append(observed, [2]int64{reg.FirstSeenMs, reg.LastSeenMs})
+	}
+	return resolveSequentialCoverOverlaps(covers, observed), occlusions
+}
+
+// resolveSequentialCoverOverlaps makes the padded cover windows of *different* captions disjoint while
+// leaving every one of them fully covered.
+//
+// A cover is padded by the sampling step on each side so the caption is hidden across the whole interval it
+// could have been on screen, and two consecutive captions' padded windows then overlap on that step. Drawing
+// both bars there leaves a ragged doubled bar with a strip sticking out (live evidence, live-20260918:
+// region-002 [0,2000] x=305 over region-004 [1500,3500] x=231); splitting the overlap and drawing each box
+// only over its own span instead exposed the incoming caption, whose line is wider than the outgoing one
+// (the same live clip at 1.6s showed 你 / 角 outside the bar). The handover is genuinely ambiguous, so the
+// contested span gets ONE bar over the union of both boxes: exactly one bar is composited at any instant and
+// no source text is left visible. Captions whose observed windows actually met keep their own overlapping
+// covers - they were on screen together.
+func resolveSequentialCoverOverlaps(covers []domain.CoverBox, observed [][2]int64) []domain.CoverBox {
+	if len(covers) != len(observed) || len(covers) < 2 {
+		return covers
+	}
+	resolved := append([]domain.CoverBox(nil), covers...)
+	var handovers []domain.CoverBox
+	for i := range covers {
+		for j := i + 1; j < len(covers); j++ {
+			// Observed together: both captions were on screen, both keep their covers.
+			if observed[i][1] > observed[j][0] && observed[j][1] > observed[i][0] {
+				continue
+			}
+			if !coverBoxesIntersect(covers[i], covers[j]) {
+				continue
+			}
+			earlier, later := i, j
+			if observed[i][0] > observed[j][0] {
+				earlier, later = j, i
+			}
+			handoverStart := max(resolved[earlier].StartMs, resolved[later].StartMs)
+			handoverEnd := min(resolved[earlier].EndMs, resolved[later].EndMs)
+			if handoverStart >= handoverEnd {
+				continue
+			}
+			handover := domain.CoverBox{
+				RegionID: fmt.Sprintf("handover-%s-%s", covers[earlier].RegionID, covers[later].RegionID),
+				Role:     covers[earlier].Role,
+				X:        min(covers[earlier].X, covers[later].X),
+				Y:        min(covers[earlier].Y, covers[later].Y),
+				Width:    max(covers[earlier].X+covers[earlier].Width, covers[later].X+covers[later].Width) - min(covers[earlier].X, covers[later].X),
+				Height:   max(covers[earlier].Y+covers[earlier].Height, covers[later].Y+covers[later].Height) - min(covers[earlier].Y, covers[later].Y),
+				StartMs:  handoverStart,
+				EndMs:    handoverEnd,
+				Color:    covers[earlier].Color,
+				Opacity:  covers[earlier].Opacity,
+			}
+			resolved[earlier].EndMs = handoverStart
+			resolved[later].StartMs = handoverEnd
+			handovers = append(handovers, handover)
+		}
+	}
+	if len(handovers) == 0 {
+		return covers
+	}
+	all := append(resolved, handovers...)
+	out := make([]domain.CoverBox, 0, len(all))
+	for _, c := range all {
+		if c.EndMs > c.StartMs {
+			out = append(out, c)
+		}
+	}
+	sort.Slice(out, func(a, b int) bool {
+		if out[a].StartMs != out[b].StartMs {
+			return out[a].StartMs < out[b].StartMs
+		}
+		return out[a].RegionID < out[b].RegionID
+	})
+	return out
+}
+
+// coverBoxesIntersect reports whether two composited covers share any pixel.
+func coverBoxesIntersect(a, b domain.CoverBox) bool {
+	return a.X < b.X+b.Width && b.X < a.X+a.Width && a.Y < b.Y+b.Height && b.Y < a.Y+a.Height
+}
+
+// captionWindowPadMs is how far a caption's cover window extends beyond its first and last
+// detection. The OCR samples the video on a fixed grid, so a detection at t proves the caption was
+// on screen at t but not whether it appeared or vanished a moment later: live evidence (run
+// 4f86657f) has the caption detected at 11000-12500 ms while still visible at 12750 ms and already
+// visible at 10750 ms, i.e. ~0.5 s of uncovered source text at each end without the pad. The pad is
+// the detection grid step read off the region's own keyframes, so it follows the sampling cadence
+// instead of a hard-coded constant.
+func captionWindowPadMs(reg domain.TrackedTextRegion) int64 {
+	step := int64(0)
+	for i := 1; i < len(reg.Keyframes); i++ {
+		delta := reg.Keyframes[i].TimestampMs - reg.Keyframes[i-1].TimestampMs
+		if delta > 0 {
+			step = delta
+			break
+		}
+	}
+	if step <= 0 || step > maxCaptionWindowPadMs {
+		return 0
+	}
+	return step
+}
+
+// maxCaptionWindowPadMs bounds the uncertainty pad so a sparse region cannot claim a window far
+// beyond its own evidence.
+const maxCaptionWindowPadMs = 1000
+
+// captionCueMaxChars is how much caption text a single cue may carry, i.e. about two lines of the
+// compact-fit style (font 24, border 18) over a 1080 px frame. Live evidence (run 4f86657f): one
+// 12 s segment carrying four sentences rendered as a single three-line block that covered a third of
+// the frame and stayed up for the whole segment.
+// captionCueMaxChars bounds one cue's text: at the live 1080x1440 scale (subtitleFontScale 0.037,
+// ~35 characters per line) it keeps every replacement within two lines of the caption block.
+const captionCueMaxChars = 68
+
+// degenerateCaptionWindowMs is the window a segment with no usable duration is given. Cues share
+// their segment's window in proportion to their text, so a segment of unknown length still yields
+// one readable cue.
+const degenerateCaptionWindowMs = 700
+
+// splitCaptionText breaks caption text into reading-sized pieces. It packs word by word up to
+// maxChars and prefers to break after sentence punctuation once a piece is at least half full, so
+// cues follow the shape of speech instead of cutting mid-thought. Every word survives, so the
+// captions stay grounded in the canonical translation text.
+func splitCaptionText(text string, maxChars int) []string {
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return nil
+	}
+	if maxChars <= 0 {
+		maxChars = captionCueMaxChars
+	}
+	var pieces []string
+	var current []string
+	currentLen := 0
+	flush := func() {
+		if len(current) > 0 {
+			pieces = append(pieces, strings.Join(current, " "))
+			current = nil
+			currentLen = 0
+		}
+	}
+	for _, w := range words {
+		wLen := len([]rune(w))
+		if currentLen > 0 && currentLen+1+wLen > maxChars {
+			flush()
+		}
+		current = append(current, w)
+		currentLen += wLen + 1
+		if endsSentence(w) && currentLen >= maxChars/2 {
+			flush()
+		}
+	}
+	flush()
+	return pieces
+}
+
+// endsSentence reports whether a word closes a sentence or clause in the target languages.
+func endsSentence(word string) bool {
+	trimmed := strings.TrimRight(word, `"'”’)`)
+	if trimmed == "" {
+		return false
+	}
+	last := []rune(trimmed)[len([]rune(trimmed))-1]
+	return last == '.' || last == '!' || last == '?' || last == '。' || last == '！' || last == '？'
+}
+
+// mergeCaptionPieces folds pieces into at most maxCues groups, keeping every piece's text in order,
+// so the cues stay grounded in the canonical translation.
+func mergeCaptionPieces(pieces []string, maxCues int) []string {
+	if maxCues < 1 {
+		maxCues = 1
+	}
+	if len(pieces) <= maxCues {
+		return pieces
+	}
+	merged := make([]string, 0, maxCues)
+	for i := range maxCues {
+		lo := i * len(pieces) / maxCues
+		hi := (i + 1) * len(pieces) / maxCues
+		merged = append(merged, strings.Join(pieces[lo:hi], " "))
+	}
+	return merged
+}
+
+// captionCueWindows spreads a segment's window across its pieces in proportion to the text each piece
+// carries, so a caption is on screen for roughly as long as it is spoken. Callers fold the pieces down
+// to at most one per millisecond of the window first (see placeSegmentCues): this function emits one
+// window per piece, so more pieces than milliseconds would mean a zero-length or reversed cue.
+func captionCueWindows(startMs, endMs int64, pieces []string) [][2]int64 {
+	windows := make([][2]int64, 0, len(pieces))
+	if len(pieces) == 0 {
+		return windows
+	}
+	if endMs <= startMs {
+		endMs = startMs + degenerateCaptionWindowMs
+	}
+	duration := endMs - startMs
+	totalLen := 0
+	lengths := make([]int, len(pieces))
+	for i, piece := range pieces {
+		lengths[i] = len([]rune(piece))
+		totalLen += lengths[i]
+	}
+	if totalLen == 0 {
+		totalLen = 1
+	}
+	cursor := startMs
+	for i := range pieces {
+		if i == len(pieces)-1 {
+			windows = append(windows, [2]int64{cursor, endMs})
+			break
+		}
+		share := int64(lengths[i]) * duration / int64(totalLen)
+		if share < 1 {
+			share = 1
+		}
+		next := cursor + share
+		if remaining := len(pieces) - i - 1; next > endMs-int64(remaining) {
+			next = endMs - int64(remaining)
+		}
+		if next <= cursor {
+			next = cursor + 1
+		}
+		windows = append(windows, [2]int64{cursor, next})
+		cursor = next
+	}
+	return windows
+}
+
+// placeSegmentCues splits one segment's caption text into reading-sized cues and places each of them
+// in the frame with the compact-fit box semantics.
+func (s *VisualTextService) placeSegmentCues(
+	plan *domain.TextRegionPlan,
+	regions []domain.TrackedTextRegion,
+	sceneProtected []domain.SceneProtectedRegion,
+	selector domain.SubtitlePlacementSelector,
+	segmentIndex int,
+	text string,
+	startMs, endMs int64,
+) ([]domain.SubtitleCue, error) {
+	pieces := splitCaptionText(text, captionCueMaxChars)
+	if len(pieces) == 0 {
+		return nil, nil
+	}
+	// A cue needs at least one millisecond on screen: a segment whose text splits into more pieces
+	// than it has milliseconds collapses into fewer, longer cues rather than emitting zero-length
+	// or reversed windows the render-plan validator rejects.
+	budgetMs := endMs - startMs
+	if budgetMs <= 0 {
+		budgetMs = degenerateCaptionWindowMs
+	}
+	pieces = mergeCaptionPieces(pieces, int(budgetMs))
+	windows := captionCueWindows(startMs, endMs, pieces)
+	cues := make([]domain.SubtitleCue, 0, len(pieces))
+	for i, piece := range pieces {
+		protects := domain.GetProtectedBoxesForTimeWindow(regions, sceneProtected, windows[i][0], windows[i][1], "")
+		cue, err := domain.ComputeCompactSubtitleBoundsWithSelector(
+			plan.FrameWidth, plan.FrameHeight, piece, 0, 0, 0, protects, selector,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("place subtitle cue for segment %d part %d: %w", segmentIndex, i, err)
+		}
+		cue.ID = fmt.Sprintf("cue-%d", segmentIndex)
+		if i > 0 {
+			cue.ID = fmt.Sprintf("cue-%d-%d", segmentIndex, i)
+		}
+		cue.StartMs, cue.EndMs = windows[i][0], windows[i][1]
+		cues = append(cues, cue)
+	}
+	return cues, nil
+}
+
+// defaultCaptionCoverMs is the shortest cover window: the default OCR sampling step, i.e. the
+// slice of video a single detection stands for.
+const defaultCaptionCoverMs = 500
+
+// clampCoverBox grows a box by padding and clamps it into the frame.
+func clampCoverBox(box domain.BoundingBox, frameWidth, frameHeight, padding int) domain.CoverBox {
+	x := max(0, box.X-padding)
+	y := max(0, box.Y-padding)
+	right := min(frameWidth, box.X+box.Width+padding)
+	bottom := min(frameHeight, box.Y+box.Height+padding)
+	return domain.CoverBox{X: x, Y: y, Width: right - x, Height: bottom - y}
+}
+
 // LocalizeVisualTrack builds the LocalizedVisualTrack (and underlying LocalizedSubtitleTrack)
 // with deterministic in-place cover/overlay, standard instructional UI terminology,
 // scale-aware compact fit-content subtitle box, and scene-aware non-occlusion.
@@ -675,6 +1389,26 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			transIdx, err = s.db.GetTranslationVariantIndexByRun(ctx, in.RunID)
 			if err == nil && transIdx != nil && (transIdx.AssetID != in.AssetID || !strings.EqualFold(transIdx.TargetLanguage, in.TargetLanguage)) {
 				return nil, fmt.Errorf("translation variant run binding mismatch for run %s", in.RunID)
+			}
+			if errors.Is(err, storage.ErrNotFound) {
+				// A run that reused a cached translation owns no index row of its own; the artifact
+				// is still bound to this run by the stage execution that consumed it. Without this
+				// the visual lane finds no variant and silently burns the SOURCE caption text as the
+				// localized subtitle (live evidence, run 3adede59: a fresh run on a fully cached
+				// pipeline rendered the Chinese captions over their own covers).
+				casHash, hashErr := s.stageArtifactHash(ctx, in.RunID, "translation")
+				if hashErr != nil {
+					return nil, hashErr
+				}
+				if casHash != "" {
+					transIdx = &storage.TranslationVariantIndex{
+						AssetID:        in.AssetID,
+						RunID:          in.RunID,
+						TargetLanguage: in.TargetLanguage,
+						CASHash:        casHash,
+					}
+					err = nil
+				}
 			}
 		} else {
 			transIdx, err = s.db.GetTranslationVariantIndex(ctx, in.AssetID, in.TargetLanguage)
@@ -716,6 +1450,10 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 	for _, id := range in.InpaintingFallbacks {
 		inpaintSet[id] = true
 	}
+	strictOverlapSet := make(map[string]bool, len(in.StrictOverlapRegionIDs))
+	for _, id := range in.StrictOverlapRegionIDs {
+		strictOverlapSet[id] = true
+	}
 
 	// Scale-aware overlay parameters
 	overlayPaddingX := int(float64(plan.FrameWidth) * 0.015) // ~16px for 1080w
@@ -737,6 +1475,7 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 
 	// 4. Generate Overlays for semantic_text & instructional_ui_text
 	var overlays []domain.LocalizedOverlayItem
+	var occlusions []domain.OcclusionReport
 	for _, reg := range activePlan.Regions {
 		switch reg.Role {
 		case domain.TextRoleSemanticText:
@@ -756,6 +1495,9 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 				ExecutionProfile:      in.ExecutionProfile,
 				AuthorizedCredentials: in.AuthorizedCredentials,
 				ConsentGranted:        in.ConsentGranted,
+				// Inline overlay text: resolved but never published as the run's canonical
+				// translation variant (the speech stages own that index).
+				Ephemeral: true,
 				Segments: []domain.TranslationInputSegment{
 					{Index: 0, SourceText: reg.Text, StartMs: reg.FirstSeenMs, EndMs: reg.LastSeenMs},
 				},
@@ -792,12 +1534,30 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			repBox := domain.BoundingBox{X: baseBox.X, Y: baseBox.Y, Width: boxW, Height: boxH}
 
 			// Non-occlusion check: verify overlay does not overlap other protected obstacles during its time window
-			overlayProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, reg.FirstSeenMs, reg.LastSeenMs, reg.ID)
-			for _, prot := range overlayProtects {
-				if domain.BoxesOverlap(repBox, prot) {
+			if prot, occluded := firstProtectedOverlap(repBox, sceneProtectedBoxes(in, reg)); occluded {
+				// A face/tap target the pipeline itself declared protected is not a layout
+				// the operator can accept: fail closed, as before.
+				return nil, fmt.Errorf("%w: overlay for semantic text %q (box %+v) occludes protected region (box %+v)",
+					domain.ErrSubtitleOverlapsProtectedRegion, reg.ID, repBox, prot)
+			}
+			if prot, occluded := firstProtectedOverlap(repBox, protectedRegionBoxes(activePlan, reg)); occluded {
+				if strictOverlapSet[reg.ID] {
 					return nil, fmt.Errorf("%w: overlay for semantic text %q (box %+v) occludes protected region (box %+v)",
 						domain.ErrSubtitleOverlapsProtectedRegion, reg.ID, repBox, prot)
 				}
+				// Another protected tracked region (UI control, brand mark): the overlay is
+				// skipped - the source text stays on screen untouched - and the region is
+				// surfaced as a pending visual_occlusion exception (architecture 9.1).
+				occlusions = append(occlusions, domain.OcclusionReport{
+					RegionID:     reg.ID,
+					Role:         reg.Role,
+					SourceText:   reg.Text,
+					OverlayBox:   repBox,
+					ProtectedBox: prot,
+					StartMs:      reg.FirstSeenMs,
+					EndMs:        reg.LastSeenMs,
+				})
+				continue
 			}
 
 			isInpainting := inpaintSet[reg.ID] // Non-default fallback
@@ -835,6 +1595,9 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 				ExecutionProfile:      in.ExecutionProfile,
 				AuthorizedCredentials: in.AuthorizedCredentials,
 				ConsentGranted:        in.ConsentGranted,
+				// Inline overlay text: resolved but never published as the run's canonical
+				// translation variant (the speech stages own that index).
+				Ephemeral: true,
 				Segments: []domain.TranslationInputSegment{
 					{Index: 0, SourceText: reg.Text, StartMs: reg.FirstSeenMs, EndMs: reg.LastSeenMs},
 				},
@@ -870,13 +1633,27 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			}
 			repBox := domain.BoundingBox{X: baseBox.X, Y: baseBox.Y, Width: boxW, Height: boxH}
 
-			// Non-occlusion check: verify overlay does not overlap other protected obstacles during its time window
-			overlayProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, reg.FirstSeenMs, reg.LastSeenMs, reg.ID)
-			for _, prot := range overlayProtects {
-				if domain.BoxesOverlap(repBox, prot) {
+			// Non-occlusion check: same rule as the semantic-text branch - scene-protected
+			// obstacles still fail closed, protected tracked regions are surfaced.
+			if prot, occluded := firstProtectedOverlap(repBox, sceneProtectedBoxes(in, reg)); occluded {
+				return nil, fmt.Errorf("%w: overlay for instructional UI %q (box %+v) occludes protected region (box %+v)",
+					domain.ErrSubtitleOverlapsProtectedRegion, reg.ID, repBox, prot)
+			}
+			if prot, occluded := firstProtectedOverlap(repBox, protectedRegionBoxes(activePlan, reg)); occluded {
+				if strictOverlapSet[reg.ID] {
 					return nil, fmt.Errorf("%w: overlay for instructional UI %q (box %+v) occludes protected region (box %+v)",
 						domain.ErrSubtitleOverlapsProtectedRegion, reg.ID, repBox, prot)
 				}
+				occlusions = append(occlusions, domain.OcclusionReport{
+					RegionID:     reg.ID,
+					Role:         reg.Role,
+					SourceText:   reg.Text,
+					OverlayBox:   repBox,
+					ProtectedBox: prot,
+					StartMs:      reg.FirstSeenMs,
+					EndMs:        reg.LastSeenMs,
+				})
+				continue
 			}
 
 			isInpainting := inpaintSet[reg.ID]
@@ -899,6 +1676,10 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 		}
 	}
 
+	// 4b. Resolve in-place replacement collisions before anything is composited.
+	overlays, overlayCollisions := resolveOverlayCollisions(overlays)
+	occlusions = append(occlusions, overlayCollisions...)
+
 	// 5. Generate Subtitle Cues grounded in canonical TranslationVariant
 	var subtitleCues []domain.SubtitleCue
 	selector := in.PlacementSelector
@@ -911,6 +1692,24 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 		dubScriptIdx, err = s.db.GetDubScriptVariantIndexByRun(ctx, in.RunID)
 		if err == nil && dubScriptIdx != nil && (dubScriptIdx.AssetID != in.AssetID || !strings.EqualFold(dubScriptIdx.TargetLanguage, in.TargetLanguage)) {
 			return nil, fmt.Errorf("dub script variant run binding mismatch for run %s", in.RunID)
+		}
+		if errors.Is(err, storage.ErrNotFound) {
+			// Same cache-hit binding as the translation index above: the dub script stage of this run
+			// recorded the artifact it consumed, even though the variant row belongs to the run that
+			// produced it.
+			casHash, hashErr := s.stageArtifactHash(ctx, in.RunID, "dub_script")
+			if hashErr != nil {
+				return nil, hashErr
+			}
+			if casHash != "" {
+				dubScriptIdx = &storage.DubScriptVariantIndex{
+					AssetID:        in.AssetID,
+					RunID:          in.RunID,
+					TargetLanguage: in.TargetLanguage,
+					CASHash:        casHash,
+				}
+				err = nil
+			}
 		}
 	} else {
 		dubScriptIdx, err = s.db.GetDubScriptVariantIndex(ctx, in.AssetID, in.TargetLanguage)
@@ -956,11 +1755,9 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			if err := json.NewDecoder(trc).Decode(&tVariant); err != nil {
 				return nil, fmt.Errorf("decode translation variant artifact (%s): %w", transCAS, err)
 			}
-			if explicitTransCAS != "" {
-				if tVariant.AssetID != in.AssetID || !strings.EqualFold(tVariant.TargetLanguage, in.TargetLanguage) {
-					return nil, fmt.Errorf("%w: explicit translation variant ownership mismatch for asset %q target %q",
-						domain.ErrMeaningPreservationFailed, in.AssetID, in.TargetLanguage)
-				}
+			if tVariant.AssetID != in.AssetID || !strings.EqualFold(tVariant.TargetLanguage, in.TargetLanguage) {
+				return nil, fmt.Errorf("%w: translation variant ownership mismatch for asset %q target %q",
+					domain.ErrMeaningPreservationFailed, in.AssetID, in.TargetLanguage)
 			}
 			if len(tVariant.Segments) == 0 {
 				return nil, fmt.Errorf("canonical translation variant has zero segments")
@@ -998,24 +1795,11 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 					endMs = tSeg.EndMs
 				}
 
-				cueProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, startMs, endMs, "")
-				cue, err := domain.ComputeCompactSubtitleBoundsWithSelector(
-					plan.FrameWidth,
-					plan.FrameHeight,
-					textToRender,
-					0,
-					0,
-					0,
-					cueProtects,
-					selector,
-				)
+				segCues, err := s.placeSegmentCues(&plan, activePlan.Regions, in.SceneProtectedRegions, selector, dSeg.Index, textToRender, startMs, endMs)
 				if err != nil {
-					return nil, fmt.Errorf("place subtitle cue for segment %d: %w", dSeg.Index, err)
+					return nil, err
 				}
-				cue.ID = fmt.Sprintf("cue-%d", dSeg.Index)
-				cue.StartMs = startMs
-				cue.EndMs = endMs
-				subtitleCues = append(subtitleCues, cue)
+				subtitleCues = append(subtitleCues, segCues...)
 			}
 		} else {
 			// A translation exists without a dub script. Use the caller-pinned CAS
@@ -1032,11 +1816,9 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			if err := json.NewDecoder(trc).Decode(&tVariant); err != nil {
 				return nil, fmt.Errorf("decode translation variant artifact (%s): %w", canonicalTransCAS, err)
 			}
-			if explicitTransCAS != "" {
-				if tVariant.AssetID != in.AssetID || !strings.EqualFold(tVariant.TargetLanguage, in.TargetLanguage) {
-					return nil, fmt.Errorf("%w: explicit translation variant ownership mismatch for asset %q target %q",
-						domain.ErrMeaningPreservationFailed, in.AssetID, in.TargetLanguage)
-				}
+			if tVariant.AssetID != in.AssetID || !strings.EqualFold(tVariant.TargetLanguage, in.TargetLanguage) {
+				return nil, fmt.Errorf("%w: translation variant ownership mismatch for asset %q target %q",
+					domain.ErrMeaningPreservationFailed, in.AssetID, in.TargetLanguage)
 			}
 			if len(tVariant.Segments) == 0 {
 				return nil, fmt.Errorf("canonical translation variant has zero segments")
@@ -1046,24 +1828,11 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 				if textToRender == "" {
 					return nil, fmt.Errorf("canonical translation target text missing for segment %d", seg.Index)
 				}
-				cueProtects := domain.GetProtectedBoxesForTimeWindow(activePlan.Regions, in.SceneProtectedRegions, seg.StartMs, seg.EndMs, "")
-				cue, err := domain.ComputeCompactSubtitleBoundsWithSelector(
-					plan.FrameWidth,
-					plan.FrameHeight,
-					textToRender,
-					0,
-					0,
-					0,
-					cueProtects,
-					selector,
-				)
+				segCues, err := s.placeSegmentCues(&plan, activePlan.Regions, in.SceneProtectedRegions, selector, seg.Index, textToRender, seg.StartMs, seg.EndMs)
 				if err != nil {
-					return nil, fmt.Errorf("place subtitle cue for translation segment %d: %w", seg.Index, err)
+					return nil, err
 				}
-				cue.ID = fmt.Sprintf("cue-%d", seg.Index)
-				cue.StartMs = seg.StartMs
-				cue.EndMs = seg.EndMs
-				subtitleCues = append(subtitleCues, cue)
+				subtitleCues = append(subtitleCues, segCues...)
 			}
 		}
 	} else {
@@ -1091,6 +1860,14 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			}
 		}
 	}
+	// 5b. Freeze the source-text covers: a burned-in source caption is only replaced visually
+	// when an opaque box hides it. Regions that collide with a protected obstacle are surfaced
+	// as occlusion exceptions instead of being covered.
+	covers, coverOcclusions := buildSubtitleCovers(activePlan, in)
+	occlusions = append(occlusions, coverOcclusions...)
+	// 5c. Seat every replacement on the cover it replaces: one opaque block carries the text.
+	subtitleCues, covers = seatReplacementCuesOnCovers(subtitleCues, covers, activePlan, in.SceneProtectedRegions)
+
 	// 6. Persist LocalizedSubtitleTrack
 	subTrackProv, err := domain.ComputeSubtitlePlanProvenanceHash(in.AssetID, in.TargetLanguage, subtitleCues, "compact_fit_cues")
 	if err != nil {
@@ -1150,6 +1927,7 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 		dubScriptProvStr,
 		overlays,
 		subtitleCues,
+		covers,
 		in.SceneProtectedRegions,
 	)
 	if err != nil {
@@ -1168,6 +1946,8 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 		SubtitleTrackCAS:   subTrack.CASHash,
 		Overlays:           overlays,
 		SubtitleCues:       subtitleCues,
+		Covers:             covers,
+		Occlusions:         occlusions,
 		ProtectedRegions:   allProtectedBoxes,
 		ProvenanceHash:     visProv,
 		CreatedAt:          time.Now().UTC(),

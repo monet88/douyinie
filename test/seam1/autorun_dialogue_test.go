@@ -20,22 +20,22 @@ import (
 )
 
 // configureDialogueTranslationGateway registers deterministic fakes representing the authorized
-// production translation gateway ladder (Gemini 3.8 Flash -> DeepSeek V4 Flash Vision Exp) and
+// production translation gateway ladder (Gemini 3.8 Flash -> DeepSeek V4.1 Flash) and
 // local Qwen (which must be rejected as ineligible for production translation).
 func configureDialogueTranslationGateway(t *testing.T, h *testHarness) {
 	t.Helper()
 
 	geminiFake := provider.NewFakeTranslationProvider(provider.GatewayGeminiTranslationProviderID)
 	geminiFake.Cap.ExecutionTier = "cloud"
-	geminiFake.ModelName = "gemini-3.8-flash"
+	geminiFake.ModelName = provider.GatewayGeminiModelAlias
 	geminiFake.ModelVersion = "2026-08"
 	geminiFake.Cap.QualityScore = 0.99
 	_ = h.registry.Register(geminiFake)
 
 	deepseekFake := provider.NewFakeTranslationProvider(provider.GatewayDeepSeekTranslationProviderID)
 	deepseekFake.Cap.ExecutionTier = "cloud"
-	deepseekFake.ModelName = "deepseek-v4-flash"
-	deepseekFake.ModelVersion = "v4"
+	deepseekFake.ModelName = provider.GatewayDeepSeekModelAlias
+	deepseekFake.ModelVersion = "v4.1"
 	deepseekFake.Cap.QualityScore = 0.95
 	_ = h.registry.Register(deepseekFake)
 
@@ -563,7 +563,10 @@ func TestSeam1_AutoRun_Dialogue_TerminalQC_FailClosed(t *testing.T) {
 		h := setupAutoRunHarness(t)
 		configureDialogueTranslationGateway(t, h)
 
-		defaultVITTSFake(t, h).DurationMs = 800
+		// The dub must fit every slot: a candidate that overruns its immutable slot is refused by the mixer
+		// (AudioMixService's dub-coverage invariant), which stops the run before the terminal QC gate these
+		// subtests are about.
+		defaultVITTSFake(t, h).DurationMs = 250
 
 		assetID1 := ingestSyntheticAssetWithFrequency(t, h.server.URL, h.dir, "qc_fail_1.mp4", 2.0, 2500)
 
@@ -612,7 +615,10 @@ func TestSeam1_AutoRun_Dialogue_TerminalQC_FailClosed(t *testing.T) {
 		h := setupAutoRunHarness(t)
 		configureDialogueTranslationGateway(t, h)
 
-		defaultVITTSFake(t, h).DurationMs = 800
+		// The dub must fit every slot: a candidate that overruns its immutable slot is refused by the mixer
+		// (AudioMixService's dub-coverage invariant), which stops the run before the terminal QC gate these
+		// subtests are about.
+		defaultVITTSFake(t, h).DurationMs = 250
 
 		// Disable ReviewService to simulate unconfigured terminal QC service
 		h.srv.SetReviewService(nil)
@@ -787,6 +793,91 @@ func TestSeam1_AutoRun_Dialogue_HandoffCASFailure_FailsClosedAndReleasesSlot(t *
 	}
 }
 
+// TestSeam1_AutoRun_ReviewPosture_FinalRenderOwnsTheJob proves that a Review-posture run stops at the
+// final-render handoff: the run's pipeline completes while its job stays open, because the handoff only
+// exposes the operator's explicit 'Start final render' action and renders nothing. The job reaches
+// 'completed' only once that explicit render (POST /render/final) succeeds.
+func TestSeam1_AutoRun_ReviewPosture_FinalRenderOwnsTheJob(t *testing.T) {
+	h := setupAutoRunHarness(t)
+	assetID := ingestSyntheticAsset(t, h.server.URL, h.dir, "review_posture_handoff.mp4", 1.5)
+	postAudioRolePlan(t, h.server.URL, assetID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleInstrumentalBgm},
+	})
+	jobID := createJob(t, h.server.URL, assetID, domain.TargetLanguageVI)
+
+	body, _ := json.Marshal(map[string]any{"config_snapshot_json": `{"posture":"review"}`})
+	resp, err := http.Post(fmt.Sprintf("%s/api/v1/jobs/%s/runs", h.server.URL, jobID), "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("enqueue run failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 enqueue review-posture run, got %d", resp.StatusCode)
+	}
+	var enqueued struct {
+		Run domain.LocalizationRun `json:"run"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&enqueued)
+	runID := enqueued.Run.ID
+
+	final := pollRunStatus(t, h.server.URL, runID, domain.RunStatusCompleted, 10*time.Second)
+	if final.Status != domain.RunStatusCompleted {
+		t.Fatalf("expected the review-posture run to finish its pipeline as %q, got %q", domain.RunStatusCompleted, final.Status)
+	}
+
+	// The handoff is a readiness gate: it succeeded without rendering anything.
+	stages := getRunStages(t, h.server.URL, runID)
+	handoffSucceeded := false
+	for _, st := range stages {
+		if st.Stage == "final_render_handoff" && st.Status == domain.StageStatusSucceeded {
+			handoffSucceeded = true
+		}
+		if st.Stage == "render_final" {
+			t.Fatalf("review posture executed render_final during the run: %+v", st)
+		}
+	}
+	if !handoffSucceeded {
+		t.Fatalf("expected a succeeded final_render_handoff stage for run %s, got %+v", runID, stages)
+	}
+
+	// No final render artifact exists for the run yet.
+	finGet, err := http.Get(fmt.Sprintf("%s/api/v1/assets/%s/render/final?run_id=%s&target_language=%s", h.server.URL, assetID, runID, domain.TargetLanguageVI))
+	if err != nil {
+		t.Fatalf("get final render failed: %v", err)
+	}
+	finGet.Body.Close()
+	if finGet.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected no final render artifact before the explicit render, got status %d", finGet.StatusCode)
+	}
+
+	job := getJobViaAPI(t, h, jobID)
+	if job.Status == "completed" {
+		t.Fatalf("job %s reads completed while the explicit final render is still pending", jobID)
+	}
+
+	// The operator's explicit render is the work the job was waiting for.
+	finResp, artifact := runRenderFinal(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": domain.TargetLanguageVI,
+	})
+	if finResp == nil || finResp.StatusCode != http.StatusCreated || artifact == nil {
+		status := 0
+		if finResp != nil {
+			status = finResp.StatusCode
+		}
+		t.Fatalf("explicit final render failed: status %d", status)
+	}
+	if finResp.Body != nil {
+		finResp.Body.Close()
+	}
+
+	job = getJobViaAPI(t, h, jobID)
+	if job.Status != "completed" {
+		t.Fatalf("job status after the explicit final render = %q, want completed", job.Status)
+	}
+}
+
 // TestSeam1_DubbingService_AssignVoices_ExplicitCAS_Validation proves that
 // DubbingService.AssignVoices strictly validates explicit transcript and dub-script CAS
 // references: rejecting unreadable, malformed, or foreign evidence instead of silently
@@ -888,18 +979,33 @@ func TestSeam1_DubbingService_AssignVoices_ExplicitCAS_Validation(t *testing.T) 
 		}
 	})
 
-	t.Run("ForeignRunTranscriptCAS_FailsClosed", func(t *testing.T) {
-		_, err := dubSvc.AssignVoices(ctx, domain.VoiceAssignmentInput{
-			AssetID:               assetID,
-			RunID:                 "run-foreign",
-			TargetLanguage:        "vi",
-			TranscriptArtifactCAS: tObj.SHA256,
-		})
-		if err == nil {
-			t.Fatal("expected error on foreign run transcript CAS, got nil")
+	t.Run("CrossRunTranscriptCAS_ReusesAssetScopedArtifact", func(t *testing.T) {
+		// The transcript identity is run-independent (locked cache rule), so the second
+		// run of the same asset reads the artifact the first run persisted. Its producer
+		// run id is provenance metadata, not an ownership claim.
+		priorRunTranscript := validTranscript
+		priorRunTranscript.ID = "t-prior"
+		priorRunTranscript.RunID = "run-prior-producer"
+		priorBytes, _ := json.Marshal(priorRunTranscript)
+		priorObj, err := h.casStore.Put(bytes.NewReader(priorBytes))
+		if err != nil {
+			t.Fatalf("put prior-run transcript in CAS: %v", err)
 		}
-		if !strings.Contains(err.Error(), "belongs to run") {
-			t.Fatalf("expected run ownership error, got %v", err)
+
+		va, err := dubSvc.AssignVoices(ctx, domain.VoiceAssignmentInput{
+			AssetID:               assetID,
+			RunID:                 runID,
+			TargetLanguage:        "vi",
+			TranscriptArtifactCAS: priorObj.SHA256,
+		})
+		if err != nil {
+			t.Fatalf("expected the earlier run's transcript to be reusable, got %v", err)
+		}
+		if va == nil || va.RunID != runID {
+			t.Fatalf("expected a voice assignment bound to run %s, got %#v", runID, va)
+		}
+		if len(va.Assignments) != 2 {
+			t.Fatalf("expected the reused transcript to yield 2 speakers, got %d: %+v", len(va.Assignments), va.Assignments)
 		}
 	})
 

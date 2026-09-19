@@ -2930,6 +2930,39 @@ func (s *DB) ListStageExecutions(ctx context.Context, runID string) ([]domain.St
 	return scanStageExecutions(rows)
 }
 
+// GetStageArtifactHash returns the artifact a run's stage recorded, i.e. what that stage actually consumed
+// or produced for the run. A run that only reused cached artifacts owns no variant index row of its own
+// (the row belongs to the run that produced it), so the stage execution is what still binds it to the
+// artifact.
+//
+// The LATEST attempt decides, matching how a resumed run picks what it may reuse (Server.executeRun reads
+// the newest row per stage regardless of status). A retry, an interruption or a correction appends its own
+// row, so an interrupted or failed attempt must not let an older success keep binding the run to an
+// artifact the run no longer holds. Returns "" when the newest execution of that stage is missing, did not
+// succeed, or carries no artifact.
+func (s *DB) GetStageArtifactHash(ctx context.Context, runID, stage string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if strings.TrimSpace(runID) == "" || strings.TrimSpace(stage) == "" {
+		return "", nil
+	}
+	var status, hash string
+	err := s.db.QueryRowContext(ctx, `SELECT status, COALESCE(artifact_sha256, '') FROM stage_executions
+		WHERE run_id = ? AND stage = ?
+		ORDER BY created_at DESC, id DESC LIMIT 1`, runID, stage).Scan(&status, &hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("query stage artifact for %s/%s: %w", runID, stage, err)
+	}
+	if status != domain.StageStatusSucceeded || hash == "" {
+		return "", nil
+	}
+	return hash, nil
+}
+
 // RunStateSnapshot loads a run with its stage executions for crash recovery projection.
 func (s *DB) RunStateSnapshot(ctx context.Context, runID string) (*domain.RunStateSnapshot, error) {
 	run, err := s.GetRun(ctx, runID)

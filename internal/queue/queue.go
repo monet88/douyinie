@@ -91,13 +91,15 @@ func (s *Service) Pause(ctx context.Context, runID string) error {
 	return nil
 }
 
-// Cancel transitions any non-terminal run to cancelled.
+// Cancel transitions any non-terminal run to cancelled. `interrupted` is recoverable (Resume
+// re-drains it from the last incomplete stage), so abandoning it must stay possible; only the
+// terminal statuses are refused.
 func (s *Service) Cancel(ctx context.Context, runID string) error {
 	e, err := s.db.GetQueueEntryByRunID(ctx, runID)
 	if err != nil {
 		return fmt.Errorf("lookup queue entry: %w", err)
 	}
-	if e.Status == domain.RunStatusCompleted || e.Status == domain.RunStatusCancelled || e.Status == domain.RunStatusInterrupted {
+	if e.Status == domain.RunStatusCompleted || e.Status == domain.RunStatusCancelled {
 		return fmt.Errorf("%w: status is %s", ErrNotQueued, e.Status)
 	}
 	if err := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusCancelled, domain.RunStatusCancelled); err != nil {

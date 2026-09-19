@@ -1142,11 +1142,20 @@ func resolveDiarizerRunner() (commandRunner, error) {
 			fmt.Sprintf("DOUYINIE_DIARIZER_BIN %q not found", bin), nil)
 	}
 
+	// Issue #106: the diarizer family resolves its own interpreter ahead of the
+	// shared one, because it needs the venv carrying modelscope/torchaudio while
+	// asr/aligner use the shared venv. Resolved up front so a misconfigured
+	// value fails closed with the variable name and path instead of any later
+	// lookup silently substituting another interpreter.
+	diarizerPy, err := resolveDiarizerPythonBinary()
+	if err != nil {
+		return commandRunner{}, err
+	}
+
 	if script := os.Getenv("DOUYINIE_DIARIZER_ADAPTER"); script != "" {
 		if _, err := os.Stat(script); err == nil {
-			pyBin := resolvePythonBinary()
-			if pyBin != "" {
-				return commandRunner{binary: pyBin, args: []string{script}}, nil
+			if diarizerPy != "" {
+				return commandRunner{binary: diarizerPy, args: []string{script}}, nil
 			}
 			return commandRunner{}, worker.NewError("DIARIZER_BINARY_NOT_FOUND",
 				"python runtime not found to execute DOUYINIE_DIARIZER_ADAPTER", nil)
@@ -1177,16 +1186,15 @@ func resolveDiarizerRunner() (commandRunner, error) {
 	for _, p := range adapterPaths {
 		if absP, err := filepath.Abs(p); err == nil {
 			if _, err := os.Stat(absP); err == nil {
-				pyBin := resolvePythonBinary()
-				if pyBin != "" {
-					return commandRunner{binary: pyBin, args: []string{absP}}, nil
+				if diarizerPy != "" {
+					return commandRunner{binary: diarizerPy, args: []string{absP}}, nil
 				}
 			}
 		}
 	}
 
 	return commandRunner{}, worker.NewError("DIARIZER_BINARY_NOT_FOUND",
-		"3D-Speaker/CAM++ diarization adapter or binary not available: install 3D-Speaker/modelscope or configure DOUYINIE_DIARIZER_ADAPTER/DOUYINIE_DIARIZER_BIN",
+		"3D-Speaker/CAM++ diarization adapter or binary not available: install 3D-Speaker/modelscope or configure DOUYINIE_DIARIZER_PYTHON_BIN/DOUYINIE_DIARIZER_ADAPTER/DOUYINIE_DIARIZER_BIN",
 		nil)
 }
 
@@ -2247,6 +2255,29 @@ func resolveTranslationPythonBinary() string {
 		}
 	}
 	return resolvePythonBinary()
+}
+
+// resolveDiarizerPythonBinary resolves the interpreter for the diarizer family
+// (Issue #106). DOUYINIE_DIARIZER_PYTHON_BIN — named after the per-family
+// interpreter variables of the other stage families — is honoured ahead of the
+// shared DOUYINIE_PYTHON_BIN, so the diarizer can run its own venv (the one
+// carrying modelscope/torchaudio) while asr/aligner keep the shared one.
+//
+// Unlike the sibling resolvers this one fails closed: a configured value that
+// is not a usable interpreter returns an error naming the variable and the
+// path. Falling back to another interpreter would only reproduce the opaque
+// DIARIZER_EXEC_FAILED this variable exists to prevent.
+func resolveDiarizerPythonBinary() (string, error) {
+	configured := strings.TrimSpace(os.Getenv("DOUYINIE_DIARIZER_PYTHON_BIN"))
+	if configured == "" {
+		return resolvePythonBinary(), nil
+	}
+	if path, err := exec.LookPath(configured); err == nil {
+		return path, nil
+	}
+	return "", worker.NewError("DIARIZER_RUNTIME_MISSING",
+		fmt.Sprintf("configured DOUYINIE_DIARIZER_PYTHON_BIN \"%s\" is not a usable interpreter (no fallback to another interpreter)", configured),
+		map[string]any{"stage": "diarizer", "env": "DOUYINIE_DIARIZER_PYTHON_BIN", "path": configured})
 }
 
 // resolveDiarizerSnapshotPaths parses and validates the typed model_snapshot envelope

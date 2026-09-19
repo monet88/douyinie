@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -152,8 +153,8 @@ func TestSeam1_Translation_LocalProfile_DisablesTranslation(t *testing.T) {
 
 	// 1. Register remote candidates with allowed policy
 	gemini, _ := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 		"http://127.0.0.1:8080",
@@ -162,8 +163,8 @@ func TestSeam1_Translation_LocalProfile_DisablesTranslation(t *testing.T) {
 	_ = reg.Register(gemini)
 
 	deepseek, _ := provider.NewGatewayTranslationProvider(
-		"gateway_deepseek_v4_flash_vision_exp",
-		"deepseek/deepseek-v4-flash-vision-exp",
+		provider.GatewayDeepSeekTranslationProviderID,
+		provider.GatewayDeepSeekModelAlias,
 		"baseline-deepseek-v4-2026-08",
 		0.95,
 		"http://127.0.0.1:8080",
@@ -217,11 +218,11 @@ func TestSeam1_Translation_HybridProfile_OrderingAndFallback(t *testing.T) {
 			http.Error(w, "upstream rate limit", http.StatusTooManyRequests)
 			return
 		}
-		if req.Model == "deepseek/deepseek-v4-flash-vision-exp" {
+		if req.Model == "deepseek-v4.1-flash" {
 			deepseekAttempted = true
 			resp := map[string]any{
 				"id":                 "chatcmpl-deepseek",
-				"model":              "deepseek-v4-flash-001",
+				"model":              "deepseek/deepseek-v4.1-flash",
 				"system_fingerprint": "fp_deepseek_exp",
 				"choices": []map[string]any{
 					{
@@ -251,8 +252,8 @@ func TestSeam1_Translation_HybridProfile_OrderingAndFallback(t *testing.T) {
 	defer ts.Close()
 
 	gemini, _ := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 		ts.Client(),
@@ -266,8 +267,8 @@ func TestSeam1_Translation_HybridProfile_OrderingAndFallback(t *testing.T) {
 	_ = reg.Register(gemini)
 
 	deepseek, _ := provider.NewGatewayTranslationProvider(
-		"gateway_deepseek_v4_flash_vision_exp",
-		"deepseek/deepseek-v4-flash-vision-exp",
+		provider.GatewayDeepSeekTranslationProviderID,
+		provider.GatewayDeepSeekModelAlias,
 		"baseline-deepseek-v4-2026-08",
 		0.95,
 		ts.Client(),
@@ -319,11 +320,11 @@ func TestSeam1_Translation_HybridProfile_OrderingAndFallback(t *testing.T) {
 	if !deepseekAttempted {
 		t.Fatalf("expected deepseek to be attempted as fallback")
 	}
-	if res.Variant.ProviderID != "gateway_deepseek_v4_flash_vision_exp" {
-		t.Fatalf("expected fallback provider gateway_deepseek_v4_flash_vision_exp, got %q", res.Variant.ProviderID)
+	if res.Variant.ProviderID != provider.GatewayDeepSeekTranslationProviderID {
+		t.Fatalf("expected fallback provider gateway_deepseek_v4_1_flash, got %q", res.Variant.ProviderID)
 	}
-	if res.Variant.ObservedModel != "deepseek-v4-flash-001" {
-		t.Fatalf("expected observed model 'deepseek-v4-flash-001', got %q", res.Variant.ObservedModel)
+	if res.Variant.ObservedModel != "deepseek/deepseek-v4.1-flash" {
+		t.Fatalf("expected observed model 'deepseek/deepseek-v4.1-flash', got %q", res.Variant.ObservedModel)
 	}
 	if res.Variant.ServiceBaselineID != "baseline-deepseek-v4-2026-08" {
 		t.Fatalf("expected service baseline 'baseline-deepseek-v4-2026-08', got %q", res.Variant.ServiceBaselineID)
@@ -334,10 +335,10 @@ func TestSeam1_Translation_HybridProfile_OrderingAndFallback(t *testing.T) {
 	if err != nil || len(attempts) != 2 {
 		t.Fatalf("expected 2 attempts recorded in SQLite, got: %d (err: %v)", len(attempts), err)
 	}
-	if attempts[0].ProviderID != "gateway_gemini_3_8_flash" || (attempts[0].Status != "failed" && attempts[0].Status != "quality_failed") {
+	if attempts[0].ProviderID != provider.GatewayGeminiTranslationProviderID || (attempts[0].Status != "failed" && attempts[0].Status != "quality_failed") {
 		t.Fatalf("unexpected first attempt: %+v", attempts[0])
 	}
-	if attempts[1].ProviderID != "gateway_deepseek_v4_flash_vision_exp" || attempts[1].Status != "succeeded" {
+	if attempts[1].ProviderID != provider.GatewayDeepSeekTranslationProviderID || attempts[1].Status != "succeeded" {
 		t.Fatalf("unexpected second attempt: %+v", attempts[1])
 	}
 }
@@ -377,10 +378,11 @@ func TestSeam1_Translation_LocalProfile_FailsClosedIfSnapshotUnverified(t *testi
 	}
 }
 
-func TestSeam1_Translation_MeaningFirstValidation_RejectsFactOrNegationCorruption(t *testing.T) {
+func TestSeam1_Translation_MeaningFirstValidation_FlagsFactOrNegationCorruption(t *testing.T) {
 	reg := provider.NewRegistry()
 
-	// Remote translation fake corrupts numbers; QA must still reject it.
+	// Remote translation fake corrupts numbers: the gate must flag it, not discard it,
+	// and the flag must reach the review queue.
 	fakeGateway := provider.NewFakeTranslationProvider(provider.GatewayGeminiTranslationProviderID)
 	fakeGateway.Cap.ExecutionTier = "cloud"
 	fakeGateway.CorruptNumbers = true
@@ -407,9 +409,24 @@ func TestSeam1_Translation_MeaningFirstValidation_RejectsFactOrNegationCorruptio
 	}
 	defer resp.Body.Close()
 
-	// Must return 422 Unprocessable Entity because QA gate rejects number corruption
-	if resp.StatusCode != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422 Unprocessable Entity when numbers corrupted, got: %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusCreated {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 201 Created with a flagged variant when numbers corrupted, got: %d body=%s", resp.StatusCode, string(raw))
+	}
+	var translateRes struct {
+		Variant domain.TranslationVariant `json:"translation_variant"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&translateRes); err != nil {
+		t.Fatalf("decode translate response: %v", err)
+	}
+	if len(translateRes.Variant.Segments) != 1 {
+		t.Fatalf("expected the flagged candidate to be persisted, got %d segments", len(translateRes.Variant.Segments))
+	}
+	if translateRes.Variant.Segments[0].PassedQAGate {
+		t.Fatalf("expected the corrupted-number segment to stay flagged, got passed_qa_gate=true")
+	}
+	if !strings.Contains(strings.ToLower(translateRes.Variant.Segments[0].ReviewReason), "number") {
+		t.Errorf("expected the review reason to name the number corruption, got %q", translateRes.Variant.Segments[0].ReviewReason)
 	}
 }
 
@@ -456,8 +473,8 @@ func TestSeam1_VisualTrack_LocalProfile_DisablesTranslation(t *testing.T) {
 
 	// 1. Remote translation providers
 	gemini, _ := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 		"http://127.0.0.1:8080",
@@ -466,8 +483,8 @@ func TestSeam1_VisualTrack_LocalProfile_DisablesTranslation(t *testing.T) {
 	_ = reg.Register(gemini)
 
 	deepseek, _ := provider.NewGatewayTranslationProvider(
-		"gateway_deepseek_v4_flash_vision_exp",
-		"deepseek/deepseek-v4-flash-vision-exp",
+		provider.GatewayDeepSeekTranslationProviderID,
+		provider.GatewayDeepSeekModelAlias,
 		"baseline-deepseek-v4-2026-08",
 		0.95,
 		"http://127.0.0.1:8080",
@@ -546,8 +563,8 @@ func TestSeam1_VisualTrack_HybridProfile_ConsentAndCredentials(t *testing.T) {
 
 	// Remote gateways requiring explicit consent
 	gemini, _ := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 		mockServer.Client(),
@@ -558,8 +575,8 @@ func TestSeam1_VisualTrack_HybridProfile_ConsentAndCredentials(t *testing.T) {
 	_ = reg.Register(gemini)
 
 	deepseek, _ := provider.NewGatewayTranslationProvider(
-		"gateway_deepseek_v4_flash_vision_exp",
-		"deepseek/deepseek-v4-flash-vision-exp",
+		provider.GatewayDeepSeekTranslationProviderID,
+		provider.GatewayDeepSeekModelAlias,
 		"baseline-deepseek-v4-2026-08",
 		0.95,
 		mockServer.Client(),
@@ -648,7 +665,7 @@ func TestSeam1_VisualTrack_HybridProfile_ConsentAndCredentials(t *testing.T) {
 	}
 	for _, decision := range decisions2 {
 		for _, cand := range decision.CandidatesEvaluated {
-			if cand.ProviderID == "gateway_gemini_3_8_flash" || cand.ProviderID == "gateway_deepseek_v4_flash_vision_exp" {
+			if cand.ProviderID == provider.GatewayGeminiTranslationProviderID || cand.ProviderID == provider.GatewayDeepSeekTranslationProviderID {
 				if !cand.Eligible {
 					t.Fatalf("gateway %s must be eligible when consent_granted=true and authorized, got rejection: %s (%s)",
 						cand.ProviderID, cand.RejectionCode, cand.Reason)
@@ -656,4 +673,144 @@ func TestSeam1_VisualTrack_HybridProfile_ConsentAndCredentials(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestSeam1_Translation_MeaningGateFlag_SurfacesForReviewAndOverride proves the operator loop for a
+// meaning-gate violation at Seam 1: the translation stage persists the best-effort variant with the
+// offending segment flagged, the violation surfaces as a pending review exception that names what is
+// wrong, and the operator clears it by recording a manual override. A flagged gate verdict must inform
+// the operator, never dead-end the run.
+func TestSeam1_Translation_MeaningGateFlag_SurfacesForReviewAndOverride(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	const sourceText = "请不要打开窗户。"
+	const inverted = "Hãy mở cửa sổ ra nhé." // prohibition rendered as an affirmative
+	for _, id := range []string{"fake_llm_translator", "fake_local_translator_fallback"} {
+		p, ok := h.registry.Get(id)
+		if !ok {
+			t.Fatalf("provider %s not registered in the seam 1 harness", id)
+		}
+		p.(*provider.FakeTranslationProvider).CustomTranslations = map[string]string{sourceText: inverted}
+	}
+
+	payload := map[string]any{
+		"run_id":            runID,
+		"job_id":            jobID,
+		"source_language":   "zh",
+		"target_language":   "vi",
+		"execution_profile": "hybrid",
+		"segments": []map[string]any{
+			{"index": 0, "source_text": sourceText, "start_ms": 0, "end_ms": 1500},
+		},
+	}
+	body, _ := json.Marshal(payload)
+	resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/translate", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /translate failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 201 Created with a flagged variant, got %d body=%s", resp.StatusCode, string(raw))
+	}
+	var translateRes struct {
+		Variant domain.TranslationVariant `json:"translation_variant"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&translateRes); err != nil {
+		t.Fatalf("decode translate response: %v", err)
+	}
+	if len(translateRes.Variant.Segments) != 1 {
+		t.Fatalf("expected the flagged candidate to be persisted, got %d segments", len(translateRes.Variant.Segments))
+	}
+	flagged := translateRes.Variant.Segments[0]
+	if flagged.PassedQAGate {
+		t.Fatalf("expected the inverted negation to stay flagged, got passed_qa_gate=true")
+	}
+	if !strings.Contains(flagged.ReviewReason, "negation polarity inverted") {
+		t.Errorf("expected the persisted review reason to name the inverted negation, got %q", flagged.ReviewReason)
+	}
+
+	// The operator can see exactly what is wrong.
+	pending := fetchRunReviewItems(t, h, runID, false)
+	var item *domain.ReviewItem
+	for i := range pending {
+		if pending[i].Type == domain.ReviewItemTypeTranslationQA && pending[i].ItemIndex == 0 {
+			item = &pending[i]
+			break
+		}
+	}
+	if item == nil {
+		t.Fatalf("expected a pending translation_qa review item, got %+v", pending)
+	}
+	if !strings.Contains(item.Reason, "negation polarity inverted") {
+		t.Errorf("expected the review item reason to name the inverted negation, got %q", item.Reason)
+	}
+	if item.Status != domain.ReviewItemStatusPending {
+		t.Errorf("expected a pending review item, got %s", item.Status)
+	}
+
+	// ...and can accept it as-is: the manual override clears the queue.
+	overrideBody, _ := json.Marshal(map[string]any{
+		"review_item_id": item.ID,
+		"item_type":      string(item.Type),
+		"stage":          item.Stage,
+		"item_index":     item.ItemIndex,
+		"reason":         "operator accepted the translation as-is",
+		"operator":       "seam1-operator",
+	})
+	ovResp, err := http.Post(h.server.URL+"/api/v1/runs/"+runID+"/review/override", "application/json", bytes.NewReader(overrideBody))
+	if err != nil {
+		t.Fatalf("POST review override failed: %v", err)
+	}
+	defer ovResp.Body.Close()
+	if ovResp.StatusCode != http.StatusCreated {
+		raw, _ := io.ReadAll(ovResp.Body)
+		t.Fatalf("expected 201 Created for the manual override, got %d body=%s", ovResp.StatusCode, string(raw))
+	}
+
+	for _, remaining := range fetchRunReviewItems(t, h, runID, false) {
+		if remaining.ID == item.ID {
+			t.Fatalf("overridden item %s must leave the pending queue", item.ID)
+		}
+	}
+	resolved := fetchRunReviewItems(t, h, runID, true)
+	var seen bool
+	for _, it := range resolved {
+		if it.ID == item.ID {
+			seen = true
+			if it.Status != domain.ReviewItemStatusManualOverride {
+				t.Errorf("expected the override to be recorded on the item, got status %s", it.Status)
+			}
+		}
+	}
+	if !seen {
+		t.Fatalf("expected the audited item to remain visible with include_resolved=true")
+	}
+}
+
+func fetchRunReviewItems(t *testing.T, h *testHarness, runID string, includeResolved bool) []domain.ReviewItem {
+	t.Helper()
+	url := h.server.URL + "/api/v1/runs/" + runID + "/review-items"
+	if includeResolved {
+		url += "?include_resolved=true"
+	}
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET review-items failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET review-items returned %d", resp.StatusCode)
+	}
+	var out struct {
+		ReviewItems []domain.ReviewItem `json:"review_items"`
+		Count       int                 `json:"count"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode review-items: %v", err)
+	}
+	return out.ReviewItems
 }

@@ -53,6 +53,40 @@ func (s *RenderService) SetFontFile(p string) {
 	s.fontFile = p
 }
 
+// assFontFamily resolves a configured font file into the family name libass matches against ASS Fontname.
+// A configured font file that cannot be opened or parsed fails closed: silently falling back to the
+// default family would ship the wrong typeface without exposing that the configured font was dropped.
+func (s *RenderService) assFontFamily(fontFile string) (string, error) {
+	trimmed := strings.TrimSpace(fontFile)
+	if trimmed == "" {
+		return "", nil
+	}
+	family, err := media.ResolveASSFontFamily(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("%w: resolve font_file %s: %v", domain.ErrRenderPlanInvalid, trimmed, err)
+	}
+	return family, nil
+}
+
+// resolveFontIdentity resolves both the family name and SHA-256 byte digest for a font file.
+// If fontFile is empty, it returns ("", "", nil).
+// An invalid, corrupt, or unparseable font file fails closed with ErrRenderPlanInvalid.
+func (s *RenderService) resolveFontIdentity(fontFile string) (family string, fontSHA string, err error) {
+	trimmed := strings.TrimSpace(fontFile)
+	if trimmed == "" {
+		return "", "", nil
+	}
+	family, err = s.assFontFamily(trimmed)
+	if err != nil {
+		return "", "", err
+	}
+	fontSHA, err = media.ComputeFontSHA256(trimmed)
+	if err != nil {
+		return "", "", fmt.Errorf("%w: hash font_file %s: %v", domain.ErrRenderPlanInvalid, trimmed, err)
+	}
+	return family, fontSHA, nil
+}
+
 // SetCustomComposer injects a custom composition backend seam for testing.
 func (s *RenderService) SetCustomComposer(fn func(ctx context.Context, req media.CompositionRequest) (*media.CompositionResult, error)) {
 	s.customComposer = fn
@@ -68,6 +102,8 @@ type RenderPlanInput struct {
 	SubtitlePlanCAS        string               `json:"subtitle_plan_cas,omitempty"`         // optional explicit CAS hash of SubtitlePlanArtifact
 	SubtitlePlanArtifactID string               `json:"subtitle_plan_artifact_id,omitempty"` // optional artifact ID
 	SubtitleCues           []domain.SubtitleCue `json:"subtitle_cues,omitempty"`
+	CoverBoxes             []domain.CoverBox    `json:"cover_boxes,omitempty"`
+	OverlayCues            []domain.SubtitleCue `json:"overlay_cues,omitempty"`
 }
 
 // FreezeRenderPlan freezes exact artifact IDs/versions into an immutable RenderPlan.
@@ -81,6 +117,11 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 	}
 	if !domain.IsValidTargetLanguage(in.TargetLanguage) {
 		return nil, fmt.Errorf("%w: %s", domain.ErrInvalidTargetLanguage, in.TargetLanguage)
+	}
+
+	fontFamily, err := s.assFontFamily(s.fontFile)
+	if err != nil {
+		return nil, err
 	}
 
 	// 1. Resolve SourceAsset
@@ -184,7 +225,7 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 		if err != nil {
 			return nil, fmt.Errorf("compute subtitle plan provenance: %w", err)
 		}
-		assContent := media.GenerateASSContent(timeline, cues, s.fontFile)
+		assContent := media.GenerateASSContent(timeline, cues, fontFamily)
 		subArt := domain.SubtitlePlanArtifact{
 			ID:             subProv,
 			SchemaVersion:  domain.SubtitlePlanSchemaVersion,
@@ -239,7 +280,7 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 			if err != nil {
 				return nil, fmt.Errorf("compute subtitle plan provenance: %w", err)
 			}
-			assContent := media.GenerateASSContent(timeline, cues, s.fontFile)
+			assContent := media.GenerateASSContent(timeline, cues, fontFamily)
 			subArt := domain.SubtitlePlanArtifact{
 				ID:             subProv,
 				SchemaVersion:  domain.SubtitlePlanSchemaVersion,
@@ -276,7 +317,7 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 			if err != nil {
 				return nil, fmt.Errorf("compute subtitle plan provenance: %w", err)
 			}
-			assContent := media.GenerateASSContent(timeline, cues, s.fontFile)
+			assContent := media.GenerateASSContent(timeline, cues, fontFamily)
 			subArt := domain.SubtitlePlanArtifact{
 				ID:             subProv,
 				SchemaVersion:  domain.SubtitlePlanSchemaVersion,
@@ -309,7 +350,42 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 		}
 	}
 
-	// 5. Compute Provenance & Build RenderPlan
+	// 5. Resolve frozen source-text covers from the run's localized visual track.
+	// Covers are what hides a burned-in source caption; without them the source text and its
+	// replacement are both visible. Resolution is run-scoped: an earlier run's track for the same
+	// asset must never leak a cover into this plan (cross-run bleed).
+	covers := in.CoverBoxes
+	overlayCues := in.OverlayCues
+	if covers == nil && overlayCues == nil {
+		var err error
+		covers, overlayCues, err = s.resolveVisualTrackLayers(ctx, in.RunID, in.AssetID, in.TargetLanguage)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for i, cue := range overlayCues {
+		if cue.StartMs < 0 || cue.EndMs <= cue.StartMs {
+			return nil, fmt.Errorf("%w: overlay cue %d invalid time bounds [%d, %d]", domain.ErrRenderPlanInvalid, i, cue.StartMs, cue.EndMs)
+		}
+	}
+
+	fitted := make([]domain.CoverBox, 0, len(covers))
+	for _, c := range covers {
+		clamped, ok := domain.ClampCoverBoxToFrame(c, timeline.Width, timeline.Height)
+		if !ok {
+			continue
+		}
+		if err := domain.ValidateCoverBox(clamped, timeline.Width, timeline.Height); err != nil {
+			return nil, err
+		}
+		fitted = append(fitted, clamped)
+	}
+	if len(fitted) == 0 {
+		fitted = nil
+	}
+	covers = fitted
+
+	// 6. Compute Provenance & Build RenderPlan
 	provHash, err := domain.ComputeRenderPlanProvenanceHash(
 		in.AssetID,
 		in.TargetLanguage,
@@ -318,6 +394,8 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 		dubMix.AudioCASHash,
 		timeline,
 		subPlanRef,
+		covers,
+		overlayCues,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("compute render plan provenance: %w", err)
@@ -350,6 +428,8 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 		Timeline:          timeline,
 		SubtitlePlan:      subPlanRef,
 		SubtitleCues:      cues,
+		CoverBoxes:        covers,
+		OverlayCues:       overlayCues,
 		ProvenanceHash:    provHash,
 		CreatedAt:         time.Now().UTC(),
 	}
@@ -381,6 +461,126 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 	return &plan, nil
 }
 
+// resolveVisualTrackLayers loads the run's localized visual track and returns the in-place
+// layers it froze: the covers that hide replaced source text, and the overlay cues that draw the
+// localized text on top of them.
+//
+// A track that was never produced is not a render blocker: the plan then renders exactly as it did
+// before these layers existed (source text left in place) rather than failing a run over a
+// visual-layer absence. Absence is the only tolerated outcome. Once a track exists, every failure
+// to read or decode it - a database error, an empty/missing/corrupt CAS object, an unreadable
+// schema, or an index that belongs to another asset or language - aborts the plan: the source
+// Chinese caption is burned into the video, so a plan that cannot prove its covers would ship a
+// "PASS" render that exposes it.
+func (s *RenderService) resolveVisualTrackLayers(ctx context.Context, runID, assetID, targetLang string) ([]domain.CoverBox, []domain.SubtitleCue, error) {
+	idx, err := s.db.GetLocalizedVisualTrackIndexByRun(ctx, runID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, nil, nil // no track was ever produced for this run: absence stays optional
+		}
+		return nil, nil, fmt.Errorf("query localized visual track index for run %s: %w", runID, err)
+	}
+	if idx == nil {
+		return nil, nil, nil
+	}
+	if idx.AssetID != assetID || !strings.EqualFold(idx.TargetLanguage, targetLang) {
+		// A run's visual track for a different asset/language is not this plan's evidence: the covers
+		// were measured on other pixels and would hide the wrong parts of this video.
+		return nil, nil, fmt.Errorf("%w: localized visual track %s of run %s belongs to asset %s (%s), not %s (%s)",
+			domain.ErrRenderOwnershipMismatch, idx.ID, runID, idx.AssetID, idx.TargetLanguage, assetID, targetLang)
+	}
+	if strings.TrimSpace(idx.CASHash) == "" {
+		return nil, nil, fmt.Errorf("%w: localized visual track index %s has no CAS hash", domain.ErrRenderPlanInvalid, idx.ID)
+	}
+	r, err := s.casStore.Get(idx.CASHash)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: load localized visual track from CAS (%s): %v", domain.ErrRenderSourceNotFound, idx.CASHash, err)
+	}
+	defer r.Close()
+	var track domain.LocalizedVisualTrack
+	if err := json.NewDecoder(r).Decode(&track); err != nil {
+		return nil, nil, fmt.Errorf("%w: decode localized visual track (%s): %v", domain.ErrRenderPlanInvalid, idx.CASHash, err)
+	}
+	if track.SchemaVersion != domain.LocalizedVisualTrackSchemaVersion {
+		return nil, nil, fmt.Errorf("%w: localized visual track schema version mismatch (got %d, expected %d)",
+			domain.ErrRenderPlanInvalid, track.SchemaVersion, domain.LocalizedVisualTrackSchemaVersion)
+	}
+
+	// Payload ownership and provenance binding: the decoded CAS payload itself must agree strictly
+	// with the request and index for all identity fields production always emits.
+	// An unbound, mismatched, or foreign payload must fail closed (domain.ErrRenderOwnershipMismatch).
+	if strings.TrimSpace(track.ID) == "" || strings.TrimSpace(idx.ID) == "" || track.ID != idx.ID {
+		return nil, nil, fmt.Errorf("%w: localized visual track payload ID %q does not match index ID %q",
+			domain.ErrRenderOwnershipMismatch, track.ID, idx.ID)
+	}
+	if strings.TrimSpace(track.RunID) == "" || strings.TrimSpace(idx.RunID) == "" || track.RunID != runID || idx.RunID != runID {
+		return nil, nil, fmt.Errorf("%w: localized visual track payload run %q does not match index run %q / request run %q",
+			domain.ErrRenderOwnershipMismatch, track.RunID, idx.RunID, runID)
+	}
+	if strings.TrimSpace(track.AssetID) == "" || strings.TrimSpace(idx.AssetID) == "" || track.AssetID != assetID || idx.AssetID != assetID {
+		return nil, nil, fmt.Errorf("%w: localized visual track payload asset %q does not match index asset %q / request asset %q",
+			domain.ErrRenderOwnershipMismatch, track.AssetID, idx.AssetID, assetID)
+	}
+	if strings.TrimSpace(track.TargetLanguage) == "" || strings.TrimSpace(idx.TargetLanguage) == "" ||
+		!strings.EqualFold(track.TargetLanguage, targetLang) || !strings.EqualFold(idx.TargetLanguage, targetLang) {
+		return nil, nil, fmt.Errorf("%w: localized visual track payload language %q does not match index language %q / request language %q",
+			domain.ErrRenderOwnershipMismatch, track.TargetLanguage, idx.TargetLanguage, targetLang)
+	}
+	if strings.TrimSpace(track.ProvenanceHash) == "" || strings.TrimSpace(idx.ProvenanceHash) == "" || track.ProvenanceHash != idx.ProvenanceHash {
+		return nil, nil, fmt.Errorf("%w: localized visual track payload provenance %q does not match index provenance %q",
+			domain.ErrRenderOwnershipMismatch, track.ProvenanceHash, idx.ProvenanceHash)
+	}
+
+	covers := append([]domain.CoverBox(nil), track.Covers...)
+	var overlayCues []domain.SubtitleCue
+	for i, ov := range track.Overlays {
+		text := strings.TrimSpace(ov.LocalizedText)
+		if text == "" || ov.EndMs <= ov.StartMs {
+			continue
+		}
+		// An in-place overlay only replaces source text when a cover hides it first; the
+		// inpainting fallback is not implemented by the composer, so it is not composited here.
+		if !ov.IsCoverDefault || ov.Inpainting {
+			continue
+		}
+		if ov.Box.Width <= 0 || ov.Box.Height <= 0 {
+			continue
+		}
+		// Negative geometry cannot be positioned deterministically; (0,0) is an accepted origin.
+		if ov.Box.X < 0 || ov.Box.Y < 0 {
+			continue
+		}
+		covers = append(covers, domain.CoverBox{
+			RegionID: ov.RegionID,
+			Role:     string(ov.Role),
+			X:        ov.Box.X,
+			Y:        ov.Box.Y,
+			Width:    ov.Box.Width,
+			Height:   ov.Box.Height,
+			StartMs:  ov.StartMs,
+			EndMs:    ov.EndMs,
+			Color:    "#000000",
+			Opacity:  1.0,
+		})
+		overlayCues = append(overlayCues, domain.SubtitleCue{
+			ID:         fmt.Sprintf("overlay-%d", i),
+			StartMs:    ov.StartMs,
+			EndMs:      ov.EndMs,
+			Text:       text,
+			X:          ov.Box.X,
+			Y:          ov.Box.Y,
+			Width:      ov.Box.Width,
+			Height:     ov.Box.Height,
+			FontSizePx: ov.FontSizePx,
+			PaddingX:   ov.PaddingX,
+			PaddingY:   ov.PaddingY,
+			BoxColor:   ov.BoxColor,
+			FontColor:  ov.FontColor,
+		})
+	}
+	return covers, overlayCues, nil
+}
+
 // RenderExecutionInput defines input parameters for preview or final video render.
 type RenderExecutionInput struct {
 	RunID          string `json:"run_id"`
@@ -400,8 +600,17 @@ func (s *RenderService) RenderPreview(ctx context.Context, in RenderExecutionInp
 		return nil, err
 	}
 
+	fontFile := s.fontFile
+	if strings.TrimSpace(in.FontFile) != "" {
+		fontFile = in.FontFile
+	}
+	_, fontSHA, err := s.resolveFontIdentity(fontFile)
+	if err != nil {
+		return nil, err
+	}
+
 	profile := domain.DefaultPreviewEncodeProfile()
-	artifactProv, err := domain.ComputeRenderArtifactProvenanceHash(plan.ProvenanceHash, domain.RenderKindPreview, profile)
+	artifactProv, err := domain.ComputeRenderArtifactProvenanceHash(plan.ProvenanceHash, domain.RenderKindPreview, profile, fontSHA)
 	if err != nil {
 		return nil, fmt.Errorf("compute preview artifact provenance: %w", err)
 	}
@@ -499,13 +708,26 @@ func (s *RenderService) RenderPreview(ctx context.Context, in RenderExecutionInp
 
 // RenderFinal executes a final high-quality delivery render pass consuming the frozen RenderPlan.
 func (s *RenderService) RenderFinal(ctx context.Context, in RenderExecutionInput) (*domain.FinalRenderArtifact, error) {
+	if err := s.verifyRenderOwnership(ctx, in); err != nil {
+		return nil, err
+	}
+
 	plan, err := s.resolvePlan(ctx, in)
 	if err != nil {
 		return nil, err
 	}
 
+	fontFile := s.fontFile
+	if strings.TrimSpace(in.FontFile) != "" {
+		fontFile = in.FontFile
+	}
+	_, fontSHA, err := s.resolveFontIdentity(fontFile)
+	if err != nil {
+		return nil, err
+	}
+
 	profile := domain.DefaultFinalEncodeProfile()
-	artifactProv, err := domain.ComputeRenderArtifactProvenanceHash(plan.ProvenanceHash, domain.RenderKindFinal, profile)
+	artifactProv, err := domain.ComputeRenderArtifactProvenanceHash(plan.ProvenanceHash, domain.RenderKindFinal, profile, fontSHA)
 	if err != nil {
 		return nil, fmt.Errorf("compute final artifact provenance: %w", err)
 	}
@@ -601,6 +823,65 @@ func (s *RenderService) RenderFinal(ctx context.Context, in RenderExecutionInput
 	return &artifact, nil
 }
 
+// verifyRenderOwnership binds an explicit render to the run and job that own the media unit.
+// A final render finishes the job a completed run left open, so rendering one asset while completing
+// another run's job is never allowed. When a run or job is supplied, their ownership must match
+// the asset and target language being rendered.
+func (s *RenderService) verifyRenderOwnership(ctx context.Context, in RenderExecutionInput) error {
+	if strings.TrimSpace(in.RunID) == "" {
+		return nil // asset-level render: no run owns this job transition
+	}
+	if s.db == nil {
+		return nil
+	}
+	run, err := s.db.GetRun(ctx, in.RunID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("%w: run %s does not exist", domain.ErrRenderOwnershipMismatch, in.RunID)
+		}
+		return fmt.Errorf("lookup run %s for render ownership: %w", in.RunID, err)
+	}
+	jobID := run.JobID
+	if strings.TrimSpace(in.JobID) != "" && in.JobID != jobID {
+		return fmt.Errorf("%w: body job_id %s does not match run %s job_id %s",
+			domain.ErrRenderOwnershipMismatch, in.JobID, in.RunID, jobID)
+	}
+	if jobID == "" {
+		return fmt.Errorf("%w: run %s has no owning job", domain.ErrRenderOwnershipMismatch, in.RunID)
+	}
+	job, err := s.db.GetJob(ctx, jobID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("%w: job %s of run %s does not exist", domain.ErrRenderOwnershipMismatch, jobID, in.RunID)
+		}
+		return fmt.Errorf("lookup job %s of run %s for render ownership: %w", jobID, in.RunID, err)
+	}
+	if strings.TrimSpace(in.AssetID) != "" && job.SourceAssetID != in.AssetID {
+		return fmt.Errorf("%w: run %s belongs to asset %s, not %s",
+			domain.ErrRenderOwnershipMismatch, in.RunID, job.SourceAssetID, in.AssetID)
+	}
+	if strings.TrimSpace(in.TargetLanguage) != "" && !strings.EqualFold(job.TargetLanguage, in.TargetLanguage) {
+		return fmt.Errorf("%w: run %s is for target language %s, not %s",
+			domain.ErrRenderOwnershipMismatch, in.RunID, job.TargetLanguage, in.TargetLanguage)
+	}
+	return nil
+}
+
+func validatePlanBinding(in RenderExecutionInput, plan *domain.RenderPlan) error {
+	if plan == nil {
+		return nil
+	}
+	if strings.TrimSpace(in.AssetID) != "" && plan.AssetID != "" && plan.AssetID != in.AssetID {
+		return fmt.Errorf("%w: plan belongs to asset %s, not requested %s",
+			domain.ErrRenderOwnershipMismatch, plan.AssetID, in.AssetID)
+	}
+	if strings.TrimSpace(in.TargetLanguage) != "" && plan.TargetLanguage != "" && !strings.EqualFold(plan.TargetLanguage, in.TargetLanguage) {
+		return fmt.Errorf("%w: plan target language %s does not match requested %s",
+			domain.ErrRenderOwnershipMismatch, plan.TargetLanguage, in.TargetLanguage)
+	}
+	return nil
+}
+
 // resolvePlan loads the RenderPlan either from explicit CAS hash, plan provenance, or latest index.
 func (s *RenderService) resolvePlan(ctx context.Context, in RenderExecutionInput) (*domain.RenderPlan, error) {
 	if in.PlanCAS != "" {
@@ -614,6 +895,9 @@ func (s *RenderService) resolvePlan(ctx context.Context, in RenderExecutionInput
 			return nil, fmt.Errorf("decode plan from CAS: %w", err)
 		}
 		plan.CASHash = in.PlanCAS
+		if err := validatePlanBinding(in, &plan); err != nil {
+			return nil, err
+		}
 		return &plan, nil
 	}
 
@@ -633,6 +917,9 @@ func (s *RenderService) resolvePlan(ctx context.Context, in RenderExecutionInput
 		}
 		plan.CASHash = idx.CASHash
 		plan.ProvenanceHash = idx.ProvenanceHash
+		if err := validatePlanBinding(in, &plan); err != nil {
+			return nil, err
+		}
 		return &plan, nil
 	}
 
@@ -652,6 +939,9 @@ func (s *RenderService) resolvePlan(ctx context.Context, in RenderExecutionInput
 	}
 	plan.CASHash = idx.CASHash
 	plan.ProvenanceHash = idx.ProvenanceHash
+	if err := validatePlanBinding(in, &plan); err != nil {
+		return nil, err
+	}
 	return &plan, nil
 }
 
@@ -677,6 +967,15 @@ func (s *RenderService) composeVideo(
 	// 3. Resolve ASS content / cues from SubtitlePlanArtifact
 	assContent := ""
 	cues := plan.SubtitleCues
+	fontFile := s.fontFile
+	if fontOverride != "" {
+		fontFile = fontOverride
+	}
+	fontFamily, err := s.assFontFamily(fontFile)
+	if err != nil {
+		return nil, err
+	}
+
 	if plan.SubtitlePlan.CASHash != "" {
 		r, err := s.casStore.Get(plan.SubtitlePlan.CASHash)
 		if err != nil {
@@ -707,12 +1006,25 @@ func (s *RenderService) composeVideo(
 		}
 
 		cues = subArt.Cues
-		assContent = subArt.ASSContent
-		if assContent == "" && len(cues) > 0 {
-			assContent = media.GenerateASSContent(plan.Timeline, cues, fontOverride)
+		if strings.TrimSpace(fontOverride) != "" && len(cues) > 0 {
+			// A runtime font override takes precedence over frozen ASSContent: regenerate with the override family.
+			assContent = media.GenerateASSContent(plan.Timeline, cues, fontFamily)
+		} else {
+			assContent = subArt.ASSContent
+			if assContent == "" && len(cues) > 0 {
+				assContent = media.GenerateASSContent(plan.Timeline, cues, fontFamily)
+			}
 		}
 	} else if len(cues) > 0 {
-		assContent = media.GenerateASSContent(plan.Timeline, cues, fontOverride)
+		assContent = media.GenerateASSContent(plan.Timeline, cues, fontFamily)
+	}
+
+	// In-place overlay cues (localized semantic/UI text) are burned with the speech subtitles:
+	// both are ASS events over the same video, and the covers freeze composited below already
+	// hide the source text each overlay replaces.
+	if len(plan.OverlayCues) > 0 {
+		cues = append(cues, plan.OverlayCues...)
+		assContent = media.GenerateASSContent(plan.Timeline, cues, fontFamily)
 	}
 
 	// 4. Create temporary output MP4 file path
@@ -722,18 +1034,13 @@ func (s *RenderService) composeVideo(
 	}
 	_ = tmpFile.Close()
 	_ = os.Remove(tmpFile.Name()) // Let ffmpeg create it
-
-	fontFile := s.fontFile
-	if fontOverride != "" {
-		fontFile = fontOverride
-	}
-
 	req := media.CompositionRequest{
 		FFmpegPath:  s.ffmpegPath,
 		SourceVideo: videoPath,
 		AudioTrack:  audioPath,
 		Timeline:    plan.Timeline,
 		Cues:        cues,
+		Covers:      plan.CoverBoxes,
 		ASSContent:  assContent,
 		FontFile:    fontFile,
 		Profile:     profile,

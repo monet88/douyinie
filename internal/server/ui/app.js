@@ -424,6 +424,27 @@ function renderStepper() {
   });
 }
 
+// The one source of truth for which run-lifecycle control each run status admits, shared by the
+// run panel buttons and the queue-row actions so the two surfaces can never disagree.
+//
+// `interrupted` is a recoverable state, not a terminal one: the RuntimeHost accepts resume for it
+// and re-drains the queue from the last incomplete stage, and cancel to abandon it. There is
+// nothing to pause in a run that is not executing.
+const RUN_ACTION_STATUSES = {
+  pause: ["queued", "running"],
+  resume: ["paused", "interrupted"],
+  cancel: ["queued", "running", "paused", "interrupted"],
+};
+
+function runActionAllowed(action, status) {
+  return RUN_ACTION_STATUSES[action]?.includes(String(status || "").toLowerCase()) || false;
+}
+
+function inlineRunAction(action, className, label, entry) {
+  if (!runActionAllowed(action, entry.status)) return "";
+  return `<button class="${className}" type="button" data-inline-action="${action}" data-inline-run="${esc(entry.run_id)}">${label}</button>`;
+}
+
 function renderQueue() {
   const body = $("#queue-body");
   if (!body) return;
@@ -479,9 +500,9 @@ function renderQueue() {
         <td>
           <div class="table-actions">
             <button class="inline-select" type="button" data-select-run="${esc(entry.run_id)}">Mở</button>
-            ${entry.status === "running" || entry.status === "queued" ? `<button class="inline-action" type="button" data-inline-action="pause" data-inline-run="${esc(entry.run_id)}">Pause</button>` : ""}
-            ${entry.status === "paused" ? `<button class="inline-action" type="button" data-inline-action="resume" data-inline-run="${esc(entry.run_id)}">Resume</button>` : ""}
-            ${entry.status === "running" || entry.status === "queued" || entry.status === "paused" ? `<button class="inline-danger" type="button" data-inline-action="cancel" data-inline-run="${esc(entry.run_id)}">Cancel</button>` : ""}
+            ${inlineRunAction("pause", "inline-action", "Pause", entry)}
+            ${inlineRunAction("resume", "inline-action", "Resume", entry)}
+            ${inlineRunAction("cancel", "inline-danger", "Cancel", entry)}
           </div>
         </td>
       </tr>`;
@@ -532,13 +553,10 @@ function renderSelectedRun() {
       <div><dt>Created</dt><dd>${esc(formatDate(run?.created_at))}</dd></div>`;
   }
 
-  const allowed = {
-    pause: ["queued", "running"],
-    resume: ["paused"],
-    cancel: ["queued", "running", "paused"],
-  };
+  // Which control is offered for this status lives in RUN_ACTION_STATUSES, so the panel and the
+  // queue-row actions cannot drift apart.
   $$("[data-run-action]").forEach((button) => {
-    button.disabled = !run || !allowed[button.dataset.runAction].includes(run.status);
+    button.disabled = !run || !runActionAllowed(button.dataset.runAction, run.status);
   });
 
   renderStages();

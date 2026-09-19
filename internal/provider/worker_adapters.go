@@ -724,8 +724,8 @@ func NewProductionSpeechRegistry(opts ...any) (*Registry, error) {
 
 		if gatewayCfg.GeminiBaselineID != "" {
 			geminiGateway, err := NewGatewayTranslationProvider(
-				"gateway_gemini_3_8_flash",
-				"gemini-3.8-flash",
+				GatewayGeminiTranslationProviderID,
+				GatewayGeminiModelAlias,
 				gatewayCfg.GeminiBaselineID,
 				0.99,
 				gwOpts...,
@@ -740,8 +740,8 @@ func NewProductionSpeechRegistry(opts ...any) (*Registry, error) {
 
 		if gatewayCfg.DeepSeekBaselineID != "" {
 			deepseekGateway, err := NewGatewayTranslationProvider(
-				"gateway_deepseek_v4_flash_vision_exp",
-				"deepseek/deepseek-v4-flash-vision-exp",
+				GatewayDeepSeekTranslationProviderID,
+				GatewayDeepSeekModelAlias,
 				gatewayCfg.DeepSeekBaselineID,
 				0.95,
 				gwOpts...,

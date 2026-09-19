@@ -18,8 +18,17 @@ var (
 )
 
 const (
-	TranslationSchemaVersion = 1
+	// TranslationSchemaVersion is part of the translation stage cache identity, so it
+	// moves whenever a TranslationVariant's persisted contract changes. Version 2 adds
+	// ReviewReason and the rule that a segment failing the meaning gate is persisted
+	// with passed_qa_gate=false for operator review instead of rejecting the candidate:
+	// a variant cached under version 1 predates both.
+	TranslationSchemaVersion = 2
 	DubScriptSchemaVersion   = 2
+
+	// ReviewReasonMeaningCorrupted marks a dub script segment whose spoken text failed
+	// the meaning-first gate. The operator corrects it or records a manual override.
+	ReviewReasonMeaningCorrupted = "meaning_corrupted"
 )
 
 // TranslationSegment represents a single translated unit (typically mapped 1:1 to a SpeechBlock or visual text region).
@@ -34,6 +43,10 @@ type TranslationSegment struct {
 	NegationPolarity bool     `json:"negation_polarity"`   // true if negative statement
 	QAConfidence     float64  `json:"qa_confidence"`       // Meaning preservation QA score (0.0 - 1.0)
 	PassedQAGate     bool     `json:"passed_qa_gate"`
+	// ReviewReason explains the meaning-gate violation that flagged this segment for
+	// operator review. Set only when PassedQAGate is false; the operator either corrects
+	// the target text or records a manual override.
+	ReviewReason string `json:"review_reason,omitempty"`
 }
 
 // TranslationVariant is the immutable target-language meaning-preserving artifact.
@@ -80,6 +93,12 @@ type TranslationJobInput struct {
 	ExecutionProfile      ExecutionProfile          `json:"execution_profile,omitempty"`
 	AuthorizedCredentials []string                  `json:"authorized_credentials,omitempty"`
 	ConsentGranted        bool                      `json:"consent_granted,omitempty"`
+	// Ephemeral marks a translation whose result is consumed inline by the caller (overlay /
+	// visual text) rather than published as the run's canonical translation. An ephemeral call
+	// must not move the run-scoped TranslationVariant index: the canonical variant is the one
+	// the speech stages pin (DubScriptVariant.TranslationVariantCAS), and republishing it from an
+	// unrelated lane makes every later artifact validate against the wrong CAS.
+	Ephemeral bool `json:"ephemeral,omitempty"`
 }
 
 type DubScriptSegment struct {

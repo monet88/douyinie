@@ -178,6 +178,14 @@ function createHarness() {
     segmentRow1: register('[data-segment-index="1"]'),
     regionRow: register('[data-region-id="reg-1"]'),
     reviewRow: register('[data-review-id="rev-1"]'),
+    runTitle: register("#run-title"),
+    runStatus: register("#run-status"),
+    runDetails: register("#run-details"),
+    runStageList: register("#stage-list"),
+    runPause: register("[data-run-action=pause]", { dataset: { runAction: "pause" } }),
+    runResume: register("[data-run-action=resume]", { dataset: { runAction: "resume" } }),
+    runCancel: register("[data-run-action=cancel]", { dataset: { runAction: "cancel" } }),
+    queueBody: register("#queue-body"),
   };
 
   lists.set("[data-inspector-tab]", [
@@ -188,6 +196,7 @@ function createHarness() {
   lists.get("[data-inspector-tab]")[0].classList.add("is-active");
   lists.set("[data-inspector-panel]", [els.panelExceptions, els.panelTranscript, els.panelRegions]);
   lists.set("[data-editor-panel]", [els.acceptForm, els.textForm, els.voiceForm, els.regionForm]);
+  lists.set("[data-run-action]", [els.runPause, els.runResume, els.runCancel]);
 
   class Headers {
     constructor(init) {
@@ -258,7 +267,7 @@ function createHarness() {
     "(function () {",
     '"use strict";',
     source,
-    "globalThis.__operatorUI = { state, loadSelectedRun, renderSpeakers, renderInspector };",
+    "globalThis.__operatorUI = { state, loadSelectedRun, renderSpeakers, renderInspector, renderSelectedRun, refreshAll };",
     "})();",
   ].join("\n");
   vm.runInContext(moduleScope, context, { filename: "app.js" });
@@ -322,6 +331,158 @@ state.selectedRegionId = null;
 state.selectedReviewItem = null;
 renderInspector();
 `;
+
+// A daemon-shaped responder whose run/queue status the test flips, so the real refreshAll ->
+// loadSelectedRun -> render chain drives the control states instead of a hand-written call.
+function runFeed(initialStatus) {
+  const feed = { run: initialStatus, queue: initialStatus };
+  const respond = (url) => {
+    if (url === "/api/v1/health") return { status: 200, payload: { status: "ok", version: "test" } };
+    if (url === "/api/v1/jobs") {
+      return { status: 200, payload: { jobs: [{ id: "job-1", source_asset_id: "asset-1", target_language: "vi" }] } };
+    }
+    if (url === "/api/v1/queue") {
+      return { status: 200, payload: { queue: [{ id: "q-1", run_id: "run-1", job_id: "job-1", status: feed.queue, position: 0 }] } };
+    }
+    if (url === "/api/v1/runs/run-1") {
+      return { status: 200, payload: { run: { id: "run-1", job_id: "job-1", status: feed.run, config_snapshot_json: "" } } };
+    }
+    if (url === "/api/v1/runs/run-1/stages") return { status: 200, payload: { stages: [{ id: "st-1", run_id: "run-1", stage: "audio_role_plan", status: "interrupted", attempt: 1 }] } };
+    if (url.startsWith("/api/v1/runs/run-1/review-items")) return { status: 200, payload: { review_items: [] } };
+    if (url === "/api/v1/runs/run-1/resume") {
+      return feed.resumeError
+        ? { status: feed.resumeError.status, payload: { error: feed.resumeError.message } }
+        : { status: 200, payload: { run_id: "run-1", status: "queued" } };
+    }
+    if (url === "/api/v1/runs/run-1/cancel") return { status: 200, payload: { run_id: "run-1", status: "cancelled" } };
+    return { status: 404, payload: { error: "no artifact at " + url } };
+  };
+  return { feed, respond };
+}
+
+const toastMessages = (h) => h.els.toastRegion.children.map((node) => ({ type: node.className.trim(), text: elementText(node) }));
+
+// The offered set is one table in app.js; this is the operator-facing contract it encodes.
+const OFFERED_CONTROLS = {
+  queued: { pause: true, resume: false, cancel: true },
+  running: { pause: true, resume: false, cancel: true },
+  paused: { pause: false, resume: true, cancel: true },
+  // A fail-closed or crash-recovered run is the state whose whole purpose is recovery: it must
+  // offer resume (the RuntimeHost re-drains the queue from the incomplete stage) and cancel (the
+  // operator abandons it), while there is nothing to pause.
+  interrupted: { pause: false, resume: true, cancel: true },
+  completed: { pause: false, resume: false, cancel: false },
+  cancelled: { pause: false, resume: false, cancel: false },
+};
+
+test("the run panel offers exactly the controls each run status admits", async () => {
+  const h = createHarness();
+  await h.ready();
+  h.evalIn(`state.selectedRunId = "run-1"; state.selectedJob = { id: "job-1", source_asset_id: "asset-1", target_language: "vi" };`);
+  for (const [status, offered] of Object.entries(OFFERED_CONTROLS)) {
+    h.evalIn(`state.selectedRun = { id: "run-1", job_id: "job-1", status: ${JSON.stringify(status)}, config_snapshot_json: "" }; renderSelectedRun();`);
+    for (const action of ["pause", "resume", "cancel"]) {
+      const button = h.els[`run${action[0].toUpperCase()}${action.slice(1)}`];
+      assert.equal(
+        button.disabled,
+        !offered[action],
+        `${status} run: ${action} must be ${offered[action] ? "offered" : "disabled"} (got disabled=${button.disabled})`
+      );
+    }
+  }
+});
+
+test("a refreshed run status re-computes the offered controls", async () => {
+  const h = createHarness();
+  await h.ready();
+  const scenario = runFeed("interrupted");
+  h.setResponder(scenario.respond);
+  h.evalIn('state.selectedRunId = "run-1";');
+
+  await h.evalIn("refreshAll({ quiet: true });");
+  assert.equal(h.els.runStatus.textContent, "interrupted", "refresh must project the run status it read");
+  assert.equal(h.els.runResume.disabled, false, "an interrupted run must offer resume after refresh");
+  assert.equal(h.els.runPause.disabled, true, "an interrupted run must not offer pause after refresh");
+
+  // The queue drains again: the same run is now executing, so the controls must follow it.
+  scenario.feed.run = "running";
+  scenario.feed.queue = "running";
+  await h.evalIn("refreshAll({ quiet: true });");
+  assert.equal(h.els.runStatus.textContent, "running", "refresh must follow the run into running");
+  assert.equal(h.els.runResume.disabled, true, "a running run must not offer resume after refresh");
+  assert.equal(h.els.runPause.disabled, false, "a running run must offer pause after refresh");
+  assert.equal(h.els.runCancel.disabled, false, "a running run must offer cancel after refresh");
+});
+
+test("the queue row offers the same run controls as the run panel", async () => {
+  const h = createHarness();
+  await h.ready();
+  const scenario = runFeed("interrupted");
+  h.setResponder(scenario.respond);
+  h.evalIn('state.selectedRunId = "run-1";');
+
+  await h.evalIn("refreshAll({ quiet: true });");
+  const interruptedRow = h.els.queueBody.innerHTML;
+  const offers = (html, action) => html.includes(`data-inline-action="${action}"`);
+  assert.ok(offers(interruptedRow, "resume"), "an interrupted queue row must offer resume inline");
+  assert.ok(offers(interruptedRow, "cancel"), "an interrupted queue row must offer cancel inline");
+  assert.ok(!offers(interruptedRow, "pause"), "an interrupted queue row must not offer pause inline");
+
+  scenario.feed.run = "completed";
+  scenario.feed.queue = "completed";
+  await h.evalIn("refreshAll({ quiet: true });");
+  const completedRow = h.els.queueBody.innerHTML;
+  assert.ok(!offers(completedRow, "resume"), "a completed queue row must not offer resume");
+  assert.ok(!offers(completedRow, "cancel"), "a completed queue row must not offer cancel");
+  assert.ok(!offers(completedRow, "pause"), "a completed queue row must not offer pause");
+});
+
+test("clicking resume calls the runtime host and surfaces the success", async () => {
+  const h = createHarness();
+  await h.ready();
+  const scenario = runFeed("interrupted");
+  h.setResponder(scenario.respond);
+  h.evalIn(`state.selectedRunId = "run-1"; state.selectedRun = { id: "run-1", job_id: "job-1", status: "interrupted", config_snapshot_json: "" }; state.selectedJob = { id: "job-1", source_asset_id: "asset-1", target_language: "vi" }; renderSelectedRun();`);
+
+  assert.equal(h.els.runResume.disabled, false, "the interrupted run must offer resume before the click");
+  h.els.runResume.dispatch("click", {});
+  await h.settle();
+  await h.settle();
+
+  const resumeCalls = h.requests.filter((req) => req.url === "/api/v1/runs/run-1/resume");
+  assert.equal(resumeCalls.length, 1, "resume must reach the runtime host exactly once");
+  assert.equal(resumeCalls[0].method, "POST", "resume must be a POST");
+  const toasts = toastMessages(h);
+  const success = toasts.find((t) => t.type.includes("success"));
+  assert.ok(success, `a successful resume must surface a toast, got ${JSON.stringify(toasts)}`);
+  assert.ok(success.text.includes("run-1"), `the success toast must name the run, got "${success?.text}"`);
+  const failure = toasts.find((t) => t.type.includes("error"));
+  assert.ok(!failure, `a successful resume must not surface an error, got "${failure?.text}"`);
+});
+
+test("a refused resume surfaces the runtime host error text", async () => {
+  const h = createHarness();
+  await h.ready();
+  const scenario = runFeed("interrupted");
+  scenario.feed.resumeError = { status: 409, message: "run is not an active queue entry: status is completed" };
+  h.setResponder(scenario.respond);
+  h.evalIn(`state.selectedRunId = "run-1"; state.selectedRun = { id: "run-1", job_id: "job-1", status: "interrupted", config_snapshot_json: "" }; state.selectedJob = { id: "job-1", source_asset_id: "asset-1", target_language: "vi" }; renderSelectedRun();`);
+
+  h.els.runResume.dispatch("click", {});
+  await h.settle();
+  await h.settle();
+
+  const toasts = toastMessages(h);
+  const failure = toasts.find((t) => t.type.includes("error"));
+  assert.ok(failure, `a refused resume must surface an error, got ${JSON.stringify(toasts)}`);
+  assert.ok(
+    failure.text.includes("run is not an active queue entry: status is completed"),
+    `the toast must carry the error text the runtime host returned, got "${failure?.text}"`
+  );
+  // The run is still interrupted, so the operator can retry: the control state must follow the
+  // status that is actually persisted, not the click.
+  assert.equal(h.els.runResume.disabled, false, "a refused resume must leave resume offered for a retry");
+});
 
 test("transcript row click syncs seek, selection, inspector tab and editor", async () => {
   const h = createHarness();

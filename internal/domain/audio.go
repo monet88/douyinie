@@ -30,7 +30,7 @@ var (
 
 const (
 	AudioRolePlanSchemaVersion = 1
-	AudioStemsSchemaVersion    = 1
+	AudioStemsSchemaVersion    = 2
 	DubMixSchemaVersion        = 1
 )
 

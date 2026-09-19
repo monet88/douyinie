@@ -1,5 +1,7 @@
 # Reference repositories & live test artifacts
 /.ref/
+# Separation stems dumped at repo root when a stageworker run inherits the repo as CWD
+/*.wav
 
 # Tooling & scratch directories
 /.playwright-cli/
@@ -11,6 +13,8 @@
 .scratch
 .claude/
 
+# Archify pipeline architecture artifacts
+/docs/architecture/douyinie-pipeline.*
 # User-supplied root media test fixtures
 /background music + voice + subtitles.mp4
 /background music audio and subtitles.mp4

@@ -392,7 +392,8 @@ func TestSeam1_FullDub_VerticalSlice_EndToEnd(t *testing.T) {
 	}
 	resp, renderPlan := runFreezeRenderPlan(t, h, assetID, planBody)
 	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("POST render-plan failed: status=%d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("POST render-plan failed: status=%d body=%s", resp.StatusCode, string(body))
 	}
 	if renderPlan.ProvenanceHash == "" || renderPlan.CASHash == "" {
 		t.Fatalf("expected valid provenance and CAS hashes on RenderPlan")
@@ -852,6 +853,7 @@ func TestSeam1_FullDub_ReviewItemProjection_TranslationQA_Failure(t *testing.T) 
 	tVariant := domain.TranslationVariant{
 		ID:             "trans-qa-fail-1",
 		SchemaVersion:  domain.TranslationSchemaVersion,
+		AssetID:        assetID,
 		RunID:          runID,
 		JobID:          jobID,
 		SourceLanguage: "zh",

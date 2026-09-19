@@ -12,6 +12,7 @@ Contract:
 - Exit code: 0 on success, non-zero on failure
 """
 
+import hashlib
 import json
 import math
 import os
@@ -173,6 +174,26 @@ def parse_v3_result(predict_results: Any, frame_idx: int, ts_ms: int) -> List[Di
 
     return detections
 
+def preprocess_for_ocr(image):
+    """Boost local contrast before detection.
+
+    Subtitles and packaging labels are often low-contrast over busy footage; CLAHE on the luma
+    channel recovers strokes the detector otherwise drops. Disable with DOUYINIE_OCR_CLAHE=0.
+    """
+    if os.environ.get("DOUYINIE_OCR_CLAHE", "1").strip() in ("0", "false", "off"):
+        return image
+    if cv2 is None:
+        return image
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+        return cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
+    except cv2.error:
+        # A frame the color conversion cannot handle must never take the whole stage down:
+        # the raw frame is still a valid OCR input.
+        return image
+
+
 def sample_media_frames(media_path: str, frame_sample_step_ms: int = 500, max_frames: int = 0) -> Tuple[int, int, List[Dict[str, Any]]]:
     """
     Deterministically sample video/image frames at the requested cadence.
@@ -192,7 +213,7 @@ def sample_media_frames(media_path: str, frame_sample_step_ms: int = 500, max_fr
         if img is None:
             raise RuntimeError(f"Failed to read image media: {media_path}")
         h, w = img.shape[:2]
-        return w, h, [{"frame_index": 0, "timestamp_ms": 0, "image": img}]
+        return w, h, [{"frame_index": 0, "timestamp_ms": 0, "image": preprocess_for_ocr(img)}]
 
     # Video file: sample frames at cadence
     cap = cv2.VideoCapture(media_path)
@@ -230,7 +251,7 @@ def sample_media_frames(media_path: str, frame_sample_step_ms: int = 500, max_fr
             sampled.append({
                 "frame_index": target_frame_num,
                 "timestamp_ms": current_ts,
-                "image": frame,
+                "image": preprocess_for_ocr(frame),
             })
 
             current_ts += step_ms
@@ -242,12 +263,79 @@ def sample_media_frames(media_path: str, frame_sample_step_ms: int = 500, max_fr
                 sampled.append({
                     "frame_index": 0,
                     "timestamp_ms": 0,
-                    "image": frame,
+                    "image": preprocess_for_ocr(frame),
                 })
 
         return w, h, sampled
     finally:
         cap.release()
+
+
+# The detector's polygon is tight to the strongest strokes, so the box a consumer gets back can sit
+# inside the glyphs it names. Live evidence (1080x1440 frame, caption 你就得到了同款上帝视角): the
+# detector's box was 237..828 while the glyph ink ran to 850, so the cover that every downstream lane
+# builds from the box (+6px padding) left the last glyph's right edge on screen. A box that names text
+# must bound the ink that text actually shows, so grow it to the strokes it overlaps - bounded by a
+# search ring and a per-edge cap so a busy background can never balloon it.
+INK_SEARCH_X_RATIO = 0.06
+INK_SEARCH_Y_RATIO = 0.30
+INK_GROW_CAP_X_RATIO = 0.05
+INK_GROW_CAP_Y_RATIO = 0.20
+
+def refine_box_to_ink(image: Any, box: Dict[str, int]) -> Dict[str, int]:
+    """Grow a detection box to the text ink it overlaps, within a search ring and a growth cap."""
+    if cv2 is None or image is None or os.environ.get("DOUYINIE_OCR_INK_REFINE", "1").strip() in ("0", "false", "off"):
+        return box
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    except Exception:
+        return box
+    h, w = gray.shape[:2]
+    bx, by, bw, bh = int(box["x"]), int(box["y"]), int(box["width"]), int(box["height"])
+    if bw <= 0 or bh <= 0:
+        return box
+    mx = max(4, int(round(bw * INK_SEARCH_X_RATIO)))
+    my = max(3, int(round(bh * INK_SEARCH_Y_RATIO)))
+    x0, x1 = max(0, bx - mx), min(w, bx + bw + mx)
+    y0, y1 = max(0, by - my), min(h, by + bh + my)
+    if x1 - x0 <= 1 or y1 - y0 <= 1:
+        return box
+    crop = gray[y0:y1, x0:x1]
+    # Otsu separates the caption's ink from its background; which side of the split the ink sits on
+    # depends on the footage (white captions over a dark pan, dark labels over a bright pack), so try
+    # both sides and keep the first that yields glyph-scale strokes.
+    _, mask = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    def ink_union(candidate: Any) -> Tuple[int, int, int, int, bool]:
+        num, _labels, stats, _centroids = cv2.connectedComponentsWithStats(candidate, 8)
+        ux0, uy0, ux1, uy1 = bx, by, bx + bw, by + bh
+        found = False
+        for i in range(1, num):
+            # Component stats are crop-local; the detector box is in frame coordinates.
+            fx, fy, fw, fh = stats[i, 0] + x0, stats[i, 1] + y0, stats[i, 2], stats[i, 3]
+            # A component only counts when it overlaps the box the detector named and is at glyph
+            # scale: a background edge or a large surface inside the ring is not the text it names.
+            if fx + fw <= bx or fx >= bx + bw or fy + fh <= by or fy >= by + bh:
+                continue
+            if fw > max(8, int(bw * 0.75)) or fh > max(6, int(bh * 1.6)) or fw * fh < 4:
+                continue
+            ux0, uy0 = min(ux0, fx), min(uy0, fy)
+            ux1, uy1 = max(ux1, fx + fw), max(uy1, fy + fh)
+            found = True
+        return ux0, uy0, ux1, uy1, found
+
+    ix0, iy0, ix1, iy1, found = ink_union(mask)
+    if not found:
+        ix0, iy0, ix1, iy1, found = ink_union(cv2.bitwise_not(mask))
+    if not found:
+        return box
+    cap_x = max(2, int(round(bw * INK_GROW_CAP_X_RATIO)))
+    cap_y = max(2, int(round(bh * INK_GROW_CAP_Y_RATIO)))
+    nx0 = max(x0, min(bx, ix0), bx - cap_x)
+    ny0 = max(y0, min(by, iy0), by - cap_y)
+    nx1 = min(x1, max(bx + bw, ix1), bx + bw + cap_x)
+    ny1 = min(y1, max(by + bh, iy1), by + bh + cap_y)
+    return {"x": int(nx0), "y": int(ny0), "width": int(nx1 - nx0), "height": int(ny1 - ny0)}
 
 
 def detect_text_paddleocr(
@@ -313,17 +401,33 @@ def detect_text_paddleocr(
     )
 
     detections = []
+    # Frames repeat bit-for-bit in a static shot, so the detector and recognizer would re-read the
+    # same pixels several times: hash the preprocessed frame and replay the previous frame's
+    # detections for an identical one, re-labelled with this frame's index and timestamp. The hash is
+    # over the exact bytes, so a frame that differs at all (a caption appearing, an object moving) is
+    # still read fresh - the reuse can never drop a detection the detector would have found.
+    last_hash = None
+    last_frame_detections = []
     for f in sampled_frames:
         frame_idx = f["frame_index"]
         ts_ms = f["timestamp_ms"]
         img = f["image"]
 
-        raw_res = ocr.predict(img)
-        if not raw_res:
+        frame_hash = hashlib.blake2b(img.tobytes(), digest_size=16).digest() if hasattr(img, "tobytes") else None
+        if frame_hash is not None and frame_hash == last_hash:
+            detections.extend(
+                {**d, "frame_index": frame_idx, "timestamp_ms": ts_ms}
+                for d in last_frame_detections
+            )
             continue
 
-        frame_detections = parse_v3_result(raw_res, frame_idx, ts_ms)
+        raw_res = ocr.predict(img)
+        frame_detections = parse_v3_result(raw_res, frame_idx, ts_ms) if raw_res else []
+        for d in frame_detections:
+            d["box"] = refine_box_to_ink(img, d["box"])
         detections.extend(frame_detections)
+        last_hash = frame_hash
+        last_frame_detections = frame_detections
     return {
         "frame_width": w,
         "frame_height": h,

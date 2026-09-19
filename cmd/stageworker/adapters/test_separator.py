@@ -10,6 +10,7 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -85,6 +86,112 @@ class TestSeparatorAdapter(unittest.TestCase):
             self.assertEqual(res["channels"], 1)
             self.assertEqual(len(res["vocals_data"]), len(dummy_wav))
             self.assertEqual(len(res["background_data"]), len(dummy_wav))
+
+    def test_demucs_native_rate_stems_leave_the_adapter_at_the_pipeline_contract(self):
+        """Demucs always writes its model's native 44.1 kHz stereo, but the pipeline contract - and
+        the audio-role analyzer that consumes these stems - is 16 kHz mono. A native-rate stem
+        dead-ends audio_role_plan, the first stage of every real run, while the persisted metadata
+        claims the contract rate; stems leaving the adapter must really be at the contract rate."""
+        native_wav = _make_dummy_wav(duration_ms=2000, sample_rate=44100, channels=2)
+        converted_wav = _make_dummy_wav(duration_ms=2000, sample_rate=16000, channels=1)
+        calls = []
+        ffmpeg_commands = []
+
+        def fake_subprocess_run(cmd, *args, **kwargs):
+            if "-m" in cmd and "demucs.separate" in cmd:
+                calls.append("demucs")
+                out_dir = cmd[cmd.index("-o") + 1]
+                model_name = cmd[cmd.index("-n") + 1]
+                track_name = os.path.splitext(os.path.basename(cmd[-1]))[0]
+                target_dir = os.path.join(out_dir, model_name, track_name)
+                os.makedirs(target_dir, exist_ok=True)
+                for name in ["vocals.wav", "no_vocals.wav"]:
+                    with open(os.path.join(target_dir, name), "wb") as f:
+                        f.write(native_wav)
+                proc = mock.MagicMock()
+                proc.returncode = 0
+                proc.stdout = b""
+                proc.stderr = b""
+                return proc
+            if cmd and cmd[0] == "ffmpeg":
+                calls.append("ffmpeg")
+                ffmpeg_commands.append(list(cmd))
+                out_path = cmd[-1]
+                with open(out_path, "wb") as f:
+                    f.write(converted_wav)
+                proc = mock.MagicMock()
+                proc.returncode = 0
+                proc.stdout = b""
+                proc.stderr = b""
+                return proc
+            raise AssertionError(f"unexpected subprocess command: {cmd}")
+
+        with mock.patch("subprocess.run", side_effect=fake_subprocess_run):
+            res = separator.separate_audio_stems("sample_audio.wav", "htdemucs", "v4")
+
+        self.assertEqual(calls[0], "demucs")
+        self.assertIn("ffmpeg", calls)
+        self.assertEqual(len(ffmpeg_commands), 2, "ffmpeg must be invoked for both vocals and background stems")
+        for cmd in ffmpeg_commands:
+            self.assertEqual(cmd[:-1], [
+                "ffmpeg", "-v", "error", "-y", "-i", "pipe:0",
+                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+            ], "ffmpeg conversion argv must strictly match the pipeline contract")
+        self.assertEqual(res["sample_rate"], 16000)
+        self.assertEqual(res["channels"], 1)
+        for key in ["vocals_data", "background_data"]:
+            rate, channels, dur_ms = separator.measure_wav_properties(res[key])
+            self.assertEqual(rate, 16000, f"{key} must really be at the contract rate")
+            self.assertEqual(channels, 1, f"{key} must be mono")
+            self.assertGreater(dur_ms, 1900, f"{key} header must declare its real length")
+            self.assertLess(dur_ms, 2100, f"{key} header must declare its real length")
+
+    def test_contract_rate_stems_are_not_re_encoded(self):
+        """Stems already at the contract rate are passed through byte-identical, so their hashes keep
+        matching the bytes the separator actually produced."""
+        contract_wav = _make_dummy_wav(duration_ms=500, sample_rate=16000, channels=1)
+        self.assertEqual(separator.normalize_stem_to_contract(contract_wav), contract_wav)
+
+    def test_contract_rate_stems_non_16bit_are_re_encoded(self):
+        """A 16 kHz mono stem that is not 16-bit PCM must be re-encoded to 16-bit PCM."""
+        expected_16bit = _make_dummy_wav(duration_ms=500, sample_rate=16000, channels=1)
+        # Re-pack with 24-bit width (3 bytes per sample)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(3)
+            wf.setframerate(16000)
+            wf.writeframes(b"".join(struct.pack("<i", 1000)[:3] for _ in range(8000)))
+        input_24bit = buf.getvalue()
+
+        ffmpeg_invoked = False
+        def fake_ffmpeg(cmd, *args, **kwargs):
+            nonlocal ffmpeg_invoked
+            self.assertEqual(cmd[0], "ffmpeg")
+            self.assertEqual(cmd[:-1], [
+                "ffmpeg", "-v", "error", "-y", "-i", "pipe:0",
+                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+            ])
+            ffmpeg_invoked = True
+            out_path = cmd[-1]
+            with open(out_path, "wb") as f:
+                f.write(expected_16bit)
+            proc = mock.MagicMock()
+            proc.returncode = 0
+            proc.stdout = b""
+            proc.stderr = b""
+            return proc
+
+        with mock.patch("subprocess.run", side_effect=fake_ffmpeg):
+            res = separator.normalize_stem_to_contract(input_24bit)
+        self.assertTrue(ffmpeg_invoked)
+        self.assertEqual(res, expected_16bit)
+
+    def test_measure_wav_properties_unreadable_payload_returns_zeroes(self):
+        """Unreadable or malformed WAV bytes must return (0, 0, 0) without raising an exception."""
+        self.assertEqual(separator.measure_wav_properties(b""), (0, 0, 0))
+        self.assertEqual(separator.measure_wav_properties(b"not a valid wav file"), (0, 0, 0))
+        self.assertEqual(separator.measure_wav_properties(b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x03\x00"), (0, 0, 0))
 
     def test_lane_dispatch_demucs_vs_uvr(self):
         """Verifies separate_audio_stems routes Demucs models to Demucs lane and UVR models to UVR lane."""
@@ -170,6 +277,52 @@ class TestSeparatorAdapter(unittest.TestCase):
         """Proves StageWorker does not carry unused compute_sha256; RuntimeHost is the byte authority."""
         self.assertFalse(hasattr(separator, "compute_sha256"))
         self.assertFalse(hasattr(separator, "verify_artifact_sha256"))
+    def test_uvr_stems_are_requested_at_contract_rate_and_reported_as_measured(self):
+        """Pin the audio contract: UVR must be asked for 16 kHz stems and the artifact must report the
+        rate/channels actually written. audio-separator defaults to 44100, and the audio-role analyzer
+        rejects anything but 16 kHz, so a hardcoded 16000 in the response (or a default-rate
+        Separator) dead-ends every real run at audio_role_plan while the metadata claims otherwise."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            onnx_file = os.path.join(tmp_dir, "UVR-MDX-NET-Inst_HQ_4.onnx")
+            with open(onnx_file, "wb") as f:
+                f.write(b"valid_model")
+            mdx_json = os.path.join(tmp_dir, "mdx_model_data.json")
+            with open(mdx_json, "w", encoding="utf-8") as f:
+                json.dump({separator.UVR_MDX_NET_INST_HQ_4_MD5: {"primary_stem": "Vocals", "compensate": 1.035}}, f)
+            # Stems as the pinned separator version writes them when no rate is requested.
+            drifted_wav = _make_dummy_wav(duration_ms=1000, sample_rate=44100, channels=2)
+            vocals_wav_path = os.path.join(tmp_dir, "track_Vocals.wav")
+            inst_wav_path = os.path.join(tmp_dir, "track_Instrumental.wav")
+            with open(vocals_wav_path, "wb") as vf:
+                vf.write(drifted_wav)
+            with open(inst_wav_path, "wb") as bf:
+                bf.write(drifted_wav)
+
+            mock_sep_inst = mock.MagicMock()
+            mock_sep_inst.separate.return_value = [vocals_wav_path, inst_wav_path]
+            mock_sep_mod = mock.MagicMock()
+            mock_sep_mod.Separator.return_value = mock_sep_inst
+            with mock.patch.dict("sys.modules", {"audio_separator": mock.MagicMock(), "audio_separator.separator": mock_sep_mod}):
+                res = separator.separate_uvr(
+                    "track.wav",
+                    "UVR-MDX-NET-Inst_HQ_4.onnx",
+                    "v3",
+                    model_path=tmp_dir,
+                    entrypoint_file=onnx_file,
+                    require_model_snapshot=True,
+                    metadata_file=mdx_json,
+                )
+
+            self.assertEqual(separator.CONTRACT_SAMPLE_RATE, 16000)
+            _, ctor_kwargs = mock_sep_mod.Separator.call_args
+            self.assertEqual(
+                ctor_kwargs.get("sample_rate"),
+                separator.CONTRACT_SAMPLE_RATE,
+                "the separator must be constructed at the pipeline contract rate, not its 44.1 kHz default",
+            )
+            self.assertEqual(res["sample_rate"], 44100, "the artifact must report the rate actually written")
+            self.assertEqual(res["channels"], 2, "the artifact must report the channel count actually written")
+
     def test_uvr_request_time_no_rehash(self):
         """Proves StageWorker respects #64: RuntimeHost is the byte-verification authority, so StageWorker does not re-hash on request."""
         with tempfile.TemporaryDirectory() as tmp_dir:

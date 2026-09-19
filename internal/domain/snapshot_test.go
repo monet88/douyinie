@@ -435,13 +435,16 @@ func TestSnapshot_ResolveTTSVoiceEntrypoint(t *testing.T) {
 		t.Fatalf("expected ErrTTSVoiceAssetMissing for fabricated VieNeu snapshot without voices_v3_turbo.json, got: %v", err)
 	}
 
-	// 6b. VieNeu valid voice with authentic voices_v3_turbo.json
 	// 6b. VieNeu valid voice with authentic voices_v3_turbo.json and fixed in-root MOSS tokenizer
+	// The lane's load-bearing digests are pinned, so the fixture declares the pinned digests for
+	// every pinned asset (placeholder bytes: the resolver compares declared digests; registration
+	// is what hashes the bytes against them).
 	vieneuDir := filepath.Join(tmpDir, "vieneu")
 	catDir := filepath.Join(vieneuDir, "src", "vieneu", "assets")
 	if err := os.MkdirAll(catDir, 0755); err != nil {
 		t.Fatal(err)
 	}
+	catRel := "src/vieneu/assets/voices_v3_turbo.json"
 	catJSON := `{"presets": {"Trúc Ly": {"id": "Trúc Ly", "name": "Trúc Ly"}}}`
 	catPath := filepath.Join(catDir, "voices_v3_turbo.json")
 	if err := os.WriteFile(catPath, []byte(catJSON), 0644); err != nil {
@@ -454,13 +457,14 @@ func TestSnapshot_ResolveTTSVoiceEntrypoint(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mossDir, "tokenizer.json"), []byte("{}"), 0644); err != nil {
 		t.Fatal(err)
 	}
+	vieneuFiles := declarePinnedAssets(t, vieneuDir, withoutPinnedRel(domain.PinnedVieNeuAssets, catRel))
+	vieneuFiles = append([]domain.SnapshotFileEntry{
+		{RelativePath: catRel, SHA256: pinnedSHA(t, domain.PinnedVieNeuAssets, catRel), SizeBytes: int64(len(catJSON))},
+	}, vieneuFiles...)
 	mVieNeuValid := domain.SnapshotManifest{
 		ModelID:      "pnnbao-ump/VieNeu-TTS-v3-Turbo",
 		ModelVersion: "v3.8.1",
-		Files: []domain.SnapshotFileEntry{
-			{RelativePath: "src/vieneu/assets/voices_v3_turbo.json", SHA256: dummySHA, SizeBytes: int64(len(catJSON))},
-			{RelativePath: "moss_tokenizer/tokenizer.json", SHA256: dummySHA, SizeBytes: 2},
-		},
+		Files:        vieneuFiles,
 	}
 	resV, err := domain.ResolveTTSVoiceEntrypoint(mVieNeuValid, vieneuDir, "pnnbao-ump/VieNeu-TTS-v3-Turbo", "Trúc Ly")
 	if err != nil {
@@ -468,6 +472,29 @@ func TestSnapshot_ResolveTTSVoiceEntrypoint(t *testing.T) {
 	}
 	if resV != catPath {
 		t.Fatalf("expected resolved catalog entrypoint path %s, got %s", catPath, resV)
+	}
+
+	// 6c. VieNeu snapshot that declares different bytes for a load-bearing weight under the pinned
+	// revision is rejected: this is the weights-digest gate, not a revision-label check.
+	mVieNeuSubstituted := mVieNeuValid
+	mVieNeuSubstituted.Files = append([]domain.SnapshotFileEntry(nil), mVieNeuValid.Files...)
+	for i := range mVieNeuSubstituted.Files {
+		if mVieNeuSubstituted.Files[i].RelativePath == "update/model.safetensors" {
+			mVieNeuSubstituted.Files[i].SHA256 = strings.Repeat("b", 64)
+		}
+	}
+	_, err = domain.ResolveTTSVoiceEntrypoint(mVieNeuSubstituted, vieneuDir, "pnnbao-ump/VieNeu-TTS-v3-Turbo", "Trúc Ly")
+	if !errors.Is(err, domain.ErrSnapshotDigestMismatch) {
+		t.Fatalf("expected ErrSnapshotDigestMismatch for substituted VieNeu weights, got: %v", err)
+	}
+
+	// 6d. A manifest that omits a load-bearing weight fails closed: an undeclared file was never
+	// hashed by registration, so the pinned digest would be unchecked.
+	mVieNeuUndeclared := mVieNeuValid
+	mVieNeuUndeclared.Files = withoutFileRel(mVieNeuValid.Files, "update/model.safetensors")
+	_, err = domain.ResolveTTSVoiceEntrypoint(mVieNeuUndeclared, vieneuDir, "pnnbao-ump/VieNeu-TTS-v3-Turbo", "Trúc Ly")
+	if !errors.Is(err, domain.ErrSnapshotFileCorrupted) {
+		t.Fatalf("expected ErrSnapshotFileCorrupted for undeclared VieNeu weights, got: %v", err)
 	}
 
 	// 7. VieNeu unverified voice rejected
@@ -517,6 +544,137 @@ func TestSnapshot_ResolveTTSVoiceEntrypoint(t *testing.T) {
 	_, err = domain.ResolveTTSVoiceEntrypoint(mVieNeuRootCatalog, vieneuDir, "pnnbao-ump/VieNeu-TTS-v3-Turbo", "Trúc Ly")
 	if !errors.Is(err, domain.ErrTTSVoiceAssetMissing) {
 		t.Fatalf("expected ErrTTSVoiceAssetMissing for root VieNeu catalog path voices_v3_turbo.json, got: %v", err)
+	}
+}
+
+// declarePinnedAssets writes a placeholder file for every pinned asset of a lane and returns
+// manifest entries declaring the pinned digests. The resolver compares declared digests against the
+// pinned constants and stats the file; registration is what hashes bytes against the declared
+// digests, so a resolver fixture does not need byte-identical placeholders.
+func declarePinnedAssets(t *testing.T, root string, assets []domain.PinnedAsset) []domain.SnapshotFileEntry {
+	t.Helper()
+	entries := make([]domain.SnapshotFileEntry, 0, len(assets))
+	for _, asset := range assets {
+		full := filepath.Join(root, filepath.FromSlash(asset.RelativePath))
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		content := []byte("fixture:" + asset.RelativePath)
+		if err := os.WriteFile(full, content, 0644); err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, domain.SnapshotFileEntry{
+			RelativePath: asset.RelativePath,
+			SHA256:       asset.SHA256,
+			SizeBytes:    int64(len(content)),
+		})
+	}
+	return entries
+}
+
+// pinnedSHA returns the pinned digest a lane declares for rel.
+func pinnedSHA(t *testing.T, assets []domain.PinnedAsset, rel string) string {
+	t.Helper()
+	for _, asset := range assets {
+		if asset.RelativePath == rel {
+			return asset.SHA256
+		}
+	}
+	t.Fatalf("no pinned asset %s", rel)
+	return ""
+}
+
+// withoutPinnedRel returns assets minus the entry whose relative path equals rel.
+func withoutPinnedRel(assets []domain.PinnedAsset, rel string) []domain.PinnedAsset {
+	out := make([]domain.PinnedAsset, 0, len(assets))
+	for _, asset := range assets {
+		if asset.RelativePath != rel {
+			out = append(out, asset)
+		}
+	}
+	return out
+}
+
+// withoutFileRel returns manifest files minus the entry whose relative path equals rel.
+func withoutFileRel(files []domain.SnapshotFileEntry, rel string) []domain.SnapshotFileEntry {
+	out := make([]domain.SnapshotFileEntry, 0, len(files))
+	for _, file := range files {
+		if file.RelativePath != rel {
+			out = append(out, file)
+		}
+	}
+	return out
+}
+
+func TestSnapshot_ResolveTTSVoiceEntrypoint_ZeroTTSPinnedWeights(t *testing.T) {
+	tmpDir := t.TempDir()
+	zeroDir := filepath.Join(tmpDir, "zerotts")
+
+	files := declarePinnedAssets(t, zeroDir, domain.PinnedZeroTTSAssets)
+	files = append(files, declarePinnedAssets(t, zeroDir, domain.PinnedZeroTTSVoiceAssets)...)
+	indexRel := "voices/index.json"
+	indexPath := filepath.Join(zeroDir, "voices", "index.json")
+	if err := os.WriteFile(indexPath, []byte(`{"voices": []}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	files = append(files, domain.SnapshotFileEntry{
+		RelativePath: indexRel, SHA256: strings.Repeat("a", 64), SizeBytes: 14,
+	})
+	mZero := domain.SnapshotManifest{
+		ModelID:      "zeroweight-ai/ZeroTTS",
+		ModelVersion: "c2bfbd67dc648cac455077333f7cf5c18a2e3bb4",
+		Files:        files,
+	}
+
+	// 1. A snapshot declaring every pinned digest resolves the requested voice asset.
+	ep, err := domain.ResolveTTSVoiceEntrypoint(mZero, zeroDir, "zeroweight-ai/ZeroTTS", "maichi")
+	if err != nil {
+		t.Fatalf("expected valid ZeroTTS voice resolution, got: %v", err)
+	}
+	expectedVoice := filepath.Join(zeroDir, "voices", "maichi", "voice.npz")
+	if ep != expectedVoice {
+		t.Fatalf("expected voice entrypoint %s, got %s", expectedVoice, ep)
+	}
+
+	// 2. Substituted graph bytes under the pinned revision are rejected (the gate is the digest,
+	// not the revision label).
+	mZeroSubstituted := mZero
+	mZeroSubstituted.Files = append([]domain.SnapshotFileEntry(nil), mZero.Files...)
+	for i := range mZeroSubstituted.Files {
+		if mZeroSubstituted.Files[i].RelativePath == "onnx/text_encoder.onnx" {
+			mZeroSubstituted.Files[i].SHA256 = strings.Repeat("b", 64)
+		}
+	}
+	_, err = domain.ResolveTTSVoiceEntrypoint(mZeroSubstituted, zeroDir, "zeroweight-ai/ZeroTTS", "maichi")
+	if !errors.Is(err, domain.ErrSnapshotDigestMismatch) {
+		t.Fatalf("expected ErrSnapshotDigestMismatch for substituted ZeroTTS text encoder, got: %v", err)
+	}
+
+	// 3. A manifest that omits a load-bearing weight fails closed instead of skipping the check.
+	mZeroUndeclared := mZero
+	mZeroUndeclared.Files = withoutFileRel(mZero.Files, domain.PinnedZeroTTSAssets[0].RelativePath)
+	_, err = domain.ResolveTTSVoiceEntrypoint(mZeroUndeclared, zeroDir, "zeroweight-ai/ZeroTTS", "maichi")
+	if !errors.Is(err, domain.ErrSnapshotFileCorrupted) {
+		t.Fatalf("expected ErrSnapshotFileCorrupted for undeclared ZeroTTS weight, got: %v", err)
+	}
+
+	// 4. Substituted voice conditioning tensors are rejected for the requested voice.
+	mZeroVoiceSwapped := mZero
+	mZeroVoiceSwapped.Files = append([]domain.SnapshotFileEntry(nil), mZero.Files...)
+	for i := range mZeroVoiceSwapped.Files {
+		if mZeroVoiceSwapped.Files[i].RelativePath == "voices/maichi/voice.npz" {
+			mZeroVoiceSwapped.Files[i].SHA256 = strings.Repeat("c", 64)
+		}
+	}
+	_, err = domain.ResolveTTSVoiceEntrypoint(mZeroVoiceSwapped, zeroDir, "zeroweight-ai/ZeroTTS", "maichi")
+	if !errors.Is(err, domain.ErrSnapshotDigestMismatch) {
+		t.Fatalf("expected ErrSnapshotDigestMismatch for substituted ZeroTTS voice asset, got: %v", err)
+	}
+
+	// 5. Unknown voice rejected before any asset check.
+	_, err = domain.ResolveTTSVoiceEntrypoint(mZero, zeroDir, "zeroweight-ai/ZeroTTS", "not_a_preset")
+	if !errors.Is(err, domain.ErrTTSVoiceAssetMissing) {
+		t.Fatalf("expected ErrTTSVoiceAssetMissing for unknown ZeroTTS voice, got: %v", err)
 	}
 }
 

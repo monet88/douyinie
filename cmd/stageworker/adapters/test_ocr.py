@@ -114,6 +114,31 @@ class TestOCRAdapter(unittest.TestCase):
                 os.unlink(tmp_path)
 
     @unittest.skipIf(cv2 is None or np is None, "OpenCV and numpy required for frame sampling tests")
+    def test_preprocess_for_ocr_recovers_low_contrast_and_honours_kill_switch(self):
+        """Frames handed to the detector carry contrast-boosted luma; DOUYINIE_OCR_CLAHE=0 keeps raw pixels."""
+        # A faint mid-gray stroke on a uniform background: the low-contrast case CLAHE exists for.
+        raw = np.full((120, 160, 3), 128, dtype=np.uint8)
+        raw[40:80, 40:120] = 150
+
+        previous = os.environ.get("DOUYINIE_OCR_CLAHE")
+        try:
+            os.environ.pop("DOUYINIE_OCR_CLAHE", None)
+            processed = ocr.preprocess_for_ocr(raw)
+            self.assertEqual(processed.shape, raw.shape)
+            # CLAHE output is grayscale-in-BGR, so every channel matches and the stroke stands out
+            # at least as much as it did in the source.
+            self.assertTrue(np.array_equal(processed[:, :, 0], processed[:, :, 1]))
+            self.assertGreaterEqual(int(processed[60, 80, 0]) - int(processed[10, 10, 0]), 22)
+
+            os.environ["DOUYINIE_OCR_CLAHE"] = "0"
+            self.assertTrue(np.array_equal(ocr.preprocess_for_ocr(raw), raw))
+        finally:
+            if previous is None:
+                os.environ.pop("DOUYINIE_OCR_CLAHE", None)
+            else:
+                os.environ["DOUYINIE_OCR_CLAHE"] = previous
+
+    @unittest.skipIf(cv2 is None or np is None, "OpenCV and numpy required for frame sampling tests")
     def test_sample_media_frames_synthetic_video(self):
         """
         Proves cadence 500ms at known FPS (20 FPS) yields expected source frame indices,
@@ -320,6 +345,136 @@ class TestOCRAdapter(unittest.TestCase):
         self.assertEqual(dets[0]["text"], "FALLBACK")
         self.assertEqual(dets[0]["confidence"], 0.92)
         self.assertEqual(dets[0]["box"], {"x": 15, "y": 25, "width": 85, "height": 35})
+
+
+class TestOcrFrameDedup(unittest.TestCase):
+    """A static shot repeats the same pixels: the OCR pass must read them once, not once per sample."""
+
+    def setUp(self):
+        ocr._OCR_MODEL_FACTORY = None
+        ocr._PADDLE_OCR_CLASS = None
+
+    def tearDown(self):
+        ocr._OCR_MODEL_FACTORY = None
+        ocr._PADDLE_OCR_CLASS = None
+
+    def test_identical_frames_are_read_once_and_replayed_with_their_own_time(self):
+        det_dir = tempfile.mkdtemp(prefix="det_snap_")
+        rec_dir = tempfile.mkdtemp(prefix="rec_snap_")
+        cls_dir = tempfile.mkdtemp(prefix="cls_snap_")
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            cv2.imwrite(f.name, np.zeros((480, 640, 3), dtype=np.uint8))
+            tmp_path = f.name
+
+        static = np.zeros((480, 640, 3), dtype=np.uint8)
+        moving = np.full((480, 640, 3), 90, dtype=np.uint8)
+        # The same bytes at 0 ms and 500 ms (a held shot) and a different frame at 1000 ms.
+        sampled = [
+            {"frame_index": 0, "timestamp_ms": 0, "image": static},
+            {"frame_index": 15, "timestamp_ms": 500, "image": static.copy()},
+            {"frame_index": 30, "timestamp_ms": 1000, "image": moving},
+        ]
+        original_sampler = ocr.sample_media_frames
+        ocr.sample_media_frames = lambda *_args, **_kwargs: (640, 480, sampled)
+
+        predicts = []
+
+        class CountingPaddleOCR:
+            def __init__(self, **kwargs):
+                pass
+
+            def predict(self, input_img, **kwargs):
+                predicts.append(int(input_img.mean()))
+                v3_res = {
+                    "input_path": "sampled_frame.png",
+                    "rec_texts": ["SUPOR"],
+                    "rec_scores": np.array([0.985]),
+                    "rec_polys": np.array([[[20, 30], [180, 30], [180, 75], [20, 75]]]),
+                }
+                return [MockV3Result(v3_res)]
+
+        ocr._PADDLE_OCR_CLASS = CountingPaddleOCR
+        try:
+            res = ocr.detect_text_paddleocr(
+                tmp_path, 500, 5, "PP-OCRv6", "v6",
+                det_model_dir=det_dir, rec_model_dir=rec_dir, cls_model_dir=cls_dir,
+            )
+        finally:
+            ocr.sample_media_frames = original_sampler
+
+        # Two distinct frames -> two model calls, not three.
+        self.assertEqual(len(predicts), 2, f"expected one read per distinct frame, got {predicts}")
+        # Every frame still reports its own detection, at its own time.
+        self.assertEqual(len(res["detections"]), 3)
+        replayed = res["detections"][1]
+        self.assertEqual(replayed["frame_index"], 15)
+        self.assertEqual(replayed["timestamp_ms"], 500)
+        self.assertEqual(replayed["text"], "SUPOR")
+        self.assertEqual(replayed["box"], {"x": 20, "y": 30, "width": 160, "height": 45})
+
+        for d in (det_dir, rec_dir, cls_dir):
+            for entry in os.listdir(d):
+                os.remove(os.path.join(d, entry))
+            os.rmdir(d)
+        os.remove(tmp_path)
+
+
+class TestInkRefinement(unittest.TestCase):
+    """The box a detection reports must bound the ink it names.
+
+    Live evidence (1080x1440 frame, caption 你就得到了同款上帝视角): PaddleOCR's polygon stopped at
+    x=828 while the glyph ink ran to 850, so every downstream cover built from that box (+6px padding)
+    left the last glyph's right edge on screen.
+    """
+
+    def _frame(self, ink_value: int = 235, background: int = 40) -> "np.ndarray":
+        frame = np.full((1440, 1080, 3), background, dtype=np.uint8)
+        # Nine glyph-sized strokes spanning x 239..850, y 945..1015.
+        for i in range(9):
+            gx = 239 + i * (850 - 239 - 56) // 8
+            frame[945:1015, gx:gx + 56] = ink_value
+        return frame
+
+    @unittest.skipUnless(cv2 is not None and np is not None, "cv2/numpy required")
+    def test_box_grows_to_the_glyph_ink(self):
+        box = {"x": 237, "y": 954, "width": 591, "height": 60}  # tight: right edge 828, top 954
+        refined = ocr.refine_box_to_ink(self._frame(), box)
+        self.assertLessEqual(refined["x"], 239)
+        self.assertGreaterEqual(refined["x"] + refined["width"], 850)
+        self.assertLessEqual(refined["y"], 945)
+        self.assertGreaterEqual(refined["y"] + refined["height"], 1015)
+
+    @unittest.skipUnless(cv2 is not None and np is not None, "cv2/numpy required")
+    def test_dark_ink_on_light_background_grows_too(self):
+        box = {"x": 237, "y": 954, "width": 591, "height": 60}
+        refined = ocr.refine_box_to_ink(self._frame(ink_value=25, background=240), box)
+        self.assertGreaterEqual(refined["x"] + refined["width"], 850)
+        self.assertLessEqual(refined["y"], 945)
+
+    @unittest.skipUnless(cv2 is not None and np is not None, "cv2/numpy required")
+    def test_box_without_ink_is_left_alone(self):
+        frame = np.full((1440, 1080, 3), 128, dtype=np.uint8)
+        box = {"x": 237, "y": 954, "width": 591, "height": 60}
+        self.assertEqual(ocr.refine_box_to_ink(frame, box), box)
+
+    @unittest.skipUnless(cv2 is not None and np is not None, "cv2/numpy required")
+    def test_a_large_bright_surface_is_not_text_and_growth_is_capped(self):
+        frame = self._frame()
+        frame[880:1080, 860:1080] = 255  # a blown-out surface right beside the caption band
+        box = {"x": 237, "y": 954, "width": 591, "height": 60}
+        refined = ocr.refine_box_to_ink(frame, box)
+        self.assertLessEqual(refined["width"], int(box["width"] * (1 + 2 * ocr.INK_GROW_CAP_X_RATIO)) + 1)
+        self.assertLessEqual(refined["height"], int(box["height"] * (1 + 2 * ocr.INK_GROW_CAP_Y_RATIO)) + 1)
+
+    @unittest.skipUnless(cv2 is not None and np is not None, "cv2/numpy required")
+    def test_refinement_can_be_switched_off(self):
+        box = {"x": 237, "y": 954, "width": 591, "height": 60}
+        os.environ["DOUYINIE_OCR_INK_REFINE"] = "0"
+        try:
+            self.assertEqual(ocr.refine_box_to_ink(self._frame(), box), box)
+        finally:
+            os.environ.pop("DOUYINIE_OCR_INK_REFINE", None)
 
 
 if __name__ == "__main__":

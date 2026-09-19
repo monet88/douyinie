@@ -18,7 +18,7 @@ import (
 
 // GatewayTranslationProvider is an OpenAI-compatible gateway translation adapter.
 // It routes through approved OpenAI-compatible gateway endpoints (e.g. Gemini 3.8 Flash,
-// DeepSeek v4 Flash Vision Exp) using an alias, without direct provider SDKs.
+// DeepSeek V4.1 Flash) using an alias, without direct provider SDKs.
 // Remote models are never represented as cryptographically pinned checkpoints.
 type GatewayTranslationProvider struct {
 	id                string
@@ -363,7 +363,7 @@ Strict Invariants:
 2. Faithfully translate each segment into natural, idiomatic %s while strictly preserving meaning.
 3. Protect and preserve all numbers, digits, quantities, proper names, entities, and negation polarity.
 4. When the source contains grammatical negation or prohibition, the target MUST express it with explicit grammatical negation or prohibition appropriate to the target language (for example English "don't", "do not", "no", "never"; Vietnamese "không", "đừng", "chẳng", "chưa", "cấm"). Do not replace it with an affirmative-form idiom; choose an explicitly negative equivalent instead.
-5. In colloquial Chinese/ASR, clause-final 不 can be an interrogative particle rather than semantic negation (for example 喜欢你不 / 去不), including when punctuation is missing and the next clause follows immediately. When 不 is functioning this way, preserve it as a yes/no or tag question; do NOT emit standalone "no/không" or turn the question into a negative assertion. For Vietnamese, prefer an explicit tag-question form such as "phải không?" or "đúng không?" so the interrogative meaning remains unambiguous. This interrogative use of 不 is NOT grammatical negation for rule 4.
+5. In Chinese, '不' can be part of a lexical compound (e.g., 不透明度 opacity, 不锈钢 stainless steel, 不可避免 inevitable, 不一定 uncertain) or a clause-final interrogative particle (e.g., 喜欢你不 / 去不). In these cases, it is NOT sentence-level grammatical negation. Translate the lexical compound according to its natural affirmative or domain meaning (e.g., '不透明度' translates to 'opacity' or 'Độ mờ' without negation), and preserve the interrogative particle as a yes/no or tag question (for Vietnamese, use "phải không?" or "đúng không?"). Do NOT emit standalone "no/không" or turn the sentence into a negative assertion for these non-negating uses of '不', and they do NOT trigger the requirement for grammatical negation in rule 4.
 6. Do NOT compress or shorten duration (e.g. no vi_short duration adaptations). Shorten-first adaptation is performed downstream.
 7. Respond ONLY with valid JSON conforming to:
 {

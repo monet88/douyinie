@@ -357,7 +357,7 @@ func TestTranslationService_QAInvalidPrimary_ValidFallback_AdvancesAndRecordsPro
 	}
 }
 
-func TestTranslationService_AllCandidatesQAInvalid_FailsClosed(t *testing.T) {
+func TestTranslationService_AllCandidatesQAFlagged_PersistsBestEffortForReview(t *testing.T) {
 	db, casStore, router, reg := setupTranslationTestEnv(t)
 	svc := service.NewTranslationService(db, casStore)
 	svc.ConfigureRouter(router)
@@ -398,17 +398,23 @@ func TestTranslationService_AllCandidatesQAInvalid_FailsClosed(t *testing.T) {
 		},
 	}
 
-	_, err := svc.Translate(ctx, input)
-	if err == nil {
-		t.Fatalf("expected translation to fail closed when all candidates fail QA")
+	variant, err := svc.Translate(ctx, input)
+	if err != nil {
+		t.Fatalf("expected a best-effort variant instead of a stage failure when every lane trips the gate, got: %v", err)
 	}
-	if !errors.Is(err, domain.ErrQualityRejected) {
-		t.Fatalf("expected error to wrap domain.ErrQualityRejected, got: %v", err)
+	if len(variant.Segments) != 1 {
+		t.Fatalf("expected the flagged candidate to be persisted, got %d segments", len(variant.Segments))
 	}
-	if !errors.Is(err, domain.ErrNegationInverted) {
-		t.Fatalf("expected error to wrap negation polarity error, got: %v", err)
+	seg := variant.Segments[0]
+	if seg.PassedQAGate {
+		t.Fatalf("expected the inverted-negation segment to stay flagged, got passed_qa_gate=true")
 	}
-
+	if !strings.Contains(seg.ReviewReason, "negation polarity inverted") {
+		t.Errorf("expected the review reason to name the inverted negation, got %q", seg.ReviewReason)
+	}
+	if variant.ProviderID == "" {
+		t.Errorf("expected the best-effort candidate to keep provider provenance")
+	}
 	// Invariant: Both attempts recorded as quality_failed in SQLite provenance
 	attempts, err := db.ListProviderAttempts(ctx, runID, "translation")
 	if err != nil {
@@ -436,7 +442,7 @@ func TestTranslationService_AllCandidatesQAInvalid_FailsClosed(t *testing.T) {
 	}
 }
 
-func TestTranslationService_HybridLadder_Gemini_DeepSeek_FailsClosedWithoutLocalFallback(t *testing.T) {
+func TestTranslationService_HybridLadder_Gemini_DeepSeek_FlagsForReviewWithoutLocalFallback(t *testing.T) {
 	tmpDir := t.TempDir()
 	casStore, err := cas.NewStore(tmpDir)
 	if err != nil {
@@ -456,15 +462,15 @@ func TestTranslationService_HybridLadder_Gemini_DeepSeek_FailsClosedWithoutLocal
 	// Production ladder: Gemini -> DeepSeek. Local Qwen may be registered but is not translation-eligible.
 	geminiFake := provider.NewFakeTranslationProvider(provider.GatewayGeminiTranslationProviderID)
 	geminiFake.Cap.ExecutionTier = "cloud"
-	geminiFake.ModelName = "gemini-3.8-flash"
+	geminiFake.ModelName = provider.GatewayGeminiModelAlias
 	geminiFake.ModelVersion = "2026-08"
 	geminiFake.CorruptNumbers = true // Primary fails QA on numbers
 	_ = reg.Register(geminiFake)
 
 	deepseekFake := provider.NewFakeTranslationProvider(provider.GatewayDeepSeekTranslationProviderID)
 	deepseekFake.Cap.ExecutionTier = "cloud"
-	deepseekFake.ModelName = "deepseek-v4-flash"
-	deepseekFake.ModelVersion = "v4"
+	deepseekFake.ModelName = provider.GatewayDeepSeekModelAlias
+	deepseekFake.ModelVersion = "v4.1"
 	// First fallback fails QA on negation inversion
 	deepseekFake.CustomTranslations = map[string]string{
 		"请将温度调至25度，张伟说不要打开窗户。": "Vui lòng điều chỉnh nhiệt độ đến 25 độ, Trương Vĩ nói hãy mở cửa sổ.",
@@ -518,9 +524,18 @@ func TestTranslationService_HybridLadder_Gemini_DeepSeek_FailsClosedWithoutLocal
 		},
 	}
 
-	_, err = svc.Translate(initCtx, input)
-	if err == nil {
-		t.Fatal("expected hybrid translation to fail closed after both remote providers fail quality QA")
+	variant, err := svc.Translate(initCtx, input)
+	if err != nil {
+		t.Fatalf("expected the best remote candidate to be persisted for review, got: %v", err)
+	}
+	if variant.ProviderID == provider.WorkerQwenTranslationProviderID {
+		t.Fatal("local Qwen must never be selected as a production translation fallback")
+	}
+	if len(variant.Segments) != 1 || variant.Segments[0].PassedQAGate {
+		t.Fatalf("expected exactly one QA-flagged segment from the remote ladder, got %+v", variant.Segments)
+	}
+	if variant.Segments[0].ReviewReason == "" {
+		t.Error("expected the flagged segment to carry the operator-facing review reason")
 	}
 
 	// Invariant: Gemini (quality_failed) -> DeepSeek (quality_failed), then stop. Qwen is never attempted.

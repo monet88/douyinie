@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/governance"
@@ -118,19 +119,20 @@ func TestVisualTextService_DetectAndTrackText(t *testing.T) {
 			if len(reg.Keyframes) < 4 {
 				t.Fatalf("expected at least 4 keyframes for subtitle, got %d", len(reg.Keyframes))
 			}
-			// Frame 2 was missing in raw detections; verify it exists as interpolated
-			var frame2 *domain.RegionKeyframe
-			for _, kf := range reg.Keyframes {
-				if kf.FrameIndex == 2 {
-					frame2 = &kf
+			// The 1000 ms sample is missing in the raw detections (frames 0, 1, 3 only): the tracker
+			// must still cover that moment with an interpolated keyframe on the sampling grid.
+			var missedSample *domain.RegionKeyframe
+			for i := range reg.Keyframes {
+				if reg.Keyframes[i].TimestampMs == 1000 {
+					missedSample = &reg.Keyframes[i]
 					break
 				}
 			}
-			if frame2 == nil {
-				t.Fatalf("expected keyframe for frame 2")
+			if missedSample == nil {
+				t.Fatalf("expected an interpolated keyframe at the missed 1000 ms sample, got %+v", reg.Keyframes)
 			}
-			if frame2.Observed {
-				t.Errorf("expected frame 2 keyframe to be marked Observed=false (interpolated)")
+			if missedSample.Observed {
+				t.Errorf("expected the 1000 ms keyframe to be marked Observed=false (interpolated)")
 			}
 			if reg.ConfidenceEvidence.InterpolatedFrames != 1 {
 				t.Errorf("got %d interpolated frames, want 1", reg.ConfidenceEvidence.InterpolatedFrames)
@@ -172,7 +174,9 @@ func TestVisualTextService_SpatioTemporalOCRInstability_FilteredAsNoise(t *testi
 	// Mock OCR returning:
 	// 1. Spatio-temporal unstable pseudo-text in top-right (frames 10, 11, 12, changing gibberish, conf ~0.58)
 	// 2. Stable unknown brand in top-left (frames 10, 11, 12, "NovaBrandX", conf ~0.58)
-	// 3. Isolated single-frame unknown text in center (frame 10, "UniqueSign", conf ~0.58)
+	// 3. Isolated single-frame unknown text in center (frame 10, "UniqueSign", conf ~0.58):
+	//    an out-of-band label the viewer can read persists across samples - a single-sample hit is
+	//    OCR flicker (20 of the 26 live overlay regions in run 4f86657f were exactly that).
 	svc.OCRInvoke = func(ctx context.Context, p provider.Provider, req provider.OCRRequest) (*provider.OCRResult, error) {
 		return &provider.OCRResult{
 			ProviderID:   "fake_ppocr",
@@ -204,7 +208,7 @@ func TestVisualTextService_SpatioTemporalOCRInstability_FilteredAsNoise(t *testi
 		t.Fatalf("DetectAndTrackText failed: %v", err)
 	}
 
-	var foundUnstableAsNoise, foundStableBrandSemantic, foundIsolatedSemantic bool
+	var foundUnstableAsNoise, foundStableBrandSemantic, foundIsolatedNoise bool
 	for _, reg := range plan.Regions {
 		if reg.Text == "XybVqwer" || reg.Text == "MnoPlkjh" || reg.Text == "ZopTyuik" {
 			if reg.Role != domain.TextRoleIgnoreNoise {
@@ -221,10 +225,12 @@ func TestVisualTextService_SpatioTemporalOCRInstability_FilteredAsNoise(t *testi
 			}
 		}
 		if reg.Text == "UniqueSign" {
-			if reg.Role != domain.TextRoleSemanticText {
-				t.Errorf("expected isolated text %q to be SemanticText, got %v", reg.Text, reg.Role)
+			if reg.Role != domain.TextRoleIgnoreNoise {
+				t.Errorf("expected single-sample text %q to be IgnoreNoise, got %v", reg.Text, reg.Role)
+			} else if reg.ReviewReason != "single_sample_observation_noise" {
+				t.Errorf("expected single-sample noise reason for %q, got %q", reg.Text, reg.ReviewReason)
 			} else {
-				foundIsolatedSemantic = true
+				foundIsolatedNoise = true
 			}
 		}
 	}
@@ -235,8 +241,227 @@ func TestVisualTextService_SpatioTemporalOCRInstability_FilteredAsNoise(t *testi
 	if !foundStableBrandSemantic {
 		t.Errorf("did not find stable brand classified as SemanticText")
 	}
-	if !foundIsolatedSemantic {
-		t.Errorf("did not find isolated text classified as SemanticText")
+	if !foundIsolatedNoise {
+		t.Errorf("did not find single-sample text classified as IgnoreNoise")
+	}
+}
+
+// Live evidence (run 4f86657f): the OCR adapter reported "BLGOK" at the top-right across two
+// seconds while the same box read "CottGG"/"Cottce" on the samples around it, and the instability
+// gate never saw those neighbours to filter it - it measured its window in frame numbers, and the
+// adapter numbers frames absolutely (30 fps), so "+/- 4 frames" is +/- 133 ms rather than the four
+// 500 ms sampling steps the sampling grid actually spaces the evidence by.
+func TestVisualTextService_InstabilityWindowIsMeasuredInTime(t *testing.T) {
+	svc, db, _, assetID := setupVisualTextService(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	reg := provider.NewSeam1FakeRegistry()
+	polSvc := governance.NewPolicyService(db)
+	licSvc := governance.NewLicenseService(db)
+	initCtx := context.Background()
+	for _, p := range reg.ListAll() {
+		mName, mVer := p.ModelInfo()
+		if mName != "" {
+			_ = licSvc.RegisterManifest(initCtx, domain.LicenseManifestEntry{
+				DependencyName: mName,
+				Version:        mVer,
+				SHA256:         "sha256_mock_" + mName,
+				SourceRepo:     "github.com/monet88/douyinie/models/" + mName,
+				CodeLicense:    "Apache-2.0",
+				ModelLicense:   "Apache-2.0",
+				DataLicense:    "OpenData",
+				ServiceTerms:   "Standard",
+				Verified:       true,
+				CreatedAt:      time.Now().UTC(),
+			})
+		}
+	}
+	credSvc := governance.NewCredentialService(db)
+	router := provider.NewRouter(reg, polSvc, licSvc, credSvc, nil, db)
+	svc.ConfigureRouter(router)
+
+	hallucinated := domain.BoundingBox{X: 810, Y: 172, Width: 63, Height: 23}
+	svc.OCRInvoke = func(ctx context.Context, p provider.Provider, req provider.OCRRequest) (*provider.OCRResult, error) {
+		dets := []provider.RawTextDetection{
+			{FrameIndex: 345, TimestampMs: 11500, Text: "Cott66", Box: hallucinated, Confidence: 0.62},
+			{FrameIndex: 360, TimestampMs: 12000, Text: "Cottce", Box: hallucinated, Confidence: 0.57},
+		}
+		for i, ms := range []int64{12500, 13000, 13500, 14000, 14500, 15000} {
+			dets = append(dets, provider.RawTextDetection{
+				FrameIndex:  int((ms / 1000) * 30),
+				TimestampMs: ms,
+				Text:        "BLGOK",
+				Box:         hallucinated,
+				Confidence:  0.87 + float64(i)/100,
+			})
+		}
+		dets = append(dets,
+			provider.RawTextDetection{FrameIndex: 465, TimestampMs: 15500, Text: "CottGG", Box: hallucinated, Confidence: 0.57},
+			provider.RawTextDetection{FrameIndex: 480, TimestampMs: 16000, Text: "Cott6e", Box: hallucinated, Confidence: 0.55},
+		)
+		return &provider.OCRResult{
+			ProviderID:   "fake_ppocr",
+			ModelName:    "paddleocr",
+			ModelVersion: "v4",
+			FrameWidth:   1080,
+			FrameHeight:  1440,
+			Detections:   dets,
+		}, nil
+	}
+
+	plan, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:             "run-instability-window-test",
+		AssetID:           assetID,
+		FrameSampleStepMs: 500,
+	})
+	if err != nil {
+		t.Fatalf("DetectAndTrackText failed: %v", err)
+	}
+
+	var checked bool
+	for _, region := range plan.Regions {
+		if region.Text == "BLGOK" {
+			checked = true
+			if region.Role != domain.TextRoleIgnoreNoise {
+				t.Errorf("expected the hallucinated Latin label to be IgnoreNoise, got %v (reason %q)", region.Role, region.ReviewReason)
+			}
+		}
+	}
+	if !checked {
+		t.Fatalf("expected a BLGOK region in the plan, got %d regions", len(plan.Regions))
+	}
+}
+
+// A fresh run on an already-processed asset reuses the cached translation and dub script, so it owns no
+// variant index row of its own. Resolving only by run id left the visual lane with no localization
+// artifact at all, and the fallback branch then burned the SOURCE caption text as the "localized"
+// subtitle - live evidence, run 3adede59: a replay run rendered the Chinese captions on top of the
+// covers that hid them. The run is still bound to those artifacts by the stage executions it recorded.
+func TestVisualTextService_CacheHitRunRendersTranslatedCaptions(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	transSvc := service.NewTranslationService(db, casStore)
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "qwen_trans",
+			ModelVersion: "v1",
+			Segments: []domain.TranslationSegment{{
+				Index:      0,
+				SourceText: req.Segments[0].SourceText,
+				TargetText: "Xuất",
+			}},
+		}, nil
+	}
+	svc.SetTranslationService(transSvc)
+
+	sourceText := "把手机放在橱柜上"
+	meaningText := "Đặt điện thoại lên tủ là bạn có ngay góc nhìn từ trên cao."
+
+	transVariant := domain.TranslationVariant{
+		ID:             "trans-origin",
+		AssetID:        assetID,
+		RunID:          "run-origin",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{{
+			Index:      0,
+			SourceText: sourceText,
+			TargetText: meaningText,
+			StartMs:    0,
+			EndMs:      3000,
+		}},
+		CreatedAt: time.Now().UTC(),
+	}
+	transBytes, _ := json.Marshal(transVariant)
+	transObj, err := casStore.Put(bytes.NewReader(transBytes))
+	if err != nil {
+		t.Fatalf("put translation in CAS: %v", err)
+	}
+	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID: "trans-origin", AssetID: assetID, RunID: "run-origin", TargetLanguage: "vi",
+		CASHash: transObj.SHA256, ProvenanceHash: "prov-trans-origin", CreatedAt: transVariant.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save translation variant index: %v", err)
+	}
+
+	dubVariant := domain.DubScriptVariant{
+		ID: "dub-origin", AssetID: assetID, RunID: "run-origin", TargetLanguage: "vi",
+		TranslationVariantCAS: transObj.SHA256,
+		Segments: []domain.DubScriptSegment{{
+			Index:       0,
+			SourceText:  sourceText,
+			MeaningText: meaningText,
+			SpokenText:  meaningText,
+			StartMs:     0,
+			EndMs:       3000,
+		}},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubBytes, _ := json.Marshal(dubVariant)
+	dubObj, err := casStore.Put(bytes.NewReader(dubBytes))
+	if err != nil {
+		t.Fatalf("put dub script in CAS: %v", err)
+	}
+	if err := db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID: "dub-origin", AssetID: assetID, RunID: "run-origin", TargetLanguage: "vi",
+		CASHash: dubObj.SHA256, ProvenanceHash: "prov-dub-origin", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("save dub script index: %v", err)
+	}
+
+	// The replay run consumed both artifacts without producing index rows of its own.
+	replayJob := domain.LocalizationJob{
+		ID: uuid.NewString(), SourceAssetID: assetID, TargetLanguage: "vi",
+		Status: "review_required", CreatedAt: time.Now().UTC(),
+	}
+	if err := db.CreateJob(ctx, replayJob); err != nil {
+		t.Fatalf("create replay job: %v", err)
+	}
+	replayRun := domain.LocalizationRun{
+		ID: "run-replay", JobID: replayJob.ID, Status: "running",
+		ConfigSnapshotJSON: "{}", CreatedAt: time.Now().UTC(),
+	}
+	if err := db.CreateRun(ctx, replayRun); err != nil {
+		t.Fatalf("create replay run: %v", err)
+	}
+	for _, st := range []struct{ stage, hash string }{
+		{"translation", transObj.SHA256},
+		{"dub_script", dubObj.SHA256},
+	} {
+		now := time.Now().UTC()
+		if err := db.CreateStageExecution(ctx, domain.StageExecution{
+			ID: uuid.NewString(), RunID: "run-replay", Stage: st.stage, Status: "succeeded",
+			ArtifactSHA256: st.hash, StartedAt: &now, CompletedAt: &now, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("create %s stage execution: %v", st.stage, err)
+		}
+	}
+
+	if _, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID: "run-replay", AssetID: assetID,
+	}); err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+
+	track, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID: "run-replay", AssetID: assetID, TargetLanguage: "vi",
+	})
+	if err != nil {
+		t.Fatalf("localize visual track failed: %v", err)
+	}
+	if len(track.SubtitleCues) == 0 {
+		t.Fatalf("expected subtitle cues for the replayed run")
+	}
+	for _, cue := range track.SubtitleCues {
+		if !strings.Contains(cue.Text, "Đặt điện thoại lên tủ") {
+			t.Fatalf("cue %s carries %q: a replay run must render the translated caption, not the source reading", cue.ID, cue.Text)
+		}
+	}
+	if strings.Contains(track.SubtitleCues[0].Text, sourceText) {
+		t.Fatalf("cue %s carries the raw source text", track.SubtitleCues[0].ID)
 	}
 }
 
@@ -954,12 +1179,14 @@ func TestVisualTextService_LocalizeVisualTrack_CanonicalTranslationGrounding_Suc
 	if len(visTrack.SubtitleCues) != 1 {
 		t.Fatalf("expected 1 subtitle cue, got %d", len(visTrack.SubtitleCues))
 	}
-	if visTrack.SubtitleCues[0].Text != canonicalMeaningText {
+	// The cue text is the canonical meaning wrapped for rendering, so compare on the words.
+	gotCueText := strings.Join(strings.Fields(visTrack.SubtitleCues[0].Text), " ")
+	if gotCueText != canonicalMeaningText {
 		t.Errorf("subtitle text %q != canonical TranslationVariant target text %q (must not use spokenText %q)",
-			visTrack.SubtitleCues[0].Text, canonicalMeaningText, shortenedSpokenText)
+			gotCueText, canonicalMeaningText, shortenedSpokenText)
 	}
-	if visTrack.SubtitleCues[0].Text == newerMeaningText {
-		t.Fatalf("selected run localized using newer run artifact: %q", visTrack.SubtitleCues[0].Text)
+	if gotCueText == newerMeaningText {
+		t.Fatalf("selected run localized using newer run artifact: %q", gotCueText)
 	}
 }
 
@@ -1086,8 +1313,8 @@ func TestVisualTextService_LocalizeVisualTrack_ExplicitTranslationCASSurvivesRes
 	if len(visTrack.SubtitleCues) != 1 {
 		t.Fatalf("expected 1 subtitle cue, got %d", len(visTrack.SubtitleCues))
 	}
-	if visTrack.SubtitleCues[0].Text != speechMeaning {
-		t.Fatalf("subtitle text %q != explicitly pinned speech translation %q", visTrack.SubtitleCues[0].Text, speechMeaning)
+	if got := strings.Join(strings.Fields(visTrack.SubtitleCues[0].Text), " "); got != speechMeaning {
+		t.Fatalf("subtitle text %q != explicitly pinned speech translation %q", got, speechMeaning)
 	}
 }
 
@@ -1637,5 +1864,509 @@ func TestVisualTextService_LocalizeVisualTrack_ForwardsRoutingContextToTranslati
 		if len(captured.AuthorizedCredentials) != 0 {
 			t.Errorf("call %d: expected empty credentials, got %v", i, captured.AuthorizedCredentials)
 		}
+	}
+}
+
+// TestVisualTextService_LocalizeVisualTrack_ProtectedOverlapSurfacesAsException pins the
+// operator-review contract for a collision with another protected tracked region
+// (architecture §9.1): the overlay is skipped (the source text stays on screen untouched),
+// the collision is reported in the artifact, and the region is projected as a pending
+// visual_occlusion exception instead of aborting the stage and dead-ending the run.
+// A collision with a scene-protected region (face / tap target) still fails closed, which
+// TestVisualTextService_LocalizeVisualTrack_And_Overrides covers.
+func TestVisualTextService_LocalizeVisualTrack_ProtectedOverlapSurfacesAsException(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	setupTestTranslationService(db, casStore, svc)
+
+	ctx := context.Background()
+
+	detected, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:   "run-occlusion",
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+	if len(detected.Regions) < 2 {
+		t.Fatalf("expected at least 2 detected regions, got %d", len(detected.Regions))
+	}
+
+	// Publish a plan where a protected control (the brand mark region) sits exactly on the
+	// box of the largest overlay-producing region: that neighbour's overlay can never clear
+	// it, which is the live failure this test pins (two tracked UI controls sharing screen
+	// space).
+	plan := *detected
+	regions := make([]domain.TrackedTextRegion, len(detected.Regions))
+	copy(regions, detected.Regions)
+	guardIdx, victim, victimArea := -1, -1, 0
+	for i, reg := range regions {
+		if len(reg.Keyframes) == 0 {
+			continue
+		}
+		if reg.ProtectedMetadata.IsProtected {
+			if guardIdx < 0 {
+				guardIdx = i
+			}
+			continue
+		}
+		if reg.Role != domain.TextRoleSemanticText && reg.Role != domain.TextRoleInstructionalUIText {
+			continue
+		}
+		if area := reg.Keyframes[0].Box.Width * reg.Keyframes[0].Box.Height; area > victimArea {
+			victim, victimArea = i, area
+		}
+	}
+	if guardIdx < 0 || victim < 0 {
+		t.Fatalf("fixture needs one protected region and one overlay-producing region: guard=%d victim=%d", guardIdx, victim)
+	}
+	victimReg := regions[victim]
+	guard := regions[guardIdx]
+	guard.FirstSeenMs = victimReg.FirstSeenMs
+	guard.LastSeenMs = victimReg.LastSeenMs
+	guard.Keyframes = []domain.RegionKeyframe{{TimestampMs: victimReg.FirstSeenMs, Box: victimReg.Keyframes[0].Box}}
+	regions[guardIdx] = guard
+	plan.Regions = regions
+	plan.ProvenanceHash = "prov-occlusion-guard"
+	plan.ID = "plan-occlusion-guard"
+	plan.CreatedAt = time.Now().UTC()
+
+	planBytes, _ := json.Marshal(plan)
+	planObj, err := casStore.Put(bytes.NewReader(planBytes))
+	if err != nil {
+		t.Fatalf("put plan in CAS: %v", err)
+	}
+	if err := db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID:             plan.ID,
+		AssetID:        assetID,
+		CASHash:        planObj.SHA256,
+		ProvenanceHash: plan.ProvenanceHash,
+		CreatedAt:      plan.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save plan index: %v", err)
+	}
+
+	vis, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-occlusion",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err != nil {
+		t.Fatalf("protected-region collision must surface for review, not fail the stage: %v", err)
+	}
+	if len(vis.Occlusions) == 0 {
+		t.Fatal("expected occlusion reports for regions colliding with the protected control, got none")
+	}
+	if vis.Occlusions[0].RegionID != victimReg.ID {
+		t.Fatalf("expected %s (the region whose overlay cannot clear the protected control) to be reported, got %+v", victimReg.ID, vis.Occlusions)
+	}
+	occluded := make(map[string]domain.OcclusionReport, len(vis.Occlusions))
+	for _, occ := range vis.Occlusions {
+		if occ.RegionID == "" {
+			t.Error("occlusion report without a region id")
+		}
+		if occ.RegionID == guard.ID {
+			t.Errorf("the protected control itself must not be reported as occluded")
+		}
+		occluded[occ.RegionID] = occ
+	}
+	for _, ov := range vis.Overlays {
+		if _, skip := occluded[ov.RegionID]; skip {
+			t.Errorf("occluded region %s must not carry an overlay", ov.RegionID)
+		}
+	}
+
+	// The persisted artifact carries the report (the overlay is absent from it).
+	rc, err := casStore.Get(vis.CASHash)
+	if err != nil {
+		t.Fatalf("read persisted visual track: %v", err)
+	}
+	var persisted domain.LocalizedVisualTrack
+	decodeErr := json.NewDecoder(rc).Decode(&persisted)
+	rc.Close()
+	if decodeErr != nil {
+		t.Fatalf("decode persisted visual track: %v", decodeErr)
+	}
+	if len(persisted.Occlusions) != len(vis.Occlusions) {
+		t.Fatalf("persisted track lost its occlusion reports: %d != %d", len(persisted.Occlusions), len(vis.Occlusions))
+	}
+
+	// ...and the operator sees one pending exception per skipped overlay.
+	reviewSvc := service.NewReviewService(db, casStore)
+	items, err := reviewSvc.ProjectReviewItemsForRun(ctx, assetID, "vi", "run-occlusion")
+	if err != nil {
+		t.Fatalf("project review items: %v", err)
+	}
+	projected := make(map[string]bool)
+	for _, item := range items {
+		if item.Type != domain.ReviewItemTypeVisualOcclusion {
+			continue
+		}
+		projected[item.RegionID] = true
+		if item.Status != domain.ReviewItemStatusPending {
+			t.Errorf("expected a pending occlusion item, got %s", item.Status)
+		}
+		if item.Stage != "visual_text_localize" {
+			t.Errorf("expected stage visual_text_localize, got %s", item.Stage)
+		}
+	}
+	for regionID := range occluded {
+		if !projected[regionID] {
+			t.Fatalf("expected a visual_occlusion exception for %s, got %+v", regionID, items)
+		}
+	}
+}
+
+// TestVisualTextService_LocalizeVisualTrack_OverlayTranslationsStayEphemeral pins the ownership
+// boundary between the visual lane and the run's canonical translation: translating overlay text
+// is an inline lookup, so it must not republish the run-scoped TranslationVariant index nor
+// append a `translation` stage row. Publishing it makes every artifact that pins the canonical
+// CAS (DubScriptVariant.TranslationVariantCAS) fail closed on the next visual_text_localize.
+func TestVisualTextService_LocalizeVisualTrack_OverlayTranslationsStayEphemeral(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	setupTestTranslationService(db, casStore, svc)
+
+	ctx := context.Background()
+
+	detected, err := svc.DetectAndTrackText(ctx, service.VisualTextDetectionInput{
+		RunID:   "run-ephemeral",
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("detect text failed: %v", err)
+	}
+	if len(detected.Regions) == 0 {
+		t.Fatal("expected detected regions")
+	}
+
+	// The speech stages already published the canonical translation for this run.
+	canonical := domain.TranslationVariant{
+		ID:             "trans-canonical",
+		AssetID:        assetID,
+		RunID:          "run-ephemeral",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "第一步:准备好所有新鲜食材。", TargetText: "Buoc 1: Chuan bi nguyen lieu.", StartMs: 0, EndMs: 3000},
+		},
+		CreatedAt: time.Now().UTC().Add(-time.Hour),
+	}
+	canonicalBytes, _ := json.Marshal(canonical)
+	canonicalObj, err := casStore.Put(bytes.NewReader(canonicalBytes))
+	if err != nil {
+		t.Fatalf("put canonical translation in CAS: %v", err)
+	}
+	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             canonical.ID,
+		AssetID:        assetID,
+		RunID:          canonical.RunID,
+		TargetLanguage: "vi",
+		CASHash:        canonicalObj.SHA256,
+		ProvenanceHash: "prov-canonical",
+		CreatedAt:      canonical.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save canonical translation index: %v", err)
+	}
+
+	before, err := db.GetTranslationVariantIndexByRun(ctx, "run-ephemeral")
+	if err != nil || before == nil {
+		t.Fatalf("read canonical translation index before localize: %v", err)
+	}
+	beforeStages, err := db.ListStageExecutions(ctx, "run-ephemeral")
+	if err != nil {
+		t.Fatalf("list stage executions before localize: %v", err)
+	}
+	translationStagesBefore := 0
+	for _, se := range beforeStages {
+		if se.Stage == "translation" {
+			translationStagesBefore++
+		}
+	}
+
+	// Localize runs the overlay translation path (the fixture's semantic-text region).
+	if _, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-ephemeral",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	}); err != nil {
+		t.Fatalf("localize visual track failed: %v", err)
+	}
+
+	after, err := db.GetTranslationVariantIndexByRun(ctx, "run-ephemeral")
+	if err != nil || after == nil {
+		t.Fatalf("read canonical translation index after localize: %v", err)
+	}
+	if after.CASHash != before.CASHash {
+		t.Fatalf("overlay translation republished the run's canonical translation:\n before=%s\n after=%s", before.CASHash, after.CASHash)
+	}
+	afterStages, err := db.ListStageExecutions(ctx, "run-ephemeral")
+	if err != nil {
+		t.Fatalf("list stage executions after localize: %v", err)
+	}
+	translationStagesAfter := 0
+	for _, se := range afterStages {
+		if se.Stage == "translation" {
+			translationStagesAfter++
+		}
+	}
+	if translationStagesAfter != translationStagesBefore {
+		t.Fatalf("overlay translation appended %d translation stage row(s); the visual lane did not run the translation stage",
+			translationStagesAfter-translationStagesBefore)
+	}
+}
+
+func seedTextRegionPlan(t *testing.T, db *storage.DB, casStore *cas.Store, assetID string, regions []domain.TrackedTextRegion) domain.TextRegionPlan {
+	t.Helper()
+	now := time.Now().UTC()
+	plan := domain.TextRegionPlan{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.TextRegionPlanSchemaVersion,
+		AssetID:        assetID,
+		ProviderID:     "test_ocr",
+		ModelName:      "test_model",
+		ModelVersion:   "v1",
+		FrameWidth:     1080,
+		FrameHeight:    1920,
+		Regions:        regions,
+		ProvenanceHash: "prov-test-plan-" + uuid.NewString(),
+		CreatedAt:      now,
+	}
+	planBytes, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	planObj, err := casStore.Put(bytes.NewReader(planBytes))
+	if err != nil {
+		t.Fatalf("put plan in CAS: %v", err)
+	}
+	plan.CASHash = planObj.SHA256
+
+	err = db.SaveTextRegionPlanIndex(context.Background(), storage.TextRegionPlanIndex{
+		ID:             plan.ID,
+		AssetID:        plan.AssetID,
+		ProviderID:     plan.ProviderID,
+		ModelName:      plan.ModelName,
+		ModelVersion:   plan.ModelVersion,
+		CASHash:        plan.CASHash,
+		ProvenanceHash: plan.ProvenanceHash,
+		CreatedAt:      plan.CreatedAt,
+	})
+	if err != nil {
+		t.Fatalf("save plan index: %v", err)
+	}
+	return plan
+}
+
+// Regression test for Violation 1:
+// When one replacement overlaps multiple kept replacements, all colliding kept items must be examined.
+// Three mutually overlapping overlays where the middle one dominates one but yields to the other
+// must leave no overlapping kept pair.
+func TestVisualTextService_LocalizeVisualTrack_OverlayCollisions_NoOverlappingKeptPair(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	setupTestTranslationService(db, casStore, svc)
+	ctx := context.Background()
+
+	regions := []domain.TrackedTextRegion{
+		{
+			ID:          "region-small",
+			Role:        domain.TextRoleSemanticText,
+			Text:        "小标签",
+			FirstSeenMs: 0,
+			LastSeenMs:  1000,
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 0, Box: domain.BoundingBox{X: 100, Y: 100, Width: 100, Height: 50}, Observed: true},
+			},
+		},
+		{
+			ID:          "region-large",
+			Role:        domain.TextRoleSemanticText,
+			Text:        "大标签",
+			FirstSeenMs: 1000,
+			LastSeenMs:  2000,
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 1000, Box: domain.BoundingBox{X: 100, Y: 100, Width: 350, Height: 120}, Observed: true},
+			},
+		},
+		{
+			ID:          "region-middle",
+			Role:        domain.TextRoleSemanticText,
+			Text:        "中标签",
+			FirstSeenMs: 500,
+			LastSeenMs:  1500,
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 500, Box: domain.BoundingBox{X: 100, Y: 100, Width: 220, Height: 80}, Observed: true},
+			},
+		},
+	}
+	seedTextRegionPlan(t, db, casStore, assetID, regions)
+
+	visTrack, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          "run-collision-test",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err != nil {
+		t.Fatalf("localize visual track failed: %v", err)
+	}
+
+	// Invariant: no two kept overlays overlap in BOTH time and space
+	for i := range visTrack.Overlays {
+		for j := i + 1; j < len(visTrack.Overlays); j++ {
+			a, b := visTrack.Overlays[i], visTrack.Overlays[j]
+			timeOverlap := a.StartMs < b.EndMs && b.StartMs < a.EndMs
+			if timeOverlap && domain.BoxesOverlap(a.Box, b.Box) {
+				t.Fatalf("found overlapping kept overlays: %s [%d-%d] and %s [%d-%d]",
+					a.RegionID, a.StartMs, a.EndMs, b.RegionID, b.StartMs, b.EndMs)
+			}
+		}
+	}
+
+	// The middle label yielded to the larger one and must not be kept
+	for _, ov := range visTrack.Overlays {
+		if ov.RegionID == "region-middle" {
+			t.Errorf("expected middle overlay to be dropped, but was kept: %+v", ov)
+		}
+	}
+}
+
+// Regression test for Violation 2:
+// When a short translation segment splits into more pieces than its duration in milliseconds,
+// pieces are merged so every emitted window is non-empty, ordered, and inside [startMs, endMs].
+func TestVisualTextService_LocalizeVisualTrack_ShortSegmentPieceCountExceedsDuration_EmitsValidWindows(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	seedTextRegionPlan(t, db, casStore, assetID, nil)
+
+	// Long text that splits into 3+ pieces (>100 runes across multiple words)
+	longText := "Đặt điện thoại lên tủ là bạn có ngay góc nhìn từ trên cao y hệt. " +
+		"Đặt điện thoại bên dưới gói mì gà cay đã cắt miệng, bạn sẽ có cảnh quay độc lạ. " +
+		"Đặt điện thoại vào trong cuộn băng dính rồi tùy ý để ở một nơi nào đó."
+
+	transVariant := domain.TranslationVariant{
+		ID:             "trans-short-window",
+		AssetID:        assetID,
+		RunID:          "run-short-window",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{
+			{
+				Index:      0,
+				SourceText: "短视频文案内容",
+				TargetText: longText,
+				StartMs:    0,
+				EndMs:      2, // 2 milliseconds available for 3+ pieces
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	transBytes, err := json.Marshal(transVariant)
+	if err != nil {
+		t.Fatalf("marshal translation: %v", err)
+	}
+	transObj, err := casStore.Put(bytes.NewReader(transBytes))
+	if err != nil {
+		t.Fatalf("put translation in CAS: %v", err)
+	}
+	err = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             transVariant.ID,
+		AssetID:        assetID,
+		RunID:          transVariant.RunID,
+		TargetLanguage: "vi",
+		CASHash:        transObj.SHA256,
+		ProvenanceHash: "prov-trans-short-window",
+		CreatedAt:      transVariant.CreatedAt,
+	})
+	if err != nil {
+		t.Fatalf("save translation variant index: %v", err)
+	}
+
+	visTrack, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:                 "run-short-window",
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: transObj.SHA256,
+	})
+	if err != nil {
+		t.Fatalf("localize visual track failed: %v", err)
+	}
+
+	if len(visTrack.SubtitleCues) == 0 {
+		t.Fatalf("expected subtitle cues to be emitted")
+	}
+
+	// Validate all emitted cue windows: must be non-empty, ordered, and within [0, 2]
+	for i, cue := range visTrack.SubtitleCues {
+		if cue.StartMs < 0 || cue.EndMs <= cue.StartMs {
+			t.Fatalf("cue %d has degenerate bounds [%d, %d]", i, cue.StartMs, cue.EndMs)
+		}
+		if cue.StartMs < 0 || cue.EndMs > 2 {
+			t.Fatalf("cue %d bounds [%d, %d] outside segment window [0, 2]", i, cue.StartMs, cue.EndMs)
+		}
+		if i > 0 && cue.StartMs < visTrack.SubtitleCues[i-1].EndMs {
+			t.Fatalf("cue %d start %d precedes previous end %d", i, cue.StartMs, visTrack.SubtitleCues[i-1].EndMs)
+		}
+	}
+}
+
+func TestVisualTextService_LocalizeVisualTrack_DecodedTranslationArtifactOwnershipMismatch(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+	seedTextRegionPlan(t, db, casStore, assetID, nil)
+	otherAssetID := "other-asset-" + uuid.NewString()[:8]
+	tVariant := domain.TranslationVariant{
+		ID:             uuid.NewString(),
+		AssetID:        otherAssetID,
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "测试", TargetText: "Thử nghiệm", PassedQAGate: true, QAConfidence: 0.9, StartMs: 0, EndMs: 1000},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(tVariant)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+
+	dVariant := domain.DubScriptVariant{
+		ID:                    uuid.NewString(),
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: tObj.SHA256,
+		Segments: []domain.DubScriptSegment{
+			{Index: 0, SourceText: "测试", SpokenText: "Thử nghiệm", PassedQAGate: true, StartMs: 0, EndMs: 1000},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dBytes, _ := json.Marshal(dVariant)
+	dObj, _ := casStore.Put(bytes.NewReader(dBytes))
+
+	_ = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             tVariant.ID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		CASHash:        tObj.SHA256,
+		ProvenanceHash: "prov-trans",
+		CreatedAt:      tVariant.CreatedAt,
+	})
+	_ = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID:             dVariant.ID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		CASHash:        dObj.SHA256,
+		ProvenanceHash: "prov-dub",
+		CreatedAt:      dVariant.CreatedAt,
+	})
+
+	_, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: "",
+	})
+	if err == nil {
+		t.Fatalf("expected error on translation variant ownership mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "ownership mismatch") {
+		t.Fatalf("expected ownership mismatch error, got %v", err)
 	}
 }

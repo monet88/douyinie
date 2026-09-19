@@ -10,6 +10,7 @@ import (
 
 	"github.com/monet88/douyinie/internal/benchmark"
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/provider"
 )
 
 func testBenchmarkIdentity() benchmark.SessionIdentityInput {
@@ -28,14 +29,14 @@ func testBenchmarkIdentity() benchmark.SessionIdentityInput {
 		ProviderBaselines: []benchmark.ProviderBaseline{
 			{
 				Role:              "translation_primary",
-				ProviderID:        "gateway_gemini_3_8_flash",
-				ModelVersion:      "gemini-3.8-flash",
+				ProviderID:        provider.GatewayGeminiTranslationProviderID,
+				ModelVersion:      provider.GatewayGeminiModelAlias,
 				ServiceBaselineID: "seam1-test-gemini-baseline",
 			},
 			{
 				Role:              "translation_fallback",
-				ProviderID:        "gateway_deepseek_v4_flash_vision_exp",
-				ModelVersion:      "deepseek/deepseek-v4-flash-vision-exp",
+				ProviderID:        provider.GatewayDeepSeekTranslationProviderID,
+				ModelVersion:      provider.GatewayDeepSeekModelAlias,
 				ServiceBaselineID: "seam1-test-deepseek-baseline",
 			},
 			{

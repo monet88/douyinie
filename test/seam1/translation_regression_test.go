@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/provider"
 )
 
-func TestSeam1_Translation_QAGateRejectsSemanticFactCorruption(t *testing.T) {
+func TestSeam1_Translation_QAGateFlagsSemanticFactCorruptionForReview(t *testing.T) {
 	h := setupHarness(t)
 	assetID, runID := setupSpeechUnderstoodAsset(t, h)
 
@@ -44,8 +45,37 @@ func TestSeam1_Translation_QAGateRejectsSemanticFactCorruption(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422 for semantic fact corruption, got %d", resp.StatusCode)
+	// A meaning-gate violation is reported, not fatal: the candidate is persisted with the
+	// segment flagged, and the exception waits in the review queue for the operator.
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 with a flagged variant for semantic fact corruption, got %d", resp.StatusCode)
+	}
+	var translateRes struct {
+		Variant domain.TranslationVariant `json:"translation_variant"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&translateRes); err != nil {
+		t.Fatalf("decode translate response: %v", err)
+	}
+	if len(translateRes.Variant.Segments) != 1 {
+		t.Fatalf("expected the flagged candidate to be persisted, got %d segments", len(translateRes.Variant.Segments))
+	}
+	flagged := translateRes.Variant.Segments[0]
+	if flagged.PassedQAGate {
+		t.Fatalf("expected the semantic fact corruption to stay flagged, got passed_qa_gate=true")
+	}
+	if !strings.Contains(flagged.ReviewReason, "weather_quality") || !strings.Contains(flagged.ReviewReason, "good") || !strings.Contains(flagged.ReviewReason, "bad") {
+		t.Errorf("expected review reason to name weather_quality fact violation (good -> bad), got: %q", flagged.ReviewReason)
+	}
+
+	items := fetchRunReviewItems(t, h, runID, false)
+	var found bool
+	for _, item := range items {
+		if item.Type == domain.ReviewItemTypeTranslationQA {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a pending translation_qa exception, got %+v", items)
 	}
 }
 

@@ -1291,15 +1291,20 @@ func TestSeam1_VoiceReassign_AssetScopedWithoutRunID(t *testing.T) {
 		t.Helper()
 		track := domain.LocalizedVisualTrack{
 			ID:             id,
+			SchemaVersion:  domain.LocalizedVisualTrackSchemaVersion,
 			AssetID:        assetID,
 			RunID:          trackRunID,
 			TargetLanguage: "vi",
+			ProvenanceHash: "prov-" + id,
 			SubtitleCues: []domain.SubtitleCue{
 				{ID: id + "-cue", StartMs: 0, EndMs: 2000, Text: cueText, FontSizePx: 48},
 			},
 			CreatedAt: createdAt,
 		}
-		raw, _ := json.Marshal(track)
+		raw, err := json.Marshal(track)
+		if err != nil {
+			t.Fatalf("marshal visual track %s: %v", id, err)
+		}
 		obj, err := h.casStore.Put(bytes.NewReader(raw))
 		if err != nil {
 			t.Fatalf("seed visual track %s: %v", id, err)

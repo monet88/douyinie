@@ -19,8 +19,8 @@ func TestRouter_TranslationLocalProfile_DisablesTranslationProviders(t *testing.
 
 	// Register remote gateway providers
 	gemini, _ := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 		"http://127.0.0.1:8080",
@@ -29,8 +29,8 @@ func TestRouter_TranslationLocalProfile_DisablesTranslationProviders(t *testing.
 	_ = reg.Register(gemini)
 
 	deepseek, _ := provider.NewGatewayTranslationProvider(
-		"gateway_deepseek_v4_flash_vision_exp",
-		"deepseek/deepseek-v4-flash-vision-exp",
+		provider.GatewayDeepSeekTranslationProviderID,
+		provider.GatewayDeepSeekModelAlias,
 		"baseline-deepseek-v4-2026-08",
 		0.95,
 		"http://127.0.0.1:8080",
@@ -61,8 +61,8 @@ func TestRouter_TranslationHybridProfile_DeterministicOrdering(t *testing.T) {
 	reg := provider.NewRegistry()
 
 	gemini, _ := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 		"http://127.0.0.1:8080",
@@ -71,8 +71,8 @@ func TestRouter_TranslationHybridProfile_DeterministicOrdering(t *testing.T) {
 	_ = reg.Register(gemini)
 
 	deepseek, _ := provider.NewGatewayTranslationProvider(
-		"gateway_deepseek_v4_flash_vision_exp",
-		"deepseek/deepseek-v4-flash-vision-exp",
+		provider.GatewayDeepSeekTranslationProviderID,
+		provider.GatewayDeepSeekModelAlias,
 		"baseline-deepseek-v4-2026-08",
 		0.95,
 		"http://127.0.0.1:8080",
@@ -97,7 +97,7 @@ func TestRouter_TranslationHybridProfile_DeterministicOrdering(t *testing.T) {
 	}
 
 	// 1. Primary must be Gateway Gemini (highest quality 0.99 in hybrid profile)
-	if res.SelectedProvider.ID() != "gateway_gemini_3_8_flash" {
+	if res.SelectedProvider.ID() != provider.GatewayGeminiTranslationProviderID {
 		t.Fatalf("expected primary provider gateway_gemini_3_8_flash, got: %s", res.SelectedProvider.ID())
 	}
 
@@ -105,8 +105,8 @@ func TestRouter_TranslationHybridProfile_DeterministicOrdering(t *testing.T) {
 	if len(res.FallbackOrdered) != 1 {
 		t.Fatalf("expected 1 fallback provider, got %d", len(res.FallbackOrdered))
 	}
-	if res.FallbackOrdered[0].ID() != "gateway_deepseek_v4_flash_vision_exp" {
-		t.Fatalf("expected first fallback gateway_deepseek_v4_flash_vision_exp, got: %s", res.FallbackOrdered[0].ID())
+	if res.FallbackOrdered[0].ID() != provider.GatewayDeepSeekTranslationProviderID {
+		t.Fatalf("expected first fallback gateway_deepseek_v4_1_flash, got: %s", res.FallbackOrdered[0].ID())
 	}
 	for _, cand := range res.Decision.CandidatesEvaluated {
 		if cand.ProviderID == "qwen3_4b_translator" {
@@ -126,8 +126,8 @@ func TestRouter_TranslationHybridProfile_FrozenOrderingRegardlessOfQuality(t *te
 
 	// Deliberately give DeepSeek a higher quality score than Gemini
 	gemini, _ := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.80, // Lower quality score
 		"http://127.0.0.1:8080",
@@ -136,8 +136,8 @@ func TestRouter_TranslationHybridProfile_FrozenOrderingRegardlessOfQuality(t *te
 	_ = reg.Register(gemini)
 
 	deepseek, _ := provider.NewGatewayTranslationProvider(
-		"gateway_deepseek_v4_flash_vision_exp",
-		"deepseek/deepseek-v4-flash-vision-exp",
+		provider.GatewayDeepSeekTranslationProviderID,
+		provider.GatewayDeepSeekModelAlias,
 		"baseline-deepseek-v4-2026-08",
 		0.99, // Higher quality score
 		"http://127.0.0.1:8080",
@@ -162,14 +162,14 @@ func TestRouter_TranslationHybridProfile_FrozenOrderingRegardlessOfQuality(t *te
 	}
 
 	// Frozen production ordering MUST still hold: Gemini > DeepSeek, with no local LLM fallback.
-	if res.SelectedProvider.ID() != "gateway_gemini_3_8_flash" {
+	if res.SelectedProvider.ID() != provider.GatewayGeminiTranslationProviderID {
 		t.Fatalf("expected primary provider gateway_gemini_3_8_flash, got: %s", res.SelectedProvider.ID())
 	}
 	if len(res.FallbackOrdered) != 1 {
 		t.Fatalf("expected 1 fallback provider, got %d", len(res.FallbackOrdered))
 	}
-	if res.FallbackOrdered[0].ID() != "gateway_deepseek_v4_flash_vision_exp" {
-		t.Fatalf("expected first fallback gateway_deepseek_v4_flash_vision_exp, got: %s", res.FallbackOrdered[0].ID())
+	if res.FallbackOrdered[0].ID() != provider.GatewayDeepSeekTranslationProviderID {
+		t.Fatalf("expected first fallback gateway_deepseek_v4_1_flash, got: %s", res.FallbackOrdered[0].ID())
 	}
 }
 
@@ -179,7 +179,7 @@ func TestRouter_TranslationHybridProfile_FrozenOrderingIgnoresPreferredProviderO
 
 	gemini, _ := provider.NewGatewayTranslationProvider(
 		provider.GatewayGeminiTranslationProviderID,
-		"gemini-3.8-flash",
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.90,
 		"http://127.0.0.1:8080",
@@ -189,7 +189,7 @@ func TestRouter_TranslationHybridProfile_FrozenOrderingIgnoresPreferredProviderO
 
 	deepseek, _ := provider.NewGatewayTranslationProvider(
 		provider.GatewayDeepSeekTranslationProviderID,
-		"deepseek/deepseek-v4-flash-vision-exp",
+		provider.GatewayDeepSeekModelAlias,
 		"baseline-deepseek-v4-2026-08",
 		0.99,
 		"http://127.0.0.1:8080",
@@ -277,8 +277,8 @@ func TestRouter_TranslationAttemptProvenance_RecordsObservedModelAndBaseline(t *
 
 	reg := provider.NewRegistry()
 	gemini, _ := provider.NewGatewayTranslationProvider(
-		"gateway_gemini_3_8_flash",
-		"gemini-3.8-flash",
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
 		"baseline-gemini-3.8-flash-2026-08",
 		0.99,
 		"http://127.0.0.1:8080",
@@ -307,10 +307,10 @@ func TestRouter_TranslationAttemptProvenance_RecordsObservedModelAndBaseline(t *
 	}
 
 	att := attempts[0]
-	if att.ProviderID != "gateway_gemini_3_8_flash" {
+	if att.ProviderID != provider.GatewayGeminiTranslationProviderID {
 		t.Fatalf("unexpected provider id: %s", att.ProviderID)
 	}
-	if att.ObservedModel != "gemini-3.8-flash" {
+	if att.ObservedModel != provider.GatewayGeminiModelAlias {
 		t.Fatalf("expected observed model 'gemini-3.8-flash', got %q", att.ObservedModel)
 	}
 	if att.ServiceBaselineID != "baseline-gemini-3.8-flash-2026-08" {

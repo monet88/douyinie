@@ -190,10 +190,21 @@ var zhNegationExceptions = []string{
 	"无聊", "无论", "无论如何", "无奈", "无数", "无所谓", "无辜", "无端", "无暇", "无微不至", "无独有偶",
 	// Non-negating words containing 不
 	"不小心", "不过", "不管", "不仅", "不得了", "不由得", "不料", "不经意", "不良", "不断", "不愧", "不知不觉", "不在话下", "差不多", "并不",
+	"不透明度", "不锈钢", "不禁", "不好意思", "不客气", "不可思议", "不朽",
 	// Existing exceptions
 	"非常", "不仅", "不管", "特别", "非凡", "非洲", "无可挑剔", "是非",
 	// Non-negating words containing 没
 	"沉没", "淹没", "埋没",
+}
+
+// Words containing negation characters that have ambiguous polarity: they carry
+// genuinely negative meaning (e.g. 不足 "insufficient", 不如 "not as good as",
+// 不一定 "not necessarily"), but depending on the target language may naturally
+// be translated with a negator ("không đủ", "không bằng", "chưa chắc") or without
+// one ("thiếu", "kém hơn"). When the source text's only negation signal comes from
+// these compounds, the QA gate accepts both target polarities.
+var zhAmbiguousNegationCompounds = []string{
+	"不如", "不足", "不一定", "不可避免", "不幸", "不同", "不安",
 }
 
 // Vietnamese grammatical negation markers.
@@ -458,29 +469,30 @@ func (g *MeaningFirstQAGate) ValidateSegment(source, target, srcLang, tgtLang st
 	// 4. Negation Polarity Check
 	srcNeg := detectNegation(src, srcLang)
 	tgtNeg := detectNegation(tgt, tgtLang)
+	srcAmbiguous := detectNegationAmbiguous(src, srcLang)
 
 	if srcNeg != tgtNeg {
-		status := "affirmative -> negative"
-		if srcNeg {
-			status = "negative -> affirmative"
+		if !(srcAmbiguous && !srcNeg && tgtNeg) {
+			status := "affirmative -> negative"
+			if srcNeg {
+				status = "negative -> affirmative"
+			}
+			violations = append(violations, fmt.Sprintf("negation polarity inverted (%s)", status))
+			return QAResult{
+				Passed:           false,
+				Confidence:       0.1,
+				ExtractedFacts:   facts,
+				NegationPolarity: srcNeg,
+				Violations:       violations,
+				Err:              fmt.Errorf("%w: %s", domain.ErrNegationInverted, status),
+			}
 		}
-		violations = append(violations, fmt.Sprintf("negation polarity inverted (%s)", status))
-		return QAResult{
-			Passed:           false,
-			Confidence:       0.1,
-			ExtractedFacts:   facts,
-			NegationPolarity: srcNeg,
-			Violations:       violations,
-			Err:              fmt.Errorf("%w: %s", domain.ErrNegationInverted, status),
-		}
-	}
-
-	if srcNeg {
+		facts = append(facts, "polarity:ambiguous")
+	} else if srcNeg {
 		facts = append(facts, "polarity:negative")
 	} else {
 		facts = append(facts, "polarity:affirmative")
 	}
-
 	// 5. Named Entities / Brand Preservation Check
 	for _, ent := range knownEntities {
 		if strings.Contains(src, ent.ZH) {
@@ -1096,6 +1108,9 @@ func detectNegation(text, lang string) bool {
 		for _, exc := range zhNegationExceptions {
 			cleaned = strings.ReplaceAll(cleaned, exc, "")
 		}
+		for _, amb := range zhAmbiguousNegationCompounds {
+			cleaned = strings.ReplaceAll(cleaned, amb, "")
+		}
 		// A-not-A or interrogative question particles (e.g. "好不", "行不", "对不", "喜欢你不", "...不")
 		// where "不" is at the end of a sentence or at a clause boundary before a new subject/discourse clause
 		// (which frequently occurs without punctuation in ASR streams) functions as a confirmation /
@@ -1186,6 +1201,29 @@ func detectNegation(text, lang string) bool {
 	return false
 }
 
+// detectNegationAmbiguous reports whether the text's only potential negation signal
+// comes from an ambiguous Chinese compound (e.g. 不足, 不如, 不一定) whose target
+// translation may legitimately be expressed with or without a grammatical negator.
+func detectNegationAmbiguous(text, lang string) bool {
+	switch strings.ToLower(lang) {
+	case "zh", "zh-cn", "zh-tw":
+	default:
+		return false
+	}
+	// If the text has an independent grammatical negation marker (e.g. 不, 没, 别),
+	// it is strictly negative; ambiguity does not apply.
+	if detectNegation(text, lang) {
+		return false
+	}
+	cjkClean := stripCJKSpaces(text)
+	for _, amb := range zhAmbiguousNegationCompounds {
+		if strings.Contains(cjkClean, amb) {
+			return true
+		}
+	}
+	return false
+}
+
 func containsJapaneseKana(s string) bool {
 	for _, r := range s {
 		if (r >= 0x3040 && r <= 0x309F) || (r >= 0x30A0 && r <= 0x30FF) {
@@ -1259,8 +1297,13 @@ func isProtectedASCIIToken(tok string) bool {
 	// Digit-bearing token with letters (e.g. 4K, MP4, H264).
 	// Exclude pure quantity+unit compounds like 3MINUTE, 20KG, 500ML which are
 	// measurements/durations rather than proprietary names/brands.
+	// Also exclude long alphanumeric codes (length > 6) like SO50L207 as they are
+	// typically model numbers or OCR noise, not mandatory entities.
 	if hasDigit && (hasUpper || hasLower) {
 		if isQuantityToken(tok) {
+			return false
+		}
+		if len(tok) > 6 {
 			return false
 		}
 		return true
@@ -1289,17 +1332,12 @@ func isProtectedASCIIToken(tok string) bool {
 	}
 
 	// All-caps tokens:
-	// Short acronyms (2-3 chars, e.g. HD, CAE, AI, 4K, 5G) are protected.
-	// Common lexical English words (e.g. SOY, TEA, ICE, RED, BIG, ONE) and ordinary
-	// all-caps words (>= 4 chars like TOTAL, DAMAGE) are not protected
-	// solely because of uppercase formatting unless listed in knownEntities (e.g. SUPOR).
+	// We no longer automatically protect short acronyms (<= 3 chars, e.g. TM, SUP) because they are
+	// frequently OCR noise from watermarks or packaging. Genuine short brands must be listed in knownEntities.
+	// Common lexical English words (e.g. SOY, TEA) and ordinary all-caps words (>= 4 chars like TOTAL, DAMAGE)
+	// are also not protected solely because of uppercase formatting.
 	if hasUpper && !hasLower && !hasDigit {
-		if len(tok) <= 3 {
-			if isCommonEnglishLexicalWord(tok) {
-				return false
-			}
-			return true
-		}
+		return false
 	}
 
 	return false

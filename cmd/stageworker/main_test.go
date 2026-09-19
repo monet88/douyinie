@@ -339,3 +339,123 @@ func TestAudioRole_SourceMixNotMappedToVocalsWhenExplicitVocalsAbsent(t *testing
 		t.Fatalf("expected bgAudio to remain empty, got %q", bgAudio)
 	}
 }
+
+// writeInertFile writes a placeholder file. On Windows exec.LookPath only stats
+// an exe path, so an inert file stands in for an interpreter and the resolution
+// tests need no real venv. On Unix, exec.LookPath requires the executable bit,
+// so the placeholder is created with 0755.
+func writeInertFile(t *testing.T, dir, name string) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, []byte("inert placeholder\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// Issue #106: the diarizer family resolves DOUYINIE_DIARIZER_PYTHON_BIN ahead
+// of the shared interpreter, while asr/aligner keep the shared one in the same
+// session.
+func TestResolveDiarizerRunnerHonoursPerFamilyInterpreter(t *testing.T) {
+	shared := writeInertFile(t, t.TempDir(), "asr-python.exe")
+	diarizerPy := writeInertFile(t, t.TempDir(), "diarizer-python.exe")
+	diarizerAdapter := writeInertFile(t, t.TempDir(), "diarizer_3dspeaker.py")
+	asrAdapter := writeInertFile(t, t.TempDir(), "asr_qwen3.py")
+	alignerAdapter := writeInertFile(t, t.TempDir(), "aligner_qwen3.py")
+
+	t.Setenv("DOUYINIE_DIARIZER_BIN", "")
+	t.Setenv("DOUYINIE_ASR_BIN", "")
+	t.Setenv("DOUYINIE_ALIGNER_BIN", "")
+	t.Setenv("DOUYINIE_PYTHON_BIN", shared)
+	t.Setenv("DOUYINIE_DIARIZER_PYTHON_BIN", diarizerPy)
+	t.Setenv("DOUYINIE_DIARIZER_ADAPTER", diarizerAdapter)
+	t.Setenv("DOUYINIE_ASR_ADAPTER", asrAdapter)
+	t.Setenv("DOUYINIE_ALIGNER_ADAPTER", alignerAdapter)
+
+	diarizer, err := resolveDiarizerRunner()
+	if err != nil {
+		t.Fatalf("diarizer runner resolution failed: %v", err)
+	}
+	if diarizer.binary != diarizerPy {
+		t.Fatalf("diarizer resolved interpreter %q, want DOUYINIE_DIARIZER_PYTHON_BIN %q", diarizer.binary, diarizerPy)
+	}
+	if len(diarizer.args) != 1 || diarizer.args[0] != diarizerAdapter {
+		t.Fatalf("diarizer runner args %v, want the adapter %q", diarizer.args, diarizerAdapter)
+	}
+
+	asr, err := resolveASRRunner()
+	if err != nil {
+		t.Fatalf("asr runner resolution failed: %v", err)
+	}
+	if asr.binary != shared {
+		t.Fatalf("asr resolved interpreter %q, want the shared DOUYINIE_PYTHON_BIN %q", asr.binary, shared)
+	}
+
+	aligner, err := resolveAlignerRunner()
+	if err != nil {
+		t.Fatalf("aligner runner resolution failed: %v", err)
+	}
+	if aligner.binary != shared {
+		t.Fatalf("aligner resolved interpreter %q, want the shared DOUYINIE_PYTHON_BIN %q", aligner.binary, shared)
+	}
+}
+
+// Issue #106: a configured-but-unusable diarizer interpreter fails closed with
+// the variable name and the path, and never falls back to a usable interpreter
+// that would reproduce the opaque DIARIZER_EXEC_FAILED.
+func TestResolveDiarizerRunnerMisconfiguredInterpreterFailsClosed(t *testing.T) {
+	shared := writeInertFile(t, t.TempDir(), "asr-python.exe")
+	diarizerAdapter := writeInertFile(t, t.TempDir(), "diarizer_3dspeaker.py")
+
+	t.Setenv("DOUYINIE_DIARIZER_BIN", "")
+	t.Setenv("DOUYINIE_PYTHON_BIN", shared)
+	t.Setenv("DOUYINIE_DIARIZER_ADAPTER", diarizerAdapter)
+
+	cases := []struct {
+		name    string
+		badPath string
+	}{
+		{"missing path", filepath.Join(t.TempDir(), "missing", "python.exe")},
+		{"directory instead of interpreter", t.TempDir()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("DOUYINIE_DIARIZER_PYTHON_BIN", tc.badPath)
+			runner, err := resolveDiarizerRunner()
+			if err == nil {
+				t.Fatalf("expected a fail-closed error for DOUYINIE_DIARIZER_PYTHON_BIN=%q, got runner %+v", tc.badPath, runner)
+			}
+			for _, want := range []string{"DIARIZER_RUNTIME_MISSING", "DOUYINIE_DIARIZER_PYTHON_BIN", tc.badPath} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q must name %q", err.Error(), want)
+				}
+			}
+			if runner.binary != "" {
+				t.Fatalf("misconfigured diarizer interpreter produced runner %q", runner.binary)
+			}
+			if strings.Contains(err.Error(), shared) {
+				t.Fatalf("error %q must not fall back to the shared interpreter %q", err.Error(), shared)
+			}
+		})
+	}
+}
+
+// Issue #106: an unset DOUYINIE_DIARIZER_PYTHON_BIN keeps the previous
+// behaviour — the diarizer family resolves the shared interpreter.
+func TestResolveDiarizerRunnerFallsBackToSharedInterpreter(t *testing.T) {
+	shared := writeInertFile(t, t.TempDir(), "asr-python.exe")
+	adapter := writeInertFile(t, t.TempDir(), "diarizer_3dspeaker.py")
+
+	t.Setenv("DOUYINIE_DIARIZER_BIN", "")
+	t.Setenv("DOUYINIE_DIARIZER_PYTHON_BIN", "")
+	t.Setenv("DOUYINIE_PYTHON_BIN", shared)
+	t.Setenv("DOUYINIE_DIARIZER_ADAPTER", adapter)
+
+	runner, err := resolveDiarizerRunner()
+	if err != nil {
+		t.Fatalf("unset DOUYINIE_DIARIZER_PYTHON_BIN must keep the shared-interpreter behaviour: %v", err)
+	}
+	if runner.binary != shared {
+		t.Fatalf("diarizer resolved interpreter %q, want the shared interpreter %q", runner.binary, shared)
+	}
+}

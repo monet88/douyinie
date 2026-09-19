@@ -1,11 +1,16 @@
 package service_test
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/service"
+	"github.com/monet88/douyinie/internal/storage"
 )
 
 func TestMeaningFirstQAGate_ValidPairs(t *testing.T) {
@@ -45,6 +50,55 @@ func TestMeaningFirstQAGate_ValidPairs(t *testing.T) {
 			target:  "The weather is very good today. Let's go for a walk in the park.",
 			srcLang: "zh",
 			tgtLang: "en",
+		},
+		{
+			name:    "Lexical compound 不 (不透明度) does not require target negation",
+			source:  "点击不透明度，拉到一百",
+			target:  "nhấn vào Độ mờ, kéo lên 100",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "Lexical compound 不 (不锈钢) does not require target negation",
+			source:  "这个是不锈钢材质",
+			target:  "cái này là chất liệu inox",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "Lexical compound 不 (不一定) translated without target negation",
+			source:  "明天不一定下雨",
+			target:  "Ngày mai có lẽ mưa",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "Lexical compound 不 (不可避免) translated as affirmative word",
+			source:  "这是不可避免的",
+			target:  "Điều này là tất yếu",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "Lexical compound 不 (不可避免) translated with target negation",
+			source:  "这是不可避免的",
+			target:  "Điều này là không thể tránh khỏi",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "Short OCR non-word token TM dropped without penalty",
+			source:  "最新款式 TM",
+			target:  "Kiểu dáng mới nhất",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "Long alphanumeric code dropped without penalty",
+			source:  "型号SO50L207",
+			target:  "Model 50 207",
+			srcLang: "zh",
+			tgtLang: "vi",
 		},
 	}
 
@@ -171,6 +225,17 @@ func TestMeaningFirstQAGate_NegationInversion(t *testing.T) {
 		t.Errorf("expected ErrNegationInverted, got: %v", res1.Err)
 	}
 
+	// Genuine sentence-level prohibition inverted
+	srcProhibit := "务必别打开窗户"
+	tgtProhibit := "Hãy mở cửa sổ" // "Don't open" -> "Please open"
+	resProhibit := qa.ValidateSegment(srcProhibit, tgtProhibit, "zh", "vi")
+	if resProhibit.Passed {
+		t.Fatalf("expected QA gate to reject dropped prohibition, but it passed")
+	}
+	if !errors.Is(resProhibit.Err, domain.ErrNegationInverted) {
+		t.Errorf("expected ErrNegationInverted, got: %v", resProhibit.Err)
+	}
+
 	// 2. Source affirmative -> Target negative (inverted)
 	src2 := "我们去公园散步吧。"
 	tgt2 := "We should not go to the park." // Affirmative -> Negative
@@ -286,37 +351,42 @@ func TestMeaningFirstQAGate_AllCapsLexicalWordsNotProtected(t *testing.T) {
 	qa := service.NewMeaningFirstQAGate()
 
 	// "TOTAL DAMAGE CAE" translated naturally to Vietnamese where TOTAL and DAMAGE
-	// are translated as "Tổng thiệt hại" but short acronym CAE is preserved.
-	source := "TOTAL DAMAGE CAE"
-	naturalTarget := "Tổng thiệt hại CAE"
+	// are translated as "Tổng thiệt hại" but the brand SUPOR is preserved.
+	source := "TOTAL DAMAGE SUPOR"
+	naturalTarget := "Tổng thiệt hại SUPOR"
 
 	res := qa.ValidateSegment(source, naturalTarget, "en", "vi")
 	if !res.Passed {
-		t.Fatalf("expected natural translation of 'TOTAL DAMAGE CAE' to pass, but got violations: %v, err: %v", res.Violations, res.Err)
+		t.Fatalf("expected natural translation of 'TOTAL DAMAGE SUPOR' to pass, but got violations: %v, err: %v", res.Violations, res.Err)
 	}
 
-	// If the short acronym CAE is dropped/corrupted, it MUST still fail
+	// If the brand SUPOR is dropped/corrupted, it MUST still fail
 	corruptedTarget := "Tổng thiệt hại hoàn toàn"
 	resCorrupted := qa.ValidateSegment(source, corruptedTarget, "en", "vi")
 	if resCorrupted.Passed {
-		t.Fatalf("expected dropped acronym CAE to fail QA gate, but it passed")
+		t.Fatalf("expected dropped token SUPOR to fail QA gate, but it passed")
 	}
 	if !errors.Is(resCorrupted.Err, domain.ErrNameCorrupted) {
-		t.Errorf("expected ErrNameCorrupted for dropped CAE, got: %v", resCorrupted.Err)
+		t.Errorf("expected ErrNameCorrupted for dropped SUPOR, got: %v", resCorrupted.Err)
 	}
 }
 
 func TestMeaningFirstQAGate_ProtectedASCIIFormsRetained(t *testing.T) {
 	qa := service.NewMeaningFirstQAGate()
 
-	// 1. Short acronym (HD) preserved
-	resHD := qa.ValidateSegment("Video quay ở chế độ HD sắc nét.", "Video shot in HD is sharp.", "vi", "en")
-	if !resHD.Passed {
-		t.Fatalf("expected HD preserved to pass, got: %v", resHD.Err)
+	// 1. Digit-bearing token (MP4) preserved
+	resMP4 := qa.ValidateSegment("Video xuất ra định dạng MP4.", "Video exported in MP4 format.", "vi", "en")
+	if !resMP4.Passed {
+		t.Fatalf("expected MP4 preserved to pass, got: %v", resMP4.Err)
 	}
-	resHDDrop := qa.ValidateSegment("Video quay ở chế độ HD sắc nét.", "Video shot in high definition is sharp.", "vi", "en")
-	if resHDDrop.Passed {
-		t.Fatalf("expected dropped HD to fail, but passed")
+	// Target preserves numeric fact '4' while dropping the letters of the protected ASCII token 'MP4'.
+	// Must fail closed with ErrNameCorrupted rather than tripping on a missing number.
+	resMP4Drop := qa.ValidateSegment("Video xuất ra định dạng MP4.", "Video exported in 4 format.", "vi", "en")
+	if resMP4Drop.Passed {
+		t.Fatalf("expected dropped MP4 to fail, but passed")
+	}
+	if !errors.Is(resMP4Drop.Err, domain.ErrNameCorrupted) {
+		t.Errorf("expected ErrNameCorrupted for dropped MP4 token, got: %v", resMP4Drop.Err)
 	}
 
 	// 2. Digit-bearing token (4K) preserved
@@ -324,9 +394,13 @@ func TestMeaningFirstQAGate_ProtectedASCIIFormsRetained(t *testing.T) {
 	if !res4K.Passed {
 		t.Fatalf("expected 4K preserved to pass, got: %v", res4K.Err)
 	}
-	res4KDrop := qa.ValidateSegment("Hỗ trợ xuất video 4K siêu nét.", "Supports ultra high resolution video export.", "vi", "en")
+	// Target preserves numeric fact '4' while dropping '4K' token.
+	res4KDrop := qa.ValidateSegment("Hỗ trợ xuất video 4K siêu nét.", "Supports ultra high resolution 4 video export.", "vi", "en")
 	if res4KDrop.Passed {
 		t.Fatalf("expected dropped 4K to fail, but passed")
+	}
+	if !errors.Is(res4KDrop.Err, domain.ErrNameCorrupted) {
+		t.Errorf("expected ErrNameCorrupted for dropped 4K token, got: %v", res4KDrop.Err)
 	}
 
 	// 3. Known entity brand (SUPOR) remains protected even though >= 4 chars all-caps
@@ -700,5 +774,252 @@ func TestMeaningFirstQAGate_TraditionalNegationMarker(t *testing.T) {
 	}
 	if !errors.Is(resInvert.Err, domain.ErrNegationInverted) {
 		t.Fatalf("expected ErrNegationInverted for genuine inversion, got: %v", resInvert.Err)
+	}
+}
+
+func TestMeaningFirstQAGate_AmbiguousNegationCompounds(t *testing.T) {
+	qa := service.NewMeaningFirstQAGate()
+
+	// 1. Genuinely negative compounds translated with target negators (e.g. không đủ, không bằng, chưa chắc)
+	// must PASS rather than being rejected as affirmative -> negative inversions.
+	passCases := []struct {
+		name    string
+		src     string
+		tgt     string
+		srcLang string
+		tgtLang string
+	}{
+		{
+			name:    "不足 with Vietnamese negator (không đủ)",
+			src:     "他的经验不足以胜任这份工作",
+			tgt:     "Kinh nghiệm của anh ấy không đủ để đảm nhận công việc này",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "不足 with affirmative lexicalization (thiếu)",
+			src:     "他的经验不足以胜任这份工作",
+			tgt:     "Kinh nghiệm của anh ấy thiếu để đảm nhận công việc này",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "不如 with Vietnamese negator (không bằng)",
+			src:     "做这个不如做那个",
+			tgt:     "Làm cái này không bằng làm cái kia",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "不如 with affirmative lexicalization (kém hơn)",
+			src:     "做这个不如做那个",
+			tgt:     "Làm cái này kém hơn làm cái kia",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "不一定 with Vietnamese negator (chưa chắc)",
+			src:     "明天不一定会下雪",
+			tgt:     "Ngày mai chưa chắc sẽ có tuyết rơi",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "不一定 with Vietnamese negator (không hẳn)",
+			src:     "明天不一定会下雪",
+			tgt:     "Ngày mai không hẳn sẽ có tuyết rơi",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "不一定 with affirmative lexicalization (có lẽ)",
+			src:     "明天不一定会下雪",
+			tgt:     "Ngày mai có lẽ sẽ có tuyết rơi",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+	}
+
+	for _, tc := range passCases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := qa.ValidateSegment(tc.src, tc.tgt, tc.srcLang, tc.tgtLang)
+			if !res.Passed {
+				t.Fatalf("expected %q -> %q to pass QA, but failed: violations=%v err=%v",
+					tc.src, tc.tgt, res.Violations, res.Err)
+			}
+		})
+	}
+
+	// 2. Ordinary affirmative text with no negation, translated with a negator,
+	// MUST FAIL with ErrNegationInverted (hard requirement: live inversion detection).
+	failInversions := []struct {
+		name    string
+		src     string
+		tgt     string
+		srcLang string
+		tgtLang string
+	}{
+		{
+			name:    "Ordinary affirmative translated with negator",
+			src:     "这首歌的旋律非常动听",
+			tgt:     "Giai điệu bài hát này không hay",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "True polarity-neutral compound (非常) translated with negator",
+			src:     "今天的天气非常暖和",
+			tgt:     "Hôm nay thời tiết không ấm áp",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "True polarity-neutral compound (无聊) translated with negator",
+			src:     "这部电影真无聊",
+			tgt:     "Bộ phim này không nhạt nhẽo",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
+			name:    "Ambiguous compound with genuine standalone negator dropped",
+			src:     "方案不足，但请不要放弃",
+			tgt:     "Phương án thiếu, nhưng hãy từ bỏ",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+	}
+
+	for _, tc := range failInversions {
+		t.Run(tc.name, func(t *testing.T) {
+			res := qa.ValidateSegment(tc.src, tc.tgt, tc.srcLang, tc.tgtLang)
+			if res.Passed {
+				t.Fatalf("expected genuine inversion %q -> %q to FAIL QA, but it passed", tc.src, tc.tgt)
+			}
+			if !errors.Is(res.Err, domain.ErrNegationInverted) {
+				t.Fatalf("expected ErrNegationInverted, got: %v", res.Err)
+			}
+		})
+	}
+}
+
+func TestTranslationService_FlaggedFallback_RefusesOnRouterFailClosed(t *testing.T) {
+	db, casStore, router, reg := setupTranslationTestEnv(t)
+	svc := service.NewTranslationService(db, casStore)
+	svc.ConfigureRouter(router)
+
+	ctx := context.Background()
+	runID := uuid.NewString()
+	assetID := uuid.NewString()
+	jobID := "job-fail-closed-test"
+	seedTranslationTestRun(t, db, ctx, assetID, runID, jobID)
+
+	// Candidate 1 (primary, fake_llm_translator) trips the QA gate by corrupting semantic facts.
+	p1, ok := reg.Get("fake_llm_translator")
+	if !ok {
+		t.Fatal("fake_llm_translator not found")
+	}
+	fake1 := p1.(*provider.FakeTranslationProvider)
+	fake1.CustomTranslations["今天天气很好。"] = "Hôm nay thời tiết rất tệ."
+
+	// Candidate 2 (fallback, fake_local_translator_fallback) fails with a fail-closed provenance error.
+	p2, ok := reg.Get("fake_local_translator_fallback")
+	if !ok {
+		t.Fatal("fake_local_translator_fallback not found")
+	}
+	fake2 := p2.(*provider.FakeTranslationProvider)
+	fake2.InjectError = domain.ErrInconsistentProvenance
+
+	_, err := svc.Translate(ctx, domain.TranslationJobInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		JobID:          jobID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "今天天气很好。", StartMs: 0, EndMs: 1000},
+		},
+	})
+	if err == nil {
+		t.Fatalf("expected fail-closed router error to abort execution, but got nil err and published variant")
+	}
+	if !errors.Is(err, domain.ErrInconsistentProvenance) {
+		t.Fatalf("expected ErrInconsistentProvenance to be preserved, got: %v", err)
+	}
+}
+func seedTranslationTestRun(t *testing.T, db *storage.DB, ctx context.Context, assetID, runID, jobID string) {
+	t.Helper()
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              attID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		DeclaredBy:      "test-operator",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		RightsAttestationID: attID,
+		SHA256:              "fake-sha256",
+		ByteSize:            1024,
+		CreatedAt:           time.Now().UTC(),
+	})
+	_ = db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             jobID,
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		CreatedAt:      time.Now().UTC(),
+	})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        runID,
+		JobID:     jobID,
+		Status:    "running",
+		CreatedAt: time.Now().UTC(),
+	})
+}
+
+func TestTranslationService_FlaggedFallback_PublishesWhenAllLanesTripQA(t *testing.T) {
+	db, casStore, router, reg := setupTranslationTestEnv(t)
+	svc := service.NewTranslationService(db, casStore)
+	svc.ConfigureRouter(router)
+
+	ctx := context.Background()
+	runID := uuid.NewString()
+	assetID := uuid.NewString()
+	jobID := "job-flagged-test"
+	seedTranslationTestRun(t, db, ctx, assetID, runID, jobID)
+
+	// Both candidate 1 and candidate 2 trip the QA gate with semantic fact corruption.
+	p1, ok := reg.Get("fake_llm_translator")
+	if !ok {
+		t.Fatal("fake_llm_translator not found")
+	}
+	fake1 := p1.(*provider.FakeTranslationProvider)
+	fake1.CustomTranslations["今天天气很好。"] = "Hôm nay thời tiết rất tệ."
+
+	p2, ok := reg.Get("fake_local_translator_fallback")
+	if !ok {
+		t.Fatal("fake_local_translator_fallback not found")
+	}
+	fake2 := p2.(*provider.FakeTranslationProvider)
+	fake2.CustomTranslations["今天天气很好。"] = "Hôm nay thời tiết rất tệ."
+
+	variant, err := svc.Translate(ctx, domain.TranslationJobInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		JobID:          jobID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "今天天气很好。", StartMs: 0, EndMs: 1000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected flagged fallback to publish best flagged candidate, got err: %v", err)
+	}
+	if variant == nil || len(variant.Segments) != 1 {
+		t.Fatalf("expected published variant with 1 segment, got: %v", variant)
+	}
+	if variant.Segments[0].PassedQAGate {
+		t.Fatalf("expected segment to stay flagged, got PassedQAGate=true")
 	}
 }

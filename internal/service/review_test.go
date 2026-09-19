@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/media"
@@ -541,6 +542,82 @@ func TestReviewService_CorruptCAS_ReturnsError(t *testing.T) {
 	}
 }
 
+// A replay run consumes the dub stage's artifact without owning a dub_segments_variants row of its own, so
+// a run-scoped projection found nothing and the blocker never reached the operator: the run shipped with the
+// source dialogue stripped and no voice, and the queue showed only the unrelated OCR items (live evidence,
+// run 959e8dab). The projection must read the variant through the run's own stage execution.
+func TestReviewService_ReplayRunProjectsDubOverrunFromStageArtifact(t *testing.T) {
+	svc, db, casStore, assetID := setupReviewTestHarness(t)
+	ctx := context.Background()
+	const originRun, replayRun = "run-dub-origin", "run-dub-replay"
+
+	dubSegVar := domain.DubSegmentsVariant{
+		ID:             "dub-seg-replay-1",
+		AssetID:        assetID,
+		RunID:          originRun,
+		TargetLanguage: "vi",
+		ProvenanceHash: "prov-dub-replay-1",
+		OverallStatus:  "REVIEW_REQUIRED",
+		ReviewSegments: []domain.DubSegmentReview{
+			{
+				Index:              0,
+				SpeakerID:          "SPEAKER_00",
+				StartMs:            0,
+				EndMs:              12400,
+				SlotDurationMs:     12400,
+				MeasuredDurationMs: 13520,
+				FitDecision:        domain.FitActionReview,
+				ReviewReason:       "DURATION_OVERRUN",
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dubSegBytes, _ := json.Marshal(dubSegVar)
+	dubSegObj, _ := casStore.Put(bytes.NewReader(dubSegBytes))
+	if err := db.SaveDubSegmentsVariantIndex(ctx, storage.DubSegmentsVariantIndex{
+		ID:             dubSegVar.ID,
+		AssetID:        assetID,
+		RunID:          originRun,
+		TargetLanguage: "vi",
+		CASHash:        dubSegObj.SHA256,
+		ProvenanceHash: dubSegVar.ProvenanceHash,
+		OverallStatus:  "REVIEW_REQUIRED",
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("save dub segments index: %v", err)
+	}
+
+	// The replay run's own record: it ran dub_synthesize and consumed that artifact.
+	now := time.Now().UTC()
+	job := domain.LocalizationJob{ID: "job-dub-replay", SourceAssetID: assetID, TargetLanguage: "vi", Status: "running", CreatedAt: now}
+	if err := db.CreateJob(ctx, job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: replayRun, JobID: job.ID, Status: "running", ConfigSnapshotJSON: "{}", CreatedAt: now}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID: uuid.NewString(), RunID: replayRun, Stage: "dub_synthesize", Status: "succeeded",
+		ArtifactSHA256: dubSegObj.SHA256, StartedAt: &now, CompletedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create stage execution: %v", err)
+	}
+
+	items, err := svc.ProjectReviewItemsForRun(ctx, assetID, "vi", replayRun)
+	if err != nil {
+		t.Fatalf("ProjectReviewItemsForRun failed: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected the replay run to project its dub overrun, got %d item(s): %+v", len(items), items)
+	}
+	if items[0].Type != domain.ReviewItemTypeTTSOverrun || items[0].Severity != "blocker" {
+		t.Errorf("expected a blocker TTS overrun item, got type=%s severity=%s", items[0].Type, items[0].Severity)
+	}
+	if items[0].StartMs != 0 || items[0].EndMs != 12400 {
+		t.Errorf("item must carry the segment slot it names, got %d-%d", items[0].StartMs, items[0].EndMs)
+	}
+}
+
 func TestReviewService_ManualOverride_LeavesExceptionQueue(t *testing.T) {
 	svc, db, casStore, assetID := setupReviewTestHarness(t)
 	ctx := context.Background()
@@ -947,6 +1024,270 @@ func TestReviewService_CorrectTargetText_TargetedRerunAndAutoResolution(t *testi
 	}
 	if len(subArt.Cues) == 0 {
 		t.Errorf("expected subtitle plan artifact to have cues")
+	}
+}
+
+// Segment indices are the source speech-block indices, so they are sparse: a clip whose speech blocks are
+// 0 and 6 carries those two indices in a two-element slice. Resolving the correction by slice position
+// rejected the operator's edit of the overrunning segment (live evidence, run eec68c8d: "segment index 6
+// out of bounds (total 4)") and, worse, would have patched the wrong segment whenever the index happened
+// to fit.
+func TestReviewService_CorrectTargetText_ResolvesSparseSegmentIndices(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+
+	transVar := domain.TranslationVariant{
+		ID:             "trans-sparse-1",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		SourceLanguage: "zh",
+		ProvenanceHash: "prov-trans-sparse",
+		OverallQAScore: 0.5,
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "点击右上角", TargetText: "Nhấn vào góc trên bên phải của màn hình", StartMs: 0, EndMs: 1500, QAConfidence: 0.9, PassedQAGate: true},
+			{Index: 6, SourceText: "以及独特的水下景观", TargetText: "cùng cảnh quan dưới nước vô cùng độc đáo", StartMs: 21840, EndMs: 27040, QAConfidence: 0.9, PassedQAGate: true},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(transVar)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID: transVar.ID, AssetID: assetID, TargetLanguage: "vi", CASHash: tObj.SHA256,
+		ProvenanceHash: transVar.ProvenanceHash, OverallQAScore: transVar.OverallQAScore, CreatedAt: transVar.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save translation index: %v", err)
+	}
+
+	dubScriptVar := domain.DubScriptVariant{
+		ID:                    "dubscript-sparse-1",
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		SourceLanguage:        "zh",
+		TranslationVariantCAS: tObj.SHA256,
+		ProvenanceHash:        "prov-dubscript-sparse",
+		OverallQAScore:        0.5,
+		Segments: []domain.DubScriptSegment{
+			{Index: 0, SourceText: "点击右上角", MeaningText: transVar.Segments[0].TargetText, SpokenText: transVar.Segments[0].TargetText, SlotDurationMs: 1500, PassedQAGate: true, RequiresReview: true, ReviewReason: "DURATION_OVERRUN"},
+			{Index: 6, SourceText: "以及独特的水下景观", MeaningText: transVar.Segments[1].TargetText, SpokenText: transVar.Segments[1].TargetText, SlotDurationMs: 5200, PassedQAGate: true, RequiresReview: true, ReviewReason: "DURATION_OVERRUN"},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dsBytes, _ := json.Marshal(dubScriptVar)
+	dsObj, _ := casStore.Put(bytes.NewReader(dsBytes))
+	if err := db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID: dubScriptVar.ID, AssetID: assetID, TargetLanguage: "vi", CASHash: dsObj.SHA256,
+		ProvenanceHash: dubScriptVar.ProvenanceHash, OverallQAScore: dubScriptVar.OverallQAScore, CreatedAt: dubScriptVar.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save dub script index: %v", err)
+	}
+
+	res, err := svc.CorrectTargetText(ctx, service.TargetTextCorrectionInput{
+		AssetID:            assetID,
+		TargetLanguage:     "vi",
+		SegmentIndex:       6,
+		NewTargetText:      "cùng cảnh quan dưới nước độc đáo",
+		SpokenTextOverride: "cùng cảnh quan dưới nước độc đáo",
+		Reason:             "Shortened for the 5.2s slot",
+		Operator:           "editor_monet",
+	})
+	if err != nil {
+		t.Fatalf("CorrectTargetText must resolve segment index 6 to its position, got: %v", err)
+	}
+
+	rc, err := casStore.Get(res.TranslationVariantCAS)
+	if err != nil {
+		t.Fatalf("load corrected translation variant: %v", err)
+	}
+	defer rc.Close()
+	var corrected domain.TranslationVariant
+	if err := json.NewDecoder(rc).Decode(&corrected); err != nil {
+		t.Fatalf("decode corrected translation variant: %v", err)
+	}
+	if len(corrected.Segments) != 2 {
+		t.Fatalf("expected both segments preserved, got %d", len(corrected.Segments))
+	}
+	if corrected.Segments[1].Index != 6 || corrected.Segments[1].TargetText != "cùng cảnh quan dưới nước độc đáo" {
+		t.Errorf("segment 6 must carry the corrected text, got index=%d text=%q", corrected.Segments[1].Index, corrected.Segments[1].TargetText)
+	}
+	if corrected.Segments[0].TargetText != transVar.Segments[0].TargetText {
+		t.Errorf("segment 0 must stay untouched, got %q", corrected.Segments[0].TargetText)
+	}
+}
+
+// A mix refusal parks a run before its visual stage, so a text correction that answers that refusal runs
+// while no text region plan exists yet. Live evidence (run 27a758e6): all three tts_overrun corrections
+// failed with `text region plan not found: record not found`, leaving the operator holding a refusal they
+// could not act on. The correction must rebuild translation, dub script, fit and mix, and leave the visual
+// track and render plan to the resumed pipeline, which runs them after the mix.
+func TestReviewService_CorrectTargetText_BeforeVisualStage_RebuildsDubOnly(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+
+	transVar := domain.TranslationVariant{
+		ID:             "trans-premix-1",
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		SourceLanguage: "zh",
+		ProvenanceHash: "prov-trans-premix",
+		OverallQAScore: 0.5,
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "把手机放在水盆下方", TargetText: "Đặt điện thoại ở phía dưới chậu nước, bạn sẽ có được thước phim đậm chất điện ảnh", StartMs: 0, EndMs: 1500, QAConfidence: 0.9, PassedQAGate: true},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(transVar)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID: transVar.ID, AssetID: assetID, TargetLanguage: "vi", CASHash: tObj.SHA256,
+		ProvenanceHash: transVar.ProvenanceHash, OverallQAScore: transVar.OverallQAScore, CreatedAt: transVar.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save translation index: %v", err)
+	}
+
+	dubScriptVar := domain.DubScriptVariant{
+		ID:                    "dubscript-premix-1",
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		SourceLanguage:        "zh",
+		TranslationVariantCAS: tObj.SHA256,
+		ProvenanceHash:        "prov-dubscript-premix",
+		OverallQAScore:        0.5,
+		Segments: []domain.DubScriptSegment{
+			{Index: 0, SourceText: "把手机放在水盆下方", MeaningText: transVar.Segments[0].TargetText, SpokenText: transVar.Segments[0].TargetText, SlotDurationMs: 1500, PassedQAGate: true, RequiresReview: true, ReviewReason: "DURATION_OVERRUN"},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dsBytes, _ := json.Marshal(dubScriptVar)
+	dsObj, _ := casStore.Put(bytes.NewReader(dsBytes))
+	if err := db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID: dubScriptVar.ID, AssetID: assetID, TargetLanguage: "vi", CASHash: dsObj.SHA256,
+		ProvenanceHash: dubScriptVar.ProvenanceHash, OverallQAScore: dubScriptVar.OverallQAScore, CreatedAt: dubScriptVar.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save dub script index: %v", err)
+	}
+
+	// The pipeline stopped at audio_mix, so text_detection never ran and no plan exists to localize against.
+	if err := db.DeleteTextRegionPlanIndex(ctx, assetID, "prov-text-"+assetID); err != nil {
+		t.Fatalf("delete seeded text region plan: %v", err)
+	}
+
+	res, err := svc.CorrectTargetText(ctx, service.TargetTextCorrectionInput{
+		AssetID:            assetID,
+		TargetLanguage:     "vi",
+		SegmentIndex:       0,
+		NewTargetText:      "Đặt điện thoại dưới chậu nước, bạn có thước phim điện ảnh",
+		SpokenTextOverride: "Đặt điện thoại dưới chậu nước, bạn có thước phim điện ảnh",
+		Reason:             "tts_overrun: shorten to fit the slot",
+		Operator:           "editor_monet",
+	})
+	if err != nil {
+		t.Fatalf("a correction answering a mix refusal must not require a text region plan: %v", err)
+	}
+	if res.DubMixCAS == "" {
+		t.Errorf("expected the mix to be rebuilt: %+v", res)
+	}
+	if res.LocalizedSubtitleCAS != "" || res.RenderPlanCAS != "" {
+		t.Errorf("the visual stage never ran, so no visual track or render plan may be claimed: %+v", res)
+	}
+}
+
+// A resumed run replays whatever its stage rows recorded. The correction rebuilds the dub segments and
+// the mix, so it must record them: otherwise the resumed run reuses the pre-correction artifact and the
+// mixer refuses the very overrun the operator just fixed (live evidence: run 27a758e6 resumed from
+// `segment 0 measured 13280ms exceeds slot 12400ms` after all three segments had been shortened to fit).
+func TestReviewService_CorrectTargetText_RecordsRebuiltStagesForResume(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-resume-1"
+	now := time.Now().UTC()
+	if err := db.CreateJob(ctx, domain.LocalizationJob{
+		ID: "job-resume-1", SourceAssetID: assetID, TargetLanguage: "vi",
+		Status: "interrupted", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: "job-resume-1", Status: "interrupted", CreatedAt: now}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	staleCAS := "stale-dub-synthesize-cas"
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID: "se-stale", RunID: runID, Stage: "dub_synthesize", Status: domain.StageStatusSucceeded,
+		ArtifactSHA256: staleCAS, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("record stale stage: %v", err)
+	}
+
+	transVar := domain.TranslationVariant{
+		ID: "trans-resume-1", AssetID: assetID, TargetLanguage: "vi", SourceLanguage: "zh",
+		ProvenanceHash: "prov-trans-resume", OverallQAScore: 0.5,
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "点击右上角", TargetText: "Nhấn vào góc trên bên phải của màn hình", StartMs: 0, EndMs: 1500, QAConfidence: 0.9, PassedQAGate: true},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(transVar)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID: transVar.ID, RunID: runID, AssetID: assetID, TargetLanguage: "vi", CASHash: tObj.SHA256,
+		ProvenanceHash: transVar.ProvenanceHash, OverallQAScore: transVar.OverallQAScore, CreatedAt: transVar.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save translation index: %v", err)
+	}
+	dubScriptVar := domain.DubScriptVariant{
+		ID: "dubscript-resume-1", RunID: runID, AssetID: assetID, TargetLanguage: "vi", SourceLanguage: "zh",
+		TranslationVariantCAS: tObj.SHA256, ProvenanceHash: "prov-dubscript-resume", OverallQAScore: 0.5,
+		Segments: []domain.DubScriptSegment{
+			{Index: 0, SourceText: "点击右上角", MeaningText: transVar.Segments[0].TargetText, SpokenText: transVar.Segments[0].TargetText, SlotDurationMs: 1500, PassedQAGate: true, RequiresReview: true, ReviewReason: "DURATION_OVERRUN"},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dsBytes, _ := json.Marshal(dubScriptVar)
+	dsObj, _ := casStore.Put(bytes.NewReader(dsBytes))
+	if err := db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID: dubScriptVar.ID, RunID: runID, AssetID: assetID, TargetLanguage: "vi", CASHash: dsObj.SHA256,
+		ProvenanceHash: dubScriptVar.ProvenanceHash, OverallQAScore: dubScriptVar.OverallQAScore, CreatedAt: dubScriptVar.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save dub script index: %v", err)
+	}
+	// The dubbing service resolves the voice assignment run-bound, as the live pipeline does.
+	va := domain.VoiceAssignment{
+		ID: "va-resume-1", RunID: runID, AssetID: assetID, TargetLanguage: "vi",
+		Assignments: map[string]domain.VoiceProfile{
+			"SPEAKER_00": {ID: "vi-preset-1", Name: "Preset Voice 1", Language: "vi", ProviderID: "fake_tts"},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	vaBytes, _ := json.Marshal(va)
+	vaObj, _ := casStore.Put(bytes.NewReader(vaBytes))
+	if err := db.SaveVoiceAssignmentIndex(ctx, storage.VoiceAssignmentIndex{
+		ID: va.ID, RunID: runID, AssetID: assetID, TargetLanguage: "vi", CASHash: vaObj.SHA256,
+		ProvenanceHash: "prov-va-resume", CreatedAt: va.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save run-bound voice assignment: %v", err)
+	}
+
+	res, err := svc.CorrectTargetText(ctx, service.TargetTextCorrectionInput{
+		RunID: runID, AssetID: assetID, TargetLanguage: "vi", SegmentIndex: 0,
+		NewTargetText: "Nhấn góc trên", SpokenTextOverride: "Nhấn góc trên",
+		Reason: "Shortened for the 1.5s slot", Operator: "editor_monet",
+	})
+	if err != nil {
+		t.Fatalf("CorrectTargetText failed: %v", err)
+	}
+
+	latest := map[string]string{}
+	stages, err := db.ListStageExecutions(ctx, runID)
+	if err != nil {
+		t.Fatalf("list stage executions: %v", err)
+	}
+	for _, st := range stages {
+		latest[st.Stage] = st.ArtifactSHA256
+	}
+	if latest["dub_synthesize"] != res.DubSegmentsVariantCAS || latest["dub_synthesize"] == staleCAS {
+		t.Errorf("resumed run would replay dub segments %q, want the corrected %q", latest["dub_synthesize"], res.DubSegmentsVariantCAS)
+	}
+	if latest["audio_mix"] != res.DubMixCAS {
+		t.Errorf("resumed run would replay dub mix %q, want the corrected %q", latest["audio_mix"], res.DubMixCAS)
 	}
 }
 
@@ -1401,7 +1742,25 @@ func TestReviewService_ReassignVoice_VisualTrackFailClosed(t *testing.T) {
 	svc, db, casStore, assetID := setupFullReviewHarness(t)
 	ctx := context.Background()
 	runID := "run-reassign-fc-01"
-
+	jobID := "job-reassign-" + uuid.NewString()[:8]
+	now := time.Now().UTC()
+	if err := db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             jobID,
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        runID,
+		JobID:     jobID,
+		Status:    "running",
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
 	// Setup initial VoiceAssignment for runID
 	va := domain.VoiceAssignment{
 		ID:             "va-fc-1",
@@ -1534,8 +1893,11 @@ func TestReviewService_ReassignVoice_VisualTrackFailClosed(t *testing.T) {
 	// Case C: Valid LocalizedVisualTrack in CAS
 	validVisTrack := domain.LocalizedVisualTrack{
 		ID:             "vis-valid-1",
+		SchemaVersion:  domain.LocalizedVisualTrackSchemaVersion,
 		AssetID:        assetID,
+		RunID:          runID,
 		TargetLanguage: "vi",
+		ProvenanceHash: "prov-vis-valid-1",
 		SubtitleCues: []domain.SubtitleCue{
 			{
 				StartMs: 0,
@@ -1583,6 +1945,24 @@ func TestReviewService_ReassignVoice_VisualTrackFailClosed(t *testing.T) {
 	}
 	if res.RenderPlanCAS == "" {
 		t.Fatalf("expected non-empty RenderPlanCAS")
+	}
+
+	stages, err := db.ListStageExecutions(ctx, runID)
+	if err != nil {
+		t.Fatalf("ListStageExecutions failed: %v", err)
+	}
+	var previewStage *domain.StageExecution
+	for _, st := range stages {
+		if st.Stage == "render_preview" {
+			previewStage = &st
+		}
+	}
+	if previewStage == nil {
+		t.Fatalf("expected render_preview stage execution to be recorded")
+	}
+	if previewStage.Status != domain.StageStatusQueued || previewStage.ArtifactSHA256 != "" {
+		t.Fatalf("expected render_preview stage to be invalidated (status=queued, empty artifact), got status=%s artifact=%s",
+			previewStage.Status, previewStage.ArtifactSHA256)
 	}
 }
 
@@ -2334,13 +2714,13 @@ func assertCorrectionKeepsDubScriptGrounding(
 
 	groundedProv, err := domain.ComputeLocalizedVisualTrackProvenanceHash(
 		assetID, "vi", visTrack.TextRegionPlanProv, dubIdx.ProvenanceHash,
-		visTrack.Overlays, visTrack.SubtitleCues, []domain.SceneProtectedRegion(nil))
+		visTrack.Overlays, visTrack.SubtitleCues, visTrack.Covers, []domain.SceneProtectedRegion(nil))
 	if err != nil {
 		t.Fatalf("compute dub-script-grounded visual track provenance: %v", err)
 	}
 	fallbackProv, err := domain.ComputeLocalizedVisualTrackProvenanceHash(
 		assetID, "vi", visTrack.TextRegionPlanProv, "",
-		visTrack.Overlays, visTrack.SubtitleCues, []domain.SceneProtectedRegion(nil))
+		visTrack.Overlays, visTrack.SubtitleCues, visTrack.Covers, []domain.SceneProtectedRegion(nil))
 	if err != nil {
 		t.Fatalf("compute translation-only visual track provenance: %v", err)
 	}
@@ -2982,8 +3362,12 @@ func TestReviewService_CorrectRegionGeometry_RendersPreviewFromCorrectedPlan(t *
 	}
 	assertPreviewConsumesPlan(t, db, casStore, assetID, runID, first.PreviewRenderCAS, firstPlan)
 
-	// A second correction must supersede that preview rather than leave the operator
-	// looking at the first one.
+	// A second correction must supersede the first one rather than leave the operator looking at
+	// stale geometry. What it supersedes is the localized visual track the inspector reads - the
+	// render plan itself is built from pinned subtitles and audio, so a second overlay-only edit
+	// freezes an identical recipe and legitimately resolves to the same content-addressed preview.
+	// (Freezing overlay references into the RenderPlan is tracked by architecture §4/RenderPlan;
+	// until then an overlay edit is visible in the track artifact, not in the burned preview.)
 	second, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
 		RunID:          runID,
 		AssetID:        assetID,
@@ -2995,8 +3379,8 @@ func TestReviewService_CorrectRegionGeometry_RendersPreviewFromCorrectedPlan(t *
 	if err != nil {
 		t.Fatalf("second region correction must succeed: %v", err)
 	}
-	if second.PreviewRenderCAS == first.PreviewRenderCAS {
-		t.Fatalf("the second correction reused the first preview artifact: %s", second.PreviewRenderCAS)
+	if second.LocalizedVisualTrackCAS == first.LocalizedVisualTrackCAS {
+		t.Fatalf("the second correction reused the first localized visual track: %s", second.LocalizedVisualTrackCAS)
 	}
 	secondPlan, err := db.GetRenderPlanIndexByRun(ctx, runID)
 	if err != nil || secondPlan == nil {
@@ -3056,5 +3440,167 @@ func assertPreviewConsumesPlan(t *testing.T, db *storage.DB, casStore *cas.Store
 	}
 	if _, err := casStore.ResolvePath(artifact.OutputCASHash); err != nil {
 		t.Errorf("the preview media the operator plays is not resolvable: %v", err)
+	}
+}
+
+// A region correction validates the geometry the operator actually changed. A collision on an
+// untouched region is a pre-existing layout fact the operator has not addressed yet: it must stay
+// a visual_occlusion exception instead of failing the whole correction, otherwise the queue can
+// never be worked one item at a time.
+func TestReviewService_CorrectRegionGeometry_UntouchedOcclusionDoesNotBlockTheEdit(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-correction-untouched-occlusion"
+	_ = bindBaselineDubMixToRun(t, db, assetID, "vi", runID)
+
+	saveRegionCorrectionPlan(t, db, casStore, assetID, "prov-untouched-occlusion", []domain.TrackedTextRegion{
+		{
+			ID:          "reg-edited",
+			Text:        "关注",
+			Role:        domain.TextRoleSemanticText,
+			FirstSeenMs: 0,
+			LastSeenMs:  1500,
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 0, Box: domain.BoundingBox{X: 100, Y: 200, Width: 300, Height: 60}, Observed: true},
+			},
+		},
+		{
+			// A protected control the operator has not touched yet, and a protected neighbour whose
+			// box sits on top of it: its overlay can never clear the neighbour.
+			ID:          "reg-colliding",
+			Text:        "剪映",
+			Role:        domain.TextRoleInstructionalUIText,
+			FirstSeenMs: 0,
+			LastSeenMs:  1500,
+			ProtectedMetadata: domain.ProtectedRegionMetadata{
+				IsProtected: true,
+				Reason:      "instructional_ui_control",
+			},
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 0, Box: domain.BoundingBox{X: 100, Y: 1400, Width: 200, Height: 50}, Observed: true},
+			},
+		},
+		{
+			ID:          "reg-neighbour",
+			Text:        "音频",
+			Role:        domain.TextRoleBrandKeep,
+			FirstSeenMs: 0,
+			LastSeenMs:  1500,
+			ProtectedMetadata: domain.ProtectedRegionMetadata{
+				IsProtected: true,
+				Reason:      "brand_authenticity",
+			},
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 0, Box: domain.BoundingBox{X: 150, Y: 1400, Width: 120, Height: 50}, Observed: true},
+			},
+		},
+	})
+
+	result, err := svc.CorrectRegionGeometry(ctx, service.RegionGeometryCorrectionInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Overrides:      []domain.RegionOverride{{RegionID: "reg-edited", BoxDeltaX: 30}},
+		Reason:         "operator moved the source text out of the way",
+		Operator:       "tester",
+	})
+	if err != nil {
+		t.Fatalf("a correction must not be blocked by an unrelated occluded region: %v", err)
+	}
+
+	rc, err := casStore.Get(result.LocalizedVisualTrackCAS)
+	if err != nil {
+		t.Fatalf("read localized visual track: %v", err)
+	}
+	defer rc.Close()
+	var track domain.LocalizedVisualTrack
+	if err := json.NewDecoder(rc).Decode(&track); err != nil {
+		t.Fatalf("decode localized visual track: %v", err)
+	}
+	found := false
+	for _, occ := range track.Occlusions {
+		if occ.RegionID == "reg-colliding" {
+			found = true
+		}
+		if occ.RegionID == "reg-edited" {
+			t.Errorf("the edited region %s was reported as occluded", occ.RegionID)
+		}
+	}
+	if !found {
+		t.Fatalf("the untouched collision must stay surfaced as an exception, got %+v", track.Occlusions)
+	}
+
+	// ...and it is projected for the operator rather than dropped.
+	reviewSvc := service.NewReviewService(db, casStore)
+	items, err := reviewSvc.ProjectReviewItemsForRun(ctx, assetID, "vi", runID)
+	if err != nil {
+		t.Fatalf("project review items: %v", err)
+	}
+	projected := false
+	for _, item := range items {
+		if item.Type == domain.ReviewItemTypeVisualOcclusion && item.RegionID == "reg-colliding" {
+			projected = true
+		}
+	}
+	if !projected {
+		t.Fatalf("expected a pending visual_occlusion item for reg-colliding, got %+v", items)
+	}
+}
+
+func TestReviewService_ProjectAllReviewItems_DecodedArtifactOwnershipMismatch(t *testing.T) {
+	reviewSvc, db, casStore, assetID := setupReviewTestHarness(t)
+	ctx := context.Background()
+	runID := "run-mismatch-" + uuid.NewString()[:8]
+
+	otherAssetID := "other-asset-" + uuid.NewString()[:8]
+	tVar := domain.TranslationVariant{
+		ID:             uuid.NewString(),
+		AssetID:        otherAssetID,
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "测试", TargetText: "Thử nghiệm", PassedQAGate: false, QAConfidence: 0.4},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(tVar)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	jobID := "job-mismatch-" + uuid.NewString()[:8]
+	now := time.Now().UTC()
+	if err := db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             jobID,
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        runID,
+		JobID:     jobID,
+		Status:    "running",
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "translation",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObj.SHA256,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create stage execution: %v", err)
+	}
+
+	_, err := reviewSvc.ProjectAllReviewItemsForRun(ctx, assetID, "vi", runID)
+	if err == nil {
+		t.Fatalf("expected error on translation variant asset mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "ownership mismatch") {
+		t.Fatalf("expected ownership mismatch error, got %v", err)
 	}
 }

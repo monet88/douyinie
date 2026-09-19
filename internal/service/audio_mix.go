@@ -300,6 +300,90 @@ func (s *AudioMixService) SeparateAudio(ctx context.Context, input AudioSeparati
 // - Mixer refusal: strictly REFUSES candidate segments whose measured duration overruns the slot (zero overrun).
 // - Preserves BGM, SFX, ambience, and music-vocal outside and through dialogue windows.
 // - Suppresses source dialogue inside speech windows with smooth crossfades (15-30ms).
+// unresolvedDubReason explains a dub-eligible mix that has no clip to place, naming the dub stage's own
+// review outcome for the affected slots so the refusal carries the real overrun instead of a generic one.
+func unresolvedDubReason(dubSegments *domain.DubSegmentsVariant, dubArtifactErr string) string {
+	if dubSegments == nil {
+		if dubArtifactErr != "" {
+			return "dubbing is required but no dub segment artifact could be loaded: " + dubArtifactErr
+		}
+		return "dubbing is required but no dub segment artifact carries a candidate clip"
+	}
+	if len(dubSegments.Segments)+len(dubSegments.ReviewSegments) == 0 {
+		return "dubbing is required but no dub segment artifact carries a candidate clip"
+	}
+	for _, rev := range dubSegments.ReviewSegments {
+		if rev.SlotDurationMs > 0 && rev.MeasuredDurationMs > rev.SlotDurationMs {
+			return fmt.Sprintf("dubbing is required but every candidate dub segment overran its immutable slot and none was accepted: segment %d measured %dms exceeds slot %dms (start: %dms, end: %dms)",
+				rev.Index, rev.MeasuredDurationMs, rev.SlotDurationMs, rev.StartMs, rev.EndMs)
+		}
+	}
+	unacceptedCount := 0
+	for _, rev := range dubSegments.ReviewSegments {
+		if rev.FitDecision != domain.FitActionAccept {
+			unacceptedCount++
+		}
+	}
+	return fmt.Sprintf("dubbing is required but no candidate dub segment could be placed: %d candidate(s) require review and %d lack an accepted fit",
+		len(dubSegments.ReviewSegments), unacceptedCount)
+}
+
+func (s *AudioMixService) loadDubSpeechClip(seg domain.DubSegment) (media.DubSpeechClip, error) {
+	if seg.AudioSHA256 == "" && seg.AudioCASPath == "" {
+		return media.DubSpeechClip{}, errors.New("neither audio_sha256 nor audio_cas_path provided")
+	}
+	var audioBytes []byte
+	var readErr error
+	if seg.AudioSHA256 != "" {
+		if s.cas != nil {
+			r, err := s.cas.Get(seg.AudioSHA256)
+			if err == nil {
+				audioBytes, readErr = io.ReadAll(r)
+				_ = r.Close()
+				if readErr != nil {
+					return media.DubSpeechClip{}, fmt.Errorf("read audio from CAS (%s): %w", seg.AudioSHA256, readErr)
+				}
+			} else {
+				readErr = err
+			}
+		} else {
+			readErr = errors.New("CAS store is not configured")
+		}
+	}
+	if audioBytes == nil && seg.AudioCASPath != "" {
+		f, err := os.Open(seg.AudioCASPath)
+		if err == nil {
+			audioBytes, readErr = io.ReadAll(f)
+			_ = f.Close()
+			if readErr != nil {
+				return media.DubSpeechClip{}, fmt.Errorf("read audio from path (%s): %w", seg.AudioCASPath, readErr)
+			}
+		} else {
+			if readErr != nil {
+				return media.DubSpeechClip{}, fmt.Errorf("read audio from CAS (%s: %v) and path (%s: %w)", seg.AudioSHA256, readErr, seg.AudioCASPath, err)
+			}
+			return media.DubSpeechClip{}, fmt.Errorf("read audio from path (%s): %w", seg.AudioCASPath, err)
+		}
+	}
+	if audioBytes == nil {
+		return media.DubSpeechClip{}, fmt.Errorf("read audio from CAS (%s): %w", seg.AudioSHA256, readErr)
+	}
+
+	clipSamples, clipHeader, err := media.ExtractPCM16Samples(audioBytes)
+	if err != nil {
+		return media.DubSpeechClip{}, fmt.Errorf("decode PCM16 samples: %w", err)
+	}
+	if len(clipSamples) == 0 {
+		return media.DubSpeechClip{}, errors.New("decoded zero PCM16 samples")
+	}
+	return media.DubSpeechClip{
+		StartMs:    seg.StartMs,
+		SampleRate: int(clipHeader.SampleRate),
+		Channels:   int(clipHeader.NumChannels),
+		Samples:    clipSamples,
+	}, nil
+}
+
 func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*domain.DubMixArtifact, error) {
 	if strings.TrimSpace(input.AssetID) == "" {
 		return nil, errors.New("asset_id is required")
@@ -466,6 +550,10 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 	// 3. Load DubSegments (if speech is present and dubbing required)
 	var dubSegments *domain.DubSegmentsVariant
 	var dubSegmentsCASRef string
+	// dubArtifactErr names why the dub artifact could not be consumed. An artifact that exists but is
+	// unreadable must not fall through to a mix that suppresses the source dialogue with nothing to place;
+	// the coverage gate below carries this reason into the refusal.
+	var dubArtifactErr string
 	if hasDubEligibleSpeech {
 		if input.DubSegmentsCAS != "" {
 			dubSegmentsCASRef = input.DubSegmentsCAS
@@ -476,7 +564,11 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 				if err := json.NewDecoder(r).Decode(&d); err == nil {
 					dubSegments = &d
 					dubSegments.CASHash = dubSegmentsCASRef
+				} else {
+					dubArtifactErr = fmt.Sprintf("dub segments CAS %s could not be decoded: %v", dubSegmentsCASRef, err)
 				}
+			} else {
+				dubArtifactErr = fmt.Sprintf("dub segments CAS %s is unreadable: %v", dubSegmentsCASRef, err)
 			}
 		}
 		if dubSegments == nil {
@@ -490,7 +582,17 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 					if err := json.NewDecoder(r).Decode(&d); err == nil {
 						dubSegments = &d
 						dubSegments.CASHash = dubSegmentsCASRef
+					} else if dubArtifactErr == "" {
+						dubArtifactErr = fmt.Sprintf("dub segments CAS %s could not be decoded: %v", dubSegmentsCASRef, err)
 					}
+				} else if dubArtifactErr == "" {
+					dubArtifactErr = fmt.Sprintf("dub segments CAS %s is unreadable: %v", dubSegmentsCASRef, err)
+				}
+			} else if dubArtifactErr == "" {
+				if err != nil {
+					dubArtifactErr = fmt.Sprintf("dub segments artifact index lookup failed: %v", err)
+				} else {
+					dubArtifactErr = fmt.Sprintf("no dub segments artifact is indexed for asset %s (language %s)", input.AssetID, input.TargetLanguage)
 				}
 			}
 		}
@@ -531,7 +633,56 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 		}
 	}
 
-	// 5. Check Mixer Invariants: Overrun Refusal & Timing Purity
+	// 5. Check Mixer Invariants: Overrun Refusal, Dub Coverage & Timing Purity.
+	//
+	// A mix that suppresses the source dialogue MUST place the replacement speech. A dub stage whose every
+	// candidate still overruns the immutable slot leaves Segments empty and parks the candidates in
+	// ReviewSegments; mixing that anyway stripped the source dialogue and shipped a video with no voice at all
+	// while reporting PASS (live evidence: runs 264aecaf and 4f86657f, whose mixes came out bit-identical to
+	// the background stem under a full-length suppress_dialogue window).
+	refuse := func(reason string) (*domain.DubMixArtifact, error) {
+		refusedArtifact := domain.DubMixArtifact{
+			ID:                  uuid.NewString(),
+			SchemaVersion:       domain.DubMixSchemaVersion,
+			AssetID:             input.AssetID,
+			RunID:               input.RunID,
+			JobID:               input.JobID,
+			TargetLanguage:      input.TargetLanguage,
+			DubSegmentsCAS:      dubSegmentsCASRef,
+			AudioStemsCAS:       stemsArtifact.CASHash,
+			PreservationPlan:    preservationPlan,
+			DialogueSuppressed:  false,
+			SoundtrackPreserved: true,
+			OverallStatus:       "REFUSED",
+			RefusalReason:       reason,
+			CreatedAt:           time.Now().UTC(),
+		}
+		provHash, _ := domain.ComputeDubMixProvenanceHash(input.AssetID, input.TargetLanguage, dubSegmentsCASRef, stemsArtifact.CASHash, preservationPlan)
+		refusedArtifact.ProvenanceHash = provHash
+
+		refusedBytes, _ := json.Marshal(refusedArtifact)
+		refusedObj, _ := s.cas.Put(bytes.NewReader(refusedBytes))
+		refusedArtifact.CASHash = refusedObj.SHA256
+
+		err := s.db.SaveDubMixArtifactIndex(ctx, storage.DubMixArtifactIndex{
+			ID:             refusedArtifact.ID,
+			AssetID:        refusedArtifact.AssetID,
+			RunID:          refusedArtifact.RunID,
+			JobID:          refusedArtifact.JobID,
+			TargetLanguage: refusedArtifact.TargetLanguage,
+			CASHash:        refusedArtifact.CASHash,
+			ProvenanceHash: refusedArtifact.ProvenanceHash,
+			OverallStatus:  refusedArtifact.OverallStatus,
+			RefusalReason:  refusedArtifact.RefusalReason,
+			CreatedAt:      refusedArtifact.CreatedAt,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("persist refused dub mix artifact index: %w", err)
+		}
+		return &refusedArtifact, fmt.Errorf("%w: %s", domain.ErrMixerOverrunRefused, reason)
+	}
+
+	speechClips := make([]media.DubSpeechClip, 0)
 	if dubSegments != nil {
 		for _, seg := range dubSegments.Segments {
 			// Skip clips outside accepted speech suppression windows (defensively ignored by mixer)
@@ -548,50 +699,22 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 			slotDuration := seg.EndMs - seg.StartMs
 			// Mixer refusal: if measured audio exceeds immutable source window (measured duration > slot duration)
 			if seg.MeasuredDurationMs > slotDuration {
-				refusalReason := fmt.Sprintf("segment %d measured duration %dms exceeds immutable slot %dms (start: %dms, end: %dms)",
-					seg.Index, seg.MeasuredDurationMs, slotDuration, seg.StartMs, seg.EndMs)
-
-				refusedArtifact := domain.DubMixArtifact{
-					ID:                  uuid.NewString(),
-					SchemaVersion:       domain.DubMixSchemaVersion,
-					AssetID:             input.AssetID,
-					RunID:               input.RunID,
-					JobID:               input.JobID,
-					TargetLanguage:      input.TargetLanguage,
-					DubSegmentsCAS:      dubSegments.CASHash,
-					AudioStemsCAS:       stemsArtifact.CASHash,
-					PreservationPlan:    preservationPlan,
-					DialogueSuppressed:  false,
-					SoundtrackPreserved: true,
-					OverallStatus:       "REFUSED",
-					RefusalReason:       refusalReason,
-					CreatedAt:           time.Now().UTC(),
-				}
-				provHash, _ := domain.ComputeDubMixProvenanceHash(input.AssetID, input.TargetLanguage, dubSegments.CASHash, stemsArtifact.CASHash, preservationPlan)
-				refusedArtifact.ProvenanceHash = provHash
-
-				refusedBytes, _ := json.Marshal(refusedArtifact)
-				refusedObj, _ := s.cas.Put(bytes.NewReader(refusedBytes))
-				refusedArtifact.CASHash = refusedObj.SHA256
-
-				err = s.db.SaveDubMixArtifactIndex(ctx, storage.DubMixArtifactIndex{
-					ID:             refusedArtifact.ID,
-					AssetID:        refusedArtifact.AssetID,
-					RunID:          refusedArtifact.RunID,
-					JobID:          refusedArtifact.JobID,
-					TargetLanguage: refusedArtifact.TargetLanguage,
-					CASHash:        refusedArtifact.CASHash,
-					ProvenanceHash: refusedArtifact.ProvenanceHash,
-					OverallStatus:  refusedArtifact.OverallStatus,
-					RefusalReason:  refusedArtifact.RefusalReason,
-					CreatedAt:      refusedArtifact.CreatedAt,
-				})
-				if err != nil {
-					return nil, fmt.Errorf("persist refused dub mix artifact index: %w", err)
-				}
-				return &refusedArtifact, fmt.Errorf("%w: %s", domain.ErrMixerOverrunRefused, refusalReason)
+				return refuse(fmt.Sprintf("segment %d measured duration %dms exceeds immutable slot %dms (start: %dms, end: %dms)",
+					seg.Index, seg.MeasuredDurationMs, slotDuration, seg.StartMs, seg.EndMs))
 			}
+			clip, err := s.loadDubSpeechClip(seg)
+			if err != nil {
+				return refuse(fmt.Sprintf("segment %d audio load or decode failure: %v", seg.Index, err))
+			}
+			speechClips = append(speechClips, clip)
 		}
+	}
+	// The dub artifact this mix consumed is what proves the dub lane ran for these slots: a run whose dub
+	// stage produced a variant with no placeable clip (every candidate parked for review) must not suppress
+	// the source dialogue and ship the silence. A mix with no dub artifact at all is left to its own
+	// passthrough contract, unchanged.
+	if hasDubEligibleSpeech && len(speechClips) == 0 && (dubSegments != nil || dubSegmentsCASRef != "") {
+		return refuse(unresolvedDubReason(dubSegments, dubArtifactErr))
 	}
 
 	// 6. Extract background and vocal stems audio
@@ -650,48 +773,7 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 		vocalsSamples = vSamples
 	}
 
-	// 7. Prepare speech clips for mixing
-	speechClips := make([]media.DubSpeechClip, 0)
-	if dubSegments != nil {
-		for _, seg := range dubSegments.Segments {
-			// Defensively reject/ignore dub clips outside accepted speech suppression windows
-			insideSuppression := false
-			for _, w := range preservationPlan.SpeechWindows {
-				if w.Action == "suppress_dialogue" && seg.StartMs >= w.StartMs && seg.EndMs <= w.EndMs {
-					insideSuppression = true
-					break
-				}
-			}
-			if !insideSuppression {
-				continue
-			}
-			if seg.AudioSHA256 != "" || seg.AudioCASPath != "" {
-				var r io.ReadCloser
-				var err error
-				if seg.AudioSHA256 != "" {
-					r, err = s.cas.Get(seg.AudioSHA256)
-				}
-				if err != nil && seg.AudioCASPath != "" {
-					r, err = os.Open(seg.AudioCASPath)
-				}
-				if err == nil && r != nil {
-					audioBytes, err := io.ReadAll(r)
-					r.Close()
-					if err == nil {
-						clipSamples, clipHeader, err := media.ExtractPCM16Samples(audioBytes)
-						if err == nil {
-							speechClips = append(speechClips, media.DubSpeechClip{
-								StartMs:    seg.StartMs,
-								SampleRate: int(clipHeader.SampleRate),
-								Channels:   int(clipHeader.NumChannels),
-								Samples:    clipSamples,
-							})
-						}
-					}
-				}
-			}
-		}
-	}
+	// 7. Speech clips were loaded, validated, and accounted in step 5 (speechClips)
 
 	// Prepare suppression windows
 	suppressIntervals := make([]media.PreservationWindowInterval, len(preservationPlan.SpeechWindows))

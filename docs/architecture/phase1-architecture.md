@@ -24,7 +24,7 @@ The system is architected around seven non-negotiable principles:
 
 Provider neutrality remains an interface property, but production eligibility is intentionally narrower than the set of adapters present in the repository:
 
-- VI/EN meaning translation for both speech and translatable visual text uses the authorized gateway in order `gemini-3.8-flash` -> `deepseek/deepseek-v4-flash-vision-exp`.
+- VI/EN meaning translation for both speech and translatable visual text uses the authorized gateway in order `gemini-3.8-flash` -> `deepseek-v4.1-flash`.
 - Local general-purpose LLM translation is not production-eligible and is not a fallback after remote failure. If both remote lanes fail policy, authorization, availability, or meaning-first QA, the translation stage fails closed and may surface review.
 - `ExecutionProfileLocal` is not an end-to-end localization release path. It verifies specialized local media stages without requiring a local translation LLM.
 - Constrained local GPU/CPU resources are reserved for ASR/alignment/diarization, TTS, separation, OCR/tracking, mixing, and rendering. Local OCR remains the source text detector; its translatable text is passed through the remote translation provider contract.
@@ -479,8 +479,9 @@ Douyinie Phase 1 implements **Variant A: Queue + Inspector** as its canonical op
 - **Actionable Exceptions**: The review queue surfaces only segments requiring human intervention:
   - Tight timing or duration overrun ($D_{\text{tts}} > T_{\text{source}}$).
   - Ambiguous visual text role classification or low OCR confidence.
-  - Subtitle bounding box colliding with active UI buttons or tap targets.
+  - Subtitle or overlay box colliding with another protected tracked region (UI control, tap target, brand mark): the overlay is skipped so the source text stays on screen untouched, and the collision is surfaced as a pending `visual_occlusion` item instead of aborting the stage. Collisions with scene-protected regions (faces, pipeline-declared tap targets) stay fatal for automatic localization, and a geometry the operator explicitly asked for that lands on a protected region (region correction / reclassify) is rejected outright so the edit can be corrected.
   - Pronunciation or acoustic anomaly flagged by multimodal QA.
+  - Meaning-gate violations on a translated or spoken segment (facts, numbers, entity names, negation polarity) when no provider lane produced a clean candidate: the best candidate is persisted with the offending segment flagged, and the run continues.
 
 ### 9.2 Approval States & Semantics
 - `auto_pass`: Stage passed all automated quality gates without human input.
@@ -541,6 +542,7 @@ Acceptance tests exercise the complete pipeline via public HTTP/WebSocket endpoi
 14. **Pre-Dub Voice Audition Artifacts**: Standalone (~5s) and contextual (~10s segment + BGM) preview synthesis artifact generation and retrieval without triggering a full video dub or final render.
 15. **Source-Relative Pacing & Inter-Turn Spacing**: Verification that dub segments satisfy both zero-overrun timing and perceptible inter-turn breathing space without run-on delivery.
 16. **Multimodal AV QC & ReviewItem Projections**: Automated projection of pronunciation anomalies, pacing issues, incomplete text cover, or UI occlusion exceptions into structured `ReviewItem` entries.
+17. **Asset-Scoped Artifact Reuse**: Stage artifacts carry a run-independent provenance identity — the producing run id is provenance metadata, never part of the identity — so a re-run of the same asset reuses the artifacts earlier runs persisted, and the artifacts handed to a run are bound to that run. Ownership checks are by asset (plus target language where the artifact is language-bound), never by run.
 
 ### 10.2 Seam 2: StageWorker Runtime Contract
 Subprocess integration tests proving IPC stability, error recovery, and OS-level resource hygiene:

@@ -236,8 +236,15 @@ func GenerateASSContent(timeline domain.RenderTimeline, cues []domain.SubtitleCu
 
 		var tags []string
 
-		// Positioning: exact (X, Y) uses \an7\pos(X, Y) top-left anchor.
-		if cue.X > 0 || cue.Y > 0 {
+		// Positioning: the declared box's center anchors the text (\an5). The box hugs the
+		// rendered text, so a top-left anchor lands the drawn box wherever the width estimate
+		// guessed; anchoring the center keeps the drawn box concentric with the geometry the
+		// plan declares, which is what the covers, the QC overlap checks and the operator see.
+		// A cue with no declared size cannot be centered on its own top-left corner without
+		// shifting the text up and left, so it keeps the legacy top-left anchor (\an7).
+		if cue.Width > 0 && cue.Height > 0 {
+			tags = append(tags, fmt.Sprintf(`\an5\pos(%d,%d)`, cue.X+cue.Width/2, cue.Y+cue.Height/2))
+		} else if cue.X > 0 || cue.Y > 0 {
 			tags = append(tags, fmt.Sprintf(`\an7\pos(%d,%d)`, cue.X, cue.Y))
 		}
 
@@ -293,8 +300,9 @@ type CompositionRequest struct {
 	AudioTrack  string // path to mixed WAV audio file
 	Timeline    domain.RenderTimeline
 	Cues        []domain.SubtitleCue
-	ASSContent  string // optional pre-generated or custom ASS script content
-	FontFile    string // optional font path
+	Covers      []domain.CoverBox // opaque boxes hiding replaced source text, composited before the subtitles
+	ASSContent  string            // optional pre-generated or custom ASS script content
+	FontFile    string            // optional font path
 	Profile     domain.EncodeProfile
 	OutputPath  string // target output MP4 file path
 }
@@ -305,6 +313,29 @@ type CompositionResult struct {
 	ByteSize   int64
 	DurationMs int64
 	Renderer   string // "native-ffmpeg-libass"
+}
+
+// ffmpegCoverColor converts a "#RRGGBB" + opacity pair into an ffmpeg color filter spec.
+// Opacity 1.0 produces an opaque RGB source; a lower opacity appends the alpha component
+// ("0xRRGGBB@a"), which is what the color filter expects.
+func ffmpegCoverColor(color string, opacity float64) (string, error) {
+	clean := strings.TrimPrefix(strings.TrimSpace(color), "#")
+	if clean == "" {
+		clean = "000000"
+	}
+	if len(clean) != 6 {
+		return "", fmt.Errorf("cover color %q is not #RRGGBB", color)
+	}
+	for _, r := range clean {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return "", fmt.Errorf("cover color %q is not hexadecimal", color)
+		}
+	}
+	spec := "0x" + strings.ToLower(clean)
+	if opacity > 0 && opacity < 1 {
+		spec = fmt.Sprintf("%s@%.3f", spec, opacity)
+	}
+	return spec, nil
 }
 
 // ComposeNativeVideo executes deterministic composition via FFmpeg and libass.
@@ -334,7 +365,15 @@ func ComposeNativeVideo(ctx context.Context, req CompositionRequest) (*Compositi
 	// Prepare ASS content if cues or ASS content provided
 	assContent := req.ASSContent
 	if assContent == "" && len(req.Cues) > 0 {
-		assContent = GenerateASSContent(req.Timeline, req.Cues, req.FontFile)
+		fontFamily := ""
+		if strings.TrimSpace(req.FontFile) != "" {
+			var err error
+			fontFamily, err = ResolveASSFontFamily(req.FontFile)
+			if err != nil {
+				return nil, fmt.Errorf("resolve font family for fallback subtitles: %w", err)
+			}
+		}
+		assContent = GenerateASSContent(req.Timeline, req.Cues, fontFamily)
 	}
 
 	var tmpDir string
@@ -353,8 +392,7 @@ func ComposeNativeVideo(ctx context.Context, req CompositionRequest) (*Compositi
 			return nil, fmt.Errorf("write ass file: %w", err)
 		}
 
-		escapedASS := EscapeFFmpegFilterPath(assPath)
-		assFilter := fmt.Sprintf("ass=filename='%s'", escapedASS)
+		assFilter := assFilterSpec(assPath, req.FontFile)
 
 		if scaleDiv > 1 {
 			filterGraph = fmt.Sprintf("%s,scale=trunc(iw/%d/2)*2:-2", assFilter, scaleDiv)
@@ -367,6 +405,29 @@ func ComposeNativeVideo(ctx context.Context, req CompositionRequest) (*Compositi
 		} else {
 			filterGraph = "null"
 		}
+	}
+
+	// Source-text covers are composited BEFORE the subtitle burn and before any proxy scale: covers
+	// and ASS events are both authored in timeline coordinates, so the scale has to stay last. A
+	// drawbox per cover spends one filter each - the alternative (a color source overlaid per cover)
+	// needs a multi-source -filter_complex graph for the same pixels.
+	if len(req.Covers) > 0 {
+		boxes := make([]string, 0, len(req.Covers))
+		for _, cov := range req.Covers {
+			if err := domain.ValidateCoverBox(cov, req.Timeline.Width, req.Timeline.Height); err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrCompositionFailed, err)
+			}
+			colorSpec, err := ffmpegCoverColor(cov.Color, cov.Opacity)
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrCompositionFailed, err)
+			}
+			boxes = append(boxes, fmt.Sprintf(
+				"drawbox=x=%d:y=%d:w=%d:h=%d:color=%s:t=fill:enable='between(t,%.3f,%.3f)'",
+				cov.X, cov.Y, cov.Width, cov.Height, colorSpec,
+				float64(cov.StartMs)/1000.0, float64(cov.EndMs)/1000.0,
+			))
+		}
+		filterGraph = strings.Join(boxes, ",") + "," + filterGraph
 	}
 
 	crf := req.Profile.CRF

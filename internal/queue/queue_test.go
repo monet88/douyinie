@@ -2,6 +2,7 @@ package queue_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -206,5 +207,133 @@ func TestQueue_Resume_InterruptedRunGetsPosition(t *testing.T) {
 	}
 	if entryResumed.Position != 1 {
 		t.Fatalf("expected assigned position 1, got %d", entryResumed.Position)
+	}
+}
+
+// #108: an interrupted run is recoverable, not terminal - the operator console offers both Resume
+// (re-drain the queue) and Cancel (abandon it). Only completed/cancelled are refused.
+func TestQueue_Cancel_StatusContract(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("interrupted run is cancellable", func(t *testing.T) {
+		db, qSvc, runID := newCancellableRun(t)
+		if err := db.UpdateQueueStatus(ctx, runID, domain.RunStatusInterrupted, domain.RunStatusInterrupted); err != nil {
+			t.Fatalf("interrupt run: %v", err)
+		}
+
+		if err := qSvc.Cancel(ctx, runID); err != nil {
+			t.Fatalf("cancel interrupted run: %v", err)
+		}
+		assertRunLifecycleStatus(t, db, runID, domain.RunStatusCancelled)
+	})
+
+	t.Run("a resumed run stays cancellable", func(t *testing.T) {
+		db, qSvc, runID := newCancellableRun(t)
+		if err := db.UpdateQueueStatus(ctx, runID, domain.RunStatusInterrupted, domain.RunStatusInterrupted); err != nil {
+			t.Fatalf("interrupt run: %v", err)
+		}
+		if err := qSvc.Resume(ctx, runID); err != nil {
+			t.Fatalf("resume interrupted run: %v", err)
+		}
+
+		if err := qSvc.Cancel(ctx, runID); err != nil {
+			t.Fatalf("cancel resumed run: %v", err)
+		}
+		assertRunLifecycleStatus(t, db, runID, domain.RunStatusCancelled)
+	})
+
+	t.Run("terminal runs are refused", func(t *testing.T) {
+		for _, status := range []string{domain.RunStatusCompleted, domain.RunStatusCancelled} {
+			db, qSvc, runID := newCancellableRun(t)
+			if err := db.UpdateQueueStatus(ctx, runID, status, status); err != nil {
+				t.Fatalf("move run to %s: %v", status, err)
+			}
+
+			if err := qSvc.Cancel(ctx, runID); !errors.Is(err, queue.ErrNotQueued) {
+				t.Fatalf("expected ErrNotQueued cancelling a %s run, got %v", status, err)
+			}
+			assertRunLifecycleStatus(t, db, runID, status)
+		}
+	})
+}
+
+// newCancellableRun seeds an isolated db with a running run and its queue entry.
+func newCancellableRun(t *testing.T) (*storage.DB, *queue.Service, string) {
+	t.Helper()
+	ctx := context.Background()
+	db, err := storage.Open(filepath.Join(t.TempDir(), "queue_cancel.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	now := time.Now().UTC()
+	runID := "run-" + uuid.NewString()
+	ra := domain.RightsAttestation{
+		ID:              "att-" + runID,
+		AttestationType: "OPERATOR_CONFIRMED",
+		DeclaredBy:      "operator",
+		TermsAccepted:   true,
+		Notes:           "test",
+		ConfirmedAt:     now,
+	}
+	if err := db.CreateRightsAttestation(ctx, ra); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+	asset := domain.SourceAsset{
+		ID:                  "asset-" + runID,
+		SHA256:              strings.Repeat("b", 64),
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		OriginalFilename:    "cancel.mp4",
+		RightsAttestationID: ra.ID,
+		CASPath:             "cancel.mp4",
+		CreatedAt:           now,
+	}
+	if err := db.CreateSourceAsset(ctx, asset); err != nil {
+		t.Fatalf("save asset: %v", err)
+	}
+	job := domain.LocalizationJob{
+		ID:             "job-" + runID,
+		SourceAssetID:  asset.ID,
+		TargetLanguage: "vi",
+		Status:         "created",
+		CreatedAt:      now,
+	}
+	if err := db.CreateJob(ctx, job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	run := domain.LocalizationRun{ID: runID, JobID: job.ID, Status: domain.RunStatusRunning, CreatedAt: now}
+	if err := db.CreateRun(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	qSvc := queue.NewService(db)
+	if _, err := qSvc.Enqueue(ctx, runID, job.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := qSvc.MarkRunning(ctx, runID); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+	return db, qSvc, runID
+}
+
+// assertRunLifecycleStatus checks the queue entry and its run agree on the status an operator sees.
+func assertRunLifecycleStatus(t *testing.T, db *storage.DB, runID, want string) {
+	t.Helper()
+	ctx := context.Background()
+	entry, err := db.GetQueueEntryByRunID(ctx, runID)
+	if err != nil {
+		t.Fatalf("get queue entry: %v", err)
+	}
+	if entry.Status != want {
+		t.Fatalf("expected queue entry status %s, got %s", want, entry.Status)
+	}
+	run, err := db.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if run.Status != want {
+		t.Fatalf("expected run status %s, got %s", want, run.Status)
 	}
 }
