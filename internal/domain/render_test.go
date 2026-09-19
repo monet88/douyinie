@@ -128,16 +128,69 @@ func TestComputeRenderArtifactProvenanceHash_DistinctKinds(t *testing.T) {
 	prevProf := domain.DefaultPreviewEncodeProfile()
 	finProf := domain.DefaultFinalEncodeProfile()
 
-	hPrev, err := domain.ComputeRenderArtifactProvenanceHash(planProv, domain.RenderKindPreview, prevProf)
+	hPrev, err := domain.ComputeRenderArtifactProvenanceHash(planProv, domain.RenderKindPreview, prevProf, "")
 	if err != nil {
 		t.Fatalf("preview artifact prov: %v", err)
 	}
-	hFin, err := domain.ComputeRenderArtifactProvenanceHash(planProv, domain.RenderKindFinal, finProf)
+	hFin, err := domain.ComputeRenderArtifactProvenanceHash(planProv, domain.RenderKindFinal, finProf, "")
 	if err != nil {
 		t.Fatalf("final artifact prov: %v", err)
 	}
 
 	if hPrev == hFin {
 		t.Errorf("expected distinct provenance hashes for preview vs final, got identical %s", hPrev)
+	}
+}
+
+func TestComputeRenderArtifactProvenanceHash_FontOverride(t *testing.T) {
+	planProv := "plan-prov-12345"
+	finProf := domain.DefaultFinalEncodeProfile()
+	prevProf := domain.DefaultPreviewEncodeProfile()
+
+	hNoFont, err := domain.ComputeRenderArtifactProvenanceHash(planProv, domain.RenderKindFinal, finProf, "")
+	if err != nil {
+		t.Fatalf("final artifact prov without font: %v", err)
+	}
+
+	fontSHA1 := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	fontSHA2 := "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+
+	hFont1, err := domain.ComputeRenderArtifactProvenanceHash(planProv, domain.RenderKindFinal, finProf, fontSHA1)
+	if err != nil {
+		t.Fatalf("final artifact prov with font 1: %v", err)
+	}
+	hFont1Repeat, err := domain.ComputeRenderArtifactProvenanceHash(planProv, domain.RenderKindFinal, finProf, fontSHA1)
+	if err != nil {
+		t.Fatalf("final artifact prov repeat with font 1: %v", err)
+	}
+	hFont2, err := domain.ComputeRenderArtifactProvenanceHash(planProv, domain.RenderKindFinal, finProf, fontSHA2)
+	if err != nil {
+		t.Fatalf("final artifact prov with font 2: %v", err)
+	}
+
+	// Deterministic
+	if hFont1 != hFont1Repeat {
+		t.Errorf("expected deterministic hash for same font override, got %s != %s", hFont1, hFont1Repeat)
+	}
+	// Runtime font override invalidates default cache key
+	if hFont1 == hNoFont {
+		t.Errorf("expected font override to produce distinct provenance from default, got identical %s", hFont1)
+	}
+	// Different fonts produce distinct cache keys
+	if hFont1 == hFont2 {
+		t.Errorf("expected different font overrides to produce distinct provenance, got identical %s", hFont1)
+	}
+
+	// Preview also differentiates font overrides
+	hPrevNoFont, err := domain.ComputeRenderArtifactProvenanceHash(planProv, domain.RenderKindPreview, prevProf, "")
+	if err != nil {
+		t.Fatalf("preview prov without font: %v", err)
+	}
+	hPrevFont1, err := domain.ComputeRenderArtifactProvenanceHash(planProv, domain.RenderKindPreview, prevProf, fontSHA1)
+	if err != nil {
+		t.Fatalf("preview prov with font 1: %v", err)
+	}
+	if hPrevNoFont == hPrevFont1 {
+		t.Errorf("expected preview with font override to produce distinct provenance from default, got identical %s", hPrevFont1)
 	}
 }

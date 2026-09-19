@@ -26,6 +26,10 @@ var (
 	ErrRenderArtifactNotFound = errors.New("render artifact not found")
 	// ErrSubtitlePlanNotFound is returned when a referenced SubtitlePlanArtifact is missing.
 	ErrSubtitlePlanNotFound = errors.New("subtitle plan artifact not found")
+	// ErrRenderOwnershipMismatch is returned when the run, job, asset, target language, and plan an
+	// explicit render names do not all describe the same unit of work. Rendering one asset while
+	// completing another run's job is never an acceptable outcome, so this fails closed.
+	ErrRenderOwnershipMismatch = errors.New("render ownership mismatch")
 )
 
 const (
@@ -373,19 +377,25 @@ func ComputeRenderPlanProvenanceHash(
 }
 
 // ComputeRenderArtifactProvenanceHash calculates deterministic cache identity for a render artifact.
+// When fontSHA256 is non-empty, it participates in the artifact provenance hash so runtime
+// font overrides invalidate cached renders generated with default or different fonts.
+// An empty fontSHA256 preserves the legacy/no-override provenance hash byte-for-byte.
 func ComputeRenderArtifactProvenanceHash(
 	planProvenanceHash, kind string,
 	profile EncodeProfile,
+	fontSHA256 string,
 ) (string, error) {
 	payload := struct {
 		PlanProvenance string        `json:"plan_provenance"`
 		Kind           string        `json:"kind"`
 		Profile        EncodeProfile `json:"profile"`
+		FontSHA256     string        `json:"font_sha256,omitempty"`
 		SchemaVersion  int           `json:"schema_version"`
 	}{
 		PlanProvenance: strings.TrimSpace(planProvenanceHash),
 		Kind:           strings.ToLower(strings.TrimSpace(kind)),
 		Profile:        profile,
+		FontSHA256:     strings.TrimSpace(fontSHA256),
 		SchemaVersion: func() int {
 			if kind == RenderKindPreview {
 				return PreviewRenderSchemaVersion

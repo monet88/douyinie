@@ -1893,8 +1893,11 @@ func TestReviewService_ReassignVoice_VisualTrackFailClosed(t *testing.T) {
 	// Case C: Valid LocalizedVisualTrack in CAS
 	validVisTrack := domain.LocalizedVisualTrack{
 		ID:             "vis-valid-1",
+		SchemaVersion:  domain.LocalizedVisualTrackSchemaVersion,
 		AssetID:        assetID,
+		RunID:          runID,
 		TargetLanguage: "vi",
+		ProvenanceHash: "prov-vis-valid-1",
 		SubtitleCues: []domain.SubtitleCue{
 			{
 				StartMs: 0,

@@ -493,7 +493,7 @@ func (s *Server) completeRunSafely(ctx context.Context, runID string) error {
 // nothing, so the run completes with its job still open). Only a run whose pipeline already reached
 // completion may be the half that was waiting: a run still executing owns its own job transition, and
 // an interrupted or failed run must not be promoted to a finished job by a manual render.
-func (s *Server) completeJobAfterExplicitFinalRender(ctx context.Context, runID string) error {
+func (s *Server) completeJobAfterExplicitFinalRender(ctx context.Context, runID, renderedAssetID string) error {
 	if strings.TrimSpace(runID) == "" || s.db == nil {
 		return nil // asset-level render: no run owns this job transition
 	}
@@ -516,6 +516,16 @@ func (s *Server) completeJobAfterExplicitFinalRender(ctx context.Context, runID 
 	}
 	if jobID == "" {
 		return nil
+	}
+	if renderedAssetID != "" {
+		job, err := s.db.GetJob(ctx, jobID)
+		if err != nil {
+			return fmt.Errorf("verify job %s before completion: %w", jobID, err)
+		}
+		if job == nil || job.SourceAssetID != renderedAssetID {
+			return fmt.Errorf("refusing to complete job %s: job asset %q does not match rendered asset %q",
+				jobID, job.SourceAssetID, renderedAssetID)
+		}
 	}
 	if err := s.db.UpdateJobStatus(ctx, jobID, "completed"); err != nil {
 		return fmt.Errorf("complete job %s after final render of run %s: %w", jobID, runID, err)
@@ -3890,11 +3900,15 @@ func (s *Server) handleFreezeRenderPlan(w http.ResponseWriter, r *http.Request) 
 
 	plan, err := s.renderSvc.FreezeRenderPlan(r.Context(), in)
 	if err != nil {
-		if errors.Is(err, domain.ErrRenderSourceNotFound) || errors.Is(err, domain.ErrDubMixNotRenderable) || errors.Is(err, domain.ErrSubtitlePlanNotFound) {
-			writeError(w, http.StatusUnprocessableEntity, err.Error())
+		if errors.Is(err, domain.ErrRenderOwnershipMismatch) {
+			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
-		if errors.Is(err, domain.ErrRenderSourceNotFound) || errors.Is(err, domain.ErrDubMixNotRenderable) {
+		if errors.Is(err, domain.ErrRenderPlanInvalid) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrRenderSourceNotFound) || errors.Is(err, domain.ErrDubMixNotRenderable) || errors.Is(err, domain.ErrSubtitlePlanNotFound) {
 			writeError(w, http.StatusUnprocessableEntity, err.Error())
 			return
 		}
@@ -3973,6 +3987,10 @@ func (s *Server) handleRenderPreview(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, domain.ErrRenderPlanNotFound) {
 			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrRenderOwnershipMismatch) {
+			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
 		if errors.Is(err, domain.ErrRenderPlanInvalid) {
@@ -4081,6 +4099,10 @@ func (s *Server) handleRenderFinal(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
+		if errors.Is(err, domain.ErrRenderOwnershipMismatch) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		if errors.Is(err, domain.ErrRenderPlanInvalid) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -4095,7 +4117,7 @@ func (s *Server) handleRenderFinal(w http.ResponseWriter, r *http.Request) {
 
 	// Review posture leaves the job open at the handoff: the run's pipeline finished, and this explicit
 	// render is the work the job was waiting for, so the job follows the render that just succeeded.
-	if err := s.completeJobAfterExplicitFinalRender(r.Context(), body.RunID); err != nil {
+	if err := s.completeJobAfterExplicitFinalRender(r.Context(), body.RunID, assetID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

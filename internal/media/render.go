@@ -365,7 +365,15 @@ func ComposeNativeVideo(ctx context.Context, req CompositionRequest) (*Compositi
 	// Prepare ASS content if cues or ASS content provided
 	assContent := req.ASSContent
 	if assContent == "" && len(req.Cues) > 0 {
-		assContent = GenerateASSContent(req.Timeline, req.Cues, req.FontFile)
+		fontFamily := ""
+		if strings.TrimSpace(req.FontFile) != "" {
+			var err error
+			fontFamily, err = ResolveASSFontFamily(req.FontFile)
+			if err != nil {
+				return nil, fmt.Errorf("resolve font family for fallback subtitles: %w", err)
+			}
+		}
+		assContent = GenerateASSContent(req.Timeline, req.Cues, fontFamily)
 	}
 
 	var tmpDir string
@@ -384,8 +392,7 @@ func ComposeNativeVideo(ctx context.Context, req CompositionRequest) (*Compositi
 			return nil, fmt.Errorf("write ass file: %w", err)
 		}
 
-		escapedASS := EscapeFFmpegFilterPath(assPath)
-		assFilter := fmt.Sprintf("ass=filename='%s'", escapedASS)
+		assFilter := assFilterSpec(assPath, req.FontFile)
 
 		if scaleDiv > 1 {
 			filterGraph = fmt.Sprintf("%s,scale=trunc(iw/%d/2)*2:-2", assFilter, scaleDiv)

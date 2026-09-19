@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/domain"
@@ -887,4 +889,534 @@ func TestSeam1_Render_RedTest_BrokenSubtitlePlanFailsClosed_AndValidEmptySucceed
 	if emptyPreview.ConsumedPlan.AudioCASHash != dubMix.AudioCASHash {
 		t.Errorf("expected dubMix audio preserved in empty subtitle render")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: Fix 1 Regression — Cross-Run / Cross-Asset Final Render Mismatch Fails Closed
+// Explicit final render must fail closed (409 Conflict) when the requested run, job,
+// and asset do not agree, and must NEVER complete another run's job.
+// ---------------------------------------------------------------------------
+func TestSeam1_Render_CrossRunFinalRenderMismatch_FailsClosedAndNeverCompletesOtherJob(t *testing.T) {
+	h := setupHarness(t)
+
+	// Asset A: has its own job, run, and a frozen render plan.
+	assetA, runA, jobA, _ := setupAssetWithDubMix(t, h)
+	cuesA := []domain.SubtitleCue{
+		{StartMs: 0, EndMs: 400, Text: "Phụ đề asset A"},
+	}
+	freezeRespA, planA := runFreezeRenderPlan(t, h, assetA, map[string]any{
+		"run_id":          runA,
+		"job_id":          jobA,
+		"target_language": domain.TargetLanguageVI,
+		"subtitle_cues":   cuesA,
+	})
+	defer freezeRespA.Body.Close()
+	if freezeRespA.StatusCode != http.StatusCreated || planA == nil {
+		t.Fatalf("freeze plan for asset A failed: %d", freezeRespA.StatusCode)
+	}
+
+	// Asset B: distinct source media, its own job and run.
+	jobB, runB := createJobAndRunWithDuration(t, h, 2.0)
+	jobBEntity := getJobViaAPI(t, h, jobB)
+	assetB := jobBEntity.SourceAssetID
+	if assetB == assetA {
+		t.Fatalf("test invariant: asset B must differ from asset A, both got %s", assetA)
+	}
+
+	// Mark run B's queue entry as completed so the completion gate would trigger
+	// if reached.
+	if err := h.db.UpdateQueueStatus(context.Background(), runB, domain.RunStatusCompleted, domain.RunStatusCompleted); err != nil {
+		t.Fatalf("mark run B queue completed: %v", err)
+	}
+
+	// 1. Cross-run attack: attempt to render asset A using run B's ID.
+	// Must fail closed with 409 Conflict.
+	finResp, _ := runRenderFinal(t, h, assetA, map[string]any{
+		"run_id":          runB,
+		"job_id":          jobB,
+		"target_language": domain.TargetLanguageVI,
+		"plan_provenance": planA.ProvenanceHash,
+	})
+	defer finResp.Body.Close()
+	if finResp.StatusCode != http.StatusConflict {
+		t.Errorf("expected 409 Conflict on cross-run render attempt, got status %d", finResp.StatusCode)
+	}
+
+	// Job B must NOT have been marked completed.
+	jobBAfter := getJobViaAPI(t, h, jobB)
+	if jobBAfter.Status == "completed" {
+		t.Fatalf("SECURITY VIOLATION: job B was completed by an explicit render of asset A")
+	}
+
+	// 2. Cross-asset plan mismatch: attempt to render asset B using asset A's frozen plan.
+	finRespPlanMismatch, _ := runRenderFinal(t, h, assetB, map[string]any{
+		"run_id":          runB,
+		"job_id":          jobB,
+		"target_language": domain.TargetLanguageVI,
+		"plan_cas":        planA.CASHash,
+	})
+	defer finRespPlanMismatch.Body.Close()
+	if finRespPlanMismatch.StatusCode != http.StatusConflict {
+		t.Errorf("expected 409 Conflict on cross-asset plan_cas render, got %d", finRespPlanMismatch.StatusCode)
+	}
+
+	// 3. Positive control: valid explicit render of asset A with matching run A succeeds
+	// and completes job A if run A was completed.
+	if err := h.db.UpdateQueueStatus(context.Background(), runA, domain.RunStatusCompleted, domain.RunStatusCompleted); err != nil {
+		t.Fatalf("mark run A queue completed: %v", err)
+	}
+	finRespValid, artValid := runRenderFinal(t, h, assetA, map[string]any{
+		"run_id":          runA,
+		"job_id":          jobA,
+		"target_language": domain.TargetLanguageVI,
+		"plan_provenance": planA.ProvenanceHash,
+	})
+	defer finRespValid.Body.Close()
+	if finRespValid.StatusCode != http.StatusCreated || artValid == nil {
+		t.Fatalf("expected 201 Created for valid same-run final render, got %d", finRespValid.StatusCode)
+	}
+	jobAAfter := getJobViaAPI(t, h, jobA)
+	if jobAAfter.Status != "completed" {
+		t.Errorf("expected job A completed after valid explicit final render, got %s", jobAAfter.Status)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: Fix 2 Regression — resolveVisualTrackLayers Fails Closed on Corrupt/Missing/Foreign Tracks
+// True absence stays optional; DB, CAS, decode, schema, and ownership failures fail closed.
+// ---------------------------------------------------------------------------
+func TestSeam1_Render_VisualTrackLayersFailClosed_OnCorruptMissingOrForeignEvidence(t *testing.T) {
+	h := setupHarness(t)
+	assetID, baseRunID, jobID, _ := setupAssetWithDubMix(t, h)
+	ctx := context.Background()
+
+	jobForeign, foreignRunID := createJobAndRunWithDuration(t, h, 2.5)
+	foreignAssetID := getJobViaAPI(t, h, jobForeign).SourceAssetID
+
+	defaultTrack := func(runID string) domain.LocalizedVisualTrack {
+		return domain.LocalizedVisualTrack{
+			ID:             uuid.NewString(),
+			SchemaVersion:  domain.LocalizedVisualTrackSchemaVersion,
+			AssetID:        assetID,
+			RunID:          runID,
+			TargetLanguage: domain.TargetLanguageVI,
+			ProvenanceHash: "prov-" + runID,
+			CreatedAt:      time.Now().UTC(),
+		}
+	}
+
+	seed := func(t *testing.T, runID string, payload any, mutateIdx func(*storage.LocalizedVisualTrackIndex)) string {
+		t.Helper()
+		var casHash string
+		trackID := uuid.NewString()
+		prov := "prov-" + runID
+
+		if payload != nil {
+			var raw []byte
+			switch v := payload.(type) {
+			case []byte:
+				raw = v
+			case string:
+				raw = []byte(v)
+			case domain.LocalizedVisualTrack:
+				trackID = v.ID
+				prov = v.ProvenanceHash
+				var err error
+				raw, err = json.Marshal(v)
+				if err != nil {
+					t.Fatalf("marshal visual track payload: %v", err)
+				}
+			default:
+				t.Fatalf("unsupported payload type: %T", payload)
+			}
+			obj, err := h.casStore.Put(bytes.NewReader(raw))
+			if err != nil {
+				t.Fatalf("put visual track in cas: %v", err)
+			}
+			casHash = obj.SHA256
+		} else {
+			casHash = "nonexistent_cas_hash_1234567890abcdef1234567890abcdef12345678"
+		}
+
+		idx := storage.LocalizedVisualTrackIndex{
+			ID:             trackID,
+			AssetID:        assetID,
+			RunID:          runID,
+			TargetLanguage: domain.TargetLanguageVI,
+			CASHash:        casHash,
+			ProvenanceHash: prov,
+			CreatedAt:      time.Now().UTC(),
+		}
+		if mutateIdx != nil {
+			mutateIdx(&idx)
+		}
+		if err := h.db.SaveLocalizedVisualTrackIndex(ctx, idx); err != nil {
+			t.Fatalf("save visual track index: %v", err)
+		}
+		return idx.RunID
+	}
+
+	cases := []struct {
+		name           string
+		expectedStatus int
+		setup          func(t *testing.T, runID string) string
+	}{
+		{
+			name:           "true absence succeeds",
+			expectedStatus: http.StatusCreated,
+			setup: func(t *testing.T, _ string) string {
+				return baseRunID
+			},
+		},
+		{
+			name:           "missing CAS",
+			expectedStatus: http.StatusUnprocessableEntity,
+			setup: func(t *testing.T, runID string) string {
+				return seed(t, runID, nil, nil)
+			},
+		},
+		{
+			name:           "corrupt CAS",
+			expectedStatus: http.StatusBadRequest,
+			setup: func(t *testing.T, runID string) string {
+				return seed(t, runID, "not-valid-json-track-bytes", nil)
+			},
+		},
+		{
+			name:           "schema mismatch",
+			expectedStatus: http.StatusBadRequest,
+			setup: func(t *testing.T, runID string) string {
+				tr := defaultTrack(runID)
+				tr.SchemaVersion = 999
+				return seed(t, runID, tr, nil)
+			},
+		},
+		{
+			name:           "foreign asset ownership",
+			expectedStatus: http.StatusConflict,
+			setup: func(t *testing.T, _ string) string {
+				tr := defaultTrack(foreignRunID)
+				tr.AssetID = foreignAssetID
+				return seed(t, foreignRunID, tr, func(idx *storage.LocalizedVisualTrackIndex) {
+					idx.AssetID = foreignAssetID
+				})
+			},
+		},
+		{
+			name:           "foreign CAS payload",
+			expectedStatus: http.StatusConflict,
+			setup: func(t *testing.T, runID string) string {
+				tr := defaultTrack(runID)
+				tr.AssetID = foreignAssetID
+				return seed(t, runID, tr, nil)
+			},
+		},
+		{
+			name:           "schema_version=0/missing",
+			expectedStatus: http.StatusBadRequest,
+			setup: func(t *testing.T, runID string) string {
+				tr := defaultTrack(runID)
+				tr.SchemaVersion = 0
+				return seed(t, runID, tr, nil)
+			},
+		},
+		{
+			name:           "mismatched run_id",
+			expectedStatus: http.StatusConflict,
+			setup: func(t *testing.T, runID string) string {
+				tr := defaultTrack(runID)
+				tr.RunID = "different_run_in_payload"
+				return seed(t, runID, tr, func(idx *storage.LocalizedVisualTrackIndex) {
+					idx.RunID = runID
+				})
+			},
+		},
+		{
+			name:           "empty run_id",
+			expectedStatus: http.StatusConflict,
+			setup: func(t *testing.T, runID string) string {
+				tr := defaultTrack(runID)
+				tr.RunID = ""
+				return seed(t, runID, tr, func(idx *storage.LocalizedVisualTrackIndex) {
+					idx.RunID = runID
+				})
+			},
+		},
+		{
+			name:           "mismatched ID",
+			expectedStatus: http.StatusConflict,
+			setup: func(t *testing.T, runID string) string {
+				tr := defaultTrack(runID)
+				tr.ID = "different-track-id-in-payload"
+				return seed(t, runID, tr, func(idx *storage.LocalizedVisualTrackIndex) {
+					idx.ID = uuid.NewString()
+				})
+			},
+		},
+		{
+			name:           "mismatched provenance",
+			expectedStatus: http.StatusConflict,
+			setup: func(t *testing.T, runID string) string {
+				tr := defaultTrack(runID)
+				tr.ProvenanceHash = "prov-in-payload-12345"
+				return seed(t, runID, tr, func(idx *storage.LocalizedVisualTrackIndex) {
+					idx.ProvenanceHash = "prov-in-index-67890"
+				})
+			},
+		},
+		{
+			name:           "empty provenance",
+			expectedStatus: http.StatusConflict,
+			setup: func(t *testing.T, runID string) string {
+				tr := defaultTrack(runID)
+				tr.ProvenanceHash = ""
+				return seed(t, runID, tr, func(idx *storage.LocalizedVisualTrackIndex) {
+					idx.ProvenanceHash = "index-has-prov-but-payload-empty"
+				})
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tcRunID := "run_vis_" + uuid.NewString()[:8]
+			reqRunID := tc.setup(t, tcRunID)
+			resp, plan := runFreezeRenderPlan(t, h, assetID, map[string]any{
+				"run_id":          reqRunID,
+				"job_id":          jobID,
+				"target_language": domain.TargetLanguageVI,
+				"subtitle_cues":   []domain.SubtitleCue{{StartMs: 0, EndMs: 300, Text: tc.name}},
+			})
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.expectedStatus {
+				t.Fatalf("expected status %d, got %d", tc.expectedStatus, resp.StatusCode)
+			}
+			if tc.expectedStatus == http.StatusCreated && plan == nil {
+				t.Fatal("expected non-nil render plan on success")
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: Fix 3 Regression — font_file File Path is Resolved to ASS Family Name (not Path as Fontname)
+// Proves that configuring a font_file path resolves the font's internal family name into ASS Fontname,
+// and registers the font directory with libass via fontsdir.
+// ---------------------------------------------------------------------------
+func TestSeam1_Render_FontFileResolvedToFamilyName_AndFontsdirRegistered(t *testing.T) {
+	h := setupHarness(t)
+	assetID, runID, jobID, _ := setupAssetWithDubMix(t, h)
+
+	// 1. Unparseable font file must fail closed when freezing a plan (prevents silent fallback/path embedding).
+	corruptFontPath := filepath.Join(t.TempDir(), "corrupt.ttf")
+	if err := os.WriteFile(corruptFontPath, []byte("not-a-valid-ttf-binary"), 0644); err != nil {
+		t.Fatalf("write corrupt font: %v", err)
+	}
+
+	renderSvc := service.NewRenderService(h.db, h.casStore)
+	renderSvc.SetFontFile(corruptFontPath)
+	h.srv.SetRenderService(renderSvc)
+
+	respFail, _ := runFreezeRenderPlan(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": domain.TargetLanguageVI,
+		"subtitle_cues":   []domain.SubtitleCue{{StartMs: 0, EndMs: 400, Text: "Fail font"}},
+	})
+	defer respFail.Body.Close()
+	if respFail.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request when font_file is unparseable, got %d", respFail.StatusCode)
+	}
+	renderSvcRuntime := service.NewRenderService(h.db, h.casStore)
+	var composerCalls int
+	var capturedReq media.CompositionRequest
+	renderSvcRuntime.SetCustomComposer(func(ctx context.Context, req media.CompositionRequest) (*media.CompositionResult, error) {
+		composerCalls++
+		capturedReq = req
+		dummy := []byte(fmt.Sprintf("FONT_OVERRIDE_TEST_%d", composerCalls))
+		if err := os.WriteFile(req.OutputPath, dummy, 0644); err != nil {
+			return nil, fmt.Errorf("write mock output: %w", err)
+		}
+		return &media.CompositionResult{OutputPath: req.OutputPath, ByteSize: int64(len(dummy)), DurationMs: 1000, Renderer: "mock"}, nil
+	})
+	h.srv.SetRenderService(renderSvcRuntime)
+
+	// 2. Freeze ONE plan without custom font -> carries default family ("Arial").
+	testFamily := "DouyinieDisplayTest"
+	fontFile := writeMinimalTestFont(t, t.TempDir(), testFamily)
+
+	freezeResp, plan := runFreezeRenderPlan(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": domain.TargetLanguageVI,
+		"subtitle_cues":   []domain.SubtitleCue{{StartMs: 0, EndMs: 400, Text: "Text with runtime font"}},
+	})
+	defer freezeResp.Body.Close()
+	if freezeResp.StatusCode != http.StatusCreated || plan == nil {
+		t.Fatalf("freeze plan failed: %d", freezeResp.StatusCode)
+	}
+
+	// Inspect frozen SubtitlePlanArtifact in CAS: it was frozen with default font (Arial)
+	r, err := h.casStore.Get(plan.SubtitlePlan.CASHash)
+	if err != nil {
+		t.Fatalf("get subtitle plan from cas: %v", err)
+	}
+	defer r.Close()
+	var subArt domain.SubtitlePlanArtifact
+	if err := json.NewDecoder(r).Decode(&subArt); err != nil {
+		t.Fatalf("decode subtitle plan: %v", err)
+	}
+	if !strings.Contains(subArt.ASSContent, "Style: CompactFitBox,Arial,") {
+		t.Fatalf("expected frozen subtitle plan to carry default Arial style, got: %s", subArt.ASSContent)
+	}
+
+	// 3. Render final WITHOUT font override -> establishes cached default-font artifact.
+	finRespDef, finalArtDef := runRenderFinal(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": domain.TargetLanguageVI,
+		"plan_provenance": plan.ProvenanceHash,
+	})
+	defer finRespDef.Body.Close()
+	if finRespDef.StatusCode != http.StatusCreated || finalArtDef == nil {
+		t.Fatalf("render default final failed: %d", finRespDef.StatusCode)
+	}
+	if composerCalls != 1 {
+		t.Fatalf("expected composer called once for default render, got %d", composerCalls)
+	}
+	if !strings.Contains(capturedReq.ASSContent, "Style: CompactFitBox,Arial,") {
+		t.Errorf("expected render without font override to preserve frozen Arial style, got: %s", capturedReq.ASSContent)
+	}
+	if capturedReq.FontFile != "" {
+		t.Errorf("expected empty CompositionRequest.FontFile when no override given, got %q", capturedReq.FontFile)
+	}
+	defaultProv := finalArtDef.ProvenanceHash
+	defaultCAS := finalArtDef.CASHash
+
+	// 4. Render the SAME plan with font_file override -> must NOT hit the cached default-font artifact!
+	finRespOverride, finalArtOverride := runRenderFinal(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": domain.TargetLanguageVI,
+		"plan_provenance": plan.ProvenanceHash,
+		"font_file":       fontFile,
+	})
+	defer finRespOverride.Body.Close()
+	if finRespOverride.StatusCode != http.StatusCreated || finalArtOverride == nil {
+		t.Fatalf("render final with font override failed: %d", finRespOverride.StatusCode)
+	}
+
+	// Composer MUST have been called a second time (did not return cached default artifact)
+	if composerCalls != 2 {
+		t.Errorf("CACHE COLLISION BUG: composer was not invoked for font override render; got call count %d, want 2", composerCalls)
+	}
+	// Render artifact provenance and output CAS must differ from default
+	if finalArtOverride.ProvenanceHash == defaultProv {
+		t.Errorf("expected distinct artifact provenance for font override render, got identical %s", defaultProv)
+	}
+	if finalArtOverride.CASHash == defaultCAS {
+		t.Errorf("expected distinct CAS output for font override render, got identical %s", defaultCAS)
+	}
+	// CompositionRequest ASSContent uses custom family, not Arial or raw path
+	if !strings.Contains(capturedReq.ASSContent, fmt.Sprintf("Style: CompactFitBox,%s,", testFamily)) {
+		t.Errorf("expected runtime font override to regenerate ASS with family %q, got: %s", testFamily, capturedReq.ASSContent)
+	}
+	if strings.Contains(capturedReq.ASSContent, "Style: CompactFitBox,Arial,") {
+		t.Errorf("runtime font override did not replace frozen Arial style in ASSContent")
+	}
+	if strings.Contains(capturedReq.ASSContent, fontFile) {
+		t.Errorf("REGRESSION DETECTED: ASS content contains raw font_file path %q as Fontname", fontFile)
+	}
+	if capturedReq.FontFile != fontFile {
+		t.Errorf("expected CompositionRequest.FontFile to preserve file path %q, got %q", fontFile, capturedReq.FontFile)
+	}
+
+	// 5. Repeated render with the SAME font override -> cache hit (idempotent; composer not re-invoked).
+	finRespRepeat, finalArtRepeat := runRenderFinal(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": domain.TargetLanguageVI,
+		"plan_provenance": plan.ProvenanceHash,
+		"font_file":       fontFile,
+	})
+	defer finRespRepeat.Body.Close()
+	if finRespRepeat.StatusCode != http.StatusCreated || finalArtRepeat == nil {
+		t.Fatalf("render final with repeated font override failed: %d", finRespRepeat.StatusCode)
+	}
+	if composerCalls != 2 {
+		t.Errorf("expected composer NOT re-invoked on repeated identical font override (cache hit), got call count %d", composerCalls)
+	}
+	if finalArtRepeat.ProvenanceHash != finalArtOverride.ProvenanceHash {
+		t.Errorf("expected repeated font override to return identical provenance hash %s, got %s",
+			finalArtOverride.ProvenanceHash, finalArtRepeat.ProvenanceHash)
+	}
+
+	// 6. Preview render parity: preview also uses corrected font identity.
+	prevDef, err := renderSvcRuntime.RenderPreview(context.Background(), service.RenderExecutionInput{
+		AssetID:        assetID,
+		TargetLanguage: domain.TargetLanguageVI,
+		PlanProvenance: plan.ProvenanceHash,
+	})
+	if err != nil {
+		t.Fatalf("preview render without font override failed: %v", err)
+	}
+	prevOverride, err := renderSvcRuntime.RenderPreview(context.Background(), service.RenderExecutionInput{
+		AssetID:        assetID,
+		TargetLanguage: domain.TargetLanguageVI,
+		PlanProvenance: plan.ProvenanceHash,
+		FontFile:       fontFile,
+	})
+	if err != nil {
+		t.Fatalf("preview render with font override failed: %v", err)
+	}
+	if prevOverride.ProvenanceHash == prevDef.ProvenanceHash {
+		t.Errorf("expected preview render with font override to produce distinct provenance, got identical %s", prevDef.ProvenanceHash)
+	}
+}
+
+// writeMinimalTestFont creates a syntactically valid TrueType sfnt binary with a single
+// 'name' table carrying the specified family name (nameID 1, Windows Unicode).
+func writeMinimalTestFont(t *testing.T, dir, family string) string {
+	t.Helper()
+
+	// Encode family string to UTF-16BE
+	utf16Units := utf16.Encode([]rune(family))
+	strBytes := make([]byte, len(utf16Units)*2)
+	for i, u := range utf16Units {
+		strBytes[i*2] = byte(u >> 8)
+		strBytes[i*2+1] = byte(u & 0xFF)
+	}
+
+	// Build 'name' table (format 0)
+	// Header: format=0 (2), count=1 (2), strOffset=6+12=18 (2) -> 6 bytes
+	// Record: platform=3 (2), encoding=1 (2), language=0x0409 (2), nameID=1 (2), length (2), offset=0 (2) -> 12 bytes
+	// String pool: strBytes
+	nameTable := new(bytes.Buffer)
+	nameTable.Write([]byte{0x00, 0x00})                                                 // format 0
+	nameTable.Write([]byte{0x00, 0x01})                                                 // count = 1
+	nameTable.Write([]byte{0x00, 18})                                                   // string offset = 18
+	nameTable.Write([]byte{0x00, 0x03, 0x00, 0x01, 0x04, 0x09, 0x00, 0x01})             // platform 3, encoding 1, lang 0x409, nameID 1
+	nameTable.Write([]byte{byte(len(strBytes) >> 8), byte(len(strBytes) & 0xFF), 0, 0}) // length, offset=0
+	nameTable.Write(strBytes)
+
+	// Pad name table to 4-byte boundary
+	for nameTable.Len()%4 != 0 {
+		nameTable.WriteByte(0)
+	}
+	nameLen := uint32(nameTable.Len())
+	nameOffset := uint32(12 + 16) // sfnt header (12) + 1 table entry (16)
+
+	// Build sfnt file
+	fontBuf := new(bytes.Buffer)
+	// Header: version 0x00010000, numTables=1, searchRange=16, entrySelector=0, rangeShift=0
+	fontBuf.Write([]byte{0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00})
+	// Table record: tag='name', checksum=0, offset=28, length=nameLen
+	fontBuf.WriteString("name")
+	fontBuf.Write([]byte{0x00, 0x00, 0x00, 0x00}) // checksum dummy
+	fontBuf.Write([]byte{byte(nameOffset >> 24), byte(nameOffset >> 16), byte(nameOffset >> 8), byte(nameOffset)})
+	fontBuf.Write([]byte{byte(nameLen >> 24), byte(nameLen >> 16), byte(nameLen >> 8), byte(nameLen)})
+	fontBuf.Write(nameTable.Bytes())
+
+	fontPath := filepath.Join(dir, "test_custom_font.ttf")
+	if err := os.WriteFile(fontPath, fontBuf.Bytes(), 0644); err != nil {
+		t.Fatalf("write minimal test font: %v", err)
+	}
+	return fontPath
 }
