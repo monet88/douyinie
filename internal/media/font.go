@@ -149,10 +149,10 @@ func ParseFontFamily(r io.ReaderAt) (string, error) {
 		}
 		rec := nameTable[recOffset : recOffset+12]
 		platformID := binary.BigEndian.Uint16(rec[0:2])
+		encodingID := binary.BigEndian.Uint16(rec[2:4])
 		nameID := binary.BigEndian.Uint16(rec[6:8])
 		length := int(binary.BigEndian.Uint16(rec[8:10]))
 		strRelOffset := int(binary.BigEndian.Uint16(rec[10:12]))
-
 		// Consider Typographic Family (16) and Font Family (1)
 		if nameID != 16 && nameID != 1 {
 			continue
@@ -175,7 +175,24 @@ func ParseFontFamily(r io.ReaderAt) (string, error) {
 				u16s[j] = binary.BigEndian.Uint16(rawBytes[j*2 : j*2+2])
 			}
 			text = string(utf16.Decode(u16s))
-		case 1: // Mac Roman / ASCII
+		case 1: // Macintosh
+			if encodingID != 0 {
+				// Non-Roman Macintosh encodings are not supported without dedicated charmaps.
+				continue
+			}
+			// Mac Roman is byte-compatible with UTF-8 only within 7-bit ASCII (0x00-0x7F).
+			// Non-ASCII bytes in Mac Roman (>=0x80) map to different code points than UTF-8,
+			// which corrupts the family name and causes libass font selection failure.
+			isASCII := true
+			for _, b := range rawBytes {
+				if b > 0x7F {
+					isASCII = false
+					break
+				}
+			}
+			if !isASCII {
+				continue
+			}
 			text = string(rawBytes)
 		case 0: // Unicode UTF-16BE
 			if length%2 != 0 {
