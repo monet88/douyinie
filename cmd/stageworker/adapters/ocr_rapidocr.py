@@ -162,12 +162,21 @@ def parse_rapidocr_result(raw_result: Any, frame_idx: int, ts_ms: int) -> List[D
     if not raw_result:
         return []
 
-    # RapidOCR returns tuple (results, elapse_list) or list of results
-    if isinstance(raw_result, (list, tuple)) and len(raw_result) == 2 and isinstance(raw_result[1], list):
-        items = raw_result[0]
-    else:
+    # RapidOCR 3.8+ returns RapidOCROutput with .boxes, .txts, .scores
+    if hasattr(raw_result, "boxes") and hasattr(raw_result, "txts") and hasattr(raw_result, "scores"):
+        raw_boxes = getattr(raw_result, "boxes", None)
+        raw_txts = getattr(raw_result, "txts", None)
+        raw_scores = getattr(raw_result, "scores", None)
+        if raw_boxes is not None and raw_txts is not None and raw_scores is not None and len(raw_boxes) > 0:
+            items = list(zip(raw_boxes, raw_txts, raw_scores))
+        else:
+            items = []
+    elif isinstance(raw_result, (list, tuple)) and len(raw_result) == 2 and isinstance(raw_result[1], list):
+        items = raw_result[0] if raw_result[0] is not None else []
+    elif isinstance(raw_result, (list, tuple)):
         items = raw_result
-
+    else:
+        items = []
     if not items:
         return []
 
@@ -239,12 +248,16 @@ def detect_text_rapidocr(
         OCRClass = _RAPIDOCR_CLASS
     else:
         try:
-            from rapidocr_onnxruntime import RapidOCR  # type: ignore
+            from rapidocr import RapidOCR  # type: ignore
             OCRClass = RapidOCR
-        except ImportError as exc:
-            raise RuntimeError(
-                "RapidOCR runtime not found: install rapidocr_onnxruntime (pip install rapidocr_onnxruntime)"
-            ) from exc
+        except ImportError:
+            try:
+                from rapidocr_onnxruntime import RapidOCR  # type: ignore
+                OCRClass = RapidOCR
+            except ImportError as exc:
+                raise RuntimeError(
+                    "RapidOCR runtime not found: install rapidocr or rapidocr_onnxruntime (pip install rapidocr)"
+                ) from exc
 
     kwargs = {}
     if det_model_dir and os.path.isfile(det_model_dir):

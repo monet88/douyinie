@@ -82,34 +82,84 @@ def run_diarization_sherpa(
         import wave
         import numpy as np
 
-        # Set up Sherpa-ONNX offline speaker diarization
-        model_file = model_path or "models/campplus.onnx"
-        vad_file = vad_model_path or "models/silero_vad.onnx"
+        model_file = model_path or "models/diarizer/campplus.onnx"
+        vad_file = vad_model_path or "models/vad/silero_vad.onnx"
 
         if not os.path.isfile(model_file) or not os.path.isfile(vad_file):
             raise FileNotFoundError(f"Diarization models missing: {model_file} or {vad_file}")
 
-        config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
-            segmentation=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(model=""),
-            embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=model_file, num_threads=2),
-            clustering=sherpa_onnx.FastClusteringConfig(num_clusters=-1, threshold=0.6),
-        )
-        diarizer = sherpa_onnx.OfflineSpeakerDiarization(config)
-
         with wave.open(audio_path, "rb") as wf:
+            sample_rate = wf.getframerate()
             num_samples = wf.getnframes()
-            samples = wf.readframes(num_samples)
-            samples_float = np.frombuffer(samples, dtype=np.int16).astype(np.float32) / 32768.0
-            segments = diarizer.process(samples_float)
+            samples = np.frombuffer(wf.readframes(num_samples), dtype=np.int16).astype(np.float32) / 32768.0
 
-        assignments = []
-        for seg in segments:
-            assignments.append({
-                "speaker_id": f"SPEAKER_{seg.speaker:02d}",
-                "label": f"SPEAKER_{seg.speaker:02d}",
-                "start_ms": int(seg.start * 1000),
-                "end_ms": int(seg.end * 1000),
+        vad_config = sherpa_onnx.VadModelConfig(
+            silero_vad=sherpa_onnx.SileroVadModelConfig(
+                model=vad_file,
+                threshold=0.5,
+                min_speech_duration=0.25,
+                min_silence_duration=0.5,
+                window_size=512,
+            ),
+            sample_rate=sample_rate,
+            num_threads=2,
+        )
+        vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=max(60, int(len(samples) / sample_rate) + 10))
+        window_size = 512
+        for i in range(0, len(samples), window_size):
+            chunk = samples[i : i + window_size]
+            if len(chunk) < window_size:
+                chunk = np.pad(chunk, (0, window_size - len(chunk)))
+            vad.accept_waveform(chunk)
+        vad.flush()
+
+        vad_segments = []
+        while not vad.empty():
+            seg = vad.front
+            start_s = seg.start / sample_rate
+            end_s = (seg.start + len(seg.samples)) / sample_rate
+            vad_segments.append((start_s, end_s, seg.samples))
+            vad.pop()
+
+        if not vad_segments:
+            return [{
+                "speaker_id": "SPEAKER_00",
+                "label": "SPEAKER_00",
+                "start_ms": 0,
+                "end_ms": int((len(samples) / sample_rate) * 1000),
                 "confidence": 0.0,
+            }]
+
+        extractor_config = sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=model_file, num_threads=2)
+        extractor = sherpa_onnx.SpeakerEmbeddingExtractor(extractor_config)
+
+        clusters: List[Dict[str, Any]] = []
+        assignments = []
+
+        for start_s, end_s, chunk_samples in vad_segments:
+            stream = extractor.create_stream()
+            stream.accept_waveform(sample_rate, chunk_samples)
+            emb = extractor.compute(stream)
+
+            assigned_id = None
+            best_sim = -1.0
+            for c in clusters:
+                sim = compute_cosine_similarity(emb, c["embedding"])
+                if sim > best_sim:
+                    best_sim = sim
+                    if sim >= 0.65:
+                        assigned_id = c["id"]
+
+            if assigned_id is None:
+                assigned_id = f"SPEAKER_{len(clusters):02d}"
+                clusters.append({"id": assigned_id, "embedding": emb})
+
+            assignments.append({
+                "speaker_id": assigned_id,
+                "label": assigned_id,
+                "start_ms": int(start_s * 1000),
+                "end_ms": int(end_s * 1000),
+                "confidence": float(round(best_sim if best_sim >= 0 else 1.0, 3)),
             })
         return assignments
 
