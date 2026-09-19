@@ -1037,18 +1037,22 @@ func resolveASRRunner() (commandRunner, error) {
 		}
 	}
 
-	// Repo-owned Python adapter cmd/stageworker/adapters/asr_qwen3.py
-	adapterPaths := []string{
-		filepath.Join("cmd", "stageworker", "adapters", "asr_qwen3.py"),
-		filepath.Join("adapters", "asr_qwen3.py"),
-	}
-	if exe, err := os.Executable(); err == nil {
-		exeDir := filepath.Dir(exe)
+	// Repo-owned Python adapters: check SenseVoice-Small ONNX first (lightweight), fallback to Qwen3-ASR
+	adapterCandidates := []string{"asr_sensevoice.py", "asr_qwen3.py"}
+	var adapterPaths []string
+	for _, name := range adapterCandidates {
 		adapterPaths = append(adapterPaths,
-			filepath.Join(exeDir, "adapters", "asr_qwen3.py"),
-			filepath.Join(exeDir, "..", "cmd", "stageworker", "adapters", "asr_qwen3.py"),
-			filepath.Join(exeDir, "..", "..", "cmd", "stageworker", "adapters", "asr_qwen3.py"),
+			filepath.Join("cmd", "stageworker", "adapters", name),
+			filepath.Join("adapters", name),
 		)
+		if exe, err := os.Executable(); err == nil {
+			exeDir := filepath.Dir(exe)
+			adapterPaths = append(adapterPaths,
+				filepath.Join(exeDir, "adapters", name),
+				filepath.Join(exeDir, "..", "cmd", "stageworker", "adapters", name),
+				filepath.Join(exeDir, "..", "..", "cmd", "stageworker", "adapters", name),
+			)
+		}
 	}
 
 	for _, p := range adapterPaths {
@@ -1894,20 +1898,24 @@ func resolveOCRRunner() (commandRunner, error) {
 				"python runtime not found to execute DOUYINIE_OCR_ADAPTER", nil)
 		}
 	}
-	// Repo-owned Python adapter cmd/stageworker/adapters/ocr.py
-	adapterPaths := []string{
-		filepath.Join("cmd", "stageworker", "adapters", "ocr.py"),
-		filepath.Join("adapters", "ocr.py"),
-		filepath.Join("..", "..", "cmd", "stageworker", "adapters", "ocr.py"),
-		filepath.Join("..", "cmd", "stageworker", "adapters", "ocr.py"),
-	}
-	if exe, err := os.Executable(); err == nil {
-		exeDir := filepath.Dir(exe)
+	// Repo-owned Python adapters: check RapidOCR ONNX first (lightweight), fallback to PaddleOCR
+	adapterCandidates := []string{"ocr_rapidocr.py", "ocr.py"}
+	var adapterPaths []string
+	for _, name := range adapterCandidates {
 		adapterPaths = append(adapterPaths,
-			filepath.Join(exeDir, "adapters", "ocr.py"),
-			filepath.Join(exeDir, "..", "cmd", "stageworker", "adapters", "ocr.py"),
-			filepath.Join(exeDir, "..", "..", "cmd", "stageworker", "adapters", "ocr.py"),
+			filepath.Join("cmd", "stageworker", "adapters", name),
+			filepath.Join("adapters", name),
+			filepath.Join("..", "..", "cmd", "stageworker", "adapters", name),
+			filepath.Join("..", "cmd", "stageworker", "adapters", name),
 		)
+		if exe, err := os.Executable(); err == nil {
+			exeDir := filepath.Dir(exe)
+			adapterPaths = append(adapterPaths,
+				filepath.Join(exeDir, "adapters", name),
+				filepath.Join(exeDir, "..", "cmd", "stageworker", "adapters", name),
+				filepath.Join(exeDir, "..", "..", "cmd", "stageworker", "adapters", name),
+			)
+		}
 	}
 
 	for _, p := range adapterPaths {
