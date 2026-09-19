@@ -1173,20 +1173,23 @@ func resolveDiarizerRunner() (commandRunner, error) {
 		}
 	}
 
-	// Repo-owned Python adapter
-	adapterPaths := []string{
-		filepath.Join("cmd", "stageworker", "adapters", "diarizer_3dspeaker.py"),
-		filepath.Join("adapters", "diarizer_3dspeaker.py"),
-	}
-	if exe, err := os.Executable(); err == nil {
-		exeDir := filepath.Dir(exe)
+	// Repo-owned Python adapters: check Sherpa-ONNX first (lightweight), fallback to 3D-Speaker
+	adapterCandidates := []string{"diarizer_sherpa_onnx.py", "diarizer_3dspeaker.py"}
+	var adapterPaths []string
+	for _, name := range adapterCandidates {
 		adapterPaths = append(adapterPaths,
-			filepath.Join(exeDir, "adapters", "diarizer_3dspeaker.py"),
-			filepath.Join(exeDir, "..", "cmd", "stageworker", "adapters", "diarizer_3dspeaker.py"),
-			filepath.Join(exeDir, "..", "..", "cmd", "stageworker", "adapters", "diarizer_3dspeaker.py"),
+			filepath.Join("cmd", "stageworker", "adapters", name),
+			filepath.Join("adapters", name),
 		)
+		if exe, err := os.Executable(); err == nil {
+			exeDir := filepath.Dir(exe)
+			adapterPaths = append(adapterPaths,
+				filepath.Join(exeDir, "adapters", name),
+				filepath.Join(exeDir, "..", "cmd", "stageworker", "adapters", name),
+				filepath.Join(exeDir, "..", "..", "cmd", "stageworker", "adapters", name),
+			)
+		}
 	}
-
 	for _, p := range adapterPaths {
 		if absP, err := filepath.Abs(p); err == nil {
 			if _, err := os.Stat(absP); err == nil {
