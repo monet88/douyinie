@@ -10,6 +10,8 @@ import (
 
 type jobObjectHandle struct{}
 
+func (j *jobObjectHandle) terminate() {}
+func (j *jobObjectHandle) close()     {}
 func jobObjectSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{Setpgid: true}
 }
