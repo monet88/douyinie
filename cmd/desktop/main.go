@@ -181,8 +181,8 @@ func main() {
 		},
 		Windows: &windows.Options{
 			WebviewIsTransparent: false,
-			WindowIsTranslucent:   false,
-			DisableWindowIcon:     false,
+			WindowIsTranslucent:  false,
+			DisableWindowIcon:    false,
 		},
 		Mac: &mac.Options{
 			TitleBar: mac.TitleBarDefault(),
