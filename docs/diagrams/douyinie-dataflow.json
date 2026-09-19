@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "Douyinie Artifact Lineage & Data Flow",
+    "output": "docs/diagrams/douyinie-dataflow.html",
+    "viewBox": [1080, 560],
+    "animation": "trace",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "full-lineage",
+        "label": "Toàn cảnh luồng dữ liệu",
+        "focus": ["source_asset", "audio_stems", "text_plan", "transcript", "translation", "dub_segments", "final_render"],
+        "note": "Từ media gốc trích xuất qua các tầng kế thừa artifact bất biến trong CAS."
+      },
+      {
+        "id": "audio-lineage",
+        "label": "Audio & Dubbing Lineage",
+        "focus": ["source_asset", "audio_stems", "transcript", "translation", "dub_segments", "final_render"],
+        "note": "Nhánh bóc tách âm thanh, nhận dạng, dịch thoại và sinh tiếng lồng ghép."
+      },
+      {
+        "id": "visual-lineage",
+        "label": "Visual In-Place Lineage",
+        "focus": ["source_asset", "text_plan", "translation", "visual_track", "final_render"],
+        "note": "Nhánh nhận dạng vùng chữ hình ảnh, dịch và tạo lớp phủ in-place."
+      }
+    ]
+  },
+  "stages": [
+    { "label": "Source Media" },
+    { "label": "Extraction" },
+    { "label": "Transcribe & Translate" },
+    { "label": "Synthesis & Overlays" },
+    { "label": "Final Output" }
+  ],
+  "nodes": [
+    { "id": "source_asset", "type": "frontend", "label": "Source Asset", "sublabel": "MP4 Video + Hash", "stage": 0, "row": 1, "tag": "SHA-256 CAS" },
+    { "id": "audio_stems", "type": "database", "label": "Audio Stems", "sublabel": "Vocals + BGM 16kHz", "stage": 1, "row": 0, "tag": "Demucs / UVR" },
+    { "id": "text_plan", "type": "database", "label": "Text Region Plan", "sublabel": "Bounding Polygons", "stage": 1, "row": 2, "tag": "PaddleOCR + Ink" },
+    { "id": "transcript", "type": "database", "label": "Transcript", "sublabel": "SpeechBlocks + Timing", "stage": 2, "row": 0, "tag": "Qwen3-ASR" },
+    { "id": "translation", "type": "cloud", "label": "Translation", "sublabel": "VI Target Meaning", "stage": 2, "row": 2, "tag": "Remote LLM" },
+    { "id": "dub_segments", "type": "database", "label": "Dub Segments", "sublabel": "ZeroTTS WAV Clips", "stage": 3, "row": 0, "tag": "Zero Overrun" },
+    { "id": "visual_track", "type": "database", "label": "Visual Track", "sublabel": "Tight Hug Overlays", "stage": 3, "row": 2, "tag": "In-Place Cover" },
+    { "id": "final_render", "type": "backend", "label": "Final Render", "sublabel": "Localized Video + Mix", "stage": 4, "row": 1, "tag": "PASS Deliverable" }
+  ],
+  "flows": [
+    { "id": "f1", "from": "source_asset", "to": "audio_stems", "label": "vocal separation", "classification": "demucs/uvr", "variant": "emphasis", "fromSide": "right", "toSide": "left", "via": [[195, 271], [195, 157]], "labelAt": [195, 214] },
+    { "id": "f2", "from": "source_asset", "to": "text_plan", "label": "ocr detection", "classification": "paddleocr", "variant": "default", "fromSide": "right", "toSide": "left", "via": [[220, 271], [220, 385]], "labelAt": [220, 328] },
+    { "id": "f3", "from": "audio_stems", "to": "transcript", "label": "speech tokens", "classification": "qwen3-asr", "variant": "emphasis", "route": "straight", "labelAt": [422, 145] },
+    { "id": "f4", "from": "text_plan", "to": "translation", "label": "visual text", "classification": "remote llm", "variant": "default", "route": "straight", "labelAt": [422, 397] },
+    { "id": "f5", "from": "transcript", "to": "dub_segments", "label": "dub script tts", "classification": "zerotts", "variant": "emphasis", "route": "straight", "labelAt": [637, 145] },
+    { "id": "f6", "from": "translation", "to": "visual_track", "label": "target labels", "classification": "translated text", "variant": "default", "route": "straight", "labelAt": [637, 397] },
+    { "id": "f7", "from": "dub_segments", "to": "final_render", "label": "speech mix", "classification": "ffmpeg mix", "variant": "emphasis", "fromSide": "right", "toSide": "left", "via": [[840, 157], [840, 271]], "labelAt": [840, 214] },
+    { "id": "f8", "from": "visual_track", "to": "final_render", "label": "draw overlays", "classification": "ffmpeg draw", "variant": "default", "fromSide": "right", "toSide": "left", "via": [[865, 385], [865, 271]], "labelAt": [865, 328] },
+    { "id": "f9", "from": "transcript", "to": "translation", "label": "dialogue text", "classification": "remote llm", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "route": "straight", "labelAt": [575, 271] }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Artifact Invariants",
+      "items": [
+        "Mọi artifact đều bất biến và lưu tại CAS theo mã băm SHA-256",
+        "SourceAsset lưu giữ timeline gốc bất biến (không co giãn thời lượng video)",
+        "Các stage worker tái sử dụng artifact qua CAS mà không tính toán lại"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Dual Track Processing",
+      "items": [
+        "Nhánh Speech: Bóc tách vocals -> ASR -> Dịch thoại -> Lồng tiếng TTS",
+        "Nhánh Visual: Nhận dạng vùng chữ -> Dịch chữ -> Che và vẽ lớp phủ in-place",
+        "Hòa âm giữ nguyên nhạc nền (BGM) và SFX từ audio stems ban đầu"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,90 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Douyinie Stage Pipeline Workflow",
+    "animation": "trace",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "full-pipeline",
+        "label": "Pipeline chính (Happy Path)",
+        "focus": ["ingest", "audio_plan", "separation", "asr_align", "translation", "dubbing", "final_render"],
+        "note": "Tiến trình tự động từ tiếp nhận video đến xuất bản phẩm hoàn thiện."
+      },
+      {
+        "id": "visual-track",
+        "label": "Nhánh Visual Text Localization",
+        "focus": ["ingest", "ocr_detect", "translation", "visual_track", "final_render"],
+        "note": "Phát hiện chữ, tinh chỉnh mực, dịch và tạo lớp phủ in-place."
+      },
+      {
+        "id": "review-gate",
+        "label": "Ngoại lệ & Review Gate",
+        "focus": ["audio_plan", "review_gate", "operator_edit", "dubbing"],
+        "note": "Xử lý khi vai trò âm thanh hoặc vùng phụ đề cần người duyệt."
+      }
+    ],
+    "output": "docs/diagrams/douyinie-workflow.html"
+  },
+  "lanes": [
+    { "id": "visual", "label": "Visual StageWorkers" },
+    { "id": "control", "label": "Pipeline Control Plane" },
+    { "id": "audio", "label": "Audio StageWorkers" },
+    { "id": "review", "label": "Exception & Review Gate", "variant": "exception" }
+  ],
+  "phases": [
+    { "id": "phase_ingest", "label": "1. Ingest & Extract", "fromCol": 0, "toCol": 1 },
+    { "id": "phase_process", "label": "2. Align & Translate", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "phase_synthesize", "label": "3. Dub, Mix & Deliver", "fromCol": 4, "toCol": 5, "variant": "dashed" }
+  ],
+  "mainPath": ["ingest", "audio_plan", "separation", "asr_align", "translation", "dubbing", "final_render"],
+  "nodes": [
+    { "id": "ingest", "lane": "control", "col": 0, "type": "frontend", "label": "Media Intake", "sublabel": "Validate & CAS Put", "tag": "SHA-256", "width": 118 },
+    { "id": "ocr_detect", "lane": "visual", "col": 1, "type": "backend", "label": "OCR & Ink Refine", "sublabel": "PaddleOCR + Ink", "tag": "Text Regions", "width": 118 },
+    { "id": "audio_plan", "lane": "audio", "col": 1, "type": "backend", "label": "Audio Role Plan", "sublabel": "YAMNet 16kHz", "tag": "Speech vs BGM", "width": 118 },
+    { "id": "separation", "lane": "audio", "col": 2, "type": "backend", "label": "Audio Separation", "sublabel": "Demucs / UVR", "tag": "Vocals & Music", "width": 118 },
+    { "id": "review_gate", "lane": "review", "col": 2, "type": "security", "label": "Review Queue", "sublabel": "Low Confidence", "tag": "Operator Stop", "width": 118 },
+    { "id": "asr_align", "lane": "audio", "col": 3, "type": "backend", "label": "ASR & Alignment", "sublabel": "Qwen3-ASR + Diarize", "tag": "Source Timing", "width": 118 },
+    { "id": "translation", "lane": "control", "col": 3, "type": "cloud", "label": "Remote Translation", "sublabel": "Gemini -> DeepSeek", "tag": "VI/EN Meaning", "width": 118 },
+    { "id": "operator_edit", "lane": "review", "col": 3, "type": "frontend", "label": "Operator Override", "sublabel": "Inspector Geometry", "tag": "Fail-Closed", "width": 118 },
+    { "id": "visual_track", "lane": "visual", "col": 4, "type": "backend", "label": "Visual Overlay", "sublabel": "Tight Hug Cover", "tag": "In-Place", "width": 118 },
+    { "id": "dubbing", "lane": "audio", "col": 4, "type": "backend", "label": "TTS Dubbing", "sublabel": "ZeroTTS & CosyVoice3", "tag": "Zero Overrun", "width": 118 },
+    { "id": "final_render", "lane": "control", "col": 5, "type": "backend", "label": "Final Render", "sublabel": "FFmpeg Mix & Draw", "tag": "PASS Deliverable", "width": 118 }
+  ],
+  "edges": [
+    { "id": "ingest-ocr", "from": "ingest", "to": "ocr_detect", "variant": "default" },
+    { "id": "ingest-audio", "from": "ingest", "to": "audio_plan", "variant": "emphasis" },
+    { "id": "ocr-trans", "from": "ocr_detect", "to": "translation", "label": "visual text", "variant": "default" },
+    { "id": "audio-sep", "from": "audio_plan", "to": "separation", "label": "vocals", "variant": "emphasis" },
+    { "id": "audio-review", "from": "audio_plan", "to": "review_gate", "label": "uncertain", "variant": "security", "role": "branch" },
+    { "id": "sep-asr", "from": "separation", "to": "asr_align", "label": "vocals stem", "variant": "emphasis" },
+    { "id": "asr-trans", "from": "asr_align", "to": "translation", "label": "speech text", "variant": "emphasis" },
+    { "id": "review-edit", "from": "review_gate", "to": "operator_edit", "label": "inspect", "variant": "security" },
+    { "id": "trans-visual", "from": "translation", "to": "visual_track", "label": "localized text", "variant": "default" },
+    { "id": "trans-dub", "from": "translation", "to": "dubbing", "label": "dub script", "variant": "emphasis" },
+    { "id": "edit-dub", "from": "operator_edit", "to": "dubbing", "label": "approved override", "variant": "emphasis", "role": "return" },
+    { "id": "visual-render", "from": "visual_track", "to": "final_render", "label": "overlay plan", "variant": "default" },
+    { "id": "dub-render", "from": "dubbing", "to": "final_render", "label": "dub mix", "variant": "emphasis" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Automated Pipeline",
+      "items": [
+        "Trích xuất âm thanh, bóc tách vocals và nhận dạng giọng nói bằng mô hình cục bộ",
+        "Dịch thuật ngữ nghĩa kết hợp audio text và visual text qua Remote LLM Gateway",
+        "Lồng tiếng TTS kiểm soát thời lượng chặt chẽ (tts_finish <= source_end)"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Exception Review Gate",
+      "items": [
+        "Bảo vệ fail-closed khi độ tin cậy thấp hoặc có xung đột vùng chữ",
+        "Operator can thiệp trên Web UI để chỉnh sửa polygon/phân loại vai trò",
+        "Sau khi duyệt, tiến trình tự động tái kích hoạt để render hoàn thiện"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "Douyinie Run Lifecycle & State Transitions",
+    "output": "docs/diagrams/douyinie-lifecycle.html",
+    "viewBox": [980, 680],
+    "animation": "trace",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "main-rail",
+        "label": "Trục thực thi chính",
+        "focus": ["queued", "extracting", "translating", "dubbing", "completed"],
+        "note": "Năm giai đoạn tuần tự từ khi tiếp nhận job đến khi có bản render hoàn thiện."
+      },
+      {
+        "id": "review-and-cancel",
+        "label": "Tạm dừng review & hủy",
+        "focus": ["translating", "review_required", "cancelled"],
+        "note": "Khi phát hiện tự tin thấp hoặc xung đột polygon, run dừng chờ duyệt hoặc bị từ chối."
+      },
+      {
+        "id": "escalation-and-failure",
+        "label": "Escalation giọng & Fail-closed",
+        "focus": ["dubbing", "escalating", "failed"],
+        "note": "ZeroTTS quá thời lượng sẽ escalate lên CosyVoice3, nếu vẫn tràn sẽ từ chối mix."
+      },
+      {
+        "id": "review-posture-delivery",
+        "label": "Review Posture Delivery",
+        "focus": ["completed", "post_review", "delivered"],
+        "note": "Ở review posture, run giữ trạng thái chờ operator duyệt render trước khi đóng job."
+      }
+    ]
+  },
+  "lanes": [
+    { "id": "main", "label": "Execution Rail" },
+    { "id": "waiting", "label": "Review & Escalation" },
+    { "id": "recovery", "label": "Recovery Controller" },
+    { "id": "terminal", "label": "Terminal Exits" }
+  ],
+  "states": [
+    { "id": "queued", "type": "start", "label": "Queued", "sublabel": "job registered", "lane": "main", "col": 0, "step": "01", "tag": "entry" },
+    { "id": "extracting", "type": "active", "label": "Extracting", "sublabel": "stems & text regions", "lane": "main", "col": 1, "step": "02", "tag": "local GPU" },
+    { "id": "translating", "type": "decision", "label": "Translating", "sublabel": "gateway & QA check", "lane": "main", "col": 2, "step": "03", "tag": "remote LLM" },
+    { "id": "dubbing", "type": "waiting", "label": "Dubbing", "sublabel": "timing & mix verify", "lane": "main", "col": 3, "step": "04", "tag": "zero overrun" },
+    { "id": "completed", "type": "success", "label": "Completed", "sublabel": "PASS video deliverable", "lane": "main", "col": 4, "step": "05", "tag": "deliverable" },
+    { "id": "review_required", "type": "waiting", "label": "Review Required", "sublabel": "confidence / overlap", "lane": "waiting", "col": 0, "tag": "operator stop" },
+    { "id": "escalating", "type": "active", "label": "Voice Escalation", "sublabel": "CosyVoice3 fallback", "lane": "recovery", "col": 1, "tag": "speaker scope" },
+    { "id": "post_review", "type": "waiting", "label": "Final Review", "sublabel": "review posture render", "lane": "waiting", "col": 2, "tag": "operator signoff" },
+    { "id": "cancelled", "type": "failure", "label": "Cancelled", "sublabel": "operator rejected", "lane": "terminal", "col": 0, "tag": "terminal" },
+    { "id": "failed", "type": "failure", "label": "Failed", "sublabel": "overrun refused", "lane": "terminal", "col": 1, "tag": "terminal" },
+    { "id": "delivered", "type": "success", "label": "Delivered", "sublabel": "job marked completed", "lane": "terminal", "col": 2, "tag": "terminal" }
+  ],
+  "transitions": [
+    { "id": "t1", "from": "translating", "to": "review_required", "variant": "security", "route": "straight", "fromSide": "bottom", "toSide": "top" },
+    { "id": "t2", "from": "review_required", "to": "cancelled", "variant": "security", "route": "straight", "fromSide": "bottom", "toSide": "top" },
+    { "id": "t3", "from": "dubbing", "to": "escalating", "variant": "security", "route": "straight", "fromSide": "bottom", "toSide": "top" },
+    { "id": "t4", "from": "escalating", "to": "failed", "variant": "security", "route": "straight", "fromSide": "bottom", "toSide": "top" },
+    { "id": "t5", "from": "completed", "to": "post_review", "variant": "dashed", "route": "straight", "fromSide": "bottom", "toSide": "top" },
+    { "id": "t6", "from": "post_review", "to": "delivered", "variant": "emphasis", "route": "straight", "fromSide": "bottom", "toSide": "top" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Execution Rail",
+      "items": [
+        "Vòng đời run trải qua 5 bước tuần tự: Queued -> Extracting -> Translating -> Dubbing -> Completed",
+        "Mỗi bước tạo ra các artifact bất biến kiểm chứng được trong CAS",
+        "Single GPU Lease đảm bảo không tràn VRAM khi chuyển giao giữa các mô hình"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Wait & Review States",
+      "items": [
+        "Review Required: Tạm dừng khi phát hiện tự tin thấp hoặc xung đột vùng chữ",
+        "Voice Escalation: Chuyển đổi giọng cục bộ linh hoạt theo từng speaker",
+        "Post-Review: Ở posture review, job chỉ đóng khi operator thực hiện explicit final render"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Fail-Closed Invariants",
+      "items": [
+        "Không bao giờ để TTS đè qua lời thoại tiếp theo (tts_finish <= source_end)",
+        "Nếu lồng tiếng không khớp thời lượng sau retry -> Hủy và báo ErrMixerOverrunRefused",
+        "Trạng thái kết thúc Terminal (Cancelled, Failed, Delivered) là bất biến"
+      ]
+    }
+  ]
+}
