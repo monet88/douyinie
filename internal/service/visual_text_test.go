@@ -2309,3 +2309,64 @@ func TestVisualTextService_LocalizeVisualTrack_ShortSegmentPieceCountExceedsDura
 		}
 	}
 }
+
+func TestVisualTextService_LocalizeVisualTrack_DecodedTranslationArtifactOwnershipMismatch(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+	seedTextRegionPlan(t, db, casStore, assetID, nil)
+	otherAssetID := "other-asset-" + uuid.NewString()[:8]
+	tVariant := domain.TranslationVariant{
+		ID:             uuid.NewString(),
+		AssetID:        otherAssetID,
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "测试", TargetText: "Thử nghiệm", PassedQAGate: true, QAConfidence: 0.9, StartMs: 0, EndMs: 1000},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(tVariant)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+
+	dVariant := domain.DubScriptVariant{
+		ID:                    uuid.NewString(),
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: tObj.SHA256,
+		Segments: []domain.DubScriptSegment{
+			{Index: 0, SourceText: "测试", SpokenText: "Thử nghiệm", PassedQAGate: true, StartMs: 0, EndMs: 1000},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dBytes, _ := json.Marshal(dVariant)
+	dObj, _ := casStore.Put(bytes.NewReader(dBytes))
+
+	_ = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             tVariant.ID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		CASHash:        tObj.SHA256,
+		ProvenanceHash: "prov-trans",
+		CreatedAt:      tVariant.CreatedAt,
+	})
+	_ = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID:             dVariant.ID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		CASHash:        dObj.SHA256,
+		ProvenanceHash: "prov-dub",
+		CreatedAt:      dVariant.CreatedAt,
+	})
+
+	_, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: "",
+	})
+	if err == nil {
+		t.Fatalf("expected error on translation variant ownership mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "ownership mismatch") {
+		t.Fatalf("expected ownership mismatch error, got %v", err)
+	}
+}

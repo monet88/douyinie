@@ -32,7 +32,5 @@ scratch path, then `DOUYINIE_SEPARATOR_ADAPTER=<scratch> go test ./test/seam2/ -
 fails with `measured vocals WAV: 44100 Hz / 2 ch`, `separator declared 44100 Hz / 2 ch` and the analyzer's
 `AUDIO_ROLE_EXEC_FAILED: unsupported sample rate: 44100 Hz`.
 
-## Caveats
-Already-persisted stem artifacts (`audio_stems_artifacts` rows) generated before the fix retain their original 44.1 kHz audio and incorrect metadata. `audio_role_plan` will continue failing closed on those runs because it will reuse the stale artifact from the stage cache without re-processing it.
-
-To unblock older assets, the `audio_stems_artifacts` rows must be explicitly dropped from the dev database, forcing a fresh run to re-separate the stems through the now-fixed adapter logic.
+## Stage Cache Invalidation
+Per `CODING_STANDARDS.md:91`, changing what a stage emits or persists requires bumping that stage's schema version in the same change so already-cached rows do not silently replay the old behavior. `AudioStemsSchemaVersion` was bumped to `2` in `internal/domain/audio.go`. Cached `audio_stems_artifacts` rows from schema version 1 are automatically bypassed by the stage provenance lookup and no manual database dropping is required.

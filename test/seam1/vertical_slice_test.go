@@ -853,6 +853,7 @@ func TestSeam1_FullDub_ReviewItemProjection_TranslationQA_Failure(t *testing.T) 
 	tVariant := domain.TranslationVariant{
 		ID:             "trans-qa-fail-1",
 		SchemaVersion:  domain.TranslationSchemaVersion,
+		AssetID:        assetID,
 		RunID:          runID,
 		JobID:          jobID,
 		SourceLanguage: "zh",

@@ -318,8 +318,14 @@ func unresolvedDubReason(dubSegments *domain.DubSegmentsVariant, dubArtifactErr 
 				rev.Index, rev.MeasuredDurationMs, rev.SlotDurationMs, rev.StartMs, rev.EndMs)
 		}
 	}
+	unacceptedCount := 0
+	for _, rev := range dubSegments.ReviewSegments {
+		if rev.FitDecision != domain.FitActionAccept {
+			unacceptedCount++
+		}
+	}
 	return fmt.Sprintf("dubbing is required but no candidate dub segment could be placed: %d candidate(s) require review and %d lack an accepted fit",
-		len(dubSegments.ReviewSegments), len(dubSegments.ReviewSegments))
+		len(dubSegments.ReviewSegments), unacceptedCount)
 }
 
 func (s *AudioMixService) loadDubSpeechClip(seg domain.DubSegment) (media.DubSpeechClip, error) {
@@ -707,7 +713,7 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 	// stage produced a variant with no placeable clip (every candidate parked for review) must not suppress
 	// the source dialogue and ship the silence. A mix with no dub artifact at all is left to its own
 	// passthrough contract, unchanged.
-	if hasDubEligibleSpeech && len(speechClips) == 0 && (dubSegments != nil || input.DubSegmentsCAS != "") {
+	if hasDubEligibleSpeech && len(speechClips) == 0 && (dubSegments != nil || dubSegmentsCASRef != "") {
 		return refuse(unresolvedDubReason(dubSegments, dubArtifactErr))
 	}
 

@@ -187,6 +187,12 @@ class TestSeparatorAdapter(unittest.TestCase):
         self.assertTrue(ffmpeg_invoked)
         self.assertEqual(res, expected_16bit)
 
+    def test_measure_wav_properties_unreadable_payload_returns_zeroes(self):
+        """Unreadable or malformed WAV bytes must return (0, 0, 0) without raising an exception."""
+        self.assertEqual(separator.measure_wav_properties(b""), (0, 0, 0))
+        self.assertEqual(separator.measure_wav_properties(b"not a valid wav file"), (0, 0, 0))
+        self.assertEqual(separator.measure_wav_properties(b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x03\x00"), (0, 0, 0))
+
     def test_lane_dispatch_demucs_vs_uvr(self):
         """Verifies separate_audio_stems routes Demucs models to Demucs lane and UVR models to UVR lane."""
         demucs_called = False

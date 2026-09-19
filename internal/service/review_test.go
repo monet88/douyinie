@@ -1742,7 +1742,25 @@ func TestReviewService_ReassignVoice_VisualTrackFailClosed(t *testing.T) {
 	svc, db, casStore, assetID := setupFullReviewHarness(t)
 	ctx := context.Background()
 	runID := "run-reassign-fc-01"
-
+	jobID := "job-reassign-" + uuid.NewString()[:8]
+	now := time.Now().UTC()
+	if err := db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             jobID,
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        runID,
+		JobID:     jobID,
+		Status:    "running",
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
 	// Setup initial VoiceAssignment for runID
 	va := domain.VoiceAssignment{
 		ID:             "va-fc-1",
@@ -1924,6 +1942,24 @@ func TestReviewService_ReassignVoice_VisualTrackFailClosed(t *testing.T) {
 	}
 	if res.RenderPlanCAS == "" {
 		t.Fatalf("expected non-empty RenderPlanCAS")
+	}
+
+	stages, err := db.ListStageExecutions(ctx, runID)
+	if err != nil {
+		t.Fatalf("ListStageExecutions failed: %v", err)
+	}
+	var previewStage *domain.StageExecution
+	for _, st := range stages {
+		if st.Stage == "render_preview" {
+			previewStage = &st
+		}
+	}
+	if previewStage == nil {
+		t.Fatalf("expected render_preview stage execution to be recorded")
+	}
+	if previewStage.Status != domain.StageStatusQueued || previewStage.ArtifactSHA256 != "" {
+		t.Fatalf("expected render_preview stage to be invalidated (status=queued, empty artifact), got status=%s artifact=%s",
+			previewStage.Status, previewStage.ArtifactSHA256)
 	}
 }
 
@@ -3505,5 +3541,63 @@ func TestReviewService_CorrectRegionGeometry_UntouchedOcclusionDoesNotBlockTheEd
 	}
 	if !projected {
 		t.Fatalf("expected a pending visual_occlusion item for reg-colliding, got %+v", items)
+	}
+}
+
+func TestReviewService_ProjectAllReviewItems_DecodedArtifactOwnershipMismatch(t *testing.T) {
+	reviewSvc, db, casStore, assetID := setupReviewTestHarness(t)
+	ctx := context.Background()
+	runID := "run-mismatch-" + uuid.NewString()[:8]
+
+	otherAssetID := "other-asset-" + uuid.NewString()[:8]
+	tVar := domain.TranslationVariant{
+		ID:             uuid.NewString(),
+		AssetID:        otherAssetID,
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "测试", TargetText: "Thử nghiệm", PassedQAGate: false, QAConfidence: 0.4},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(tVar)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	jobID := "job-mismatch-" + uuid.NewString()[:8]
+	now := time.Now().UTC()
+	if err := db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             jobID,
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        runID,
+		JobID:     jobID,
+		Status:    "running",
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "translation",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObj.SHA256,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create stage execution: %v", err)
+	}
+
+	_, err := reviewSvc.ProjectAllReviewItemsForRun(ctx, assetID, "vi", runID)
+	if err == nil {
+		t.Fatalf("expected error on translation variant asset mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "ownership mismatch") {
+		t.Fatalf("expected ownership mismatch error, got %v", err)
 	}
 }

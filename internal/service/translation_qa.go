@@ -190,7 +190,7 @@ var zhNegationExceptions = []string{
 	"无聊", "无论", "无论如何", "无奈", "无数", "无所谓", "无辜", "无端", "无暇", "无微不至", "无独有偶",
 	// Non-negating words containing 不
 	"不小心", "不过", "不管", "不仅", "不得了", "不由得", "不料", "不经意", "不良", "不断", "不愧", "不知不觉", "不在话下", "差不多", "并不",
-	"不透明度", "不锈钢", "不可避免", "不禁", "不同", "不安", "不幸", "不好意思", "不客气", "不可思议", "不朽",
+	"不透明度", "不锈钢", "不禁", "不好意思", "不客气", "不可思议", "不朽",
 	// Existing exceptions
 	"非常", "不仅", "不管", "特别", "非凡", "非洲", "无可挑剔", "是非",
 	// Non-negating words containing 没
@@ -204,7 +204,7 @@ var zhNegationExceptions = []string{
 // one ("thiếu", "kém hơn"). When the source text's only negation signal comes from
 // these compounds, the QA gate accepts both target polarities.
 var zhAmbiguousNegationCompounds = []string{
-	"不如", "不足", "不一定",
+	"不如", "不足", "不一定", "不可避免", "不幸", "不同", "不安",
 }
 
 // Vietnamese grammatical negation markers.
@@ -1297,7 +1297,7 @@ func isProtectedASCIIToken(tok string) bool {
 	// Digit-bearing token with letters (e.g. 4K, MP4, H264).
 	// Exclude pure quantity+unit compounds like 3MINUTE, 20KG, 500ML which are
 	// measurements/durations rather than proprietary names/brands.
-	// Also exclude long alphanumeric codes (length > 5) like SO50L207 as they are
+	// Also exclude long alphanumeric codes (length > 6) like SO50L207 as they are
 	// typically model numbers or OCR noise, not mandatory entities.
 	if hasDigit && (hasUpper || hasLower) {
 		if isQuantityToken(tok) {

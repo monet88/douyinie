@@ -1139,7 +1139,13 @@ func resolveSequentialCoverOverlaps(covers []domain.CoverBox, observed [][2]int6
 	if len(handovers) == 0 {
 		return covers
 	}
-	out := append(resolved, handovers...)
+	all := append(resolved, handovers...)
+	out := make([]domain.CoverBox, 0, len(all))
+	for _, c := range all {
+		if c.EndMs > c.StartMs {
+			out = append(out, c)
+		}
+	}
 	sort.Slice(out, func(a, b int) bool {
 		if out[a].StartMs != out[b].StartMs {
 			return out[a].StartMs < out[b].StartMs
@@ -1749,11 +1755,9 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			if err := json.NewDecoder(trc).Decode(&tVariant); err != nil {
 				return nil, fmt.Errorf("decode translation variant artifact (%s): %w", transCAS, err)
 			}
-			if explicitTransCAS != "" {
-				if tVariant.AssetID != in.AssetID || !strings.EqualFold(tVariant.TargetLanguage, in.TargetLanguage) {
-					return nil, fmt.Errorf("%w: explicit translation variant ownership mismatch for asset %q target %q",
-						domain.ErrMeaningPreservationFailed, in.AssetID, in.TargetLanguage)
-				}
+			if tVariant.AssetID != in.AssetID || !strings.EqualFold(tVariant.TargetLanguage, in.TargetLanguage) {
+				return nil, fmt.Errorf("%w: translation variant ownership mismatch for asset %q target %q",
+					domain.ErrMeaningPreservationFailed, in.AssetID, in.TargetLanguage)
 			}
 			if len(tVariant.Segments) == 0 {
 				return nil, fmt.Errorf("canonical translation variant has zero segments")
@@ -1812,11 +1816,9 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 			if err := json.NewDecoder(trc).Decode(&tVariant); err != nil {
 				return nil, fmt.Errorf("decode translation variant artifact (%s): %w", canonicalTransCAS, err)
 			}
-			if explicitTransCAS != "" {
-				if tVariant.AssetID != in.AssetID || !strings.EqualFold(tVariant.TargetLanguage, in.TargetLanguage) {
-					return nil, fmt.Errorf("%w: explicit translation variant ownership mismatch for asset %q target %q",
-						domain.ErrMeaningPreservationFailed, in.AssetID, in.TargetLanguage)
-				}
+			if tVariant.AssetID != in.AssetID || !strings.EqualFold(tVariant.TargetLanguage, in.TargetLanguage) {
+				return nil, fmt.Errorf("%w: translation variant ownership mismatch for asset %q target %q",
+					domain.ErrMeaningPreservationFailed, in.AssetID, in.TargetLanguage)
 			}
 			if len(tVariant.Segments) == 0 {
 				return nil, fmt.Errorf("canonical translation variant has zero segments")

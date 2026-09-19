@@ -80,6 +80,13 @@ func TestMeaningFirstQAGate_ValidPairs(t *testing.T) {
 			tgtLang: "vi",
 		},
 		{
+			name:    "Lexical compound 不 (不可避免) translated with target negation",
+			source:  "这是不可避免的",
+			target:  "Điều này là không thể tránh khỏi",
+			srcLang: "zh",
+			tgtLang: "vi",
+		},
+		{
 			name:    "Short OCR non-word token TM dropped without penalty",
 			source:  "最新款式 TM",
 			target:  "Kiểu dáng mới nhất",

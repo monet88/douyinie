@@ -346,3 +346,47 @@ func boxContains(outer domain.BoundingBox, inner domain.BoundingBox) bool {
 	return inner.X >= outer.X && inner.Y >= outer.Y &&
 		inner.X+inner.Width <= outer.X+outer.Width && inner.Y+inner.Height <= outer.Y+outer.Height
 }
+
+func TestResolveSequentialCoverOverlaps_CollapsedCoverFiltered(t *testing.T) {
+	covers := []domain.CoverBox{
+		{
+			RegionID: "reg-1",
+			Role:     string(domain.TextRoleSpeechSubtitle),
+			X:        100,
+			Y:        100,
+			Width:    200,
+			Height:   50,
+			StartMs:  500,
+			EndMs:    1000,
+			Color:    "#000000",
+			Opacity:  1.0,
+		},
+		{
+			RegionID: "reg-2",
+			Role:     string(domain.TextRoleSpeechSubtitle),
+			X:        120,
+			Y:        100,
+			Width:    200,
+			Height:   50,
+			StartMs:  0,
+			EndMs:    3000,
+			Color:    "#000000",
+			Opacity:  1.0,
+		},
+	}
+	observed := [][2]int64{
+		{500, 1000},
+		{1100, 2000},
+	}
+
+	resolved := resolveSequentialCoverOverlaps(covers, observed)
+
+	for _, c := range resolved {
+		if c.EndMs <= c.StartMs {
+			t.Fatalf("cover %s has collapsed time window [%d, %d]", c.RegionID, c.StartMs, c.EndMs)
+		}
+		if err := domain.ValidateCoverBox(c, 1920, 1080); err != nil {
+			t.Fatalf("ValidateCoverBox failed on cover %s [%d, %d]: %v", c.RegionID, c.StartMs, c.EndMs, err)
+		}
+	}
+}

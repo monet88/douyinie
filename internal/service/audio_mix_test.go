@@ -3,6 +3,8 @@ package service_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -687,5 +689,168 @@ func TestAudioMixService_DubEligibleWithUnreadableDubSegmentsCAS_Refused(t *test
 	}
 	if !strings.Contains(mix.RefusalReason, "unreadable") {
 		t.Errorf("expected refusal reason to mention unreadable CAS, got %q", mix.RefusalReason)
+	}
+}
+
+func TestAudioMixService_DubEligibleWithUnreadableDubSegmentsIndex_Refused(t *testing.T) {
+	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+	assetID, runID, stemsCAS := mixFixtureWithDubEligibleSpeech(t, db, casStore)
+
+	unreadableCAS := "sha256_unreadable_from_db_index"
+	err := db.SaveDubSegmentsVariantIndex(ctx, storage.DubSegmentsVariantIndex{
+		ID:             "dubseg-unreadable-idx",
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        unreadableCAS,
+		ProvenanceHash: "prov-unreadable",
+		CreatedAt:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("save dub segments index: %v", err)
+	}
+
+	mix, err := mixSvc.MixAudio(ctx, service.AudioMixInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		DubSegmentsCAS: "",
+		AudioStemsCAS:  stemsCAS,
+	})
+	if err == nil {
+		t.Fatalf("expected ErrMixerOverrunRefused when dub-eligible plan has unreadable dub index CAS, got PASS mix: %+v", mix)
+	}
+	if !errors.Is(err, domain.ErrMixerOverrunRefused) {
+		t.Fatalf("expected ErrMixerOverrunRefused, got %v", err)
+	}
+	if mix == nil || mix.OverallStatus != "REFUSED" {
+		t.Fatalf("expected a REFUSED dub mix artifact, got %+v", mix)
+	}
+	if !strings.Contains(mix.RefusalReason, "unreadable") {
+		t.Errorf("expected refusal reason to mention unreadable CAS, got %q", mix.RefusalReason)
+	}
+}
+
+func computeLegacyAudioStemsProvenanceHashV1(assetID, providerID, modelName, modelVersion string) string {
+	payload := struct {
+		AssetID      string `json:"asset_id"`
+		ProviderID   string `json:"provider_id"`
+		ModelName    string `json:"model_name"`
+		ModelVersion string `json:"model_version"`
+		SchemaVer    int    `json:"schema_version"`
+	}{
+		AssetID:      assetID,
+		ProviderID:   providerID,
+		ModelName:    modelName,
+		ModelVersion: modelVersion,
+		SchemaVer:    1,
+	}
+	b, _ := json.Marshal(payload)
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+func TestAudioMixService_SeparateAudio_SchemaVersion2_BypassesLegacyV1Cache(t *testing.T) {
+	mixSvc, db, casStore, reg, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+
+	assetID := "asset_schema_bump_" + uuid.NewString()[:8]
+	runID := "run_schema_bump_" + uuid.NewString()[:8]
+
+	dummyMedia := []byte("DUMMY_AUDIO_DATA_FOR_SCHEMA_TEST")
+	mediaObj, _ := casStore.Put(bytes.NewReader(dummyMedia))
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              attID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		TermsAccepted:   true,
+		ConfirmedAt:     time.Now().UTC(),
+	})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		RightsAttestationID: attID,
+		SHA256:              mediaObj.SHA256,
+		CASPath:             mediaObj.Path,
+		ByteSize:            int64(len(dummyMedia)),
+		CreatedAt:           time.Now().UTC(),
+	})
+
+	normWAVBytes := media.GeneratePCM16WAV(16000, 1, 2000)
+	wavObj, _ := casStore.Put(bytes.NewReader(normWAVBytes))
+	_ = db.SavePreflightReport(ctx, domain.PreflightReport{
+		ID:                     "preflight_" + assetID,
+		AssetID:                assetID,
+		DurationSec:            2.0,
+		DurationMs:             2000,
+		AudioChannels:          1,
+		AudioSampleRate:        16000,
+		ContainerFormat:        "mp4",
+		ContainerValid:         true,
+		FingerprintMatch:       true,
+		NormalizedAudioSHA256:  wavObj.SHA256,
+		NormalizedAudioCASPath: wavObj.Path,
+		CreatedAt:              time.Now().UTC(),
+	})
+
+	p := reg.ListAll()[0]
+	mName, mVer := p.ModelInfo()
+	legacyProvHash := computeLegacyAudioStemsProvenanceHashV1(assetID, p.ID(), mName, mVer)
+
+	legacyArtifact := domain.AudioStemArtifacts{
+		ID:            "legacy_stems_v1",
+		SchemaVersion: 1,
+		AssetID:       assetID,
+		ProviderID:    p.ID(),
+		ModelName:     mName,
+		ModelVersion:  mVer,
+		Stems: []domain.AudioStem{
+			{
+				Type:       domain.StemTypeVocals,
+				SampleRate: 44100,
+				Channels:   2,
+				Format:     "wav",
+				DurationMs: 2000,
+			},
+			{
+				Type:       domain.StemTypeBackground,
+				SampleRate: 44100,
+				Channels:   2,
+				Format:     "wav",
+				DurationMs: 2000,
+			},
+		},
+		ProvenanceHash: legacyProvHash,
+		CreatedAt:      time.Now().UTC(),
+	}
+	legacyBytes, _ := json.Marshal(legacyArtifact)
+	legacyObj, _ := casStore.Put(bytes.NewReader(legacyBytes))
+
+	err := db.SaveAudioStemsArtifactIndex(ctx, storage.AudioStemsArtifactIndex{
+		ID:             legacyArtifact.ID,
+		AssetID:        assetID,
+		ProviderID:     p.ID(),
+		ModelName:      mName,
+		ModelVersion:   mVer,
+		CASHash:        legacyObj.SHA256,
+		ProvenanceHash: legacyProvHash,
+		CreatedAt:      legacyArtifact.CreatedAt,
+	})
+	if err != nil {
+		t.Fatalf("save legacy stems index: %v", err)
+	}
+
+	stems, err := mixSvc.SeparateAudio(ctx, service.AudioSeparationInput{
+		RunID:   runID,
+		AssetID: assetID,
+	})
+	if err != nil {
+		t.Fatalf("SeparateAudio failed: %v", err)
+	}
+	if stems.SchemaVersion != 2 {
+		t.Fatalf("expected stems.SchemaVersion == 2, got %d (stale cache replayed)", stems.SchemaVersion)
+	}
+	if stems.Stems[0].SampleRate == 44100 {
+		t.Fatalf("expected contract 16000 Hz stems, got stale 44100 Hz from cache")
 	}
 }

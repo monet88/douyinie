@@ -222,9 +222,11 @@ def measure_wav_properties(wav_bytes: bytes) -> tuple:
     """Return (sample_rate, channels, duration_ms) of a WAV payload, or (0, 0, 0) when unreadable."""
     if not wav_bytes:
         return 0, 0, 0
-    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
-        return wf.getframerate(), wf.getnchannels(), int((wf.getnframes() * 1000) / wf.getframerate())
-
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            return wf.getframerate(), wf.getnchannels(), int((wf.getnframes() * 1000) / wf.getframerate())
+    except Exception:
+        return 0, 0, 0
 
 def normalize_stem_to_contract(wav_bytes: bytes) -> bytes:
     """Return the stem payload resampled to the pipeline contract rate (16 kHz 16-bit mono).

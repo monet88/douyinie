@@ -239,11 +239,8 @@ type RegionGeometryCorrectionResult struct {
 	Message                 string                  `json:"message"`
 }
 
-// recordCorrectionStage appends a succeeded stage execution for an artifact a correction just produced,
-// so a resumed run reuses what the correction built instead of the pre-correction artifact recorded when
-// the run first passed through that stage. Nothing else moves the run's stage rows.
-func (s *ReviewService) recordCorrectionStage(ctx context.Context, runID, stage, casHash string) error {
-	if runID == "" || casHash == "" {
+func (s *ReviewService) recordStageExecution(ctx context.Context, runID, stage, status, casHash string) error {
+	if runID == "" {
 		return nil
 	}
 	// A legacy asset-scoped correction runs under a synthetic "corr-run-…" id with no run row, and stage
@@ -255,20 +252,39 @@ func (s *ReviewService) recordCorrectionStage(ctx context.Context, runID, stage,
 		return fmt.Errorf("look up run %s for %s stage record: %w", runID, stage, err)
 	}
 	now := time.Now().UTC()
-	if err := s.db.CreateStageExecution(ctx, domain.StageExecution{
-		ID:             uuid.NewString(),
-		RunID:          runID,
-		Stage:          stage,
-		Status:         domain.StageStatusSucceeded,
-		ArtifactSHA256: casHash,
-		StartedAt:      &now,
-		CompletedAt:    &now,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	}); err != nil {
+	se := domain.StageExecution{
+		ID:        uuid.NewString(),
+		RunID:     runID,
+		Stage:     stage,
+		Status:    status,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if status == domain.StageStatusSucceeded {
+		se.ArtifactSHA256 = casHash
+		se.StartedAt = &now
+		se.CompletedAt = &now
+	}
+	if err := s.db.CreateStageExecution(ctx, se); err != nil {
 		return fmt.Errorf("record %s stage for run %s: %w", stage, runID, err)
 	}
 	return nil
+}
+
+// recordCorrectionStage appends a succeeded stage execution for an artifact a correction just produced,
+// so a resumed run reuses what the correction built instead of the pre-correction artifact recorded when
+// the run first passed through that stage. Nothing else moves the run's stage rows.
+func (s *ReviewService) recordCorrectionStage(ctx context.Context, runID, stage, casHash string) error {
+	if casHash == "" {
+		return nil
+	}
+	return s.recordStageExecution(ctx, runID, stage, domain.StageStatusSucceeded, casHash)
+}
+
+// invalidateCorrectionStage records a queued stage execution with no artifact, invalidating
+// any previously succeeded execution of this stage so a resumed run will not reuse stale artifacts.
+func (s *ReviewService) invalidateCorrectionStage(ctx context.Context, runID, stage string) error {
+	return s.recordStageExecution(ctx, runID, stage, domain.StageStatusQueued, "")
 }
 
 // CorrectTargetText updates target text for a segment and triggers targeted rerun of only declared downstream descendants:
@@ -611,6 +627,9 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		if err := s.recordCorrectionStage(ctx, in.RunID, "render_plan", rPlan.CASHash); err != nil {
 			return nil, err
 		}
+		if err := s.invalidateCorrectionStage(ctx, in.RunID, "render_preview"); err != nil {
+			return nil, err
+		}
 	} else if !errors.Is(planErr, storage.ErrNotFound) {
 		return nil, fmt.Errorf("load text region plan index: %w", planErr)
 	}
@@ -835,6 +854,9 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 		return nil, err
 	}
 	if err := s.recordCorrectionStage(ctx, in.RunID, "render_plan", result.RenderPlanCAS); err != nil {
+		return nil, err
+	}
+	if err := s.invalidateCorrectionStage(ctx, in.RunID, "render_preview"); err != nil {
 		return nil, err
 	}
 
@@ -1407,7 +1429,7 @@ func (s *ReviewService) projectReviewItems(ctx context.Context, assetID, targetL
 }
 
 // ProjectAllReviewItems collects all review exceptions along with their resolution status (pending, auto_pass, auto_resolved, manual_override).
-// runBoundVariantIndex resolves the variant artifact a run bound when the run owns no index row of its
+// runBoundArtifactCAS resolves the variant artifact a run bound when the run owns no index row of its
 // own. A run whose stages were all cache hits consumes artifacts produced by an older run, so the
 // run-scoped lookups find nothing and the review queue would silently stay empty for that run - hiding the
 // dub overruns that block the mix. The run's own stage execution records the artifact it consumed, so the
@@ -1557,6 +1579,9 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 		if decodeErr != nil {
 			return nil, fmt.Errorf("decode localized visual track (%s): %w", visIdx.CASHash, decodeErr)
 		}
+		if vis.AssetID != assetID || !strings.EqualFold(vis.TargetLanguage, targetLang) {
+			return nil, fmt.Errorf("localized visual track ownership mismatch for asset %q target %q", assetID, targetLang)
+		}
 		createdAt := vis.CreatedAt
 		if createdAt.IsZero() {
 			createdAt = visIdx.CreatedAt
@@ -1622,6 +1647,9 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 			return nil, fmt.Errorf("decode translation variant (%s): %w", transIdx.CASHash, err)
 		}
 		rc.Close()
+		if tVar.AssetID != assetID || !strings.EqualFold(tVar.TargetLanguage, targetLang) {
+			return nil, fmt.Errorf("%w: translation variant ownership mismatch for asset %q target %q", domain.ErrMeaningPreservationFailed, assetID, targetLang)
+		}
 		createdAt := tVar.CreatedAt
 		if createdAt.IsZero() {
 			createdAt = transIdx.CreatedAt
@@ -1695,6 +1723,9 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 			return nil, fmt.Errorf("decode dub segments variant (%s): %w", dubSegIdx.CASHash, err)
 		}
 		rc.Close()
+		if dsVar.AssetID != assetID || !strings.EqualFold(dsVar.TargetLanguage, targetLang) {
+			return nil, fmt.Errorf("dub segments variant ownership mismatch for asset %q target %q", assetID, targetLang)
+		}
 		hasDubSegments = true
 		createdAt := dsVar.CreatedAt
 		if createdAt.IsZero() {
