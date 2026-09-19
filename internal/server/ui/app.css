@@ -155,7 +155,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); backgro
 .color-custom-row input[type="color"] { width: 36px; height: 36px; padding: 2px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-soft); cursor: pointer; flex-shrink: 0; }
 .color-custom-row input[type="text"] { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; }
 
-.rights-row { padding: 18px 24px; display: flex; justify-content: space-between; gap: 24px; align-items: center; }
+.rights-row { padding: 18px 24px; display: flex; justify-content: flex-end; gap: 24px; align-items: center; }
 .check-field { display: flex; gap: 11px; align-items: flex-start; cursor: pointer; }
 .check-field input { width: auto; margin-top: 3px; accent-color: var(--accent); }
 .check-field > span { display: grid; gap: 3px; }

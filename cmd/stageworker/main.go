@@ -1902,7 +1902,8 @@ func resolveOCRRunner() (commandRunner, error) {
 		}
 	}
 	// Repo-owned Python adapters: check RapidOCR ONNX first (lightweight), fallback to PaddleOCR
-	adapterCandidates := []string{"ocr_rapidocr.py", "ocr.py"}
+	// Repo-owned Python adapters: check PaddleOCR first, fallback to RapidOCR ONNX
+	adapterCandidates := []string{"ocr.py", "ocr_rapidocr.py"}
 	var adapterPaths []string
 	for _, name := range adapterCandidates {
 		adapterPaths = append(adapterPaths,

@@ -2151,7 +2151,7 @@ async function handleNewJob(event) {
   const target = $("input[name=target_language]:checked").value;
   const posture = $("input[name=review_posture]:checked")?.value || "auto";
   const operator = operatorName();
-  if (!source || !$("#rights-confirm").checked) return;
+  if (!source) return;
 
   setBusy(button, true, "Đang tạo job…");
   try {
