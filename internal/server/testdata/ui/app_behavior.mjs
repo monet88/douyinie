@@ -186,6 +186,14 @@ function createHarness() {
     runResume: register("[data-run-action=resume]", { dataset: { runAction: "resume" } }),
     runCancel: register("[data-run-action=cancel]", { dataset: { runAction: "cancel" } }),
     queueBody: register("#queue-body"),
+    discoveryDateFilter: register("#discovery-date-filter"),
+    discoveryLikeFilter: register("#discovery-like-filter"),
+    discoveryDownload: register("#discovery-download"),
+    discoverySelectedCount: register("#discovery-selected-count"),
+    discoveryResults: register("#discovery-results"),
+    discoveryStatus: register("#discovery-status"),
+    discoveryMore: register("#discovery-more"),
+    discoveryPreview: register("#discovery-preview"),
   };
 
   lists.set("[data-inspector-tab]", [
@@ -267,7 +275,7 @@ function createHarness() {
     "(function () {",
     '"use strict";',
     source,
-    "globalThis.__operatorUI = { state, loadSelectedRun, renderSpeakers, renderInspector, renderSelectedRun, refreshAll };",
+    "globalThis.__operatorUI = { state, loadSelectedRun, renderSpeakers, renderInspector, renderSelectedRun, refreshAll, renderDiscovery, downloadSelectedDiscovery };",
     "})();",
   ].join("\n");
   vm.runInContext(moduleScope, context, { filename: "app.js" });
@@ -482,6 +490,29 @@ test("a refused resume surfaces the runtime host error text", async () => {
   // The run is still interrupted, so the operator can retry: the control state must follow the
   // status that is actually persisted, not the click.
   assert.equal(h.els.runResume.disabled, false, "a refused resume must leave resume offered for a retry");
+});
+
+test("discovery bulk download excludes selected videos hidden by current filters", async () => {
+  const h = createHarness();
+  await h.ready();
+  h.els.discoveryLikeFilter.value = "1000";
+  h.setResponder((url) => {
+    if (url === "/api/v1/sources/acquire") return { status: 201, payload: { asset: { id: "asset-1" } } };
+    return { status: 200, payload: {} };
+  });
+  h.evalIn('state.discoveryVideos = [' +
+    '{ aweme_id: "low", canonical_url: "https://www.douyin.com/video/7000000000000000001", like_count: 100 },' +
+    '{ aweme_id: "high", canonical_url: "https://www.douyin.com/video/7000000000000000002", like_count: 2000 }' +
+    ']; state.discoverySelected = new Set(["low", "high"]); renderDiscovery();');
+
+  assert.equal(h.els.discoverySelectedCount.textContent, "1", "bulk count must reflect only selected videos visible under the active filter");
+  await h.evalIn("downloadSelectedDiscovery();");
+  await h.settle();
+  await h.settle();
+
+  const acquisitions = h.requests.filter((req) => req.url === "/api/v1/sources/acquire");
+  assert.equal(acquisitions.length, 1, "hidden selected videos must not be acquired");
+  assert.equal(acquisitions[0].body.locator.location, "https://www.douyin.com/video/7000000000000000002");
 });
 
 test("transcript row click syncs seek, selection, inspector tab and editor", async () => {

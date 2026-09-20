@@ -42,6 +42,7 @@ type Server struct {
 	casStore        *cas.Store
 	ingest          *service.IngestService
 	acquisition     *service.AcquisitionService
+	discovery       *service.DiscoveryService
 	registry        *provider.Registry
 	policySvc       *governance.PolicyService
 	licenseSvc      *governance.LicenseService
@@ -77,6 +78,7 @@ type Config struct {
 	CASStore        *cas.Store
 	Ingest          *service.IngestService
 	Acquisition     *service.AcquisitionService // Douyin URL acquisition ladder (T05)
+	Discovery       *service.DiscoveryService   // transient Douyin search/lookup (Issue #128)
 	Registry        *provider.Registry
 	PolicySvc       *governance.PolicyService
 	LicenseSvc      *governance.LicenseService
@@ -185,6 +187,7 @@ func New(cfg Config) *Server {
 		casStore:       cfg.CASStore,
 		ingest:         cfg.Ingest,
 		acquisition:    cfg.Acquisition,
+		discovery:      cfg.Discovery,
 		registry:       cfg.Registry,
 		policySvc:      cfg.PolicySvc,
 		licenseSvc:     cfg.LicenseSvc,
@@ -1371,6 +1374,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/assets/upload", s.handleUploadAsset)
 	s.mux.HandleFunc("POST /api/v1/sources/probe", s.handleProbeSource)
 	s.mux.HandleFunc("POST /api/v1/sources/acquire", s.handleAcquireSource)
+	s.mux.HandleFunc("POST /api/v1/douyin/search", s.handleDouyinSearch)
+	s.mux.HandleFunc("POST /api/v1/douyin/lookup/video", s.handleDouyinVideoLookup)
+	s.mux.HandleFunc("POST /api/v1/douyin/lookup/creator", s.handleDouyinCreatorLookup)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}", s.handleGetAsset)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/preflight", s.handleGetAssetPreflight)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/audio-role-plan", s.handleSaveAudioRolePlan)
@@ -1687,6 +1693,75 @@ func (s *Server) handleAcquireSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, res)
+}
+
+func (s *Server) handleDouyinSearch(w http.ResponseWriter, r *http.Request) {
+	if s.discovery == nil {
+		writeError(w, http.StatusServiceUnavailable, "Douyin discovery is not configured")
+		return
+	}
+	var req service.DiscoveryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	page, err := s.discovery.Search(r.Context(), req)
+	if err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) handleDouyinVideoLookup(w http.ResponseWriter, r *http.Request) {
+	if s.discovery == nil {
+		writeError(w, http.StatusServiceUnavailable, "Douyin discovery is not configured")
+		return
+	}
+	var req service.DiscoveryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	video, err := s.discovery.LookupVideo(r.Context(), req)
+	if err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"video": video})
+}
+
+func (s *Server) handleDouyinCreatorLookup(w http.ResponseWriter, r *http.Request) {
+	if s.discovery == nil {
+		writeError(w, http.StatusServiceUnavailable, "Douyin discovery is not configured")
+		return
+	}
+	var req service.DiscoveryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	creator, err := s.discovery.LookupCreator(r.Context(), req)
+	if err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, creator)
+}
+
+func writeDiscoveryError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrPolicyBlocked),
+		errors.Is(err, domain.ErrConsentRequired),
+		errors.Is(err, domain.ErrAuthRequired),
+		errors.Is(err, domain.ErrNoEligibleProvider),
+		errors.Is(err, domain.ErrCircuitOpen):
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+	case errors.Is(err, domain.ErrInvalidDiscoveryRequest):
+		writeError(w, http.StatusBadRequest, err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, err.Error())
+	}
 }
 
 func (s *Server) handleGetAsset(w http.ResponseWriter, r *http.Request) {
