@@ -1254,6 +1254,80 @@ func (s *DB) migrate(ctx context.Context) error {
 			return fmt.Errorf("commit migration v19: %w", err)
 		}
 	}
+
+	// Migration v20: durable Douyin workstation follow/video lifecycle state (#129).
+	var countV20 int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = 20`).Scan(&countV20); err != nil {
+		return fmt.Errorf("check migration version 20: %w", err)
+	}
+	if countV20 == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration v20 tx: %w", err)
+		}
+		defer tx.Rollback()
+		schemaV20SQL := `
+		CREATE TABLE IF NOT EXISTS followed_creators (
+			sec_uid TEXT PRIMARY KEY,
+			canonical_url TEXT NOT NULL,
+			display_name TEXT,
+			avatar_url TEXT,
+			followed INTEGER NOT NULL DEFAULT 1 CHECK (followed IN (0,1)),
+			followed_at TEXT NOT NULL,
+			baseline_at TEXT NOT NULL,
+			automation_mode TEXT NOT NULL DEFAULT 'A' CHECK (automation_mode IN ('A','B','C')),
+			target_language TEXT NOT NULL DEFAULT 'vi' CHECK (target_language IN ('vi','en')),
+				review_posture TEXT NOT NULL DEFAULT 'auto' CHECK (review_posture IN ('auto','review')),
+			cover_color TEXT NOT NULL DEFAULT '#000000',
+			configured_by TEXT NOT NULL,
+			rights_attestation_id TEXT,
+			last_successful_poll_at TEXT,
+			last_attempt_at TEXT,
+			next_check_at TEXT,
+			poll_state TEXT NOT NULL DEFAULT 'idle',
+			failure_code TEXT,
+			failure_message TEXT,
+			failure_json TEXT,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+
+		CREATE TABLE IF NOT EXISTS douyin_videos (
+			aweme_id TEXT PRIMARY KEY,
+			source_id TEXT NOT NULL UNIQUE,
+			sec_uid TEXT,
+			canonical_url TEXT NOT NULL,
+			title TEXT,
+			cover_url TEXT,
+			published_at TEXT,
+			like_count INTEGER,
+			duration_ms INTEGER,
+			first_observed_at TEXT NOT NULL,
+			last_observed_at TEXT NOT NULL,
+			origin TEXT NOT NULL CHECK (origin IN ('baseline','historical','monitoring')),
+			disposition TEXT NOT NULL CHECK (disposition IN ('new','seen','ignored')),
+				acquisition_request_state TEXT NOT NULL DEFAULT 'none' CHECK (acquisition_request_state IN ('none','queued','downloading','downloaded','failed')),
+			acquisition_failure_json TEXT,
+			automation_failure_json TEXT,
+			library_visible INTEGER NOT NULL DEFAULT 1 CHECK (library_visible IN (0,1)),
+			removed_at TEXT,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_followed_creators_followed ON followed_creators(followed, updated_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_douyin_videos_creator_observed ON douyin_videos(sec_uid, first_observed_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_douyin_videos_disposition ON douyin_videos(disposition, last_observed_at DESC);
+
+		INSERT INTO schema_migrations (version, applied_at) VALUES (20, datetime('now'));
+		`
+		if _, err := tx.ExecContext(ctx, schemaV20SQL); err != nil {
+			return fmt.Errorf("execute migration v20: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration v20: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -4817,6 +4891,378 @@ func (s *DB) GetSourceAcquisitionBySourceID(ctx context.Context, sourceID string
 		return nil, fmt.Errorf("unmarshal acquisition provenance: %w", err)
 	}
 	return &prov, nil
+}
+
+// SaveFollowedCreator upserts the durable creator snapshot and follow state.
+func (s *DB) SaveFollowedCreator(ctx context.Context, creator domain.FollowedCreator) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return saveFollowedCreator(ctx, s.db, creator)
+}
+
+func saveFollowedCreator(ctx context.Context, exec sqlExecer, creator domain.FollowedCreator) error {
+	_, err := exec.ExecContext(ctx, `
+		INSERT INTO followed_creators (
+			sec_uid, canonical_url, display_name, avatar_url, followed, followed_at, baseline_at,
+			automation_mode, target_language, review_posture, cover_color, configured_by,
+			last_successful_poll_at, last_attempt_at, next_check_at, poll_state,
+			failure_code, failure_message, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(sec_uid) DO UPDATE SET
+			canonical_url=excluded.canonical_url,
+			display_name=CASE WHEN excluded.display_name <> '' THEN excluded.display_name ELSE followed_creators.display_name END,
+			avatar_url=CASE WHEN excluded.avatar_url <> '' THEN excluded.avatar_url ELSE followed_creators.avatar_url END,
+			followed=excluded.followed,
+			followed_at=excluded.followed_at,
+			baseline_at=excluded.baseline_at,
+			automation_mode=excluded.automation_mode,
+			target_language=excluded.target_language,
+			review_posture=excluded.review_posture,
+			cover_color=excluded.cover_color,
+			configured_by=excluded.configured_by,
+			last_successful_poll_at=excluded.last_successful_poll_at,
+			last_attempt_at=excluded.last_attempt_at,
+			next_check_at=excluded.next_check_at,
+			poll_state=excluded.poll_state,
+			failure_code=excluded.failure_code,
+			failure_message=excluded.failure_message,
+			updated_at=excluded.updated_at
+	`, creator.SecUID, creator.CanonicalURL, creator.DisplayName, creator.AvatarURL, boolInt(creator.Followed),
+		creator.FollowedAt.Format(time.RFC3339Nano), creator.BaselineAt.Format(time.RFC3339Nano), creator.AutomationMode,
+		creator.TargetLanguage, creator.ReviewPosture, creator.CoverColor, creator.ConfiguredBy,
+		timePtrString(creator.LastSuccessfulPollAt), timePtrString(creator.LastAttemptAt), timePtrString(creator.NextCheckAt),
+		creator.PollState, creator.FailureCode, creator.FailureMessage, creator.CreatedAt.Format(time.RFC3339Nano), creator.UpdatedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("upsert followed creator: %w", err)
+	}
+	return nil
+}
+
+// SaveFollowBaseline atomically establishes one FollowedCreator and its bounded
+// historical baseline. A failed baseline never leaves a creator row or partial
+// observations behind.
+func (s *DB) SaveFollowBaseline(ctx context.Context, creator domain.FollowedCreator, videos []domain.DouyinVideo) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin follow baseline tx: %w", err)
+	}
+	defer tx.Rollback()
+	if err := saveFollowedCreator(ctx, tx, creator); err != nil {
+		return err
+	}
+	for _, video := range videos {
+		if err := saveDouyinVideoObservation(ctx, tx, video); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit follow baseline tx: %w", err)
+	}
+	return nil
+}
+
+func (s *DB) GetFollowedCreator(ctx context.Context, secUID string) (*domain.FollowedCreator, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	row := s.db.QueryRowContext(ctx, `
+		SELECT sec_uid, canonical_url, COALESCE(display_name,''), COALESCE(avatar_url,''), followed,
+			followed_at, baseline_at, automation_mode, target_language, review_posture, cover_color, configured_by,
+			last_successful_poll_at, last_attempt_at, next_check_at, poll_state,
+			COALESCE(failure_code,''), COALESCE(failure_message,''), created_at, updated_at
+		FROM followed_creators WHERE sec_uid = ?`, secUID)
+	creator, err := scanFollowedCreator(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query followed creator: %w", err)
+	}
+	return creator, nil
+}
+
+func (s *DB) ListFollowedCreators(ctx context.Context) ([]domain.FollowedCreator, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT sec_uid, canonical_url, COALESCE(display_name,''), COALESCE(avatar_url,''), followed,
+			followed_at, baseline_at, automation_mode, target_language, review_posture, cover_color, configured_by,
+			last_successful_poll_at, last_attempt_at, next_check_at, poll_state,
+			COALESCE(failure_code,''), COALESCE(failure_message,''), created_at, updated_at
+		FROM followed_creators ORDER BY followed DESC, updated_at DESC, sec_uid ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list followed creators: %w", err)
+	}
+	defer rows.Close()
+	var creators []domain.FollowedCreator
+	for rows.Next() {
+		creator, err := scanFollowedCreator(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan followed creator: %w", err)
+		}
+		creators = append(creators, *creator)
+	}
+	return creators, rows.Err()
+}
+
+func (s *DB) SetCreatorFollowed(ctx context.Context, secUID string, followed bool, updatedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.ExecContext(ctx, `UPDATE followed_creators SET followed = ?, updated_at = ? WHERE sec_uid = ?`, boolInt(followed), updatedAt.Format(time.RFC3339Nano), secUID)
+	if err != nil {
+		return fmt.Errorf("update creator follow state: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SaveMonitoringVideosIfFollowed atomically orders a completed monitoring
+// result against Unfollow. Both operations take the DB mutex, and the followed
+// check plus observation batch commit in one transaction, so an in-flight poll
+// cannot reintroduce New videos after Unfollow has committed.
+func (s *DB) SaveMonitoringVideosIfFollowed(ctx context.Context, secUID string, videos []domain.DouyinVideo) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin monitoring observation tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var followed int
+	if err := tx.QueryRowContext(ctx, `SELECT followed FROM followed_creators WHERE sec_uid = ?`, secUID).Scan(&followed); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, ErrNotFound
+		}
+		return false, fmt.Errorf("query creator follow state for monitoring: %w", err)
+	}
+	if followed != 1 {
+		return false, nil
+	}
+	for _, video := range videos {
+		if err := saveDouyinVideoObservation(ctx, tx, video); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit monitoring observation tx: %w", err)
+	}
+	return true, nil
+}
+
+// SaveDouyinVideoObservation inserts newly retained discovery state or refreshes
+// mutable observed metadata on a known aweme without changing its lifecycle.
+func (s *DB) SaveDouyinVideoObservation(ctx context.Context, video domain.DouyinVideo) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return saveDouyinVideoObservation(ctx, s.db, video)
+}
+
+func saveDouyinVideoObservation(ctx context.Context, exec sqlExecer, video domain.DouyinVideo) error {
+	_, err := exec.ExecContext(ctx, `
+		INSERT INTO douyin_videos (
+			aweme_id, source_id, sec_uid, canonical_url, title, cover_url, published_at, like_count, duration_ms,
+			first_observed_at, last_observed_at, origin, disposition, acquisition_request_state,
+			acquisition_failure_json, automation_failure_json, library_visible, removed_at, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(aweme_id) DO UPDATE SET
+			sec_uid=COALESCE(NULLIF(excluded.sec_uid,''), douyin_videos.sec_uid),
+			canonical_url=excluded.canonical_url,
+			title=COALESCE(NULLIF(excluded.title,''), douyin_videos.title),
+			cover_url=COALESCE(NULLIF(excluded.cover_url,''), douyin_videos.cover_url),
+			published_at=COALESCE(excluded.published_at, douyin_videos.published_at),
+			like_count=COALESCE(excluded.like_count, douyin_videos.like_count),
+			duration_ms=COALESCE(excluded.duration_ms, douyin_videos.duration_ms),
+			last_observed_at=excluded.last_observed_at,
+			updated_at=excluded.updated_at
+	`, video.AwemeID, video.SourceID, video.SecUID, video.CanonicalURL, video.Title, video.CoverURL,
+		timePtrString(video.PublishedAt), int64PtrValue(video.LikeCount), int64PtrValue(video.DurationMs),
+		video.FirstObservedAt.Format(time.RFC3339Nano), video.LastObservedAt.Format(time.RFC3339Nano), video.Origin, video.Disposition,
+		video.AcquisitionRequestState, emptyToNil(video.AcquisitionFailureCode), emptyToNil(video.AutomationFailureCode),
+		boolInt(video.LibraryVisible), timePtrString(video.RemovedAt), video.CreatedAt.Format(time.RFC3339Nano), video.UpdatedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("upsert douyin video observation: %w", err)
+	}
+	return nil
+}
+
+func (s *DB) GetDouyinVideo(ctx context.Context, awemeID string) (*domain.DouyinVideo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	video, err := scanDouyinVideo(s.db.QueryRowContext(ctx, douyinVideoSelect+` WHERE aweme_id = ?`, awemeID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query douyin video: %w", err)
+	}
+	return video, nil
+}
+
+func (s *DB) ListDouyinVideos(ctx context.Context, secUID string) ([]domain.DouyinVideo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	query := douyinVideoSelect
+	args := []any{}
+	if secUID != "" {
+		query += ` WHERE sec_uid = ?`
+		args = append(args, secUID)
+	}
+	query += ` ORDER BY first_observed_at DESC, aweme_id DESC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list douyin videos: %w", err)
+	}
+	defer rows.Close()
+	var videos []domain.DouyinVideo
+	for rows.Next() {
+		video, err := scanDouyinVideo(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan douyin video: %w", err)
+		}
+		videos = append(videos, *video)
+	}
+	return videos, rows.Err()
+}
+
+func (s *DB) SetDouyinVideoDisposition(ctx context.Context, awemeID string, disposition domain.DiscoveryDisposition, updatedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.ExecContext(ctx, `UPDATE douyin_videos SET disposition = ?, updated_at = ? WHERE aweme_id = ?`, disposition, updatedAt.Format(time.RFC3339Nano), awemeID)
+	if err != nil {
+		return fmt.Errorf("update douyin video disposition: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *DB) MarkDouyinVideoDownloadRequested(ctx context.Context, awemeID string, updatedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE douyin_videos
+		SET disposition = CASE WHEN disposition = 'new' THEN 'seen' ELSE disposition END,
+			acquisition_request_state = CASE WHEN acquisition_request_state = 'none' THEN 'queued' ELSE acquisition_request_state END,
+			updated_at = ?
+		WHERE aweme_id = ?`, updatedAt.Format(time.RFC3339Nano), awemeID)
+	if err != nil {
+		return fmt.Errorf("mark douyin video download requested: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+const douyinVideoSelect = `SELECT aweme_id, source_id, COALESCE(sec_uid,''), canonical_url,
+	COALESCE(title,''), COALESCE(cover_url,''), published_at, like_count, duration_ms,
+	first_observed_at, last_observed_at, origin, disposition, acquisition_request_state,
+	COALESCE(acquisition_failure_json,''), COALESCE(automation_failure_json,''), library_visible,
+	removed_at, created_at, updated_at FROM douyin_videos`
+
+type sqlScanner interface {
+	Scan(dest ...any) error
+}
+
+type sqlExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func scanFollowedCreator(scanner sqlScanner) (*domain.FollowedCreator, error) {
+	var creator domain.FollowedCreator
+	var followed int
+	var followedAt, baselineAt, createdAt, updatedAt string
+	var lastSuccess, lastAttempt, nextCheck sql.NullString
+	if err := scanner.Scan(&creator.SecUID, &creator.CanonicalURL, &creator.DisplayName, &creator.AvatarURL, &followed,
+		&followedAt, &baselineAt, &creator.AutomationMode, &creator.TargetLanguage, &creator.ReviewPosture, &creator.CoverColor, &creator.ConfiguredBy,
+		&lastSuccess, &lastAttempt, &nextCheck, &creator.PollState, &creator.FailureCode, &creator.FailureMessage, &createdAt, &updatedAt); err != nil {
+		return nil, err
+	}
+	creator.Followed = followed == 1
+	creator.FollowedAt, _ = time.Parse(time.RFC3339Nano, followedAt)
+	creator.BaselineAt, _ = time.Parse(time.RFC3339Nano, baselineAt)
+	creator.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	creator.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	creator.LastSuccessfulPollAt = parseNullTime(lastSuccess)
+	creator.LastAttemptAt = parseNullTime(lastAttempt)
+	creator.NextCheckAt = parseNullTime(nextCheck)
+	return &creator, nil
+}
+
+func scanDouyinVideo(scanner sqlScanner) (*domain.DouyinVideo, error) {
+	var video domain.DouyinVideo
+	var published, removed sql.NullString
+	var likes, duration sql.NullInt64
+	var firstObserved, lastObserved, createdAt, updatedAt string
+	var libraryVisible int
+	if err := scanner.Scan(&video.AwemeID, &video.SourceID, &video.SecUID, &video.CanonicalURL,
+		&video.Title, &video.CoverURL, &published, &likes, &duration, &firstObserved, &lastObserved,
+		&video.Origin, &video.Disposition, &video.AcquisitionRequestState, &video.AcquisitionFailureCode,
+		&video.AutomationFailureCode, &libraryVisible, &removed, &createdAt, &updatedAt); err != nil {
+		return nil, err
+	}
+	video.PublishedAt = parseNullTime(published)
+	if likes.Valid {
+		v := likes.Int64
+		video.LikeCount = &v
+	}
+	if duration.Valid {
+		v := duration.Int64
+		video.DurationMs = &v
+	}
+	video.FirstObservedAt, _ = time.Parse(time.RFC3339Nano, firstObserved)
+	video.LastObservedAt, _ = time.Parse(time.RFC3339Nano, lastObserved)
+	video.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	video.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	video.RemovedAt = parseNullTime(removed)
+	video.LibraryVisible = libraryVisible == 1
+	return &video, nil
+}
+
+func parseNullTime(value sql.NullString) *time.Time {
+	if !value.Valid || value.String == "" {
+		return nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value.String)
+	if err != nil {
+		return nil
+	}
+	return &parsed
+}
+
+func timePtrString(value *time.Time) any {
+	if value == nil {
+		return nil
+	}
+	return value.Format(time.RFC3339Nano)
+}
+
+func int64PtrValue(value *int64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func emptyToNil(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 // ---- Job Bundle Storage Helpers (T21) ----

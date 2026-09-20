@@ -7,6 +7,27 @@ import (
 	"testing"
 )
 
+func TestOperatorUIFollowedCreatorSurface(t *testing.T) {
+	index, err := operatorUIFS.ReadFile("ui/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := operatorUIFS.ReadFile("ui/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{"Theo dõi kênh", `data-view="followed"`, `id="followed-creators"`, `id="followed-videos"`} {
+		if !strings.Contains(string(index), marker) {
+			t.Fatalf("followed creator UI missing %q", marker)
+		}
+	}
+	for _, marker := range []string{"/api/v1/followed-creators", "/api/v1/discovery/videos", "data-load-older", "data-video-disposition", "data-request-download"} {
+		if !strings.Contains(string(app), marker) {
+			t.Fatalf("followed creator UI behavior missing %q", marker)
+		}
+	}
+}
+
 // TestOperatorUIAppBehavior pins the Operator UI behaviors that string markers
 // cannot: internal/server/ui/app.js is executed in a Node vm with a stubbed DOM
 // and driven through its real event listeners. It fails if selection stops

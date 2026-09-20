@@ -28,16 +28,20 @@
           <span class="nav-index">02</span>
           <span><strong>Cào ngay</strong><small>Tìm kiếm · Lookup · Chọn video</small></span>
         </button>
-        <button class="nav-item" data-view-target="jobs" type="button">
+        <button class="nav-item" data-view-target="followed" type="button">
           <span class="nav-index">03</span>
+          <span><strong>Theo dõi kênh</strong><small>Baseline · New / Seen / Ignored</small></span>
+        </button>
+        <button class="nav-item" data-view-target="jobs" type="button">
+          <span class="nav-index">04</span>
           <span><strong>Jobs & Queue</strong><small>Tiến độ · 1 active slot</small></span>
         </button>
         <button class="nav-item" data-view-target="inspector" type="button">
-          <span class="nav-index">04</span>
+          <span class="nav-index">05</span>
           <span><strong>Review Workspace</strong><small>Speaker · Timeline · Review</small></span>
         </button>
         <button class="nav-item" data-view-target="result" type="button">
-          <span class="nav-index">05</span>
+          <span class="nav-index">06</span>
           <span><strong>Kết quả</strong><small>Preview & final render</small></span>
         </button>
       </nav>
@@ -255,6 +259,27 @@
               <button class="secondary-button" id="discovery-follow" type="button">Follow creator</button>
               <button class="primary-button" id="discovery-download" type="button">Download đã chọn</button>
             </div>
+          </div>
+        </section>
+
+        <section class="view" data-view="followed" aria-labelledby="followed-title">
+          <div class="section-header-row">
+            <div>
+              <p class="section-kicker">Durable Douyin discovery</p>
+              <h2 id="followed-title">Theo dõi kênh</h2>
+              <p class="lead compact-lead">Creator đã follow và video đã retain. Baseline/Load older là lịch sử; video mới từ monitoring mới mang trạng thái New.</p>
+            </div>
+            <button class="secondary-button" id="followed-refresh" type="button">Refresh</button>
+          </div>
+          <div class="discovery-layout">
+            <div class="discovery-main">
+              <div class="discovery-status" id="followed-status">Chưa tải dữ liệu.</div>
+              <div class="discovery-results" id="followed-creators"></div>
+            </div>
+            <aside class="panel discovery-preview">
+              <p class="section-kicker">Retained lifecycle</p>
+              <div class="discovery-results" id="followed-videos"></div>
+            </aside>
           </div>
         </section>
 

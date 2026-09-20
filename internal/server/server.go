@@ -1377,6 +1377,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/douyin/search", s.handleDouyinSearch)
 	s.mux.HandleFunc("POST /api/v1/douyin/lookup/video", s.handleDouyinVideoLookup)
 	s.mux.HandleFunc("POST /api/v1/douyin/lookup/creator", s.handleDouyinCreatorLookup)
+	s.mux.HandleFunc("GET /api/v1/discovery/videos", s.handleListDouyinVideos)
+	s.mux.HandleFunc("PATCH /api/v1/discovery/videos/{aweme_id}", s.handlePatchDouyinVideo)
+	s.mux.HandleFunc("GET /api/v1/followed-creators", s.handleListFollowedCreators)
+	s.mux.HandleFunc("POST /api/v1/followed-creators", s.handleFollowCreator)
+	s.mux.HandleFunc("DELETE /api/v1/followed-creators/{sec_uid}", s.handleUnfollowCreator)
+	s.mux.HandleFunc("POST /api/v1/followed-creators/{sec_uid}/load-older", s.handleLoadOlderCreatorVideos)
+	s.mux.HandleFunc("POST /api/v1/library/media/downloads", s.handleRequestDouyinDownloads)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}", s.handleGetAsset)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/preflight", s.handleGetAssetPreflight)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/audio-role-plan", s.handleSaveAudioRolePlan)
@@ -1749,8 +1756,130 @@ func (s *Server) handleDouyinCreatorLookup(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, creator)
 }
 
+func (s *Server) handleListFollowedCreators(w http.ResponseWriter, r *http.Request) {
+	if s.discovery == nil {
+		writeError(w, http.StatusServiceUnavailable, "Douyin discovery is not configured")
+		return
+	}
+	creators, err := s.discovery.ListFollowedCreators(r.Context())
+	if err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"creators": creators})
+}
+
+func (s *Server) handleFollowCreator(w http.ResponseWriter, r *http.Request) {
+	if s.discovery == nil {
+		writeError(w, http.StatusServiceUnavailable, "Douyin discovery is not configured")
+		return
+	}
+	var req service.FollowCreatorRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	creator, err := s.discovery.FollowCreator(r.Context(), req)
+	if err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"creator": creator})
+}
+
+func (s *Server) handleUnfollowCreator(w http.ResponseWriter, r *http.Request) {
+	if s.discovery == nil {
+		writeError(w, http.StatusServiceUnavailable, "Douyin discovery is not configured")
+		return
+	}
+	if err := s.discovery.UnfollowCreator(r.Context(), r.PathValue("sec_uid")); err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleLoadOlderCreatorVideos(w http.ResponseWriter, r *http.Request) {
+	if s.discovery == nil {
+		writeError(w, http.StatusServiceUnavailable, "Douyin discovery is not configured")
+		return
+	}
+	var req service.LoadOlderRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+			return
+		}
+	}
+	videos, err := s.discovery.LoadOlder(r.Context(), r.PathValue("sec_uid"), req)
+	if err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"videos": videos})
+}
+
+func (s *Server) handleListDouyinVideos(w http.ResponseWriter, r *http.Request) {
+	if s.discovery == nil {
+		writeError(w, http.StatusServiceUnavailable, "Douyin discovery is not configured")
+		return
+	}
+	videos, err := s.discovery.ListRetainedVideos(r.Context(), r.URL.Query().Get("sec_uid"))
+	if err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"videos": videos})
+}
+
+func (s *Server) handlePatchDouyinVideo(w http.ResponseWriter, r *http.Request) {
+	if s.discovery == nil {
+		writeError(w, http.StatusServiceUnavailable, "Douyin discovery is not configured")
+		return
+	}
+	var req struct {
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	video, err := s.discovery.SetVideoDisposition(r.Context(), r.PathValue("aweme_id"), req.Action)
+	if err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"video": video})
+}
+
+func (s *Server) handleRequestDouyinDownloads(w http.ResponseWriter, r *http.Request) {
+	if s.discovery == nil {
+		writeError(w, http.StatusServiceUnavailable, "Douyin discovery is not configured")
+		return
+	}
+	var req struct {
+		AwemeIDs []string `json:"aweme_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	if len(req.AwemeIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "aweme_ids is required")
+		return
+	}
+	videos, err := s.discovery.RequestDownloads(r.Context(), req.AwemeIDs)
+	if err != nil {
+		writeDiscoveryError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"videos": videos})
+}
+
 func writeDiscoveryError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		writeError(w, http.StatusNotFound, "not found")
 	case errors.Is(err, domain.ErrPolicyBlocked),
 		errors.Is(err, domain.ErrConsentRequired),
 		errors.Is(err, domain.ErrAuthRequired),

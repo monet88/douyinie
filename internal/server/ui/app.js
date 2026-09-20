@@ -26,6 +26,9 @@ const state = {
   discoveryContinuation: "",
   discoverySelected: new Set(),
   discoveryPreview: null,
+  followedCreators: [],
+  followedVideos: [],
+  followedSecUID: "",
 };
 
 let pollTimer = null;
@@ -33,6 +36,7 @@ let pollTimer = null;
 const titles = {
   new: "Tạo localization job",
   discover: "Cào ngay",
+  followed: "Theo dõi kênh",
   jobs: "Jobs & Queue",
   inspector: "Review Workspace",
   result: "Kết quả",
@@ -233,6 +237,7 @@ function navigate(view) {
   if (titleNode) titleNode.textContent = titles[view] || "Douyinie Operator";
   if (view === "inspector") renderInspector();
   if (view === "result") refreshResult().catch(showError);
+  if (view === "followed") loadFollowedWorkspace().catch(showError);
 }
 
 function getRunPosture(run) {
@@ -2709,6 +2714,79 @@ async function lookupDiscoveryCreator() {
   }
 }
 
+async function followDiscoveryCreator() {
+  const selected = discoveryFilteredVideos().filter((video) => state.discoverySelected.has(video.aweme_id));
+  const url = selected.find((video) => video.creator?.canonical_url)?.creator?.canonical_url || $("#discovery-url")?.value?.trim() || "";
+  if (!url) {
+    toast("Thiếu creator URL", "Lookup creator hoặc chọn video có creator identity trước khi Follow.", "error");
+    return;
+  }
+  const button = $("#discovery-follow");
+  setBusy(button, true, "Đang Follow…");
+  try {
+    await api("/api/v1/followed-creators", { method: "POST", body: jsonBody({ url, recent_limit: 20, configured_by: operatorName() }) });
+    toast("Đã Follow", "Baseline gần nhất đã được lưu dưới dạng Seen.", "success");
+    await loadFollowedWorkspace();
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function loadFollowedWorkspace() {
+  const data = await api("/api/v1/followed-creators");
+  state.followedCreators = Array.isArray(data.creators) ? data.creators : [];
+  if (!state.followedSecUID || !state.followedCreators.some((creator) => creator.sec_uid === state.followedSecUID)) {
+    state.followedSecUID = state.followedCreators.find((creator) => creator.followed)?.sec_uid || state.followedCreators[0]?.sec_uid || "";
+  }
+  if (state.followedSecUID) {
+    const videos = await api("/api/v1/discovery/videos?sec_uid=" + encodeURIComponent(state.followedSecUID));
+    state.followedVideos = Array.isArray(videos.videos) ? videos.videos : [];
+  } else {
+    state.followedVideos = [];
+  }
+  renderFollowedWorkspace();
+}
+
+function renderFollowedWorkspace() {
+  const creatorsNode = $("#followed-creators");
+  const videosNode = $("#followed-videos");
+  const status = $("#followed-status");
+  if (!creatorsNode || !videosNode) return;
+  const active = state.followedCreators.filter((creator) => creator.followed).length;
+  if (status) status.textContent = active + " creator đang follow · " + state.followedVideos.filter((video) => video.disposition === "new").length + " video New";
+  creatorsNode.innerHTML = state.followedCreators.length ? state.followedCreators.map((creator) =>
+    '<article class="discovery-card ' + (creator.sec_uid === state.followedSecUID ? "is-selected" : "") + '" data-followed-creator="' + esc(creator.sec_uid) + '">' +
+      '<div class="discovery-card-body"><strong>' + esc(creator.display_name || creator.sec_uid) + '</strong>' +
+      '<span>' + esc(creator.followed ? "Following" : "Unfollowed") + ' · mode ' + esc(creator.automation_mode || "A") + '</span>' +
+      '<small>Baseline ' + esc(formatDate(creator.baseline_at)) + '</small></div>' +
+      (creator.followed ? '<button class="secondary-button" data-load-older="' + esc(creator.sec_uid) + '" type="button">Load older</button>' : '') +
+      (creator.followed ? '<button class="secondary-button" data-unfollow-creator="' + esc(creator.sec_uid) + '" type="button">Unfollow</button>' : '') +
+    '</article>').join("") : '<div class="empty-state compact-empty"><strong>Chưa Follow kênh nào</strong><span>Lookup creator ở Cào ngay rồi bấm Follow creator.</span></div>';
+  videosNode.innerHTML = state.followedVideos.length ? state.followedVideos.map((video) => {
+    const disposition = video.disposition || "seen";
+    const toggle = disposition === "ignored" ? "unignore" : "ignore";
+    return '<article class="discovery-card" data-retained-video="' + esc(video.aweme_id) + '">' +
+      '<div class="discovery-card-body"><strong>' + esc(video.title || ("Douyin " + video.aweme_id)) + '</strong>' +
+      '<span>' + esc(disposition.toUpperCase()) + ' · ' + esc(video.origin || "historical") + '</span>' +
+      '<small>' + esc(video.acquisition_request_state || "none") + '</small></div>' +
+      (disposition === "new" ? '<button class="secondary-button" data-video-disposition="seen" data-aweme-id="' + esc(video.aweme_id) + '" type="button">Mark seen</button>' : '') +
+      '<button class="secondary-button" data-video-disposition="' + esc(toggle) + '" data-aweme-id="' + esc(video.aweme_id) + '" type="button">' + (toggle === "ignore" ? "Ignore" : "Unignore") + '</button>' +
+      '<button class="primary-button" data-request-download="' + esc(video.aweme_id) + '" type="button">Download</button>' +
+    '</article>';
+  }).join("") : '<div class="empty-state compact-empty"><strong>Chưa có retained video</strong><span>Baseline hoặc Load older sẽ xuất hiện ở đây.</span></div>';
+}
+
+async function setRetainedDisposition(awemeID, action) {
+  await api("/api/v1/discovery/videos/" + encodeURIComponent(awemeID), { method: "PATCH", body: jsonBody({ action }) });
+  await loadFollowedWorkspace();
+}
+
+async function requestRetainedDownload(awemeID) {
+  await api("/api/v1/library/media/downloads", { method: "POST", body: jsonBody({ aweme_ids: [awemeID] }) });
+  await loadFollowedWorkspace();
+  toast("Đã xếp hàng Download", "Video đã chuyển khỏi New và yêu cầu được lưu.", "success");
+}
+
 async function downloadSelectedDiscovery() {
   // Bulk actions apply only to the currently visible filtered set. A selection
   // hidden by a later date/like filter must not be acquired invisibly.
@@ -2784,8 +2862,38 @@ function bindEvents() {
     }
   });
   $("#discovery-download")?.addEventListener("click", () => downloadSelectedDiscovery().catch(showError));
-  $("#discovery-follow")?.addEventListener("click", () => {
-    toast("Follow chưa bật", "Slice hiện tại chỉ discovery transient; durable Follow được giữ ngoài #128.");
+  $("#discovery-follow")?.addEventListener("click", () => followDiscoveryCreator().catch(showError));
+  $("#followed-refresh")?.addEventListener("click", () => loadFollowedWorkspace().catch(showError));
+  $("#followed-creators")?.addEventListener("click", (event) => {
+    const loadOlder = event.target.closest("[data-load-older]");
+    if (loadOlder) {
+      api("/api/v1/followed-creators/" + encodeURIComponent(loadOlder.dataset.loadOlder) + "/load-older", { method: "POST", body: jsonBody({ recent_limit: 50 }) }).then(loadFollowedWorkspace).catch(showError);
+      return;
+    }
+    const unfollow = event.target.closest("[data-unfollow-creator]");
+    if (unfollow) {
+      api("/api/v1/followed-creators/" + encodeURIComponent(unfollow.dataset.unfollowCreator), { method: "DELETE" }).then(loadFollowedWorkspace).catch(showError);
+      return;
+    }
+    const creator = event.target.closest("[data-followed-creator]");
+    if (creator) {
+      state.followedSecUID = creator.dataset.followedCreator;
+      loadFollowedWorkspace().catch(showError);
+    }
+  });
+  $("#followed-videos")?.addEventListener("click", (event) => {
+    const disposition = event.target.closest("[data-video-disposition]");
+    if (disposition) {
+      setRetainedDisposition(disposition.dataset.awemeId, disposition.dataset.videoDisposition).catch(showError);
+      return;
+    }
+    const download = event.target.closest("[data-request-download]");
+    if (download) {
+      requestRetainedDownload(download.dataset.requestDownload).catch(showError);
+      return;
+    }
+    const video = event.target.closest("[data-retained-video]");
+    if (video) setRetainedDisposition(video.dataset.retainedVideo, "seen").catch(showError);
   });
   $("#refresh-all")?.addEventListener("click", () => refreshAll());
   $("#jobs-refresh")?.addEventListener("click", () => refreshAll());

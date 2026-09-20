@@ -131,7 +131,7 @@ func main() {
 	// Discovery intentionally uses a governance-aware Router without the
 	// provenance DB writer: ordinary exploration is transient by contract.
 	discoveryRouter := provider.NewRouter(reg, polSvc, licSvc, credSvc, nil, nil)
-	discoverySvc := service.NewDiscoveryService(discoveryRouter)
+	discoverySvc := service.NewDiscoveryService(discoveryRouter, db)
 
 	// 6. Optional Demo Ingestion
 	if *demoFile != "" {

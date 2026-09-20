@@ -136,7 +136,7 @@ func main() {
 	// Keep discovery metadata and routing attempts transient until the operator
 	// explicitly chooses Download/Follow.
 	discoveryRouter := provider.NewRouter(reg, polSvc, licSvc, credSvc, nil, nil)
-	discoverySvc := service.NewDiscoveryService(discoveryRouter)
+	discoverySvc := service.NewDiscoveryService(discoveryRouter, db)
 
 	// 4. RuntimeHost HTTP Server
 	addr := fmt.Sprintf("127.0.0.1:%d", listenPort)

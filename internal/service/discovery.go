@@ -2,21 +2,27 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/provider"
+	"github.com/monet88/douyinie/internal/storage"
 )
 
 type DiscoveryService struct {
 	router *provider.Router
+	store  *storage.DB
 }
 
-func NewDiscoveryService(router *provider.Router) *DiscoveryService {
-	return &DiscoveryService{router: router}
+func NewDiscoveryService(router *provider.Router, store *storage.DB) *DiscoveryService {
+	return &DiscoveryService{router: router, store: store}
 }
+
+const defaultFollowBaselineLimit = 20
+const maxFollowBaselineLimit = 50
 
 type DiscoveryRequest struct {
 	Query                 string     `json:"query,omitempty"`
@@ -27,6 +33,18 @@ type DiscoveryRequest struct {
 	PublishedAfter        *time.Time `json:"published_after,omitempty"`
 	MinLikes              *int64     `json:"min_likes,omitempty"`
 	AuthorizedCredentials []string   `json:"authorized_credentials,omitempty"`
+}
+
+type FollowCreatorRequest struct {
+	URL                   string   `json:"url"`
+	RecentLimit           int      `json:"recent_limit,omitempty"`
+	ConfiguredBy          string   `json:"configured_by,omitempty"`
+	AuthorizedCredentials []string `json:"authorized_credentials,omitempty"`
+}
+
+type LoadOlderRequest struct {
+	RecentLimit           int      `json:"recent_limit,omitempty"`
+	AuthorizedCredentials []string `json:"authorized_credentials,omitempty"`
 }
 
 func (s *DiscoveryService) Search(ctx context.Context, req DiscoveryRequest) (*domain.DiscoveryPage, error) {
@@ -74,6 +92,207 @@ func (s *DiscoveryService) LookupCreator(ctx context.Context, req DiscoveryReque
 	}
 	creator.RecentVideos = filterDiscoveredVideos(creator.RecentVideos, req.PublishedAfter, req.MinLikes)
 	return creator, nil
+}
+
+func (s *DiscoveryService) FollowCreator(ctx context.Context, req FollowCreatorRequest) (*domain.FollowedCreator, error) {
+	if s == nil || s.store == nil {
+		return nil, fmt.Errorf("durable Douyin discovery unavailable")
+	}
+	limit := boundedRecentLimit(req.RecentLimit)
+	lookup, err := s.LookupCreator(ctx, DiscoveryRequest{URL: req.URL, RecentLimit: limit, AuthorizedCredentials: req.AuthorizedCredentials})
+	if err != nil {
+		return nil, err
+	}
+	if !lookup.RecentViewAvailable {
+		return nil, fmt.Errorf("%w: creator recent baseline is unavailable", domain.ErrNoEligibleProvider)
+	}
+	if strings.TrimSpace(lookup.Creator.SecUID) == "" {
+		return nil, fmt.Errorf("%w: creator sec_uid is required", domain.ErrInvalidDiscoveryRequest)
+	}
+	now := time.Now().UTC()
+	creator := domain.FollowedCreator{
+		SecUID: lookup.Creator.SecUID, CanonicalURL: lookup.Creator.CanonicalURL, DisplayName: lookup.Creator.DisplayName, AvatarURL: lookup.Creator.AvatarURL,
+		Followed: true, FollowedAt: now, BaselineAt: now, AutomationMode: domain.ChannelAutomationDetect,
+		TargetLanguage: "vi", ReviewPosture: "auto", CoverColor: "#000000", ConfiguredBy: strings.TrimSpace(req.ConfiguredBy),
+		PollState: "idle", CreatedAt: now, UpdatedAt: now,
+	}
+	if creator.ConfiguredBy == "" {
+		creator.ConfiguredBy = "local-operator"
+	}
+	if previous, getErr := s.store.GetFollowedCreator(ctx, creator.SecUID); getErr == nil {
+		creator.AutomationMode = previous.AutomationMode
+		creator.TargetLanguage = previous.TargetLanguage
+		creator.ReviewPosture = previous.ReviewPosture
+		creator.CoverColor = previous.CoverColor
+		creator.CreatedAt = previous.CreatedAt
+	} else if !errors.Is(getErr, storage.ErrNotFound) {
+		return nil, fmt.Errorf("load existing followed creator: %w", getErr)
+	}
+	baseline := make([]domain.DouyinVideo, 0, limit)
+	for _, observed := range boundedVideos(lookup.RecentVideos, limit) {
+		video, err := retainedVideo(creator.SecUID, observed, domain.DiscoveryOriginBaseline, domain.DiscoveryDispositionSeen, now)
+		if err != nil {
+			return nil, err
+		}
+		baseline = append(baseline, video)
+	}
+	if err := s.store.SaveFollowBaseline(ctx, creator, baseline); err != nil {
+		return nil, err
+	}
+	return s.store.GetFollowedCreator(ctx, creator.SecUID)
+}
+
+func (s *DiscoveryService) UnfollowCreator(ctx context.Context, secUID string) error {
+	if s == nil || s.store == nil {
+		return fmt.Errorf("durable Douyin discovery unavailable")
+	}
+	if strings.TrimSpace(secUID) == "" {
+		return fmt.Errorf("%w: sec_uid is required", domain.ErrInvalidDiscoveryRequest)
+	}
+	return s.store.SetCreatorFollowed(ctx, secUID, false, time.Now().UTC())
+}
+
+func (s *DiscoveryService) ListFollowedCreators(ctx context.Context) ([]domain.FollowedCreator, error) {
+	if s == nil || s.store == nil {
+		return nil, fmt.Errorf("durable Douyin discovery unavailable")
+	}
+	return s.store.ListFollowedCreators(ctx)
+}
+
+func (s *DiscoveryService) ListRetainedVideos(ctx context.Context, secUID string) ([]domain.DouyinVideo, error) {
+	if s == nil || s.store == nil {
+		return nil, fmt.Errorf("durable Douyin discovery unavailable")
+	}
+	return s.store.ListDouyinVideos(ctx, secUID)
+}
+
+func (s *DiscoveryService) SetVideoDisposition(ctx context.Context, awemeID, action string) (*domain.DouyinVideo, error) {
+	if s == nil || s.store == nil {
+		return nil, fmt.Errorf("durable Douyin discovery unavailable")
+	}
+	video, err := s.store.GetDouyinVideo(ctx, awemeID)
+	if err != nil {
+		return nil, err
+	}
+	var next domain.DiscoveryDisposition
+	switch action {
+	case "seen":
+		if video.Disposition == domain.DiscoveryDispositionIgnored {
+			return video, nil
+		}
+		next = domain.DiscoveryDispositionSeen
+	case "ignore":
+		next = domain.DiscoveryDispositionIgnored
+	case "unignore":
+		if video.Disposition != domain.DiscoveryDispositionIgnored {
+			return video, nil
+		}
+		next = domain.DiscoveryDispositionSeen
+	default:
+		return nil, fmt.Errorf("%w: unsupported disposition action %q", domain.ErrInvalidDiscoveryRequest, action)
+	}
+	if err := s.store.SetDouyinVideoDisposition(ctx, awemeID, next, time.Now().UTC()); err != nil {
+		return nil, err
+	}
+	return s.store.GetDouyinVideo(ctx, awemeID)
+}
+
+func (s *DiscoveryService) LoadOlder(ctx context.Context, secUID string, req LoadOlderRequest) ([]domain.DouyinVideo, error) {
+	if s == nil || s.store == nil {
+		return nil, fmt.Errorf("durable Douyin discovery unavailable")
+	}
+	creator, err := s.store.GetFollowedCreator(ctx, secUID)
+	if err != nil {
+		return nil, err
+	}
+	limit := boundedRecentLimit(req.RecentLimit)
+	lookup, err := s.LookupCreator(ctx, DiscoveryRequest{URL: creator.CanonicalURL, RecentLimit: limit, AuthorizedCredentials: req.AuthorizedCredentials})
+	if err != nil {
+		return nil, err
+	}
+	if !lookup.RecentViewAvailable {
+		return nil, fmt.Errorf("%w: creator historical view is unavailable", domain.ErrNoEligibleProvider)
+	}
+	now := time.Now().UTC()
+	for _, observed := range boundedVideos(lookup.RecentVideos, limit) {
+		if err := s.retainVideo(ctx, secUID, observed, domain.DiscoveryOriginHistorical, domain.DiscoveryDispositionSeen, now); err != nil {
+			return nil, err
+		}
+	}
+	return s.store.ListDouyinVideos(ctx, secUID)
+}
+
+func (s *DiscoveryService) RequestDownloads(ctx context.Context, awemeIDs []string) ([]domain.DouyinVideo, error) {
+	if s == nil || s.store == nil {
+		return nil, fmt.Errorf("durable Douyin discovery unavailable")
+	}
+	now := time.Now().UTC()
+	result := make([]domain.DouyinVideo, 0, len(awemeIDs))
+	for _, awemeID := range awemeIDs {
+		if err := s.store.MarkDouyinVideoDownloadRequested(ctx, awemeID, now); err != nil {
+			return nil, err
+		}
+		video, err := s.store.GetDouyinVideo(ctx, awemeID)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, *video)
+	}
+	return result, nil
+}
+
+// RetainMonitoringVideos is the persistence contract later polling (#130) calls
+// after a successful observation. It does not fetch, schedule, or advance poll
+// checkpoints in this ticket.
+func (s *DiscoveryService) RetainMonitoringVideos(ctx context.Context, secUID string, videos []domain.DiscoveredVideo) error {
+	if s == nil || s.store == nil {
+		return fmt.Errorf("durable Douyin discovery unavailable")
+	}
+	now := time.Now().UTC()
+	retained := make([]domain.DouyinVideo, 0, len(videos))
+	for _, observed := range videos {
+		video, err := retainedVideo(secUID, observed, domain.DiscoveryOriginMonitoring, domain.DiscoveryDispositionNew, now)
+		if err != nil {
+			return err
+		}
+		retained = append(retained, video)
+	}
+	_, err := s.store.SaveMonitoringVideosIfFollowed(ctx, secUID, retained)
+	return err
+}
+
+func (s *DiscoveryService) retainVideo(ctx context.Context, secUID string, observed domain.DiscoveredVideo, origin domain.DiscoveryOrigin, initialDisposition domain.DiscoveryDisposition, now time.Time) error {
+	video, err := retainedVideo(secUID, observed, origin, initialDisposition, now)
+	if err != nil {
+		return err
+	}
+	return s.store.SaveDouyinVideoObservation(ctx, video)
+}
+
+func retainedVideo(secUID string, observed domain.DiscoveredVideo, origin domain.DiscoveryOrigin, initialDisposition domain.DiscoveryDisposition, now time.Time) (domain.DouyinVideo, error) {
+	if strings.TrimSpace(observed.AwemeID) == "" || strings.TrimSpace(observed.SourceID) == "" || strings.TrimSpace(observed.CanonicalURL) == "" {
+		return domain.DouyinVideo{}, fmt.Errorf("%w: retained video requires aweme_id, source_id, and canonical_url", domain.ErrInvalidDiscoveryRequest)
+	}
+	video := domain.DouyinVideo{DiscoveredVideo: observed, SecUID: secUID, FirstObservedAt: now, LastObservedAt: now, Origin: origin,
+		Disposition: initialDisposition, AcquisitionRequestState: "none", LibraryVisible: true, CreatedAt: now, UpdatedAt: now}
+	return video, nil
+}
+
+func boundedRecentLimit(limit int) int {
+	if limit <= 0 {
+		return defaultFollowBaselineLimit
+	}
+	if limit > maxFollowBaselineLimit {
+		return maxFollowBaselineLimit
+	}
+	return limit
+}
+
+func boundedVideos(videos []domain.DiscoveredVideo, limit int) []domain.DiscoveredVideo {
+	if len(videos) <= limit {
+		return videos
+	}
+	return videos[:limit]
 }
 
 func (s *DiscoveryService) execute(ctx context.Context, feature string, credentials []string, input string, run func(provider.DouyinDiscoveryProvider, string) error) error {
