@@ -123,10 +123,12 @@ func main() {
 			}
 		}
 	}
-	// 5b. Douyin URL acquisition ladder (Issue #28): Jiji preferred -> F2
-	// parser fallback -> browser-assisted auth last. Adapters are fail-closed
-	// (REQUIRES_AUTHORIZATION) until an operator enables them for an
-	// authorized-use basis; session secrets resolve only through the
+	// 5b. Douyin URL acquisition (Issue #125): known Argus-gated single-video
+	// detail requests require an operator-authorized real-page helper. Direct
+	// Jiji remains registered for probe/discovery-compatible behavior but its
+	// Acquire path fails closed before invoking the gated CLI request. F2 is
+	// registered only when the operator has separately established live evidence
+	// for the exact gated operation. Session secrets resolve only through the
 	// CredentialService seam at call time and are never logged or persisted.
 	jijiScript := os.Getenv("DOUYINIE_JIJI_SCRIPT")
 	jijiPython := os.Getenv("DOUYINIE_JIJI_PYTHON")
@@ -135,9 +137,11 @@ func main() {
 	}
 	if jijiScript != "" {
 		_ = reg.Register(provider.NewJijiAdapter("v2", jijiPython, jijiScript, credSvc.MaterializeSecret))
-		_ = reg.Register(provider.NewBrowserAssistAdapter("v2", jijiPython, jijiScript, credSvc.MaterializeSecret))
 	}
-	if f2Bin := os.Getenv("DOUYINIE_F2_BIN"); f2Bin != "" {
+	if pageHelper := os.Getenv("DOUYINIE_DOUYIN_PAGE_HELPER"); pageHelper != "" {
+		_ = reg.Register(provider.NewPageBackedJijiAdapter("v1", pageHelper, credSvc.MaterializeSecret))
+	}
+	if f2Bin := os.Getenv("DOUYINIE_F2_BIN"); f2Bin != "" && os.Getenv("DOUYINIE_F2_ARGUS_VERIFIED") == "1" {
 		_ = reg.Register(provider.NewF2Adapter("v0", f2Bin, credSvc.MaterializeSecret))
 	}
 	acquisitionSvc := service.NewAcquisitionService(db, ingestSvc, router, absDataDir)

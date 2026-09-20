@@ -633,6 +633,7 @@ type LocalizeVisualTrackInput struct {
 	ExecutionProfile       domain.ExecutionProfile          `json:"execution_profile,omitempty"`
 	AuthorizedCredentials  []string                         `json:"authorized_credentials,omitempty"`
 	ConsentGranted         bool                             `json:"consent_granted,omitempty"`
+	CoverColor            string                        `json:"cover_color,omitempty"`
 }
 
 // ApplyRegionOverrides applies direct-manipulation overrides (drag/resize/reclassify/text) to a TextRegionPlan.
@@ -719,6 +720,9 @@ func ApplyRegionOverrides(plan *domain.TextRegionPlan, overrides []domain.Region
 				reg.ProtectedMetadata.Reason = "manual_override_protection"
 			}
 		}
+		if ov.CoverColor != nil {
+			reg.CoverColor = *ov.CoverColor
+		}
 
 		// Apply bounding box deltas (drag / resize) to all keyframes and clamp to frame bounds
 		if ov.BoxDeltaX != 0 || ov.BoxDeltaY != 0 || ov.BoxDeltaW != 0 || ov.BoxDeltaH != 0 {
@@ -801,7 +805,7 @@ func firstProtectedOverlap(box domain.BoundingBox, protected []domain.BoundingBo
 
 // coverPaddingPx absorbs the anti-aliased edge of a burned-in caption so the cover box does
 // not leave a one-pixel halo of the original text behind.
-const coverPaddingPx = 6
+const coverPaddingPx = 8
 
 // resolveOverlayCollisions drops in-place replacements that would land on another replacement sharing the
 // screen, and reports each dropped region as an occlusion exception.
@@ -1046,7 +1050,16 @@ func buildSubtitleCovers(
 		cover.Role = string(reg.Role)
 		cover.StartMs = startMs
 		cover.EndMs = endMs
-		cover.Color = "#000000"
+		coverColor := "#000000"
+		if reg.CoverColor != "" {
+			coverColor = reg.CoverColor
+		} else if strings.TrimSpace(in.CoverColor) != "" {
+			coverColor = strings.TrimSpace(in.CoverColor)
+		}
+		if !strings.HasPrefix(coverColor, "#") && len(coverColor) == 6 {
+			coverColor = "#" + coverColor
+		}
+		cover.Color = coverColor
 		cover.Opacity = 1.0
 		if err := domain.ValidateCoverBox(cover, plan.FrameWidth, plan.FrameHeight); err != nil {
 			continue

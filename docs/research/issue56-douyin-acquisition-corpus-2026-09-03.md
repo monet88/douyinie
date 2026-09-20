@@ -42,7 +42,7 @@ Douyinie's codebase implements a clean, policy-gated acquisition architecture ce
    - Hard blocks (fail-closed, never retried or fallen through):
      - `INVALID_URL`: malformed URL or unsupported locator type (e.g. non-Douyin domain). Returns HTTP 400.
      - `UNSUPPORTED_MEDIA_TYPE`: V1 only accepts standard video posts. Gallery/photo-notes (`/note/`) and live streams (`live.douyin.com`) are rejected at the `Probe` phase. Returns HTTP 422.
-     - `CONTENT_UNAVAILABLE`: upstream returns HTTP 404, 410 Gone, 403 Forbidden on the canonical URL, or adapter classifies explicit "removed / private / not found". Returns HTTP 422.
+     - `CONTENT_UNAVAILABLE`: upstream returns HTTP 404/410 for genuinely missing media, or the adapter classifies explicit "removed / private / not found". Returns HTTP 422. Security/WAF/Argus 403 responses are `ANTI_BOT_OR_EMPTY_RESPONSE`, not content absence.
    - Fallback-eligible soft failures (advance through the adapter ladder):
      - `ANTI_BOT_OR_EMPTY_RESPONSE`: empty HTTP 200 or redirect to verification interstitial without an `aweme_id`.
      - `AUTH_REQUIRED`: endpoint requires logged-in session cookies.
@@ -52,10 +52,7 @@ Douyinie's codebase implements a clean, policy-gated acquisition architecture ce
      - `INTEGRITY_FAILED`: media downloaded but failed container integrity (`ContainerValid == false`) or content fingerprinting.
 
 2. **The Acquisition Ladder (`internal/service/acquisition.go` & `internal/provider/acquisition_cli.go`)**:
-   - Order:
-     1. `jiji_douyin` (quality 0.95, method `api`): drives `jiji262/douyin-downloader` CLI (`run.py -u <url> -p <dest> --cookie-file <temp>`).
-     2. `f2_douyin` (quality 0.60, method `api`): fallback driving `f2` CLI (`f2 dy -M one -u <url> -p <dest> -k <temp>`).
-     3. `douyin_browser_assist` (quality 0.50, method `browser`): last-resort driving Jiji with `--browser-fallback` using pre-authorized operator session cookies.
+   - The original September 3 order was `jiji_douyin -> f2_douyin -> douyin_browser_assist`. Issue #125 supersedes that execution assumption for Argus-gated operations: direct Jiji single-video acquisition now fails closed before CLI execution; `douyin_browser_assist` is a separately configured real-page helper and is preferred when present; F2 is registered for the gated lane only after explicit fresh live verification (`DOUYINIE_F2_ARGUS_VERIFIED=1`). Jiji CLI `--browser-fallback` is not treated as a single-video page bridge.
    - **Probe vs. Acquire separation**: `Probe` resolves short links (`v.douyin.com/...`) via HTTP redirect to canonical aweme IDs (`douyin:aweme:<id>`) without downloading media bytes or persisting durable assets.
    - **Per-candidate integrity gate**: each adapter downloads into an isolated candidate directory. The media file is ingested and probed immediately by `media.Prober` (running `ffprobe`). Corrupt media (`moov` atom missing, zero duration, stream missing) triggers `ErrQualityRejected`, recording a `quality_failed` attempt and advancing to the next ladder candidate. `INTEGRITY_FAILED` surfaces only when all candidates fail.
    - **CAS & SQLite Dedup**: successful media commits into CAS by SHA-256. If a canonical `aweme_id` or identical content SHA was previously acquired, reacquisition dedups directly to the existing `SourceAsset`.
@@ -66,8 +63,7 @@ Empirical smoke tests (`docs/research/douyin-ingestion-reference-smoke-test.md`)
 
 1. **Unauthenticated Public Access is Heavily Rate-Limited & WAF-Gated**:
    - Douyin Web edge WAF frequently responds with empty HTTP 200 bodies, status -1, or redirects to web security check pages (`/security-check`) when accessed without valid browser cookies.
-   - The primary API endpoint `/aweme/v1/web/aweme/detail/` requires valid Web cookies (`ttwid`, `odin_tt`, `passport_csrf_token`, `sid_guard`) and query parameters (`aid=1128` or `6383`, `a_bogus` / `x-bogus`).
-   - `jiji262/douyin-downloader` uses `tools.cookie_fetcher` (Playwright Chromium session capture) to obtain an operator-authorized cookie bundle. Douyinie's live smoke evidence proves **1/1 authenticated sample succeeded** after capture; it does not establish corpus-wide reliability, which is exactly what the 100-URL benchmark must measure.
+   - The 2026-08-19 authenticated sample succeeded with cookies, but current Jiji upstream at `47f4eef87b34042a7862d36d9bc10f749fcb888d` documents `/aweme/v1/web/aweme/detail/` as Argus-gated since 2026-09-14. Cookie-only direct HTTP is no longer a viable acquisition contract; the page SDK inside a real Douyin page supplies the required `uifid`/timestamp/`x-secsdk-web-signature` material.
 2. **URL Shapes & Normalization**:
    - Share short-links: `https://v.douyin.com/<token>/` (must follow 1 redirect hop to extract `aweme_id`).
    - Canonical web video URLs: `https://www.douyin.com/video/<aweme_id>` (numeric, 15–20 digits).
@@ -255,10 +251,10 @@ All retries and adapter transitions must be governed strictly by the Router and 
    - If an adapter returns `CONTENT_UNAVAILABLE`, `INVALID_URL`, or `UNSUPPORTED_MEDIA_TYPE`, the Router halts immediately. **Zero retries, zero fallback**.
 2. **Score the Frozen Production Retry Configuration, Not Benchmark-Only Retries**:
    - At `main@7bbac44969442444934338867db4abcb29a4d24b`, `AcquisitionService` calls `ExecuteRoutedWithRetry(..., 1, ...)`, so the Douyinie Router invokes each ladder candidate once.
-   - Individual external CLIs may retry internally. Current upstream Jiji documents configurable retries with exponential backoff; therefore the RC evidence must pin each adapter's effective internal retry configuration/version and retain enough attempt/log evidence to distinguish Router fallback from adapter-internal retry.
+   - Individual external CLIs may retry internally, but Issue #125 forbids sending known deterministic Argus-gated `aweme/detail` work into the direct Jiji CLI at all. A deterministic Argus 403 is classified once and routed to the page-backed lane or failed closed; it is not transient-retried.
    - The benchmark harness must not add hidden retries that production does not receive.
 3. **Ladder Transition (Fallback)**:
-   - On a fallback-eligible probe/acquire failure, the Router advances from `jiji_douyin` to `f2_douyin` and then `douyin_browser_assist` according to the shipped policy/routing contract.
+   - For Argus-gated acquisition, an available operator-authorized `douyin_browser_assist` real-page helper is the viable production lane. Direct Jiji is probe-only for this operation. F2 participates only when fresh live evidence for the same gate has been explicitly acknowledged by the operator/runtime configuration.
    - Each shipped CLI adapter invocation is currently bounded by a 10-minute `context.WithTimeout`; there is no verified `_VIDEO_ITEM_DEADLINE_S` 15-minute corpus contract in the repo, so Issue #56 does not invent one.
    - Interactive CAPTCHA solving during a scored run is not a success path. Browser-assist may use an already authorized operator session, but a scored run requiring fresh human CAPTCHA completion is a `FAIL`/`CAPTCHA_REQUIRED` outcome rather than hidden manual recovery.
 
@@ -304,7 +300,7 @@ To remain 100% compliant with the Phase 1 charter and legal/architectural guardr
 1. **Active Corpus**: exactly 100 valid public Douyin URLs plus a pre-curated reserve pool that preserves declared acquisition-relevant strata; reserve size/quotas are frozen evidence, not a universal constant.
 2. **Oracle Gate**: $T_0$ out-of-band probe confirming source existence, supported media type, stable `aweme_id`, and upstream media availability before benchmark execution. The oracle is benchmark precondition tooling, not a third architectural testing seam.
 3. **Identity & Quality Assertion**: Every successful acquisition must match the expected `aweme_id`, pass `PreflightReport` container integrity, and stay within the entry's pre-frozen duration tolerance. Byte-identical SHA is supporting evidence, not required across valid upstream transcodes.
-4. **Ladder Execution**: Managed via Seam 1 `AcquisitionService` using `jiji_douyin` $\to$ `f2_douyin` $\to$ `douyin_browser_assist`, with the exact RC Router + adapter-internal retry configuration frozen in evidence. No benchmark-only retry budget is added.
+4. **Ladder Execution**: Managed via Seam 1 `AcquisitionService`. For the post-2026-09-14 Argus state, the configured real-page `douyin_browser_assist` lane is preferred; direct `jiji_douyin` acquisition fails closed before CLI execution, and `f2_douyin` is admitted only when the exact gated operation has fresh live evidence. No benchmark-only retry budget is added.
 5. **Threshold**: $\ge 98\%$ success rate ($98/100$), zero anti-bot bypass mechanisms, zero local-file substitution.
 
 ---
@@ -312,7 +308,7 @@ To remain 100% compliant with the Phase 1 charter and legal/architectural guardr
 ## 10. Unresolved Evidence Gaps
 
 The following empirical gaps remain before full automated benchmark execution:
-1. **Live Douyin Session Longevity**: While Jiji cookie-assisted acquisition is verified on individual videos, the lifespan of captured web session cookies (`ttwid`, `odin_tt`) under sequential 100-request load without triggering intermediate WAF session expiration needs empirical measurement during dry runs.
+1. **Live Page-Backed Douyin Session Longevity**: The historical cookie-only Jiji success predates the September 14 Argus change. Fresh evidence must measure the operator-authorized real-page helper under sequential load, including truthful session/CAPTCHA expiry behavior; cookie-only direct HTTP is not a fallback contract.
 2. **Out-of-Band Oracle Tooling**: Issue #59 must define how the harness stores sanitized oracle evidence without introducing a third architectural seam. A scored production provider such as F2 may corroborate, but cannot be the sole validity oracle.
 3. **Per-entry Duration Tolerance Calibration**: The first dry-run/corpus-curation pass must pin a defensible tolerance for every URL before scoring; Issue #56 deliberately rejects an evidence-free global `3s` constant.
 4. **Actual Corpus Manifest Assembly**: The concrete 100 active URLs plus reserve pool, strata, oracle snapshots, and frozen adapter/runtime configuration still need to be curated before the Phase 1.1 release gate executes.

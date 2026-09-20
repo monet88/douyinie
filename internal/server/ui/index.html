@@ -130,7 +130,7 @@
               </label>
             </div>
 
-            <div class="form-section three-column">
+            <div class="form-section four-column">
               <div>
                 <div class="section-heading compact">
                   <span>02</span>
@@ -141,10 +141,26 @@
                   <label class="language-option"><input type="radio" name="target_language" value="en"><strong>EN</strong><span>English</span></label>
                 </div>
               </div>
-
               <div>
                 <div class="section-heading compact">
                   <span>03</span>
+                  <div><h3>Nền subtitle</h3><p>Màu cover box che chữ.</p></div>
+                </div>
+                <div class="color-picker-control">
+                  <div class="color-presets" role="group" aria-label="Preset màu cover box">
+                    <button type="button" class="color-preset is-active" data-color="#000000"><span class="preset-swatch" style="background:#000000;border:1px solid #555;"></span>Đen</button>
+                    <button type="button" class="color-preset" data-color="#ffffff"><span class="preset-swatch" style="background:#ffffff;"></span>Trắng</button>
+                  </div>
+                  <div class="color-custom-row">
+                    <input type="color" id="cover-color-picker" value="#000000" title="Chọn màu tùy ý">
+                    <input type="text" id="cover-color-input" name="cover_color" value="#000000" maxlength="7" spellcheck="false" placeholder="#000000">
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <div class="section-heading compact">
+                  <span>04</span>
                   <div><h3>Chế độ review</h3><p>Quy định gate xuất bản.</p></div>
                 </div>
                 <div class="posture-picker" role="radiogroup" aria-label="Chế độ review">
@@ -167,7 +183,7 @@
 
               <div>
                 <div class="section-heading compact">
-                  <span>04</span>
+                  <span>05</span>
                   <div><h3>Người vận hành</h3><p>Ghi vào audit trail.</p></div>
                 </div>
                 <label class="field">
@@ -178,10 +194,6 @@
             </div>
 
             <div class="rights-row">
-              <label class="check-field">
-                <input id="rights-confirm" type="checkbox" required>
-                <span><strong>Tôi xác nhận có quyền xử lý media này.</strong><small>Douyinie lưu attestation vào job evidence; không bypass policy.</small></span>
-              </label>
               <button class="primary-button" id="start-job" type="submit"><span>Tạo job & đưa vào queue</span><span aria-hidden="true">→</span></button>
             </div>
           </form>
@@ -504,6 +516,13 @@
                             <option value="ignore/noise">ignore/noise</option>
                             <option value="uncertain">uncertain</option>
                           </select>
+                        </label>
+                        <label class="field field-span-2">
+                          <span>Màu Cover Box (tùy chọn)</span>
+                          <div class="color-custom-row">
+                            <input type="color" id="region-cover-color" value="#000000" title="Chọn màu hộp che cho region">
+                            <input type="text" id="region-cover-color-text" placeholder="#000000" maxlength="7">
+                          </div>
                         </label>
                         <label class="field field-span-2"><span>Text mới (tùy chọn)</span><input id="region-text" type="text"></label>
                         <label class="field field-span-2"><span>Lý do</span><input id="region-reason" type="text" value="Operator adjusted text region from Inspector"></label>

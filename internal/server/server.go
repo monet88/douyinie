@@ -631,6 +631,15 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 	if err != nil {
 		return s.failRun(ctx, runID, "run_config", err.Error())
 	}
+	coverColor := "#000000"
+	if run, err := s.db.GetRun(ctx, runID); err == nil && run != nil && strings.TrimSpace(run.ConfigSnapshotJSON) != "" {
+		var runCfg struct {
+			CoverColor string `json:"cover_color"`
+		}
+		if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &runCfg); err == nil && strings.TrimSpace(runCfg.CoverColor) != "" {
+			coverColor = strings.TrimSpace(runCfg.CoverColor)
+		}
+	}
 	priorStages, _ := s.db.ListStageExecutions(ctx, runID)
 	latestStageMap := make(map[string]domain.StageExecution)
 	for _, st := range priorStages {
@@ -1149,6 +1158,7 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 				AssetID:        assetID,
 				JobID:          jobID,
 				TargetLanguage: targetLang,
+				CoverColor:     coverColor,
 			})
 			if locErr != nil {
 				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
@@ -3751,6 +3761,7 @@ func (s *Server) handleLocalizeVisualTrack(w http.ResponseWriter, r *http.Reques
 		ExecutionProfile      domain.ExecutionProfile       `json:"execution_profile,omitempty"`
 		AuthorizedCredentials []string                      `json:"authorized_credentials,omitempty"`
 		ConsentGranted        bool                          `json:"consent_granted,omitempty"`
+		CoverColor            string                        `json:"cover_color,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
 		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
@@ -3774,6 +3785,7 @@ func (s *Server) handleLocalizeVisualTrack(w http.ResponseWriter, r *http.Reques
 		ExecutionProfile:      body.ExecutionProfile,
 		AuthorizedCredentials: body.AuthorizedCredentials,
 		ConsentGranted:        body.ConsentGranted,
+		CoverColor:            body.CoverColor,
 	}
 
 	track, err := s.visualTextSvc.LocalizeVisualTrack(r.Context(), in)

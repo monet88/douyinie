@@ -48,6 +48,10 @@ yarn-error.log*
 /test_demo_sample.mp4
 *.exe
 
+# Local model caches (manifest.json tracked)
+/models/*
+!/models/manifest.json
+dist_installer/
 # SQLite runtime artifacts
 *.sqlite
 *.sqlite3

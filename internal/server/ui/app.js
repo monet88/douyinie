@@ -991,6 +991,11 @@ function syncEditorToSelection() {
     if (roleInput && region?.role) roleInput.value = region.role;
     const textInput = $("#region-text");
     if (textInput && region?.text) textInput.value = region.text;
+    const coverColorInput = $("#region-cover-color");
+    const coverColorText = $("#region-cover-color-text");
+    const regColor = region?.cover_color || "#000000";
+    if (coverColorInput) coverColorInput.value = regColor;
+    if (coverColorText) coverColorText.value = regColor;
     // A pending rectangle edit belongs to exactly one region: switching the
     // active region must not carry the previous region's deltas onto it.
     if (lastSyncedRegionId !== state.selectedRegionId) {
@@ -2146,7 +2151,7 @@ async function handleNewJob(event) {
   const target = $("input[name=target_language]:checked").value;
   const posture = $("input[name=review_posture]:checked")?.value || "auto";
   const operator = operatorName();
-  if (!source || !$("#rights-confirm").checked) return;
+  if (!source) return;
 
   setBusy(button, true, "Đang tạo job…");
   try {
@@ -2163,7 +2168,12 @@ async function handleNewJob(event) {
       body: jsonBody({
         posture,
         review_posture: posture,
-        config_snapshot_json: JSON.stringify({ profile: "hybrid", source: "operator-ui", posture }),
+        config_snapshot_json: JSON.stringify({
+          profile: "hybrid",
+          source: "operator-ui",
+          posture,
+          cover_color: $("#cover-color-input")?.value?.trim() || "#000000",
+        }),
       }),
     });
     toast(
@@ -2350,6 +2360,8 @@ async function submitRegionCorrection(event) {
     const text = $("#region-text")?.value.trim() || "";
     if (role) override.new_role = role;
     if (text) override.new_text = text;
+    const regionCoverColor = ($("#region-cover-color-text")?.value || $("#region-cover-color")?.value || "").trim();
+    if (regionCoverColor) override.cover_color = regionCoverColor;
     const data = await api(`/api/v1/runs/${encodeURIComponent(state.selectedRun.id)}/inspector/override-region`, {
       method: "POST",
       body: jsonBody({
@@ -2745,6 +2757,48 @@ function bindEvents() {
   });
   $("#region-role")?.addEventListener("change", renderRegionDiff);
 
+
+  // Cover color picker sync (New Job form)
+  const coverPicker = $("#cover-color-picker");
+  const coverInput = $("#cover-color-input");
+  if (coverPicker && coverInput) {
+    coverPicker.addEventListener("input", (e) => {
+      coverInput.value = e.target.value.toLowerCase();
+      $$(".color-preset").forEach((b) => b.classList.toggle("is-active", b.dataset.color.toLowerCase() === coverInput.value));
+    });
+    coverInput.addEventListener("input", (e) => {
+      const val = e.target.value.trim();
+      if (/^#[0-9a-fA-F]{6}$/.test(val)) {
+        coverPicker.value = val;
+        $$(".color-preset").forEach((b) => b.classList.toggle("is-active", b.dataset.color.toLowerCase() === val.toLowerCase()));
+      }
+    });
+    $$(".color-preset").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const c = btn.dataset.color;
+        if (c) {
+          coverPicker.value = c;
+          coverInput.value = c;
+          $$(".color-preset").forEach((b) => b.classList.toggle("is-active", b === btn));
+        }
+      });
+    });
+  }
+
+  // Region cover color picker sync (Inspector Region form)
+  const regCoverPicker = $("#region-cover-color");
+  const regCoverText = $("#region-cover-color-text");
+  if (regCoverPicker && regCoverText) {
+    regCoverPicker.addEventListener("input", (e) => {
+      regCoverText.value = e.target.value.toLowerCase();
+    });
+    regCoverText.addEventListener("input", (e) => {
+      const val = e.target.value.trim();
+      if (/^#[0-9a-fA-F]{6}$/.test(val)) {
+        regCoverPicker.value = val;
+      }
+    });
+  }
   // Result view buttons
   $("#check-handoff")?.addEventListener("click", (event) => checkHandoff(event.currentTarget));
   $("#start-final-render")?.addEventListener("click", (event) => startFinalRender(event.currentTarget));

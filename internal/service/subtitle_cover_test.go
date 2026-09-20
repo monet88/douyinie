@@ -390,3 +390,24 @@ func TestResolveSequentialCoverOverlaps_CollapsedCoverFiltered(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildSubtitleCovers_CustomCoverColor(t *testing.T) {
+	reg1 := subtitleRegion("region-sub-1", domain.BoundingBox{X: 100, Y: 800, Width: 600, Height: 90}, 0, 5000)
+	reg2 := subtitleRegion("region-sub-2", domain.BoundingBox{X: 100, Y: 900, Width: 600, Height: 90}, 6000, 10000)
+	reg2.CoverColor = "#ffffff"
+
+	plan := coverTestPlan(reg1, reg2)
+	covers, _ := buildSubtitleCovers(plan, LocalizeVisualTrackInput{
+		CoverColor: "#131215",
+	})
+
+	if len(covers) != 2 {
+		t.Fatalf("expected 2 covers, got %d", len(covers))
+	}
+	if covers[0].Color != "#131215" {
+		t.Errorf("expected input cover color #131215 for reg1, got %s", covers[0].Color)
+	}
+	if covers[1].Color != "#ffffff" {
+		t.Errorf("expected region override cover color #ffffff for reg2, got %s", covers[1].Color)
+	}
+}

@@ -40,6 +40,11 @@ type cliAcquisitionProvider struct {
 	buildArgs     func(canonicalURL, destDir, cookieFile string) []string
 	resolveSecret SecretResolver
 	httpClient    *http.Client
+	// acquireBlockedDetail makes an adapter probe-only for operations whose
+	// execution lane is known to be structurally unavailable. The check runs
+	// before credential materialization or subprocess execution so a
+	// deterministic platform rejection cannot be retried inside the CLI.
+	acquireBlockedDetail string
 }
 
 func (a *cliAcquisitionProvider) ID() string                            { return a.id }
@@ -112,6 +117,26 @@ func (a *cliAcquisitionProvider) Probe(ctx context.Context, locator domain.Sourc
 		}, nil
 	}
 
+	// Canonical Douyin URLs already carry the stable source identity. Avoid a
+	// redundant HTTP fetch here: a real-page acquisition helper must remain
+	// viable even when ordinary HTTP to the canonical page is WAF/Argus-gated.
+	if host := strings.ToLower(u.Hostname()); host == "douyin.com" || host == "www.douyin.com" {
+		if awemeID := extractAwemeID(raw); awemeID != "" {
+			mediaType := "video"
+			canonical := "https://www.douyin.com/video/" + awemeID
+			if strings.Contains(u.Path, "/note/") {
+				mediaType = "gallery"
+				canonical = "https://www.douyin.com/note/" + awemeID
+			}
+			return &domain.SourceDescriptor{
+				SourceID:     "douyin:aweme:" + awemeID,
+				Platform:     "douyin",
+				CanonicalURL: canonical,
+				MediaType:    mediaType,
+			}, nil
+		}
+	}
+
 	finalURL, status, err := resolveRedirect(ctx, a.httpClient, raw)
 	if err != nil {
 		return nil, &domain.AcquisitionError{State: domain.AcquisitionDownloadFailed, ProviderID: a.id, Detail: "short link resolution failed"}
@@ -157,6 +182,14 @@ func isDouyinLiveHost(host string) bool {
 // durable local media file. Session secrets are materialized only as a
 // transient temp cookie file passed to the subprocess and removed after.
 func (a *cliAcquisitionProvider) Acquire(ctx context.Context, desc domain.SourceDescriptor, destDir string, authRef string) (*AcquiredMedia, error) {
+	if a.acquireBlockedDetail != "" {
+		return nil, &domain.AcquisitionError{
+			State:      domain.AcquisitionAntiBotOrEmpty,
+			ProviderID: a.id,
+			Detail:     a.acquireBlockedDetail,
+		}
+	}
+
 	cookieFile := ""
 	authenticated := false
 	if a.requiresAuth {
@@ -197,11 +230,12 @@ func (a *cliAcquisitionProvider) Acquire(ctx context.Context, desc domain.Source
 	cmd.Env = append(os.Environ(), "PYTHONUTF8=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		state := ClassifyAcquisitionFailure(string(out))
+		output := string(out)
+		state := ClassifyAcquisitionFailure(output)
 		if state == domain.AcquisitionContentUnavailable {
 			return nil, &domain.AcquisitionError{State: state, ProviderID: a.id, Detail: "content unavailable"}
 		}
-		return nil, &domain.AcquisitionError{State: state, ProviderID: a.id, Detail: "adapter run failed"}
+		return nil, &domain.AcquisitionError{State: state, ProviderID: a.id, Detail: safeAcquisitionFailureDetail(output, state)}
 	}
 
 	mediaPath, err := newestMediaFile(destDir)
@@ -251,9 +285,11 @@ func ClassifyAcquisitionFailure(output string) domain.AcquisitionState {
 		return domain.AcquisitionCaptchaRequired
 	case containsAny(lower, "session expired", "cookie expired", "login expired", "re-login"):
 		return domain.AcquisitionSessionExpired
+	case containsAny(lower, "browser closed", "page closed", "target closed", "browser disconnected", "page disconnected", "browser runtime unavailable", "page runtime unavailable", "browser executable not found", "page helper unavailable"):
+		return domain.AcquisitionDownloadFailed
 	case containsAny(lower, "login", "cookie", "auth"):
 		return domain.AcquisitionAuthRequired
-	case containsAny(lower, "403", "forbidden", "waf", "429", "too many requests", "rate limit", "empty response", "anti-bot", "status_code=-1", `status_code": -1`, "status_code=5", `status_code": 5`, "风控", "服务异常"):
+	case containsAny(lower, "argussecurityplugin", "uifid not found", "403", "forbidden", "waf", "429", "too many requests", "rate limit", "empty response", "anti-bot", "status_code=-1", `status_code": -1`, "status_code=5", `status_code": 5`, "风控", "服务异常"):
 		// Invariant (Issue #70 / #63): 403/429/WAF/security challenge/empty-response drift is
 		// classified as AntiBotOrEmpty (fallback-eligible failure), not CONTENT_UNAVAILABLE.
 		return domain.AcquisitionAntiBotOrEmpty
@@ -261,6 +297,34 @@ func ClassifyAcquisitionFailure(output string) domain.AcquisitionState {
 		return domain.AcquisitionContentUnavailable
 	default:
 		return domain.AcquisitionDownloadFailed
+	}
+}
+
+// safeAcquisitionFailureDetail preserves an operator-actionable structural
+// reason without returning provider stdout/stderr, which may contain session
+// material or signed request data. Keep this vocabulary deliberately small and
+// stable; the detailed raw helper output is never persisted or surfaced.
+func safeAcquisitionFailureDetail(output string, state domain.AcquisitionState) string {
+	lower := strings.ToLower(output)
+	switch {
+	case containsAny(lower, "browser closed", "page closed", "target closed", "browser disconnected", "page disconnected"):
+		return "authorized browser/page is unavailable"
+	case containsAny(lower, "browser runtime unavailable", "page runtime unavailable", "browser executable not found", "page helper unavailable"):
+		return "page-backed browser runtime is unavailable"
+	case containsAny(lower, "argussecurityplugin", "uifid not found"):
+		return "provider risk-control rejected the direct request"
+	}
+	switch state {
+	case domain.AcquisitionAuthRequired:
+		return "authorized session required"
+	case domain.AcquisitionSessionExpired:
+		return "authorized session expired"
+	case domain.AcquisitionCaptchaRequired:
+		return "manual verification required"
+	case domain.AcquisitionAntiBotOrEmpty:
+		return "provider risk-control or empty response"
+	default:
+		return "adapter run failed"
 	}
 }
 
@@ -344,10 +408,13 @@ func newestMediaFile(dir string) (string, error) {
 	return newest, nil
 }
 
-// NewJijiAdapter builds the preferred Jiji-family Douyin adapter
-// (jiji262/douyin-downloader CLI contract: `python run.py -u <url> -p <path>`).
+// NewJijiAdapter builds the direct Jiji-family Douyin adapter. Probe remains
+// useful for canonical URL/identity resolution, but single-video acquisition
+// is intentionally fail-closed: since 2026-09-14 Douyin's Argus gate rejects
+// direct aweme/detail requests even with cookies. Running the CLI here would
+// only repeat a deterministic rejection before a page-backed lane can run.
 func NewJijiAdapter(version string, pythonBin string, scriptPath string, resolver SecretResolver) *cliAcquisitionProvider {
-	return newCLIAcquisitionProvider("jiji_douyin", version, pythonBin, []string{scriptPath}, "hybrid", 0.95, "api", true,
+	adapter := newCLIAcquisitionProvider("jiji_douyin", version, pythonBin, []string{scriptPath}, "hybrid", 0.95, "api", true,
 		func(canonicalURL, destDir, cookieFile string) []string {
 			args := []string{"-u", canonicalURL, "-p", destDir}
 			if cookieFile != "" {
@@ -355,12 +422,14 @@ func NewJijiAdapter(version string, pythonBin string, scriptPath string, resolve
 			}
 			return args
 		}, resolver)
+	adapter.acquireBlockedDetail = "direct Jiji aweme/detail is Argus-gated; an operator-authorized page-backed Douyin runtime is required"
+	return adapter
 }
 
 // NewF2Adapter builds the secondary F2 parser/CLI fallback adapter
-// (`f2 dy -M one -u <url>`). All three adapters share one tier so the locked
-// ladder order (Jiji -> F2 -> browser-assist) is decided by quality score
-// alone and cannot be reordered by the execution profile.
+// (`f2 dy -M one -u <url>`). RuntimeHost registers it for Argus-gated
+// acquisition only after explicit live verification of that operation; when
+// present, normal Router scoring still orders it deterministically.
 func NewF2Adapter(version string, f2Bin string, resolver SecretResolver) *cliAcquisitionProvider {
 	return newCLIAcquisitionProvider("f2_douyin", version, f2Bin, []string{"dy", "-M", "one"}, "hybrid", 0.60, "api", true,
 		func(canonicalURL, destDir, cookieFile string) []string {
@@ -372,12 +441,20 @@ func NewF2Adapter(version string, f2Bin string, resolver SecretResolver) *cliAcq
 		}, resolver)
 }
 
-// NewBrowserAssistAdapter builds the last-resort browser-assisted adapter:
-// the Jiji flow driven with an operator-authorized captured session
-// (documented cookie_fetcher path). No captcha/anti-bot bypass is attempted.
-func NewBrowserAssistAdapter(version string, pythonBin string, scriptPath string, resolver SecretResolver) *cliAcquisitionProvider {
-	return newCLIAcquisitionProvider("douyin_browser_assist", version, pythonBin, []string{scriptPath}, "hybrid", 0.50, "browser", true,
+// NewPageBackedJijiAdapter builds the acquisition lane for a separately
+// configured helper that executes gated requests inside an operator-authorized
+// real Douyin page. Douyinie passes only a transient credential-file path and
+// the canonical source URL; the helper owns page execution and must write the
+// resulting media into destDir. Raw session material and page-generated
+// security fields never enter argv, returned values, logs, or provenance.
+func NewPageBackedJijiAdapter(version string, helperBin string, resolver SecretResolver) *cliAcquisitionProvider {
+	return newCLIAcquisitionProvider("douyin_browser_assist", version, helperBin, nil, "hybrid", 0.99, "browser", true,
 		func(canonicalURL, destDir, cookieFile string) []string {
-			return []string{"-u", canonicalURL, "-p", destDir, "--cookie-file", cookieFile, "--browser-fallback"}
+			return []string{
+				"acquire",
+				"--url", canonicalURL,
+				"--dest", destDir,
+				"--credential-file", cookieFile,
+			}
 		}, resolver)
 }
