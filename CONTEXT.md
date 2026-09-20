@@ -55,6 +55,37 @@ Calculates cadence and duration adaptation for each speech segment:
 - `QualityResult`: Multimodal audiovisual QC report (evaluating naturalness, soundtrack preservation, text elimination, and synchronization).
 - `ReviewItem`: Actionable exception item surfaced in the operator review queue when automated quality gates flag low confidence, tight timing, or occlusion risks.
 
+### 7. Douyin Discovery & Followed Creators
+- `DouyinCreator`: A creator identity on Douyin, canonically identified by stable `sec_uid` independent of the provider used to observe it.
+  _Avoid_: treating display name, profile URL, or provider-specific cursor as creator identity.
+- `DiscoveredVideo`: A Douyin video observation canonically identified by `aweme_id`; title, cover, like count, publish time, and other display metadata may change between observations without changing identity.
+  _Avoid_: treating signed CDN URLs or provider-specific result objects as durable video identity.
+- `FollowedCreator`: A `DouyinCreator` the operator has chosen to monitor for subsequently discovered videos.
+  _Avoid_: using “follow” to mean an action on the operator's actual Douyin social account.
+- `FollowBaseline`: The bounded set of already-existing videos observed when a creator is first followed; baseline videos are historical context, not `New`. Older history may be loaded explicitly without redefining the baseline.
+- `DiscoveryDisposition`: The operator-facing state of a discovered video: `New`, `Seen`, or `Ignored`. Opening/detailing or explicitly marking a `New` video makes it `Seen`; `Ignored` is durable and reversible.
+- `DownloadRequest`: An explicit request to acquire a discovered video through the existing acquisition boundary. Requesting download also makes a `New` video `Seen`; download state is not a replacement for `DiscoveryDisposition`.
+
+### 8. Workstation Libraries
+- `MediaLibraryEntry`: The operator-facing view of one requested or acquired Douyin source, combining its stable source identity, a browsing metadata snapshot, acquisition state, and any localization state derived from the existing production records.
+  _Avoid_: treating it as a second media asset independent from `SourceAsset`.
+- `RenderLibraryEntry`: The operator-facing view of a final localized render associated with its source, job, run, target language, and immutable render evidence.
+  _Avoid_: treating preview renders as finished library outputs.
+- `LibraryRemoval`: Removing an entry from normal library browsing without implying destruction of immutable source/run evidence. A separate purge may physically reclaim unreferenced media when no production evidence depends on it.
+  _Avoid_: using “delete” ambiguously for both hide/remove and irreversible storage reclamation.
+
+### 9. Followed-Creator Automation
+- `ChannelAutomationMode`: The per-`FollowedCreator` policy controlling what happens to newly discovered videos: `A` observes only, `B` also requests acquisition, and `C` additionally requests localization after acquisition.
+  _Avoid_: treating the mode as a workflow engine or as permission to bypass acquisition/localization policy gates.
+- `ChannelLocalizationDefaults`: The target language, review posture, and presentation defaults attached to a creator when mode `C` is enabled; they apply to future automatic localization requests until the operator changes them.
+- `AutomationFailure`: A video-scoped failure of an automatic action that remains visible and retryable without disabling the followed creator or silently changing its automation mode.
+
+### 10. Followed-Creator Polling
+- `CreatorPoll`: A bounded attempt to refresh one `FollowedCreator` from the newest available feed toward its previously known boundary. A poll may succeed, fail, or become blocked, but only a successful poll may advance durable discovery progress.
+- `PollBlocked`: A followed creator state requiring operator intervention before automatic polling resumes, used for conditions such as authorization/session/CAPTCHA requirements or an unavailable required browser/page execution lane.
+  _Avoid_: treating a blocked poll as a successful empty feed or as a reason to discard the follow.
+- `PollSchedule`: The monitoring cadence for followed creators. It is independent from `ChannelAutomationMode`; A/B/C decide post-discovery actions, not how often discovery occurs.
+
 ---
 
 ## Approved Testing Seams

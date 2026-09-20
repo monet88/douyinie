@@ -20,6 +20,7 @@ func TestClassifyAcquisitionFailure(t *testing.T) {
 		{"anti-bot empty", "empty response from server, likely anti-bot", domain.AcquisitionAntiBotOrEmpty},
 		{"anti-bot status", `status_code": -1 retrying`, domain.AcquisitionAntiBotOrEmpty},
 		{"anti-bot 403 forbidden", "HTTP Error 403: Forbidden - WAF challenge", domain.AcquisitionAntiBotOrEmpty},
+		{"argus deterministic gate", "Blocked by ArgusSecurityPlugin Uifid Not Found", domain.AcquisitionAntiBotOrEmpty},
 		{"anti-bot 429 rate limit", "HTTP 429: Too Many Requests / rate limit reached", domain.AcquisitionAntiBotOrEmpty},
 		{"removed", "aweme not found or removed", domain.AcquisitionContentUnavailable},
 		{"410 gone", "HTTP status 410: resource gone", domain.AcquisitionContentUnavailable},

@@ -33,30 +33,57 @@ func runCLIHelper() {
 	cookie := ""
 	for i := range args {
 		switch args[i] {
-		case "-p":
+		case "-p", "--dest":
 			if i+1 < len(args) {
 				dest = args[i+1]
 			}
-		case "--cookie-file", "-k":
+		case "--cookie-file", "-k", "--credential-file":
 			if i+1 < len(args) {
 				cookie = args[i+1]
 			}
 		}
 	}
+	_ = os.WriteFile(filepath.Join(os.TempDir(), "douyinie-cli-helper-argv"), []byte(strings.Join(args, "\n")), 0600)
 	if cookie != "" {
 		_ = os.WriteFile(filepath.Join(os.TempDir(), "douyinie-cli-helper-cookie-path"), []byte(cookie), 0600)
 	}
-	for i := range args {
-		if args[i] == "--browser-fallback" {
-			_ = os.WriteFile(filepath.Join(os.TempDir(), "douyinie-cli-helper-browser-fallback"), []byte("1"), 0600)
-			break
-		}
+	if os.Getenv("DOUYINIE_CLI_HELPER_FAIL_WITH_SENSITIVE_MARKER") != "" {
+		_, _ = os.Stderr.WriteString("synthetic-sensitive-marker-for-test")
+		os.Exit(9)
+	}
+	if os.Getenv("DOUYINIE_CLI_HELPER_PAGE_CLOSED") != "" {
+		_, _ = os.Stderr.WriteString("page closed while waiting for authorized Douyin context")
+		os.Exit(10)
 	}
 	if dest == "" {
 		os.Exit(3)
 	}
 	if err := os.WriteFile(filepath.Join(dest, "helper-produced.mp4"), []byte("HELPER_MEDIA_BYTES"), 0644); err != nil {
 		os.Exit(4)
+	}
+}
+
+func TestJijiAcquireFailsClosedBeforeDirectArgusRequest(t *testing.T) {
+	t.Setenv("DOUYINIE_CLI_HELPER", "1")
+	resolverCalls := 0
+	adapter := NewJijiAdapter("vtest", os.Args[0], "script", func(ctx context.Context, authRef, providerID string) (string, error) {
+		resolverCalls++
+		return "session=must-not-be-materialized", nil
+	})
+
+	_, err := adapter.Acquire(context.Background(), domain.SourceDescriptor{
+		SourceID:     "douyin:aweme:7300000000000000000",
+		CanonicalURL: "https://www.douyin.com/video/7300000000000000000",
+	}, t.TempDir(), "cred-ref")
+	var acqErr *domain.AcquisitionError
+	if !errors.As(err, &acqErr) || acqErr.State != domain.AcquisitionAntiBotOrEmpty {
+		t.Fatalf("direct Jiji acquisition must fail closed as Argus-gated, got %v", err)
+	}
+	if resolverCalls != 0 {
+		t.Fatalf("deterministic Argus lane must stop before materializing credentials, resolver calls=%d", resolverCalls)
+	}
+	if !strings.Contains(acqErr.Detail, "page-backed") || strings.Contains(acqErr.Detail, "must-not-be-materialized") {
+		t.Fatalf("expected safe page-backed requirement without secret echo, got %q", acqErr.Detail)
 	}
 }
 
@@ -205,6 +232,23 @@ func TestCLIProbeStructuralStates(t *testing.T) {
 	}
 }
 
+func TestCLIProbeCanonicalDouyinURLDoesNotRequireDirectHTTP(t *testing.T) {
+	adapter := NewJijiAdapter("vtest", os.Args[0], "script", nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	desc, err := adapter.Probe(ctx, domain.SourceLocator{
+		Type:     "douyin_url",
+		Location: "https://www.douyin.com/video/7300000000000000004?previous_page=web_code_link",
+	}, "")
+	if err != nil {
+		t.Fatalf("canonical Douyin identity must not depend on direct HTTP availability: %v", err)
+	}
+	if desc.SourceID != "douyin:aweme:7300000000000000004" || desc.CanonicalURL != "https://www.douyin.com/video/7300000000000000004" {
+		t.Fatalf("unexpected canonical descriptor: %+v", desc)
+	}
+}
+
 // TestCLIProbeClassifiesGalleryAndLive proves probe classifies non-ordinary-
 // video sources before expensive work (resolved Issue #4 V1 media policy):
 // live rooms from the host without any network call, gallery/note posts from
@@ -288,66 +332,106 @@ func TestNewestMediaFile(t *testing.T) {
 	}
 }
 
-// TestNewBrowserAssistAdapterWiring proves the last-resort adapter's
-// deterministic construction without any live Douyin/browser interaction:
-// browser method reporting, required-auth gating (structural AUTH_REQUIRED
-// when no credential reference is available), and argv carrying the
-// authorized cookie reference path plus the --browser-fallback flag.
-func TestNewBrowserAssistAdapterWiring(t *testing.T) {
-	adapter := NewBrowserAssistAdapter("vtest", os.Args[0], "version", func(ctx context.Context, authRef, providerID string) (string, error) {
-		if providerID != "douyin_browser_assist" {
-			t.Errorf("resolver saw unexpected provider %q", providerID)
-		}
-		return "session=authorized-secret", nil
+func TestPageBackedJijiAdapterUsesTransientCredentialFileWithoutSecretEcho(t *testing.T) {
+	const secret = "session=page-backed-secret-value"
+	argvCapture := filepath.Join(os.TempDir(), "douyinie-cli-helper-argv")
+	cookieCapture := filepath.Join(os.TempDir(), "douyinie-cli-helper-cookie-path")
+	_ = os.Remove(argvCapture)
+	_ = os.Remove(cookieCapture)
+	t.Cleanup(func() {
+		_ = os.Remove(argvCapture)
+		_ = os.Remove(cookieCapture)
 	})
-
-	if adapter.ID() != "douyin_browser_assist" {
-		t.Errorf("unexpected adapter id %q", adapter.ID())
-	}
-	if adapter.method != "browser" {
-		t.Errorf("browser-assist must report browser method, got %q", adapter.method)
-	}
-	if !adapter.requiresAuth {
-		t.Error("browser-assist must require an authorized credential reference")
-	}
-	if adapter.PolicyState() != domain.PolicyRequiresAuthorization {
-		t.Errorf("browser-assist must be fail-closed REQUIRES_AUTHORIZATION, got %s", adapter.PolicyState())
-	}
-
-	// No auth reference -> structural AUTH_REQUIRED, no subprocess run.
-	if _, err := adapter.Acquire(context.Background(), domain.SourceDescriptor{SourceID: "douyin:aweme:1", CanonicalURL: "https://www.douyin.com/video/1"}, t.TempDir(), ""); err == nil {
-		t.Fatal("expected AUTH_REQUIRED without a credential reference")
-	} else {
-		var acqErr *domain.AcquisitionError
-		if !errors.As(err, &acqErr) || acqErr.State != domain.AcquisitionAuthRequired {
-			t.Fatalf("expected structural AUTH_REQUIRED, got %v", err)
-		}
-	}
-
-	// With an authorized reference the argv must carry the transient cookie
-	// file and the browser fallback flag (reuses the TestMain subprocess
-	// helper; no network, no real browser).
-	fbCapture := filepath.Join(os.TempDir(), "douyinie-cli-helper-browser-fallback")
-	_ = os.Remove(fbCapture)
-	t.Cleanup(func() { _ = os.Remove(fbCapture) })
 	t.Setenv("DOUYINIE_CLI_HELPER", "1")
 
+	adapter := NewPageBackedJijiAdapter("vtest", os.Args[0], func(ctx context.Context, authRef, providerID string) (string, error) {
+		if authRef != "cred-ref-page" || providerID != "douyin_browser_assist" {
+			t.Errorf("resolver saw unexpected ref/provider %q/%q", authRef, providerID)
+		}
+		return secret, nil
+	})
+	if adapter.method != "browser" || adapter.PolicyState() != domain.PolicyRequiresAuthorization {
+		t.Fatalf("unexpected page-backed adapter contract: method=%q policy=%s", adapter.method, adapter.PolicyState())
+	}
+
 	dest := t.TempDir()
-	media, err := adapter.Acquire(context.Background(), domain.SourceDescriptor{SourceID: "douyin:aweme:2", CanonicalURL: "https://www.douyin.com/video/2"}, dest, "cred-ref-browser")
+	media, err := adapter.Acquire(context.Background(), domain.SourceDescriptor{
+		SourceID:     "douyin:aweme:7300000000000000002",
+		CanonicalURL: "https://www.douyin.com/video/7300000000000000002",
+	}, dest, "cred-ref-page")
 	if err != nil {
-		t.Fatalf("authorized browser-assist acquire failed: %v", err)
+		t.Fatalf("page-backed helper acquire failed: %v", err)
 	}
 	if media.Method != "browser" || !media.Authenticated {
 		t.Errorf("expected browser+authenticated media, got %+v", media)
 	}
-	if flag, err := os.ReadFile(fbCapture); err != nil || string(flag) != "1" {
-		t.Errorf("argv must include --browser-fallback, capture err=%v", err)
-	}
-	cookiePath, err := os.ReadFile(filepath.Join(os.TempDir(), "douyinie-cli-helper-cookie-path"))
+
+	argv, err := os.ReadFile(argvCapture)
 	if err != nil {
-		t.Fatalf("helper did not capture a cookie file: %v", err)
+		t.Fatalf("helper argv capture missing: %v", err)
+	}
+	argvText := string(argv)
+	if !strings.Contains(argvText, "--credential-file") || !strings.Contains(argvText, "--dest") || strings.Contains(argvText, secret) {
+		t.Fatalf("helper argv must carry only the credential-file reference and no raw secret: %q", argvText)
+	}
+	cookiePath, err := os.ReadFile(cookieCapture)
+	if err != nil {
+		t.Fatalf("helper did not capture credential file path: %v", err)
 	}
 	if _, err := os.Stat(string(cookiePath)); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("authorized cookie file must be transient: %s still exists", cookiePath)
+		t.Errorf("page-backed credential file must be transient: %s still exists", cookiePath)
+	}
+}
+
+func TestPageBackedJijiAdapterScrubsHelperOutputOnFailure(t *testing.T) {
+	const secret = "synthetic-sensitive-marker-for-test"
+	t.Setenv("DOUYINIE_CLI_HELPER", "1")
+	t.Setenv("DOUYINIE_CLI_HELPER_FAIL_WITH_SENSITIVE_MARKER", "1")
+
+	adapter := NewPageBackedJijiAdapter("vtest", os.Args[0], func(context.Context, string, string) (string, error) {
+		return secret, nil
+	})
+	_, err := adapter.Acquire(context.Background(), domain.SourceDescriptor{
+		SourceID:     "douyin:aweme:7300000000000000003",
+		CanonicalURL: "https://www.douyin.com/video/7300000000000000003",
+	}, t.TempDir(), "cred-ref-page")
+	if err == nil {
+		t.Fatal("expected helper failure")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("helper stderr leaked credential material through returned error: %v", err)
+	}
+	var acqErr *domain.AcquisitionError
+	if !errors.As(err, &acqErr) || acqErr.Detail != "adapter run failed" {
+		t.Fatalf("expected safe structural failure detail, got %v", err)
+	}
+}
+
+func TestPageBackedJijiAdapterSurfacesClosedPageSafely(t *testing.T) {
+	t.Setenv("DOUYINIE_CLI_HELPER", "1")
+	t.Setenv("DOUYINIE_CLI_HELPER_PAGE_CLOSED", "1")
+
+	adapter := NewPageBackedJijiAdapter("vtest", os.Args[0], func(context.Context, string, string) (string, error) {
+		return "session=authorized-secret-value", nil
+	})
+	_, err := adapter.Acquire(context.Background(), domain.SourceDescriptor{
+		SourceID:     "douyin:aweme:7300000000000000005",
+		CanonicalURL: "https://www.douyin.com/video/7300000000000000005",
+	}, t.TempDir(), "cred-ref-page")
+	if err == nil {
+		t.Fatal("expected closed-page helper failure")
+	}
+	var acqErr *domain.AcquisitionError
+	if !errors.As(err, &acqErr) {
+		t.Fatalf("expected structured acquisition error, got %v", err)
+	}
+	if acqErr.State != domain.AcquisitionDownloadFailed {
+		t.Fatalf("closed page should surface as deterministic runtime failure, got %s", acqErr.State)
+	}
+	if acqErr.Detail != "authorized browser/page is unavailable" {
+		t.Fatalf("expected safe actionable page-unavailable detail, got %q", acqErr.Detail)
+	}
+	if strings.Contains(acqErr.Error(), "authorized-secret-value") {
+		t.Fatalf("closed-page error leaked credential material: %v", acqErr)
 	}
 }

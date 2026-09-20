@@ -10,7 +10,7 @@ Live testing was performed on `https://v.douyin.com/t6U4nCrLIYc/` (resolved publ
 
 All source-ingestion references are shallow-cloned under the repo-local `.ref/` directory, which is ignored by the repository root `.gitignore`.
 
-- `douyin-downloader` — `848bcaf7bf5c5bebbe028e8ccec76e30ad1bef6b`
+- `douyin-downloader` — current repo-local reference `47f4eef87b34042a7862d36d9bc10f749fcb888d` (the live results below were captured on the older August pin and are retained as historical evidence)
 - `Douyin_TikTok_Download_API` — `42784ffc83a72a516bfe952153ad7e2a3998d16c`
 - `TikTokDownloader` — `d3806386b392da7341397e18522acdd5283f2c81`
 - `f2` — `7dab3e2ffffaa2535834d28fca99dbc2e89fa9d3`
@@ -63,7 +63,8 @@ All source-ingestion references are shallow-cloned under the repo-local `.ref/` 
 
 ## Open questions
 
-- Authenticated cookie-assisted acquisition has now succeeded with Jiji on the live sample. Jiji browser-fallback pagination itself remains untested; source watermark/visual-quality review is still pending.
+- The 2026-08-19 cookie-assisted Jiji success below is historical pre-Argus evidence. Current upstream at `47f4eef87b34042a7862d36d9bc10f749fcb888d` documents direct `aweme/detail` as deterministically Argus-gated since 2026-09-14 even with cookies, so it is no longer evidence that the direct CLI acquisition lane is viable.
+- Jiji CLI `--browser-fallback` is a profile-post recovery path, not the desktop `page_bridge`; current single-video acquisition requires an operator-authorized real-page execution lane or must fail closed.
 - If normal acquisition fails because Douyin requires authorization/captcha, the product policy decision remains whether the Phase 1 default should require a user-supplied local source artifact.
 
 ## Sources
@@ -118,4 +119,4 @@ The controlled Jiji retest used its documented `tools.cookie_fetcher` Playwright
 
 ### Updated implication
 
-For this sample, Jiji has a demonstrated `probe -> authenticated acquire -> integrity check` path. This materially improves its value as the primary SourceAdapter reference, while still leaving product-policy gating and a user-supplied local-file fallback necessary for cases where authorized acquisition is unavailable or fails.
+For this sample, Jiji demonstrated a `probe -> authenticated acquire -> integrity check` path on 2026-08-19. That result does not describe the post-2026-09-14 platform state. Current upstream routes `aweme/detail` through a gated request path and states that the CLI's direct HTTP lane receives deterministic Argus 403 responses; only a real logged-in page context can supply the required page SDK security material. Douyinie therefore keeps Jiji's direct lane for still-reachable operations/probing, while gated single-video acquisition must execute through an operator-authorized page-backed provider or fail closed.
