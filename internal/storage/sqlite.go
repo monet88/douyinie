@@ -4954,7 +4954,7 @@ func (s *DB) SaveFollowBaseline(ctx context.Context, creator domain.FollowedCrea
 		return err
 	}
 	for _, video := range videos {
-		if err := saveDouyinVideoObservation(ctx, tx, video); err != nil {
+		if err := saveDouyinVideoObservation(ctx, tx, video, true); err != nil {
 			return err
 		}
 	}
@@ -5021,10 +5021,11 @@ func (s *DB) SetCreatorFollowed(ctx context.Context, secUID string, followed boo
 }
 
 // SaveMonitoringVideosIfFollowed atomically orders a completed monitoring
-// result against Unfollow. Both operations take the DB mutex, and the followed
-// check plus observation batch commit in one transaction, so an in-flight poll
-// cannot reintroduce New videos after Unfollow has committed.
-func (s *DB) SaveMonitoringVideosIfFollowed(ctx context.Context, secUID string, videos []domain.DouyinVideo) (bool, error) {
+// result against Unfollow and re-follow generations. The follow state,
+// baseline generation token, and observation batch commit in one transaction,
+// so an in-flight poll from an earlier follow generation cannot reintroduce
+// New videos after Unfollow -> Re-follow.
+func (s *DB) SaveMonitoringVideosIfFollowed(ctx context.Context, secUID string, baselineToken time.Time, videos []domain.DouyinVideo) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -5035,7 +5036,8 @@ func (s *DB) SaveMonitoringVideosIfFollowed(ctx context.Context, secUID string, 
 	defer tx.Rollback()
 
 	var followed int
-	if err := tx.QueryRowContext(ctx, `SELECT followed FROM followed_creators WHERE sec_uid = ?`, secUID).Scan(&followed); err != nil {
+	var baselineAtStr string
+	if err := tx.QueryRowContext(ctx, `SELECT followed, baseline_at FROM followed_creators WHERE sec_uid = ?`, secUID).Scan(&followed, &baselineAtStr); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, ErrNotFound
 		}
@@ -5044,8 +5046,15 @@ func (s *DB) SaveMonitoringVideosIfFollowed(ctx context.Context, secUID string, 
 	if followed != 1 {
 		return false, nil
 	}
+	parsedBaselineAt, err := time.Parse(time.RFC3339Nano, baselineAtStr)
+	if err != nil {
+		return false, fmt.Errorf("parse creator baseline_at: %w", err)
+	}
+	if baselineToken.IsZero() || !parsedBaselineAt.Equal(baselineToken) {
+		return false, nil
+	}
 	for _, video := range videos {
-		if err := saveDouyinVideoObservation(ctx, tx, video); err != nil {
+		if err := saveDouyinVideoObservation(ctx, tx, video, false); err != nil {
 			return false, err
 		}
 	}
@@ -5060,10 +5069,14 @@ func (s *DB) SaveMonitoringVideosIfFollowed(ctx context.Context, secUID string, 
 func (s *DB) SaveDouyinVideoObservation(ctx context.Context, video domain.DouyinVideo) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return saveDouyinVideoObservation(ctx, s.db, video)
+	return saveDouyinVideoObservation(ctx, s.db, video, false)
 }
 
-func saveDouyinVideoObservation(ctx context.Context, exec sqlExecer, video domain.DouyinVideo) error {
+func saveDouyinVideoObservation(ctx context.Context, exec sqlExecer, video domain.DouyinVideo, promoteNewToSeen bool) error {
+	dispositionUpdate := ""
+	if promoteNewToSeen {
+		dispositionUpdate = "disposition=CASE WHEN douyin_videos.disposition = 'new' THEN 'seen' ELSE douyin_videos.disposition END,\n\t\t\t"
+	}
 	_, err := exec.ExecContext(ctx, `
 		INSERT INTO douyin_videos (
 			aweme_id, source_id, sec_uid, canonical_url, title, cover_url, published_at, like_count, duration_ms,
@@ -5073,7 +5086,7 @@ func saveDouyinVideoObservation(ctx context.Context, exec sqlExecer, video domai
 		ON CONFLICT(aweme_id) DO UPDATE SET
 			sec_uid=COALESCE(NULLIF(excluded.sec_uid,''), douyin_videos.sec_uid),
 			canonical_url=excluded.canonical_url,
-			title=COALESCE(NULLIF(excluded.title,''), douyin_videos.title),
+			`+dispositionUpdate+`title=COALESCE(NULLIF(excluded.title,''), douyin_videos.title),
 			cover_url=COALESCE(NULLIF(excluded.cover_url,''), douyin_videos.cover_url),
 			published_at=COALESCE(excluded.published_at, douyin_videos.published_at),
 			like_count=COALESCE(excluded.like_count, douyin_videos.like_count),
@@ -5144,21 +5157,72 @@ func (s *DB) SetDouyinVideoDisposition(ctx context.Context, awemeID string, disp
 }
 
 func (s *DB) MarkDouyinVideoDownloadRequested(ctx context.Context, awemeID string, updatedAt time.Time) error {
+	_, err := s.MarkDouyinVideosDownloadRequested(ctx, []string{awemeID}, updatedAt)
+	return err
+}
+
+// MarkDouyinVideosDownloadRequested atomically queues download requests for a batch
+// of retained videos. Prevalidates all targets: a batch containing any missing or
+// blank ID fails closed with ErrNotFound without mutating earlier rows.
+func (s *DB) MarkDouyinVideosDownloadRequested(ctx context.Context, awemeIDs []string, updatedAt time.Time) ([]domain.DouyinVideo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE douyin_videos
-		SET disposition = CASE WHEN disposition = 'new' THEN 'seen' ELSE disposition END,
-			acquisition_request_state = CASE WHEN acquisition_request_state = 'none' THEN 'queued' ELSE acquisition_request_state END,
-			updated_at = ?
-		WHERE aweme_id = ?`, updatedAt.Format(time.RFC3339Nano), awemeID)
+
+	if len(awemeIDs) == 0 {
+		return nil, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("mark douyin video download requested: %w", err)
+		return nil, fmt.Errorf("begin download request tx: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
+	defer tx.Rollback()
+
+	// Prevalidate: every ID must exist and not be blank
+	for _, awemeID := range awemeIDs {
+		if strings.TrimSpace(awemeID) == "" {
+			return nil, ErrNotFound
+		}
+		var exists int
+		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM douyin_videos WHERE aweme_id = ?`, awemeID).Scan(&exists); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, ErrNotFound
+			}
+			return nil, fmt.Errorf("check douyin video existence %s: %w", awemeID, err)
+		}
 	}
-	return nil
+
+	// Mutate all in the same transaction
+	for _, awemeID := range awemeIDs {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE douyin_videos
+			SET disposition = CASE WHEN disposition = 'new' THEN 'seen' ELSE disposition END,
+				acquisition_request_state = CASE WHEN acquisition_request_state = 'none' THEN 'queued' ELSE acquisition_request_state END,
+				updated_at = ?
+			WHERE aweme_id = ?`, updatedAt.Format(time.RFC3339Nano), awemeID)
+		if err != nil {
+			return nil, fmt.Errorf("mark douyin video download requested %s: %w", awemeID, err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return nil, ErrNotFound
+		}
+	}
+
+	// Read all updated videos in original requested order
+	result := make([]domain.DouyinVideo, 0, len(awemeIDs))
+	for _, awemeID := range awemeIDs {
+		row := tx.QueryRowContext(ctx, douyinVideoSelect+` WHERE aweme_id = ?`, awemeID)
+		video, err := scanDouyinVideo(row)
+		if err != nil {
+			return nil, fmt.Errorf("read updated douyin video %s: %w", awemeID, err)
+		}
+		result = append(result, *video)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit download request tx: %w", err)
+	}
+	return result, nil
 }
 
 const douyinVideoSelect = `SELECT aweme_id, source_id, COALESCE(sec_uid,''), canonical_url,

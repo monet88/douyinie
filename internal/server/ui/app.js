@@ -29,6 +29,8 @@ const state = {
   followedCreators: [],
   followedVideos: [],
   followedSecUID: "",
+  followedPreview: null,
+  followedLoadSeq: 0,
 };
 
 let pollTimer = null;
@@ -2733,18 +2735,46 @@ async function followDiscoveryCreator() {
 }
 
 async function loadFollowedWorkspace() {
+  const seq = ++state.followedLoadSeq;
   const data = await api("/api/v1/followed-creators");
+  if (seq !== state.followedLoadSeq) return;
   state.followedCreators = Array.isArray(data.creators) ? data.creators : [];
   if (!state.followedSecUID || !state.followedCreators.some((creator) => creator.sec_uid === state.followedSecUID)) {
     state.followedSecUID = state.followedCreators.find((creator) => creator.followed)?.sec_uid || state.followedCreators[0]?.sec_uid || "";
   }
-  if (state.followedSecUID) {
-    const videos = await api("/api/v1/discovery/videos?sec_uid=" + encodeURIComponent(state.followedSecUID));
+  const currentSecUID = state.followedSecUID;
+  if (currentSecUID) {
+    const videos = await api("/api/v1/discovery/videos?sec_uid=" + encodeURIComponent(currentSecUID));
+    if (seq !== state.followedLoadSeq || state.followedSecUID !== currentSecUID) return;
     state.followedVideos = Array.isArray(videos.videos) ? videos.videos : [];
   } else {
     state.followedVideos = [];
   }
   renderFollowedWorkspace();
+}
+
+function renderFollowedPreview(video = state.followedPreview) {
+  const node = $("#followed-preview");
+  if (!node) return;
+  if (!video) {
+    node.innerHTML = '<p class="section-kicker">Retained Detail</p><div class="discovery-preview-empty">Chọn một video để xem chi tiết.</div>';
+    return;
+  }
+  const likes = video.like_count == null ? "unknown" : Number(video.like_count).toLocaleString("vi-VN");
+  const disposition = (video.disposition || "seen").toUpperCase();
+  node.innerHTML =
+    '<p class="section-kicker">Retained Detail</p>' +
+    (video.cover_url ? '<img class="discovery-cover" src="' + esc(video.cover_url) + '" alt="">' : '') +
+    '<h3>' + esc(video.title || ("Douyin " + video.aweme_id)) + '</h3>' +
+    '<dl class="discovery-meta">' +
+    '<div><dt>aweme_id</dt><dd>' + esc(video.aweme_id) + '</dd></div>' +
+    '<div><dt>Trạng thái</dt><dd>' + esc(disposition) + '</dd></div>' +
+    '<div><dt>Nguồn</dt><dd>' + esc(video.origin || "historical") + '</dd></div>' +
+    '<div><dt>Download</dt><dd>' + esc(video.acquisition_request_state || "none") + '</dd></div>' +
+    '<div><dt>Likes</dt><dd>' + esc(likes) + '</dd></div>' +
+    '<div><dt>Published</dt><dd>' + esc(video.published_at ? formatDate(video.published_at) : "unknown") + '</dd></div>' +
+    '</dl>' +
+    (video.canonical_url ? '<a class="secondary-button discovery-open-link" href="' + esc(video.canonical_url) + '" target="_blank" rel="noreferrer">Mở trên Douyin</a>' : '');
 }
 
 function renderFollowedWorkspace() {
@@ -2765,7 +2795,8 @@ function renderFollowedWorkspace() {
   videosNode.innerHTML = state.followedVideos.length ? state.followedVideos.map((video) => {
     const disposition = video.disposition || "seen";
     const toggle = disposition === "ignored" ? "unignore" : "ignore";
-    return '<article class="discovery-card" data-retained-video="' + esc(video.aweme_id) + '">' +
+    const isSelected = state.followedPreview?.aweme_id === video.aweme_id;
+    return '<article class="discovery-card ' + (isSelected ? "is-selected" : "") + '" data-retained-video="' + esc(video.aweme_id) + '">' +
       '<div class="discovery-card-body"><strong>' + esc(video.title || ("Douyin " + video.aweme_id)) + '</strong>' +
       '<span>' + esc(disposition.toUpperCase()) + ' · ' + esc(video.origin || "historical") + '</span>' +
       '<small>' + esc(video.acquisition_request_state || "none") + '</small></div>' +
@@ -2774,8 +2805,22 @@ function renderFollowedWorkspace() {
       '<button class="primary-button" data-request-download="' + esc(video.aweme_id) + '" type="button">Download</button>' +
     '</article>';
   }).join("") : '<div class="empty-state compact-empty"><strong>Chưa có retained video</strong><span>Baseline hoặc Load older sẽ xuất hiện ở đây.</span></div>';
+  if (state.followedPreview) {
+    state.followedPreview = state.followedVideos.find((v) => v.aweme_id === state.followedPreview.aweme_id) || null;
+  }
+  renderFollowedPreview();
 }
 
+async function openRetainedVideo(awemeID) {
+  const video = state.followedVideos.find((item) => item.aweme_id === awemeID) || null;
+  if (!video) return;
+  state.followedPreview = video;
+  renderFollowedPreview();
+  renderFollowedWorkspace();
+  if (video.disposition === "new") {
+    await setRetainedDisposition(awemeID, "seen");
+  }
+}
 async function setRetainedDisposition(awemeID, action) {
   await api("/api/v1/discovery/videos/" + encodeURIComponent(awemeID), { method: "PATCH", body: jsonBody({ action }) });
   await loadFollowedWorkspace();
@@ -2877,6 +2922,9 @@ function bindEvents() {
     }
     const creator = event.target.closest("[data-followed-creator]");
     if (creator) {
+      if (state.followedSecUID !== creator.dataset.followedCreator) {
+        state.followedPreview = null;
+      }
       state.followedSecUID = creator.dataset.followedCreator;
       loadFollowedWorkspace().catch(showError);
     }
@@ -2893,7 +2941,7 @@ function bindEvents() {
       return;
     }
     const video = event.target.closest("[data-retained-video]");
-    if (video) setRetainedDisposition(video.dataset.retainedVideo, "seen").catch(showError);
+    if (video) openRetainedVideo(video.dataset.retainedVideo).catch(showError);
   });
   $("#refresh-all")?.addEventListener("click", () => refreshAll());
   $("#jobs-refresh")?.addEventListener("click", () => refreshAll());

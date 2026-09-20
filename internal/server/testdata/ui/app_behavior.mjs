@@ -194,6 +194,10 @@ function createHarness() {
     discoveryStatus: register("#discovery-status"),
     discoveryMore: register("#discovery-more"),
     discoveryPreview: register("#discovery-preview"),
+    followedStatus: register("#followed-status"),
+    followedCreators: register("#followed-creators"),
+    followedVideos: register("#followed-videos"),
+    followedPreview: register("#followed-preview"),
   };
 
   lists.set("[data-inspector-tab]", [
@@ -221,7 +225,7 @@ function createHarness() {
   const fetchStub = async (url, options = {}) => {
     const body = options.body ? JSON.parse(options.body) : null;
     requests.push({ url: String(url), method: options.method || "GET", body });
-    const { status, payload } = respond(String(url), options);
+    const { status, payload } = await respond(String(url), options);
     return {
       ok: status >= 200 && status < 300,
       status,
@@ -275,7 +279,7 @@ function createHarness() {
     "(function () {",
     '"use strict";',
     source,
-    "globalThis.__operatorUI = { state, loadSelectedRun, renderSpeakers, renderInspector, renderSelectedRun, refreshAll, renderDiscovery, downloadSelectedDiscovery };",
+    "globalThis.__operatorUI = { state, loadSelectedRun, renderSpeakers, renderInspector, renderSelectedRun, refreshAll, renderDiscovery, downloadSelectedDiscovery, loadFollowedWorkspace, renderFollowedWorkspace, renderFollowedPreview, openRetainedVideo };",
     "})();",
   ].join("\n");
   vm.runInContext(moduleScope, context, { filename: "app.js" });
@@ -1152,6 +1156,189 @@ test("the overlay follows the playhead when no region is selected", async () => 
 
   playTo(h, 1500);
   assert.equal(h.els.regionOverlay.classList.contains("hidden"), false, "returning to a tracked region must restore the projection");
+});
+
+test("a late creator-A response cannot overwrite creator B's retained videos", async () => {
+  const h = createHarness();
+  await h.ready();
+  let releaseA;
+  const gateA = new Promise((resolve) => {
+    releaseA = resolve;
+  });
+  h.setResponder(async (url) => {
+    if (url === "/api/v1/followed-creators") {
+      return {
+        status: 200,
+        payload: {
+          creators: [
+            { sec_uid: "creator-a", display_name: "Creator A", followed: true, baseline_at: "2026-09-21T00:00:00Z" },
+            { sec_uid: "creator-b", display_name: "Creator B", followed: true, baseline_at: "2026-09-21T00:00:00Z" },
+          ],
+        },
+      };
+    }
+    if (url === "/api/v1/discovery/videos?sec_uid=creator-a") {
+      await gateA;
+      return {
+        status: 200,
+        payload: {
+          videos: [{ aweme_id: "video-a", title: "Video from A", disposition: "new" }],
+        },
+      };
+    }
+    if (url === "/api/v1/discovery/videos?sec_uid=creator-b") {
+      return {
+        status: 200,
+        payload: {
+          videos: [{ aweme_id: "video-b", title: "Video from B", disposition: "new" }],
+        },
+      };
+    }
+    return { status: 200, payload: {} };
+  });
+
+  const callA = h.evalIn("state.followedSecUID = 'creator-a'; loadFollowedWorkspace();");
+  await h.settle();
+
+  const callB = h.evalIn("state.followedSecUID = 'creator-b'; loadFollowedWorkspace();");
+  await callB;
+  await h.settle();
+
+  assert.ok(h.els.followedVideos.innerHTML.includes("Video from B"), "creator B's videos must be displayed");
+
+  releaseA();
+  await callA;
+  await h.settle();
+
+  assert.ok(
+    h.els.followedVideos.innerHTML.includes("Video from B"),
+    "creator B's videos must remain displayed after A's delayed response finishes"
+  );
+  assert.ok(
+    !h.els.followedVideos.innerHTML.includes("Video from A"),
+    "creator A's stale response must not overwrite creator B's displayed videos"
+  );
+});
+
+test("opening a retained New video displays its detail preview and transitions it to Seen", async () => {
+  const h = createHarness();
+  await h.ready();
+  const patchedAwemes = [];
+  h.setResponder((url, options) => {
+    if (url === "/api/v1/followed-creators") {
+      return {
+        status: 200,
+        payload: {
+          creators: [
+            { sec_uid: "creator-1", display_name: "Creator 1", followed: true, baseline_at: "2026-09-21T00:00:00Z" },
+          ],
+        },
+      };
+    }
+    if (url.startsWith("/api/v1/discovery/videos/")) {
+      const awemeID = decodeURIComponent(url.replace("/api/v1/discovery/videos/", ""));
+      patchedAwemes.push({ awemeID, body: options.body ? JSON.parse(options.body) : null });
+      return { status: 200, payload: { video: { aweme_id: awemeID, disposition: "seen" } } };
+    }
+    if (url.startsWith("/api/v1/discovery/videos?sec_uid=")) {
+      return {
+        status: 200,
+        payload: {
+          videos: [
+            {
+              aweme_id: "retained-new-1",
+              title: "Tua Nhanh Video",
+              canonical_url: "https://www.douyin.com/video/retained-new-1",
+              disposition: patchedAwemes.some((p) => p.awemeID === "retained-new-1") ? "seen" : "new",
+              origin: "monitoring",
+              acquisition_request_state: "none",
+            },
+          ],
+        },
+      };
+    }
+    return { status: 200, payload: {} };
+  });
+
+  await h.evalIn("state.followedSecUID = 'creator-1'; loadFollowedWorkspace();");
+  await h.settle();
+
+  h.click(h.els.followedVideos, {
+    "[data-retained-video]": { dataset: { retainedVideo: "retained-new-1" } },
+  });
+  await h.settle();
+  await h.settle();
+
+  assert.ok(h.els.followedPreview.innerHTML.includes("Tua Nhanh Video"), "preview must show video title");
+  assert.ok(h.els.followedPreview.innerHTML.includes("retained-new-1"), "preview must show video aweme_id");
+  assert.ok(h.els.followedPreview.innerHTML.includes("Mở trên Douyin"), "preview must show external link");
+
+  const patchReq = patchedAwemes.find((p) => p.awemeID === "retained-new-1");
+  assert.ok(patchReq, "opening a New retained video must invoke RuntimeHost to mark it seen");
+  assert.equal(patchReq.body?.action, "seen", "action must be seen");
+});
+
+test("switching followed creator clears preview from previous creator", async () => {
+  const h = createHarness();
+  await h.ready();
+  h.setResponder((url) => {
+    if (url === "/api/v1/followed-creators") {
+      return {
+        status: 200,
+        payload: {
+          creators: [
+            { sec_uid: "creator-a", display_name: "Creator A", followed: true, baseline_at: "2026-09-21T00:00:00Z" },
+            { sec_uid: "creator-b", display_name: "Creator B", followed: true, baseline_at: "2026-09-21T00:00:00Z" },
+          ],
+        },
+      };
+    }
+    if (url === "/api/v1/discovery/videos?sec_uid=creator-a") {
+      return {
+        status: 200,
+        payload: {
+          videos: [{ aweme_id: "video-a", title: "Video from A", disposition: "seen" }],
+        },
+      };
+    }
+    if (url === "/api/v1/discovery/videos?sec_uid=creator-b") {
+      return {
+        status: 200,
+        payload: {
+          videos: [{ aweme_id: "video-b", title: "Video from B", disposition: "seen" }],
+        },
+      };
+    }
+    return { status: 200, payload: {} };
+  });
+
+  await h.evalIn("state.followedSecUID = 'creator-a'; loadFollowedWorkspace();");
+  await h.settle();
+
+  h.click(h.els.followedVideos, {
+    "[data-retained-video]": { dataset: { retainedVideo: "video-a" } },
+  });
+  await h.settle();
+  assert.ok(h.els.followedPreview.innerHTML.includes("Video from A"), "creator A preview must be visible");
+
+  h.click(h.els.followedCreators, {
+    "[data-followed-creator]": { dataset: { followedCreator: "creator-b" } },
+  });
+  await h.settle();
+  await h.settle();
+
+  assert.ok(
+    !h.els.followedPreview.innerHTML.includes("Video from A"),
+    "creator A preview must not remain visible after switching to creator B"
+  );
+  assert.ok(
+    !h.els.followedPreview.innerHTML.includes("video-a"),
+    "creator A aweme_id must not remain visible after switching to creator B"
+  );
+  assert.ok(
+    h.els.followedPreview.innerHTML.includes("Chọn một video để xem chi tiết"),
+    "preview must reset to empty prompt under creator B"
+  );
 });
 
 let failed = 0;

@@ -16,12 +16,12 @@ func TestOperatorUIFollowedCreatorSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, marker := range []string{"Theo dõi kênh", `data-view="followed"`, `id="followed-creators"`, `id="followed-videos"`} {
+	for _, marker := range []string{"Theo dõi kênh", `data-view="followed"`, `id="followed-creators"`, `id="followed-videos"`, `id="followed-preview"`} {
 		if !strings.Contains(string(index), marker) {
 			t.Fatalf("followed creator UI missing %q", marker)
 		}
 	}
-	for _, marker := range []string{"/api/v1/followed-creators", "/api/v1/discovery/videos", "data-load-older", "data-video-disposition", "data-request-download"} {
+	for _, marker := range []string{"/api/v1/followed-creators", "/api/v1/discovery/videos", "data-load-older", "data-video-disposition", "data-request-download", "openRetainedVideo"} {
 		if !strings.Contains(string(app), marker) {
 			t.Fatalf("followed creator UI behavior missing %q", marker)
 		}

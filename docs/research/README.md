@@ -23,3 +23,6 @@ This directory contains empirical research evaluations, provider smoke tests, an
 
 6. **[Qwen3-ASR & Forced Aligner Smoke Test (2026-08-19)](qwen3-asr-forced-aligner-smoke-2026-08-19.md)**
    Validation of Qwen3-ASR transcription accuracy, timestamp precision, and forced alignment capabilities on Chinese audio.
+
+7. **[pyVideoTrans, Poiiky & CapAssistant Mining (2026-09-21)](pyvideotrans-poiiky-capassistant-mining-2026-09-21.md)**
+   Technical mining of pyVideoTrans v4.13 core pipeline, Poiiky scraper/anti-detection, and CapAssistant VAR review / dynamic video stretching.

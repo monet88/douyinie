@@ -240,6 +240,7 @@ func TestFollowedCreatorBaselineAndDispositionLifecycleThroughRuntimeHost(t *tes
 	if !followed.Creator.Followed || followed.Creator.SecUID != creator.SecUID {
 		t.Fatalf("unexpected followed creator: %+v", followed.Creator)
 	}
+	token1 := followed.Creator.BaselineAt
 	var listed struct {
 		Videos []domain.DouyinVideo `json:"videos"`
 	}
@@ -256,7 +257,7 @@ func TestFollowedCreatorBaselineAndDispositionLifecycleThroughRuntimeHost(t *tes
 	// Later successful monitoring is owned by #130; #129 exposes the retention
 	// contract it will call. Unknown IDs become New while known IDs only refresh.
 	likes := int64(9001)
-	if err := discoverySvc.RetainMonitoringVideos(context.Background(), creator.SecUID, []domain.DiscoveredVideo{
+	if err := discoverySvc.RetainMonitoringVideos(context.Background(), creator.SecUID, token1, []domain.DiscoveredVideo{
 		{AwemeID: "129001", SourceID: "douyin:aweme:129001", CanonicalURL: "https://www.douyin.com/video/129001", Title: "refreshed title", LikeCount: &likes},
 		{AwemeID: "129003", SourceID: "douyin:aweme:129003", CanonicalURL: "https://www.douyin.com/video/129003", Title: "new monitored"},
 	}); err != nil {
@@ -290,7 +291,7 @@ func TestFollowedCreatorBaselineAndDispositionLifecycleThroughRuntimeHost(t *tes
 		t.Fatalf("unignore must return to seen: %+v", patched.Video)
 	}
 
-	if err := discoverySvc.RetainMonitoringVideos(context.Background(), creator.SecUID, []domain.DiscoveredVideo{{AwemeID: "129004", SourceID: "douyin:aweme:129004", CanonicalURL: "https://www.douyin.com/video/129004"}}); err != nil {
+	if err := discoverySvc.RetainMonitoringVideos(context.Background(), creator.SecUID, token1, []domain.DiscoveredVideo{{AwemeID: "129004", SourceID: "douyin:aweme:129004", CanonicalURL: "https://www.douyin.com/video/129004"}}); err != nil {
 		t.Fatal(err)
 	}
 	var downloads struct {
@@ -300,17 +301,46 @@ func TestFollowedCreatorBaselineAndDispositionLifecycleThroughRuntimeHost(t *tes
 	if len(downloads.Videos) != 1 || downloads.Videos[0].Disposition != domain.DiscoveryDispositionSeen || downloads.Videos[0].AcquisitionRequestState != "queued" {
 		t.Fatalf("download request must mark New seen and retain request state: %+v", downloads.Videos)
 	}
+	if err := discoverySvc.RetainMonitoringVideos(context.Background(), creator.SecUID, token1, []domain.DiscoveredVideo{
+		{AwemeID: "129090", SourceID: "douyin:aweme:129090", CanonicalURL: "https://www.douyin.com/video/129090", Title: "monitored new prior to load older"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	beforeLoadOlderNew, err := db.GetDouyinVideo(context.Background(), "129090")
+	if err != nil {
+		t.Fatalf("get 129090 before load older: %v", err)
+	}
+	if beforeLoadOlderNew.Disposition != domain.DiscoveryDispositionNew {
+		t.Fatalf("129090 must be New prior to load older: %+v", beforeLoadOlderNew)
+	}
 
 	fake.Creator.RecentVideos = []domain.DiscoveredVideo{
 		{AwemeID: "129001", SourceID: "douyin:aweme:129001", CanonicalURL: "https://www.douyin.com/video/129001", Title: "load older refresh"},
 		{AwemeID: "129000", SourceID: "douyin:aweme:129000", CanonicalURL: "https://www.douyin.com/video/129000", Title: "older history"},
+		{AwemeID: "129090", SourceID: "douyin:aweme:129090", CanonicalURL: "https://www.douyin.com/video/129090", Title: "load older overlap with known new"},
 	}
-	before, _ := db.GetFollowedCreator(context.Background(), creator.SecUID)
+	before, err := db.GetFollowedCreator(context.Background(), creator.SecUID)
+	if err != nil {
+		t.Fatalf("get creator before load older: %v", err)
+	}
 	doJSON(http.MethodPost, "/api/v1/followed-creators/"+creator.SecUID+"/load-older", map[string]any{"recent_limit": 10}, http.StatusOK, &listed)
-	older, _ := db.GetDouyinVideo(context.Background(), "129000")
-	after, _ := db.GetFollowedCreator(context.Background(), creator.SecUID)
+	older, err := db.GetDouyinVideo(context.Background(), "129000")
+	if err != nil {
+		t.Fatalf("get older video: %v", err)
+	}
+	after, err := db.GetFollowedCreator(context.Background(), creator.SecUID)
+	if err != nil {
+		t.Fatalf("get creator after load older: %v", err)
+	}
 	if older.Origin != domain.DiscoveryOriginHistorical || older.Disposition != domain.DiscoveryDispositionSeen {
-		t.Fatalf("load older must retain historical seen: %+v", older)
+		t.Fatalf("load older must retain newly observed historical seen: %+v", older)
+	}
+	overlapNew, err := db.GetDouyinVideo(context.Background(), "129090")
+	if err != nil {
+		t.Fatalf("get overlap video: %v", err)
+	}
+	if overlapNew.Disposition != domain.DiscoveryDispositionNew {
+		t.Fatalf("load older must NOT clear an already-known New lifecycle item: %+v", overlapNew)
 	}
 	if !sameOptionalTime(before.LastSuccessfulPollAt, after.LastSuccessfulPollAt) {
 		t.Fatalf("load older advanced monitoring progress")
@@ -320,25 +350,104 @@ func TestFollowedCreatorBaselineAndDispositionLifecycleThroughRuntimeHost(t *tes
 	doJSON(http.MethodPost, "/api/v1/followed-creators/"+creator.SecUID+"/load-older", map[string]any{"recent_limit": 10}, http.StatusServiceUnavailable, nil)
 	fake.Creator.RecentViewAvailable = true
 
+	// Seed video 129006 as still-New and 129007 as Ignored prior to Unfollow -> Re-follow.
+	if err := discoverySvc.RetainMonitoringVideos(context.Background(), creator.SecUID, token1, []domain.DiscoveredVideo{
+		{AwemeID: "129006", SourceID: "douyin:aweme:129006", CanonicalURL: "https://www.douyin.com/video/129006", Title: "still new before unfollow"},
+		{AwemeID: "129007", SourceID: "douyin:aweme:129007", CanonicalURL: "https://www.douyin.com/video/129007", Title: "ignored before unfollow"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	doJSON(http.MethodPatch, "/api/v1/discovery/videos/129007", map[string]any{"action": "ignore"}, http.StatusOK, &patched)
+	beforeRefollowNew, err := db.GetDouyinVideo(context.Background(), "129006")
+	if err != nil {
+		t.Fatalf("get 129006 before unfollow: %v", err)
+	}
+	if beforeRefollowNew.Disposition != domain.DiscoveryDispositionNew {
+		t.Fatalf("129006 should be New before unfollow: %+v", beforeRefollowNew)
+	}
+
 	doJSON(http.MethodDelete, "/api/v1/followed-creators/"+creator.SecUID, nil, http.StatusNoContent, nil)
-	unfollowed, _ := db.GetFollowedCreator(context.Background(), creator.SecUID)
+	unfollowed, err := db.GetFollowedCreator(context.Background(), creator.SecUID)
+	if err != nil {
+		t.Fatalf("get creator after unfollow: %v", err)
+	}
 	if unfollowed.Followed {
 		t.Fatal("unfollow must stop follow state")
 	}
-	if err := discoverySvc.RetainMonitoringVideos(context.Background(), creator.SecUID, []domain.DiscoveredVideo{{AwemeID: "129005", SourceID: "douyin:aweme:129005", CanonicalURL: "https://www.douyin.com/video/129005"}}); err != nil {
+	if err := discoverySvc.RetainMonitoringVideos(context.Background(), creator.SecUID, token1, []domain.DiscoveredVideo{{AwemeID: "129005", SourceID: "douyin:aweme:129005", CanonicalURL: "https://www.douyin.com/video/129005"}}); err != nil {
 		t.Fatalf("late monitoring result after unfollow should be discarded cleanly: %v", err)
 	}
 	if _, err := db.GetDouyinVideo(context.Background(), "129005"); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("unfollow must stop later monitoring retention: err=%v", err)
 	}
-	fake.Creator.RecentVideos = []domain.DiscoveredVideo{{AwemeID: "129003", SourceID: "douyin:aweme:129003", CanonicalURL: "https://www.douyin.com/video/129003"}}
+
+	fake.Creator.RecentVideos = []domain.DiscoveredVideo{
+		{AwemeID: "129003", SourceID: "douyin:aweme:129003", CanonicalURL: "https://www.douyin.com/video/129003"},
+		{AwemeID: "129006", SourceID: "douyin:aweme:129006", CanonicalURL: "https://www.douyin.com/video/129006", Title: "baseline refreshed 129006"},
+		{AwemeID: "129007", SourceID: "douyin:aweme:129007", CanonicalURL: "https://www.douyin.com/video/129007", Title: "baseline refreshed 129007"},
+	}
 	doJSON(http.MethodPost, "/api/v1/followed-creators", map[string]any{"url": creator.CanonicalURL, "recent_limit": 5}, http.StatusCreated, &followed)
-	reknown, _ := db.GetDouyinVideo(context.Background(), "129003")
-	if reknown.Disposition != domain.DiscoveryDispositionSeen {
-		t.Fatalf("re-follow must not make old identity New again: %+v", reknown)
+	token2 := followed.Creator.BaselineAt
+
+	// 1. Re-follow baseline correctness: still-New video must become Seen, Ignored stays Ignored, known identity preserved.
+	refollowedNew, err := db.GetDouyinVideo(context.Background(), "129006")
+	if err != nil {
+		t.Fatalf("get 129006 after refollow: %v", err)
+	}
+	if refollowedNew.Disposition != domain.DiscoveryDispositionSeen {
+		t.Fatalf("re-follow baseline must promote still-New video to Seen: %+v", refollowedNew)
+	}
+	if !refollowedNew.FirstObservedAt.Equal(beforeRefollowNew.FirstObservedAt) {
+		t.Fatalf("re-follow baseline must preserve first_observed_at: got %v want %v", refollowedNew.FirstObservedAt, beforeRefollowNew.FirstObservedAt)
+	}
+	refollowedIgnored, err := db.GetDouyinVideo(context.Background(), "129007")
+	if err != nil {
+		t.Fatalf("get 129007 after refollow: %v", err)
+	}
+	if refollowedIgnored.Disposition != domain.DiscoveryDispositionIgnored {
+		t.Fatalf("re-follow baseline must preserve Ignored disposition: %+v", refollowedIgnored)
+	}
+	// 2. Prevent stale monitoring results from previous generation crossing Unfollow -> Re-follow.
+	if err := discoverySvc.RetainMonitoringVideos(context.Background(), creator.SecUID, token1, []domain.DiscoveredVideo{
+		{AwemeID: "129008", SourceID: "douyin:aweme:129008", CanonicalURL: "https://www.douyin.com/video/129008", Title: "stale gen1 late observation"},
+	}); err != nil {
+		t.Fatalf("stale generation observation must be discarded cleanly: %v", err)
+	}
+	if _, err := db.GetDouyinVideo(context.Background(), "129008"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("stale generation monitoring result must not be retained: err=%v", err)
+	}
+
+	// Current generation token commits successfully.
+	if err := discoverySvc.RetainMonitoringVideos(context.Background(), creator.SecUID, token2, []domain.DiscoveredVideo{
+		{AwemeID: "129009", SourceID: "douyin:aweme:129009", CanonicalURL: "https://www.douyin.com/video/129009", Title: "current gen2 observation"},
+	}); err != nil {
+		t.Fatalf("current generation monitoring observation must succeed: %v", err)
+	}
+	curGenVideo, err := db.GetDouyinVideo(context.Background(), "129009")
+	if err != nil || curGenVideo.Disposition != domain.DiscoveryDispositionNew {
+		t.Fatalf("current generation observation must be retained as New: %+v err=%v", curGenVideo, err)
+	}
+
+	// 3. Make bulk RequestDownloads atomic: batch containing missing ID must not partially mutate.
+	doJSON(http.MethodPost, "/api/v1/library/media/downloads", map[string]any{"aweme_ids": []string{"129009", "129-nonexistent-missing"}}, http.StatusNotFound, nil)
+	unmutated, err := db.GetDouyinVideo(context.Background(), "129009")
+	if err != nil {
+		t.Fatalf("get unmutated 129009: %v", err)
+	}
+	if unmutated.Disposition != domain.DiscoveryDispositionNew || unmutated.AcquisitionRequestState != "none" {
+		t.Fatalf("bulk download request with invalid target must roll back without partial mutation: %+v", unmutated)
+	}
+
+	// Valid batch commits atomically.
+	doJSON(http.MethodPost, "/api/v1/library/media/downloads", map[string]any{"aweme_ids": []string{"129009"}}, http.StatusAccepted, &downloads)
+	queuedVideo, err := db.GetDouyinVideo(context.Background(), "129009")
+	if err != nil {
+		t.Fatalf("get queued 129009: %v", err)
+	}
+	if queuedVideo.Disposition != domain.DiscoveryDispositionSeen || queuedVideo.AcquisitionRequestState != "queued" {
+		t.Fatalf("valid bulk download request must mark Seen and queued: %+v", queuedVideo)
 	}
 }
-
 func TestV19ToV20MigrationPreservesAcquisitionTruth(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "migration-v19.db")
 	db, err := storage.Open(path)

@@ -227,24 +227,14 @@ func (s *DiscoveryService) RequestDownloads(ctx context.Context, awemeIDs []stri
 		return nil, fmt.Errorf("durable Douyin discovery unavailable")
 	}
 	now := time.Now().UTC()
-	result := make([]domain.DouyinVideo, 0, len(awemeIDs))
-	for _, awemeID := range awemeIDs {
-		if err := s.store.MarkDouyinVideoDownloadRequested(ctx, awemeID, now); err != nil {
-			return nil, err
-		}
-		video, err := s.store.GetDouyinVideo(ctx, awemeID)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, *video)
-	}
-	return result, nil
+	return s.store.MarkDouyinVideosDownloadRequested(ctx, awemeIDs, now)
 }
 
 // RetainMonitoringVideos is the persistence contract later polling (#130) calls
 // after a successful observation. It does not fetch, schedule, or advance poll
-// checkpoints in this ticket.
-func (s *DiscoveryService) RetainMonitoringVideos(ctx context.Context, secUID string, videos []domain.DiscoveredVideo) error {
+// checkpoints in this ticket. It validates the baselineToken captured at poll
+// start so a stale poll cannot reintroduce New videos after an Unfollow -> Re-follow.
+func (s *DiscoveryService) RetainMonitoringVideos(ctx context.Context, secUID string, baselineToken time.Time, videos []domain.DiscoveredVideo) error {
 	if s == nil || s.store == nil {
 		return fmt.Errorf("durable Douyin discovery unavailable")
 	}
@@ -257,7 +247,7 @@ func (s *DiscoveryService) RetainMonitoringVideos(ctx context.Context, secUID st
 		}
 		retained = append(retained, video)
 	}
-	_, err := s.store.SaveMonitoringVideosIfFollowed(ctx, secUID, retained)
+	_, err := s.store.SaveMonitoringVideosIfFollowed(ctx, secUID, baselineToken, retained)
 	return err
 }
 
