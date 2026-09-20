@@ -129,7 +129,14 @@ func main() {
 	}
 	router := provider.NewRouter(reg, polSvc, licSvc, credSvc, nil, db)
 	router.SetSnapshotService(snapSvc)
+	if err := provider.RegisterProductionDouyinProviders(reg, credSvc.MaterializeSecret); err != nil {
+		log.Fatalf("[Desktop] Douyin provider registry init failed: %v", err)
+	}
 	acquisitionSvc := service.NewAcquisitionService(db, ingestSvc, router, absDataDir)
+	// Keep discovery metadata and routing attempts transient until the operator
+	// explicitly chooses Download/Follow.
+	discoveryRouter := provider.NewRouter(reg, polSvc, licSvc, credSvc, nil, nil)
+	discoverySvc := service.NewDiscoveryService(discoveryRouter)
 
 	// 4. RuntimeHost HTTP Server
 	addr := fmt.Sprintf("127.0.0.1:%d", listenPort)
@@ -139,6 +146,7 @@ func main() {
 		CASStore:        casStore,
 		Ingest:          ingestSvc,
 		Acquisition:     acquisitionSvc,
+		Discovery:       discoverySvc,
 		Registry:        reg,
 		PolicySvc:       polSvc,
 		LicenseSvc:      licSvc,

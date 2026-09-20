@@ -63,6 +63,7 @@ func TestOperatorUIShellRoutes(t *testing.T) {
 				"workflow-stepper", "review-workspace", "observational-timeline",
 				"review_posture", "data-step=\"source\"", "data-step=\"export\"",
 				"zone-context", "zone-center", "zone-inspector",
+				"data-view-target=\"discover\"", "id=\"discovery-search-form\"", "id=\"discovery-download\"",
 			},
 			notContains: []string{
 				"kokoro_tts_en", "af_heart",
@@ -74,7 +75,7 @@ func TestOperatorUIShellRoutes(t *testing.T) {
 			contains: []string{
 				"--surface", ".app-shell", ".workflow-stepper", ".review-workspace",
 				".observational-timeline-panel", ".stepper-step.status-queued",
-				".speaker-card.is-unassigned",
+				".speaker-card.is-unassigned", ".discovery-layout", ".discovery-bulk",
 			},
 		},
 		{
@@ -83,6 +84,8 @@ func TestOperatorUIShellRoutes(t *testing.T) {
 			contains: []string{
 				"/api/v1/health", "/api/v1/jobs", "/api/v1/assets/upload",
 				"/api/v1/runs/", "/render/handoff", "computeStepState", "speakerColor",
+				"/api/v1/douyin/search", "/api/v1/douyin/lookup/video", "/api/v1/douyin/lookup/creator",
+				"downloadSelectedDiscovery", "discoverySelected",
 				"\"queued\"", "unassigned-badge",
 				`const finalStage = state.stages.find((st) => st.stage === "render_final")`,
 				`getRunPosture(state.selectedRun) === "review"`,

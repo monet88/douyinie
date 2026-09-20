@@ -22,12 +22,17 @@ const state = {
   inspectorTab: "exceptions",
   selectedSegmentIndex: null,
   selectedRegionId: null,
+  discoveryVideos: [],
+  discoveryContinuation: "",
+  discoverySelected: new Set(),
+  discoveryPreview: null,
 };
 
 let pollTimer = null;
 
 const titles = {
   new: "Tạo localization job",
+  discover: "Cào ngay",
   jobs: "Jobs & Queue",
   inspector: "Review Workspace",
   result: "Kết quả",
@@ -2566,6 +2571,172 @@ function seekVideoTo(timeMs) {
   }
 }
 
+function discoveryFilteredVideos() {
+  const dateValue = $("#discovery-date-filter")?.value || "";
+  const after = dateValue ? new Date(dateValue + "T00:00:00") : null;
+  const likesRaw = $("#discovery-like-filter")?.value?.trim() || "";
+  const minLikes = likesRaw === "" ? null : Number(likesRaw);
+  return state.discoveryVideos.filter((video) => {
+    if (after && video.published_at) {
+      const published = new Date(video.published_at);
+      if (!Number.isNaN(published.getTime()) && published < after) return false;
+    }
+    if (minLikes != null && Number.isFinite(minLikes) && video.like_count != null && Number(video.like_count) < minLikes) {
+      return false;
+    }
+    return true;
+  });
+}
+
+function appendDiscoveryVideos(videos) {
+  const byID = new Map(state.discoveryVideos.map((video) => [video.aweme_id, video]));
+  (videos || []).forEach((video) => {
+    if (video?.aweme_id) byID.set(video.aweme_id, video);
+  });
+  state.discoveryVideos = [...byID.values()];
+}
+
+function renderDiscoveryPreview(video = state.discoveryPreview) {
+  const node = $("#discovery-preview");
+  if (!node) return;
+  if (!video) {
+    node.innerHTML = '<p class="section-kicker">Preview / Detail</p><div class="discovery-preview-empty">Chọn một video để xem metadata.</div>';
+    return;
+  }
+  const likes = video.like_count == null ? "unknown" : Number(video.like_count).toLocaleString("vi-VN");
+  const creator = video.creator?.display_name || video.creator?.sec_uid || "—";
+  node.innerHTML =
+    '<p class="section-kicker">Preview / Detail</p>' +
+    (video.cover_url ? '<img class="discovery-cover" src="' + esc(video.cover_url) + '" alt="">' : '') +
+    '<h3>' + esc(video.title || ("Douyin " + video.aweme_id)) + '</h3>' +
+    '<dl class="discovery-meta">' +
+    '<div><dt>aweme_id</dt><dd>' + esc(video.aweme_id) + '</dd></div>' +
+    '<div><dt>Creator</dt><dd>' + esc(creator) + '</dd></div>' +
+    '<div><dt>Likes</dt><dd>' + esc(likes) + '</dd></div>' +
+    '<div><dt>Published</dt><dd>' + esc(video.published_at ? formatDate(video.published_at) : "unknown") + '</dd></div>' +
+    '</dl><a class="secondary-button discovery-open-link" href="' + esc(video.canonical_url) + '" target="_blank" rel="noreferrer">Mở trên Douyin</a>';
+}
+
+function renderDiscovery() {
+  const node = $("#discovery-results");
+  if (!node) return;
+  const videos = discoveryFilteredVideos();
+  const status = $("#discovery-status");
+  if (status) status.textContent = videos.length + " / " + state.discoveryVideos.length + " kết quả đang hiển thị.";
+  const count = $("#discovery-selected-count");
+  if (count) {
+    const visibleIDs = new Set(videos.map((video) => video.aweme_id));
+    count.textContent = String([...state.discoverySelected].filter((id) => visibleIDs.has(id)).length);
+  }
+  $("#discovery-more")?.classList.toggle("hidden", !state.discoveryContinuation);
+  if (!videos.length) {
+    node.innerHTML = '<div class="empty-state compact-empty"><strong>Không có video phù hợp</strong><span>Đổi từ khóa hoặc bộ lọc rồi thử lại.</span></div>';
+    renderDiscoveryPreview();
+    return;
+  }
+  node.innerHTML = videos.map((video) => {
+    const selected = state.discoverySelected.has(video.aweme_id);
+    const likes = video.like_count == null ? "unknown" : Number(video.like_count).toLocaleString("vi-VN");
+    return '<article class="discovery-card ' + (selected ? "is-selected" : "") + '" data-discovery-preview="' + esc(video.aweme_id) + '">' +
+      '<label class="discovery-select"><input type="checkbox" data-discovery-select="' + esc(video.aweme_id) + '" ' + (selected ? "checked" : "") + '></label>' +
+      (video.cover_url ? '<img src="' + esc(video.cover_url) + '" alt="">' : '<div class="discovery-cover-placeholder">DY</div>') +
+      '<div class="discovery-card-body"><strong>' + esc(video.title || ("Douyin " + video.aweme_id)) + '</strong>' +
+      '<span>' + esc(video.creator?.display_name || video.creator?.sec_uid || "Creator unknown") + '</span>' +
+      '<small>' + esc(video.published_at ? formatDate(video.published_at) : "date unknown") + ' · ♥ ' + esc(likes) + '</small></div></article>';
+  }).join("");
+  renderDiscoveryPreview();
+}
+
+async function runDiscoverySearch(append = false) {
+  const query = $("#discovery-query")?.value?.trim() || "";
+  if (!query) return;
+  const button = append ? $("#discovery-more") : $("#discovery-search");
+  setBusy(button, true, append ? "Đang tải…" : "Đang tìm…");
+  try {
+    const page = await api("/api/v1/douyin/search", {
+      method: "POST",
+      body: jsonBody({ query, limit: 20, continuation: append ? state.discoveryContinuation : "" }),
+    });
+    if (!append) {
+      state.discoveryVideos = [];
+      state.discoverySelected.clear();
+      state.discoveryPreview = null;
+    }
+    appendDiscoveryVideos(page.videos);
+    state.discoveryContinuation = page.continuation || "";
+    renderDiscovery();
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function lookupDiscoveryVideo() {
+  const url = $("#discovery-url")?.value?.trim() || "";
+  if (!url) return;
+  const button = $("#lookup-video");
+  setBusy(button, true, "Đang lookup…");
+  try {
+    const result = await api("/api/v1/douyin/lookup/video", { method: "POST", body: jsonBody({ url }) });
+    if (result.video) {
+      appendDiscoveryVideos([result.video]);
+      state.discoveryPreview = result.video;
+      renderDiscovery();
+    }
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function lookupDiscoveryCreator() {
+  const url = $("#discovery-url")?.value?.trim() || "";
+  if (!url) return;
+  const button = $("#lookup-creator");
+  setBusy(button, true, "Đang lookup…");
+  try {
+    const result = await api("/api/v1/douyin/lookup/creator", { method: "POST", body: jsonBody({ url, recent_limit: 12 }) });
+    appendDiscoveryVideos(result.recent_videos || []);
+    renderDiscovery();
+    const node = $("#discovery-preview");
+    if (node) {
+      node.innerHTML = '<p class="section-kicker">Creator lookup</p><h3>' +
+        esc(result.creator?.display_name || result.creator?.sec_uid || "Douyin creator") +
+        '</h3><p class="quiet">' + esc(result.creator?.sec_uid || "") + '</p><p class="quiet">' +
+        (result.recent_view_available ? ((result.recent_videos || []).length + " video recent") : "Recent feed unavailable qua lane metadata hiện tại; không giả lập dữ liệu.") +
+        '</p>' + (result.creator?.canonical_url ? '<a class="secondary-button discovery-open-link" href="' + esc(result.creator.canonical_url) + '" target="_blank" rel="noreferrer">Mở profile</a>' : "");
+    }
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function downloadSelectedDiscovery() {
+  // Bulk actions apply only to the currently visible filtered set. A selection
+  // hidden by a later date/like filter must not be acquired invisibly.
+  const selected = discoveryFilteredVideos().filter((video) => state.discoverySelected.has(video.aweme_id));
+  if (!selected.length) return;
+  const button = $("#discovery-download");
+  setBusy(button, true, "Đang download " + selected.length + "…");
+  const priorMode = state.sourceMode;
+  let ok = 0;
+  let firstFailure = "";
+  try {
+    state.sourceMode = "douyin_url";
+    for (const video of selected) {
+      try {
+        await createSource(video.canonical_url, operatorName());
+        ok += 1;
+      } catch (error) {
+        if (!firstFailure) firstFailure = video.aweme_id + ": " + (error.message || error);
+      }
+    }
+    if (ok) toast("Đã acquire", ok + "/" + selected.length + " video đã được lưu vào source assets.", "success");
+    if (firstFailure) toast("Một số video chưa download được", firstFailure, "error");
+  } finally {
+    state.sourceMode = priorMode;
+    setBusy(button, false);
+  }
+}
+
 function showError(error) {
   console.error(error);
   toast("Có lỗi", error?.message || String(error), "error");
@@ -2588,6 +2759,34 @@ function bindEvents() {
   );
 
   $("#new-job-form")?.addEventListener("submit", handleNewJob);
+  $("#discovery-search-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    runDiscoverySearch(false).catch(showError);
+  });
+  $("#discovery-more")?.addEventListener("click", () => runDiscoverySearch(true).catch(showError));
+  $("#lookup-video")?.addEventListener("click", () => lookupDiscoveryVideo().catch(showError));
+  $("#lookup-creator")?.addEventListener("click", () => lookupDiscoveryCreator().catch(showError));
+  $("#discovery-date-filter")?.addEventListener("change", renderDiscovery);
+  $("#discovery-like-filter")?.addEventListener("input", renderDiscovery);
+  $("#discovery-results")?.addEventListener("click", (event) => {
+    const checkbox = event.target.closest("[data-discovery-select]");
+    if (checkbox) {
+      const id = checkbox.dataset.discoverySelect;
+      if (checkbox.checked) state.discoverySelected.add(id);
+      else state.discoverySelected.delete(id);
+      renderDiscovery();
+      return;
+    }
+    const card = event.target.closest("[data-discovery-preview]");
+    if (card) {
+      state.discoveryPreview = state.discoveryVideos.find((video) => video.aweme_id === card.dataset.discoveryPreview) || null;
+      renderDiscoveryPreview();
+    }
+  });
+  $("#discovery-download")?.addEventListener("click", () => downloadSelectedDiscovery().catch(showError));
+  $("#discovery-follow")?.addEventListener("click", () => {
+    toast("Follow chưa bật", "Slice hiện tại chỉ discovery transient; durable Follow được giữ ngoài #128.");
+  });
   $("#refresh-all")?.addEventListener("click", () => refreshAll());
   $("#jobs-refresh")?.addEventListener("click", () => refreshAll());
   $("#result-refresh")?.addEventListener("click", () => refreshResult().catch(showError));
@@ -2812,6 +3011,7 @@ async function boot() {
   renderSelectedRun();
   renderInspector();
   renderResult();
+  renderDiscovery();
   renderStepper();
   await refreshAll({ quiet: true });
   syncPolling();

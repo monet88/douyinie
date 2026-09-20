@@ -123,28 +123,15 @@ func main() {
 			}
 		}
 	}
-	// 5b. Douyin URL acquisition (Issue #125): known Argus-gated single-video
-	// detail requests require an operator-authorized real-page helper. Direct
-	// Jiji remains registered for probe/discovery-compatible behavior but its
-	// Acquire path fails closed before invoking the gated CLI request. F2 is
-	// registered only when the operator has separately established live evidence
-	// for the exact gated operation. Session secrets resolve only through the
-	// CredentialService seam at call time and are never logged or persisted.
-	jijiScript := os.Getenv("DOUYINIE_JIJI_SCRIPT")
-	jijiPython := os.Getenv("DOUYINIE_JIJI_PYTHON")
-	if jijiPython == "" {
-		jijiPython = "python"
-	}
-	if jijiScript != "" {
-		_ = reg.Register(provider.NewJijiAdapter("v2", jijiPython, jijiScript, credSvc.MaterializeSecret))
-	}
-	if pageHelper := os.Getenv("DOUYINIE_DOUYIN_PAGE_HELPER"); pageHelper != "" {
-		_ = reg.Register(provider.NewPageBackedJijiAdapter("v1", pageHelper, credSvc.MaterializeSecret))
-	}
-	if f2Bin := os.Getenv("DOUYINIE_F2_BIN"); f2Bin != "" && os.Getenv("DOUYINIE_F2_ARGUS_VERIFIED") == "1" {
-		_ = reg.Register(provider.NewF2Adapter("v0", f2Bin, credSvc.MaterializeSecret))
+	// 5b. Shared Douyin acquisition + transient discovery composition.
+	if err := provider.RegisterProductionDouyinProviders(reg, credSvc.MaterializeSecret); err != nil {
+		log.Fatalf("[RuntimeHost] Douyin provider registry init failed: %v", err)
 	}
 	acquisitionSvc := service.NewAcquisitionService(db, ingestSvc, router, absDataDir)
+	// Discovery intentionally uses a governance-aware Router without the
+	// provenance DB writer: ordinary exploration is transient by contract.
+	discoveryRouter := provider.NewRouter(reg, polSvc, licSvc, credSvc, nil, nil)
+	discoverySvc := service.NewDiscoveryService(discoveryRouter)
 
 	// 6. Optional Demo Ingestion
 	if *demoFile != "" {
@@ -184,6 +171,7 @@ func main() {
 		CASStore:        casStore,
 		Ingest:          ingestSvc,
 		Acquisition:     acquisitionSvc,
+		Discovery:       discoverySvc,
 		Registry:        reg,
 		PolicySvc:       polSvc,
 		LicenseSvc:      licSvc,

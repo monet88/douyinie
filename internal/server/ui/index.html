@@ -24,16 +24,20 @@
           <span class="nav-index">01</span>
           <span><strong>Job mới</strong><small>Nguồn → VI/EN · Posture</small></span>
         </button>
-        <button class="nav-item" data-view-target="jobs" type="button">
+        <button class="nav-item" data-view-target="discover" type="button">
           <span class="nav-index">02</span>
+          <span><strong>Cào ngay</strong><small>Tìm kiếm · Lookup · Chọn video</small></span>
+        </button>
+        <button class="nav-item" data-view-target="jobs" type="button">
+          <span class="nav-index">03</span>
           <span><strong>Jobs & Queue</strong><small>Tiến độ · 1 active slot</small></span>
         </button>
         <button class="nav-item" data-view-target="inspector" type="button">
-          <span class="nav-index">03</span>
+          <span class="nav-index">04</span>
           <span><strong>Review Workspace</strong><small>Speaker · Timeline · Review</small></span>
         </button>
         <button class="nav-item" data-view-target="result" type="button">
-          <span class="nav-index">04</span>
+          <span class="nav-index">05</span>
           <span><strong>Kết quả</strong><small>Preview & final render</small></span>
         </button>
       </nav>
@@ -199,7 +203,62 @@
           </form>
         </section>
 
-        <!-- VIEW 02: JOBS & QUEUE -->
+        <!-- VIEW 02: TRANSIENT DOUYIN DISCOVERY -->
+        <section class="view" data-view="discover" aria-labelledby="discover-title">
+          <div class="section-header-row">
+            <div>
+              <p class="section-kicker">Transient Douyin discovery</p>
+              <h2 id="discover-title">Cào ngay</h2>
+              <p class="lead compact-lead">Tìm video theo từ khóa hoặc lookup URL. Kết quả chỉ nằm trong phiên hiện tại cho tới khi operator bấm Download.</p>
+            </div>
+          </div>
+
+          <div class="discovery-layout">
+            <div class="discovery-main">
+              <article class="panel discovery-query-panel">
+                <form id="discovery-search-form" class="discovery-search-row">
+                  <label class="field">
+                    <span>Từ khóa</span>
+                    <input id="discovery-query" type="search" autocomplete="off" placeholder="váy nữ mùa hè">
+                  </label>
+                  <button class="primary-button" id="discovery-search" type="submit">Tìm trên Douyin</button>
+                </form>
+                <div class="discovery-lookup-row">
+                  <label class="field">
+                    <span>Douyin URL</span>
+                    <input id="discovery-url" type="url" autocomplete="off" placeholder="https://www.douyin.com/video/… hoặc /user/…">
+                  </label>
+                  <button class="secondary-button" id="lookup-video" type="button">Lookup video</button>
+                  <button class="secondary-button" id="lookup-creator" type="button">Lookup creator</button>
+                </div>
+                <div class="discovery-filter-row">
+                  <label class="field"><span>Từ ngày</span><input id="discovery-date-filter" type="date"></label>
+                  <label class="field"><span>Like tối thiểu</span><input id="discovery-like-filter" type="number" min="0" step="1" placeholder="Không giới hạn"></label>
+                  <div class="discovery-filter-note">Like chưa biết vẫn giữ là <strong>unknown</strong>, không đổi thành 0.</div>
+                </div>
+              </article>
+
+              <div class="discovery-status" id="discovery-status">Chưa có kết quả.</div>
+              <div class="discovery-results" id="discovery-results"></div>
+              <button class="secondary-button discovery-more hidden" id="discovery-more" type="button">Tải thêm</button>
+            </div>
+
+            <aside class="panel discovery-preview" id="discovery-preview">
+              <p class="section-kicker">Preview / Detail</p>
+              <div class="discovery-preview-empty">Chọn một video để xem metadata.</div>
+            </aside>
+          </div>
+
+          <div class="discovery-bulk" id="discovery-bulk">
+            <span><strong id="discovery-selected-count">0</strong> video đã chọn</span>
+            <div>
+              <button class="secondary-button" id="discovery-follow" type="button">Follow creator</button>
+              <button class="primary-button" id="discovery-download" type="button">Download đã chọn</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- VIEW 03: JOBS & QUEUE -->
         <section class="view" data-view="jobs" aria-labelledby="jobs-title">
           <div class="section-header-row">
             <div>
