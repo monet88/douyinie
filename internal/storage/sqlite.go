@@ -1307,7 +1307,10 @@ func (s *DB) migrate(ctx context.Context) error {
 			origin TEXT NOT NULL CHECK (origin IN ('baseline','historical','monitoring')),
 			disposition TEXT NOT NULL CHECK (disposition IN ('new','seen','ignored')),
 				acquisition_request_state TEXT NOT NULL DEFAULT 'none' CHECK (acquisition_request_state IN ('none','queued','downloading','downloaded','failed')),
-			acquisition_failure_json TEXT,
+				acquisition_failure_json TEXT,
+				rights_attestation_id TEXT,
+				credential_ref TEXT,
+				consent_granted INTEGER NOT NULL DEFAULT 0 CHECK (consent_granted IN (0,1)),
 			automation_failure_json TEXT,
 			library_visible INTEGER NOT NULL DEFAULT 1 CHECK (library_visible IN (0,1)),
 			removed_at TEXT,
@@ -1326,6 +1329,52 @@ func (s *DB) migrate(ctx context.Context) error {
 		}
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit migration v20: %w", err)
+		}
+	}
+	// #131 completes the v20 request contract. Some development databases may
+	// already carry the earlier #129 v20 marker, so make these additive columns
+	// present without changing the schema version.
+	if err := s.ensureDouyinDownloadColumns(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *DB) ensureDouyinDownloadColumns(ctx context.Context) error {
+	columns := []struct {
+		name string
+		ddl  string
+	}{
+		{name: "rights_attestation_id", ddl: "ALTER TABLE douyin_videos ADD COLUMN rights_attestation_id TEXT"},
+		{name: "credential_ref", ddl: "ALTER TABLE douyin_videos ADD COLUMN credential_ref TEXT"},
+		{name: "consent_granted", ddl: "ALTER TABLE douyin_videos ADD COLUMN consent_granted INTEGER NOT NULL DEFAULT 0 CHECK (consent_granted IN (0,1))"},
+	}
+	for _, column := range columns {
+		rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(douyin_videos)")
+		if err != nil {
+			return fmt.Errorf("inspect douyin_videos columns: %w", err)
+		}
+		found := false
+		for rows.Next() {
+			var cid, notNull, pk int
+			var name, typ string
+			var defaultValue any
+			if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan douyin_videos columns: %w", err)
+			}
+			if name == column.name {
+				found = true
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if found {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, column.ddl); err != nil {
+			return fmt.Errorf("add douyin_videos.%s: %w", column.name, err)
 		}
 	}
 	return nil
@@ -4893,6 +4942,36 @@ func (s *DB) GetSourceAcquisitionBySourceID(ctx context.Context, sourceID string
 	return &prov, nil
 }
 
+func (s *DB) ListSourceAcquisitions(ctx context.Context, platform string) ([]domain.AcquisitionProvenance, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	query := `SELECT provenance_json FROM source_acquisitions`
+	args := []any{}
+	if strings.TrimSpace(platform) != "" {
+		query += ` WHERE platform = ?`
+		args = append(args, platform)
+	}
+	query += ` ORDER BY created_at DESC, source_id ASC`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list source acquisitions: %w", err)
+	}
+	defer rows.Close()
+	var out []domain.AcquisitionProvenance
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var prov domain.AcquisitionProvenance
+		if err := json.Unmarshal([]byte(raw), &prov); err != nil {
+			return nil, fmt.Errorf("unmarshal source acquisition: %w", err)
+		}
+		out = append(out, prov)
+	}
+	return out, rows.Err()
+}
+
 // SaveFollowedCreator upserts the durable creator snapshot and follow state.
 func (s *DB) SaveFollowedCreator(ctx context.Context, creator domain.FollowedCreator) error {
 	s.mu.Lock()
@@ -4904,10 +4983,10 @@ func saveFollowedCreator(ctx context.Context, exec sqlExecer, creator domain.Fol
 	_, err := exec.ExecContext(ctx, `
 		INSERT INTO followed_creators (
 			sec_uid, canonical_url, display_name, avatar_url, followed, followed_at, baseline_at,
-			automation_mode, target_language, review_posture, cover_color, configured_by,
+				automation_mode, target_language, review_posture, cover_color, configured_by, rights_attestation_id,
 			last_successful_poll_at, last_attempt_at, next_check_at, poll_state,
 			failure_code, failure_message, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(sec_uid) DO UPDATE SET
 			canonical_url=excluded.canonical_url,
 			display_name=CASE WHEN excluded.display_name <> '' THEN excluded.display_name ELSE followed_creators.display_name END,
@@ -4918,8 +4997,9 @@ func saveFollowedCreator(ctx context.Context, exec sqlExecer, creator domain.Fol
 			automation_mode=excluded.automation_mode,
 			target_language=excluded.target_language,
 			review_posture=excluded.review_posture,
-			cover_color=excluded.cover_color,
-			configured_by=excluded.configured_by,
+				cover_color=excluded.cover_color,
+				configured_by=excluded.configured_by,
+				rights_attestation_id=COALESCE(NULLIF(excluded.rights_attestation_id,''), followed_creators.rights_attestation_id),
 			last_successful_poll_at=excluded.last_successful_poll_at,
 			last_attempt_at=excluded.last_attempt_at,
 			next_check_at=excluded.next_check_at,
@@ -4929,7 +5009,7 @@ func saveFollowedCreator(ctx context.Context, exec sqlExecer, creator domain.Fol
 			updated_at=excluded.updated_at
 	`, creator.SecUID, creator.CanonicalURL, creator.DisplayName, creator.AvatarURL, boolInt(creator.Followed),
 		creator.FollowedAt.Format(time.RFC3339Nano), creator.BaselineAt.Format(time.RFC3339Nano), creator.AutomationMode,
-		creator.TargetLanguage, creator.ReviewPosture, creator.CoverColor, creator.ConfiguredBy,
+		creator.TargetLanguage, creator.ReviewPosture, creator.CoverColor, creator.ConfiguredBy, emptyToNil(creator.RightsAttestationID),
 		timePtrString(creator.LastSuccessfulPollAt), timePtrString(creator.LastAttemptAt), timePtrString(creator.NextCheckAt),
 		creator.PollState, creator.FailureCode, creator.FailureMessage, creator.CreatedAt.Format(time.RFC3339Nano), creator.UpdatedAt.Format(time.RFC3339Nano))
 	if err != nil {
@@ -4968,9 +5048,10 @@ func (s *DB) GetFollowedCreator(ctx context.Context, secUID string) (*domain.Fol
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	row := s.db.QueryRowContext(ctx, `
-		SELECT sec_uid, canonical_url, COALESCE(display_name,''), COALESCE(avatar_url,''), followed,
-			followed_at, baseline_at, automation_mode, target_language, review_posture, cover_color, configured_by,
-			last_successful_poll_at, last_attempt_at, next_check_at, poll_state,
+			SELECT sec_uid, canonical_url, COALESCE(display_name,''), COALESCE(avatar_url,''), followed,
+				followed_at, baseline_at, automation_mode, target_language, review_posture, cover_color, configured_by,
+				COALESCE(rights_attestation_id,''),
+				last_successful_poll_at, last_attempt_at, next_check_at, poll_state,
 			COALESCE(failure_code,''), COALESCE(failure_message,''), created_at, updated_at
 		FROM followed_creators WHERE sec_uid = ?`, secUID)
 	creator, err := scanFollowedCreator(row)
@@ -4987,9 +5068,10 @@ func (s *DB) ListFollowedCreators(ctx context.Context) ([]domain.FollowedCreator
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sec_uid, canonical_url, COALESCE(display_name,''), COALESCE(avatar_url,''), followed,
-			followed_at, baseline_at, automation_mode, target_language, review_posture, cover_color, configured_by,
-			last_successful_poll_at, last_attempt_at, next_check_at, poll_state,
+			SELECT sec_uid, canonical_url, COALESCE(display_name,''), COALESCE(avatar_url,''), followed,
+				followed_at, baseline_at, automation_mode, target_language, review_posture, cover_color, configured_by,
+				COALESCE(rights_attestation_id,''),
+				last_successful_poll_at, last_attempt_at, next_check_at, poll_state,
 			COALESCE(failure_code,''), COALESCE(failure_message,''), created_at, updated_at
 		FROM followed_creators ORDER BY followed DESC, updated_at DESC, sec_uid ASC`)
 	if err != nil {
@@ -5078,11 +5160,12 @@ func saveDouyinVideoObservation(ctx context.Context, exec sqlExecer, video domai
 		dispositionUpdate = "disposition=CASE WHEN douyin_videos.disposition = 'new' THEN 'seen' ELSE douyin_videos.disposition END,\n\t\t\t"
 	}
 	_, err := exec.ExecContext(ctx, `
-		INSERT INTO douyin_videos (
-			aweme_id, source_id, sec_uid, canonical_url, title, cover_url, published_at, like_count, duration_ms,
-			first_observed_at, last_observed_at, origin, disposition, acquisition_request_state,
-			acquisition_failure_json, automation_failure_json, library_visible, removed_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO douyin_videos (
+				aweme_id, source_id, sec_uid, canonical_url, title, cover_url, published_at, like_count, duration_ms,
+				first_observed_at, last_observed_at, origin, disposition, acquisition_request_state,
+				acquisition_failure_json, rights_attestation_id, credential_ref, consent_granted,
+				automation_failure_json, library_visible, removed_at, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(aweme_id) DO UPDATE SET
 			sec_uid=COALESCE(NULLIF(excluded.sec_uid,''), douyin_videos.sec_uid),
 			canonical_url=excluded.canonical_url,
@@ -5096,7 +5179,7 @@ func saveDouyinVideoObservation(ctx context.Context, exec sqlExecer, video domai
 	`, video.AwemeID, video.SourceID, video.SecUID, video.CanonicalURL, video.Title, video.CoverURL,
 		timePtrString(video.PublishedAt), int64PtrValue(video.LikeCount), int64PtrValue(video.DurationMs),
 		video.FirstObservedAt.Format(time.RFC3339Nano), video.LastObservedAt.Format(time.RFC3339Nano), video.Origin, video.Disposition,
-		video.AcquisitionRequestState, emptyToNil(video.AcquisitionFailureCode), emptyToNil(video.AutomationFailureCode),
+		video.AcquisitionRequestState, failureJSON(video.AcquisitionFailure), emptyToNil(video.RightsAttestationID), emptyToNil(video.CredentialRef), boolInt(video.ConsentGranted), emptyToNil(video.AutomationFailureCode),
 		boolInt(video.LibraryVisible), timePtrString(video.RemovedAt), video.CreatedAt.Format(time.RFC3339Nano), video.UpdatedAt.Format(time.RFC3339Nano))
 	if err != nil {
 		return fmt.Errorf("upsert douyin video observation: %w", err)
@@ -5156,80 +5239,168 @@ func (s *DB) SetDouyinVideoDisposition(ctx context.Context, awemeID string, disp
 	return nil
 }
 
-func (s *DB) MarkDouyinVideoDownloadRequested(ctx context.Context, awemeID string, updatedAt time.Time) error {
-	_, err := s.MarkDouyinVideosDownloadRequested(ctx, []string{awemeID}, updatedAt)
-	return err
-}
-
-// MarkDouyinVideosDownloadRequested atomically queues download requests for a batch
-// of retained videos. Prevalidates all targets: a batch containing any missing or
-// blank ID fails closed with ErrNotFound without mutating earlier rows.
-func (s *DB) MarkDouyinVideosDownloadRequested(ctx context.Context, awemeIDs []string, updatedAt time.Time) ([]domain.DouyinVideo, error) {
+// QueueDouyinDownloads atomically persists any transient discovery snapshots,
+// validates the whole logical batch, binds its safe acquisition contract, and
+// only then makes new requests claimable as queued.
+func (s *DB) QueueDouyinDownloads(ctx context.Context, observations []domain.DouyinVideo, awemeIDs []string, attestationID, credentialRef string, consent bool, updatedAt time.Time) ([]domain.DouyinVideo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if len(awemeIDs) == 0 {
-		return nil, nil
-	}
-
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("begin download request tx: %w", err)
+		return nil, fmt.Errorf("begin queue douyin downloads: %w", err)
 	}
 	defer tx.Rollback()
-
-	// Prevalidate: every ID must exist and not be blank
+	for _, video := range observations {
+		if err := saveDouyinVideoObservation(ctx, tx, video, false); err != nil {
+			return nil, err
+		}
+	}
 	for _, awemeID := range awemeIDs {
 		if strings.TrimSpace(awemeID) == "" {
 			return nil, ErrNotFound
 		}
 		var exists int
-		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM douyin_videos WHERE aweme_id = ?`, awemeID).Scan(&exists); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM douyin_videos WHERE aweme_id=?`, awemeID).Scan(&exists); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, ErrNotFound
 			}
-			return nil, fmt.Errorf("check douyin video existence %s: %w", awemeID, err)
+			return nil, fmt.Errorf("validate queued douyin video %s: %w", awemeID, err)
 		}
 	}
-
-	// Mutate all in the same transaction
 	for _, awemeID := range awemeIDs {
-		res, err := tx.ExecContext(ctx, `
-			UPDATE douyin_videos
-			SET disposition = CASE WHEN disposition = 'new' THEN 'seen' ELSE disposition END,
-				acquisition_request_state = CASE WHEN acquisition_request_state = 'none' THEN 'queued' ELSE acquisition_request_state END,
-				updated_at = ?
-			WHERE aweme_id = ?`, updatedAt.Format(time.RFC3339Nano), awemeID)
+		_, err := tx.ExecContext(ctx, `UPDATE douyin_videos SET
+			disposition=CASE WHEN disposition='new' THEN 'seen' ELSE disposition END,
+			acquisition_request_state=CASE
+				WHEN acquisition_request_state='none' THEN 'queued'
+				WHEN acquisition_request_state='failed' AND COALESCE(rights_attestation_id,'')='' THEN 'queued'
+				ELSE acquisition_request_state END,
+			rights_attestation_id=CASE
+				WHEN acquisition_request_state IN ('none','queued','failed') AND COALESCE(rights_attestation_id,'')='' THEN ?
+				ELSE rights_attestation_id END,
+			credential_ref=CASE
+				WHEN acquisition_request_state IN ('none','queued','failed') AND COALESCE(rights_attestation_id,'')='' THEN ?
+				ELSE credential_ref END,
+			consent_granted=CASE
+				WHEN acquisition_request_state IN ('none','queued','failed') AND COALESCE(rights_attestation_id,'')='' THEN ?
+				ELSE consent_granted END,
+			acquisition_failure_json=CASE
+				WHEN acquisition_request_state='none' OR (acquisition_request_state='failed' AND COALESCE(rights_attestation_id,'')='') THEN NULL
+				ELSE acquisition_failure_json END,
+			updated_at=?
+			WHERE aweme_id=?`,
+			attestationID, credentialRef, boolInt(consent), updatedAt.Format(time.RFC3339Nano), awemeID)
 		if err != nil {
-			return nil, fmt.Errorf("mark douyin video download requested %s: %w", awemeID, err)
-		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			return nil, ErrNotFound
+			return nil, fmt.Errorf("queue douyin video %s: %w", awemeID, err)
 		}
 	}
-
-	// Read all updated videos in original requested order
 	result := make([]domain.DouyinVideo, 0, len(awemeIDs))
 	for _, awemeID := range awemeIDs {
-		row := tx.QueryRowContext(ctx, douyinVideoSelect+` WHERE aweme_id = ?`, awemeID)
-		video, err := scanDouyinVideo(row)
+		video, err := scanDouyinVideo(tx.QueryRowContext(ctx, douyinVideoSelect+` WHERE aweme_id=?`, awemeID))
 		if err != nil {
-			return nil, fmt.Errorf("read updated douyin video %s: %w", awemeID, err)
+			return nil, err
 		}
 		result = append(result, *video)
 	}
-
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit download request tx: %w", err)
+		return nil, fmt.Errorf("commit queue douyin downloads: %w", err)
 	}
 	return result, nil
 }
 
+// RecoverDouyinDownloads makes interrupted I/O work resumable after host restart.
+func (s *DB) RecoverDouyinDownloads(ctx context.Context, updatedAt time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.ExecContext(ctx, `UPDATE douyin_videos
+		SET acquisition_request_state='queued', updated_at=?
+		WHERE acquisition_request_state='downloading'`, updatedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, fmt.Errorf("recover douyin downloads: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// ClaimNextDouyinDownload serializes queued->downloading so one bounded worker
+// owns a logical request at a time.
+func (s *DB) ClaimNextDouyinDownload(ctx context.Context, updatedAt time.Time) (*domain.DouyinVideo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin claim douyin download: %w", err)
+	}
+	defer tx.Rollback()
+	var awemeID string
+	if err := tx.QueryRowContext(ctx, `SELECT aweme_id FROM douyin_videos
+		WHERE acquisition_request_state='queued' AND COALESCE(rights_attestation_id,'')<>''
+		ORDER BY updated_at ASC, aweme_id ASC LIMIT 1`).Scan(&awemeID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("find queued douyin download: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE douyin_videos SET acquisition_request_state='downloading', updated_at=?
+		WHERE aweme_id=? AND acquisition_request_state='queued'`, updatedAt.Format(time.RFC3339Nano), awemeID)
+	if err != nil {
+		return nil, fmt.Errorf("claim douyin download: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return nil, ErrNotFound
+	}
+	video, err := scanDouyinVideo(tx.QueryRowContext(ctx, douyinVideoSelect+` WHERE aweme_id = ?`, awemeID))
+	if err != nil {
+		return nil, fmt.Errorf("read claimed douyin download: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit claimed douyin download: %w", err)
+	}
+	return video, nil
+}
+
+func (s *DB) FinishDouyinDownload(ctx context.Context, awemeID, state string, failure *domain.WorkstationFailure, updatedAt time.Time) error {
+	if state != domain.AcquisitionRequestDownloaded && state != domain.AcquisitionRequestFailed {
+		return fmt.Errorf("invalid terminal download state %q", state)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.ExecContext(ctx, `UPDATE douyin_videos
+		SET acquisition_request_state=?, acquisition_failure_json=?, updated_at=? WHERE aweme_id=?`,
+		state, failureJSON(failure), updatedAt.Format(time.RFC3339Nano), awemeID)
+	if err != nil {
+		return fmt.Errorf("finish douyin download: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *DB) RetryDouyinDownload(ctx context.Context, awemeID string, updatedAt time.Time) (*domain.DouyinVideo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.ExecContext(ctx, `UPDATE douyin_videos
+		SET acquisition_request_state='queued', acquisition_failure_json=NULL, updated_at=?
+		WHERE aweme_id=? AND acquisition_request_state='failed'`, updatedAt.Format(time.RFC3339Nano), awemeID)
+	if err != nil {
+		return nil, fmt.Errorf("retry douyin download: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, ErrNotFound
+	}
+	video, err := scanDouyinVideo(s.db.QueryRowContext(ctx, douyinVideoSelect+` WHERE aweme_id=?`, awemeID))
+	if err != nil {
+		return nil, err
+	}
+	return video, nil
+}
+
 const douyinVideoSelect = `SELECT aweme_id, source_id, COALESCE(sec_uid,''), canonical_url,
-	COALESCE(title,''), COALESCE(cover_url,''), published_at, like_count, duration_ms,
-	first_observed_at, last_observed_at, origin, disposition, acquisition_request_state,
-	COALESCE(acquisition_failure_json,''), COALESCE(automation_failure_json,''), library_visible,
-	removed_at, created_at, updated_at FROM douyin_videos`
+		COALESCE(title,''), COALESCE(cover_url,''), published_at, like_count, duration_ms,
+		first_observed_at, last_observed_at, origin, disposition, acquisition_request_state,
+		COALESCE(acquisition_failure_json,''), COALESCE(rights_attestation_id,''), COALESCE(credential_ref,''), consent_granted,
+		COALESCE(automation_failure_json,''), library_visible,
+		removed_at, created_at, updated_at FROM douyin_videos`
 
 type sqlScanner interface {
 	Scan(dest ...any) error
@@ -5245,7 +5416,7 @@ func scanFollowedCreator(scanner sqlScanner) (*domain.FollowedCreator, error) {
 	var followedAt, baselineAt, createdAt, updatedAt string
 	var lastSuccess, lastAttempt, nextCheck sql.NullString
 	if err := scanner.Scan(&creator.SecUID, &creator.CanonicalURL, &creator.DisplayName, &creator.AvatarURL, &followed,
-		&followedAt, &baselineAt, &creator.AutomationMode, &creator.TargetLanguage, &creator.ReviewPosture, &creator.CoverColor, &creator.ConfiguredBy,
+		&followedAt, &baselineAt, &creator.AutomationMode, &creator.TargetLanguage, &creator.ReviewPosture, &creator.CoverColor, &creator.ConfiguredBy, &creator.RightsAttestationID,
 		&lastSuccess, &lastAttempt, &nextCheck, &creator.PollState, &creator.FailureCode, &creator.FailureMessage, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
@@ -5265,10 +5436,11 @@ func scanDouyinVideo(scanner sqlScanner) (*domain.DouyinVideo, error) {
 	var published, removed sql.NullString
 	var likes, duration sql.NullInt64
 	var firstObserved, lastObserved, createdAt, updatedAt string
-	var libraryVisible int
+	var libraryVisible, consentGranted int
+	var failureJSONValue string
 	if err := scanner.Scan(&video.AwemeID, &video.SourceID, &video.SecUID, &video.CanonicalURL,
 		&video.Title, &video.CoverURL, &published, &likes, &duration, &firstObserved, &lastObserved,
-		&video.Origin, &video.Disposition, &video.AcquisitionRequestState, &video.AcquisitionFailureCode,
+		&video.Origin, &video.Disposition, &video.AcquisitionRequestState, &failureJSONValue, &video.RightsAttestationID, &video.CredentialRef, &consentGranted,
 		&video.AutomationFailureCode, &libraryVisible, &removed, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
@@ -5287,7 +5459,25 @@ func scanDouyinVideo(scanner sqlScanner) (*domain.DouyinVideo, error) {
 	video.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
 	video.RemovedAt = parseNullTime(removed)
 	video.LibraryVisible = libraryVisible == 1
+	video.ConsentGranted = consentGranted == 1
+	if failureJSONValue != "" {
+		var failure domain.WorkstationFailure
+		if json.Unmarshal([]byte(failureJSONValue), &failure) == nil {
+			video.AcquisitionFailure = &failure
+		}
+	}
 	return &video, nil
+}
+
+func failureJSON(failure *domain.WorkstationFailure) any {
+	if failure == nil {
+		return nil
+	}
+	b, err := json.Marshal(failure)
+	if err != nil {
+		return nil
+	}
+	return string(b)
 }
 
 func parseNullTime(value sql.NullString) *time.Time {

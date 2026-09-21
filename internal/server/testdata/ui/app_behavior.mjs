@@ -198,6 +198,8 @@ function createHarness() {
     followedCreators: register("#followed-creators"),
     followedVideos: register("#followed-videos"),
     followedPreview: register("#followed-preview"),
+    mediaLibrary: register("#media-library"),
+    libraryStatus: register("#library-status"),
   };
 
   lists.set("[data-inspector-tab]", [
@@ -501,7 +503,8 @@ test("discovery bulk download excludes selected videos hidden by current filters
   await h.ready();
   h.els.discoveryLikeFilter.value = "1000";
   h.setResponder((url) => {
-    if (url === "/api/v1/sources/acquire") return { status: 201, payload: { asset: { id: "asset-1" } } };
+    if (url === "/api/v1/attestations") return { status: 201, payload: { attestation: { id: "att-1" } } };
+    if (url === "/api/v1/library/media/downloads") return { status: 202, payload: { videos: [] } };
     return { status: 200, payload: {} };
   });
   h.evalIn('state.discoveryVideos = [' +
@@ -514,9 +517,10 @@ test("discovery bulk download excludes selected videos hidden by current filters
   await h.settle();
   await h.settle();
 
-  const acquisitions = h.requests.filter((req) => req.url === "/api/v1/sources/acquire");
-  assert.equal(acquisitions.length, 1, "hidden selected videos must not be acquired");
-  assert.equal(acquisitions[0].body.locator.location, "https://www.douyin.com/video/7000000000000000002");
+  const acquisitions = h.requests.filter((req) => req.url === "/api/v1/library/media/downloads");
+  assert.equal(acquisitions.length, 1, "bulk download must converge to one durable request");
+  assert.equal(acquisitions[0].body.videos.length, 1, "hidden selected videos must not be acquired");
+  assert.equal(acquisitions[0].body.videos[0].canonical_url, "https://www.douyin.com/video/7000000000000000002");
 });
 
 test("transcript row click syncs seek, selection, inspector tab and editor", async () => {
@@ -1338,6 +1342,17 @@ test("switching followed creator clears preview from previous creator", async ()
   assert.ok(
     h.els.followedPreview.innerHTML.includes("Chọn một video để xem chi tiết"),
     "preview must reset to empty prompt under creator B"
+  );
+});
+
+test("Media Library prefers local thumbnail URL over provider cover fallback", async () => {
+  assert.ok(
+    source.includes("item.thumbnail?.url || item.thumbnail?.fallback_url || item.cover_url"),
+    "Media Library must prefer the local thumbnail URL before provider cover fallback"
+  );
+  assert.ok(
+    source.includes("(thumbnailURL ? '<img src=\"' + esc(thumbnailURL)"),
+    "Media Library image rendering must use the resolved thumbnail URL"
   );
 });
 

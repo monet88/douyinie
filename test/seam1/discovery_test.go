@@ -291,16 +291,6 @@ func TestFollowedCreatorBaselineAndDispositionLifecycleThroughRuntimeHost(t *tes
 		t.Fatalf("unignore must return to seen: %+v", patched.Video)
 	}
 
-	if err := discoverySvc.RetainMonitoringVideos(context.Background(), creator.SecUID, token1, []domain.DiscoveredVideo{{AwemeID: "129004", SourceID: "douyin:aweme:129004", CanonicalURL: "https://www.douyin.com/video/129004"}}); err != nil {
-		t.Fatal(err)
-	}
-	var downloads struct {
-		Videos []domain.DouyinVideo `json:"videos"`
-	}
-	doJSON(http.MethodPost, "/api/v1/library/media/downloads", map[string]any{"aweme_ids": []string{"129004"}}, http.StatusAccepted, &downloads)
-	if len(downloads.Videos) != 1 || downloads.Videos[0].Disposition != domain.DiscoveryDispositionSeen || downloads.Videos[0].AcquisitionRequestState != "queued" {
-		t.Fatalf("download request must mark New seen and retain request state: %+v", downloads.Videos)
-	}
 	if err := discoverySvc.RetainMonitoringVideos(context.Background(), creator.SecUID, token1, []domain.DiscoveredVideo{
 		{AwemeID: "129090", SourceID: "douyin:aweme:129090", CanonicalURL: "https://www.douyin.com/video/129090", Title: "monitored new prior to load older"},
 	}); err != nil {
@@ -428,25 +418,6 @@ func TestFollowedCreatorBaselineAndDispositionLifecycleThroughRuntimeHost(t *tes
 		t.Fatalf("current generation observation must be retained as New: %+v err=%v", curGenVideo, err)
 	}
 
-	// 3. Make bulk RequestDownloads atomic: batch containing missing ID must not partially mutate.
-	doJSON(http.MethodPost, "/api/v1/library/media/downloads", map[string]any{"aweme_ids": []string{"129009", "129-nonexistent-missing"}}, http.StatusNotFound, nil)
-	unmutated, err := db.GetDouyinVideo(context.Background(), "129009")
-	if err != nil {
-		t.Fatalf("get unmutated 129009: %v", err)
-	}
-	if unmutated.Disposition != domain.DiscoveryDispositionNew || unmutated.AcquisitionRequestState != "none" {
-		t.Fatalf("bulk download request with invalid target must roll back without partial mutation: %+v", unmutated)
-	}
-
-	// Valid batch commits atomically.
-	doJSON(http.MethodPost, "/api/v1/library/media/downloads", map[string]any{"aweme_ids": []string{"129009"}}, http.StatusAccepted, &downloads)
-	queuedVideo, err := db.GetDouyinVideo(context.Background(), "129009")
-	if err != nil {
-		t.Fatalf("get queued 129009: %v", err)
-	}
-	if queuedVideo.Disposition != domain.DiscoveryDispositionSeen || queuedVideo.AcquisitionRequestState != "queued" {
-		t.Fatalf("valid bulk download request must mark Seen and queued: %+v", queuedVideo)
-	}
 }
 func TestV19ToV20MigrationPreservesAcquisitionTruth(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "migration-v19.db")

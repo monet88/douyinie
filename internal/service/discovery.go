@@ -39,6 +39,7 @@ type FollowCreatorRequest struct {
 	URL                   string   `json:"url"`
 	RecentLimit           int      `json:"recent_limit,omitempty"`
 	ConfiguredBy          string   `json:"configured_by,omitempty"`
+	RightsAttestationID   string   `json:"rights_attestation_id,omitempty"`
 	AuthorizedCredentials []string `json:"authorized_credentials,omitempty"`
 }
 
@@ -114,16 +115,29 @@ func (s *DiscoveryService) FollowCreator(ctx context.Context, req FollowCreatorR
 		SecUID: lookup.Creator.SecUID, CanonicalURL: lookup.Creator.CanonicalURL, DisplayName: lookup.Creator.DisplayName, AvatarURL: lookup.Creator.AvatarURL,
 		Followed: true, FollowedAt: now, BaselineAt: now, AutomationMode: domain.ChannelAutomationDetect,
 		TargetLanguage: "vi", ReviewPosture: "auto", CoverColor: "#000000", ConfiguredBy: strings.TrimSpace(req.ConfiguredBy),
-		PollState: "idle", CreatedAt: now, UpdatedAt: now,
+		RightsAttestationID: strings.TrimSpace(req.RightsAttestationID),
+		PollState:           "idle", CreatedAt: now, UpdatedAt: now,
 	}
 	if creator.ConfiguredBy == "" {
 		creator.ConfiguredBy = "local-operator"
+	}
+	if creator.RightsAttestationID != "" {
+		attestation, err := s.store.GetRightsAttestation(ctx, creator.RightsAttestationID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve rights attestation: %w", err)
+		}
+		if !attestation.TermsAccepted {
+			return nil, domain.ErrRightsAttestationRequired
+		}
 	}
 	if previous, getErr := s.store.GetFollowedCreator(ctx, creator.SecUID); getErr == nil {
 		creator.AutomationMode = previous.AutomationMode
 		creator.TargetLanguage = previous.TargetLanguage
 		creator.ReviewPosture = previous.ReviewPosture
 		creator.CoverColor = previous.CoverColor
+		if creator.RightsAttestationID == "" {
+			creator.RightsAttestationID = previous.RightsAttestationID
+		}
 		creator.CreatedAt = previous.CreatedAt
 	} else if !errors.Is(getErr, storage.ErrNotFound) {
 		return nil, fmt.Errorf("load existing followed creator: %w", getErr)
@@ -220,14 +234,6 @@ func (s *DiscoveryService) LoadOlder(ctx context.Context, secUID string, req Loa
 		}
 	}
 	return s.store.ListDouyinVideos(ctx, secUID)
-}
-
-func (s *DiscoveryService) RequestDownloads(ctx context.Context, awemeIDs []string) ([]domain.DouyinVideo, error) {
-	if s == nil || s.store == nil {
-		return nil, fmt.Errorf("durable Douyin discovery unavailable")
-	}
-	now := time.Now().UTC()
-	return s.store.MarkDouyinVideosDownloadRequested(ctx, awemeIDs, now)
 }
 
 // RetainMonitoringVideos is the persistence contract later polling (#130) calls

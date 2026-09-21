@@ -352,6 +352,12 @@ func extractAwemeID(rawURL string) string {
 	return m[2]
 }
 
+// DouyinAwemeIDFromURL exposes the provider package's single canonical Douyin
+// URL parser to control-plane callers that must validate persisted identity.
+func DouyinAwemeIDFromURL(rawURL string) string {
+	return extractAwemeID(rawURL)
+}
+
 // resolveRedirect follows at most one redirect hop (short links) and returns
 // the final URL plus the first response status. It never follows into an
 // auth/captcha interstitial loop.

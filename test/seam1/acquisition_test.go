@@ -67,6 +67,8 @@ type acquisitionHarness struct {
 	server   *httptest.Server
 	db       *storage.DB
 	registry *provider.Registry
+	acq      *service.AcquisitionService
+	cred     *governance.CredentialService
 	dir      string
 }
 
@@ -130,7 +132,7 @@ func newAcquisitionHarness(t *testing.T, prober media.Prober) *acquisitionHarnes
 		_ = db.Close()
 	})
 
-	return &acquisitionHarness{server: ts, db: db, registry: registry, dir: tmpDir}
+	return &acquisitionHarness{server: ts, db: db, registry: registry, acq: acqSvc, cred: credSvc, dir: tmpDir}
 }
 
 func setupAcquisitionHarness(t *testing.T) *acquisitionHarness {

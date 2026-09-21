@@ -31,6 +31,7 @@ const state = {
   followedSecUID: "",
   followedPreview: null,
   followedLoadSeq: 0,
+  mediaLibrary: [],
 };
 
 let pollTimer = null;
@@ -39,6 +40,7 @@ const titles = {
   new: "Tạo localization job",
   discover: "Cào ngay",
   followed: "Theo dõi kênh",
+  library: "File đã tải",
   jobs: "Jobs & Queue",
   inspector: "Review Workspace",
   result: "Kết quả",
@@ -240,6 +242,7 @@ function navigate(view) {
   if (view === "inspector") renderInspector();
   if (view === "result") refreshResult().catch(showError);
   if (view === "followed") loadFollowedWorkspace().catch(showError);
+  if (view === "library") loadMediaLibrary().catch(showError);
 }
 
 function getRunPosture(run) {
@@ -2155,6 +2158,19 @@ async function createSource(source, operator) {
   });
 }
 
+async function createDownloadAttestation() {
+  const result = await api("/api/v1/attestations", {
+    method: "POST",
+    body: jsonBody({
+      attestation_type: "OPERATOR_EXPLICIT_CONFIRMATION",
+      declared_by: operatorName(),
+      terms_accepted: true,
+      notes: "Download requested from Douyinie Operator UI",
+    }),
+  });
+  return result.attestation?.id || "";
+}
+
 async function handleNewJob(event) {
   event.preventDefault();
   const button = $("#start-job");
@@ -2827,7 +2843,11 @@ async function setRetainedDisposition(awemeID, action) {
 }
 
 async function requestRetainedDownload(awemeID) {
-  await api("/api/v1/library/media/downloads", { method: "POST", body: jsonBody({ aweme_ids: [awemeID] }) });
+  const attestationID = await createDownloadAttestation();
+  await api("/api/v1/library/media/downloads", {
+    method: "POST",
+    body: jsonBody({ aweme_ids: [awemeID], attestation_id: attestationID, consent_granted: true }),
+  });
   await loadFollowedWorkspace();
   toast("Đã xếp hàng Download", "Video đã chuyển khỏi New và yêu cầu được lưu.", "success");
 }
@@ -2839,25 +2859,55 @@ async function downloadSelectedDiscovery() {
   if (!selected.length) return;
   const button = $("#discovery-download");
   setBusy(button, true, "Đang download " + selected.length + "…");
-  const priorMode = state.sourceMode;
-  let ok = 0;
-  let firstFailure = "";
   try {
-    state.sourceMode = "douyin_url";
-    for (const video of selected) {
-      try {
-        await createSource(video.canonical_url, operatorName());
-        ok += 1;
-      } catch (error) {
-        if (!firstFailure) firstFailure = video.aweme_id + ": " + (error.message || error);
-      }
-    }
-    if (ok) toast("Đã acquire", ok + "/" + selected.length + " video đã được lưu vào source assets.", "success");
-    if (firstFailure) toast("Một số video chưa download được", firstFailure, "error");
+    const attestationID = await createDownloadAttestation();
+    await api("/api/v1/library/media/downloads", {
+      method: "POST",
+      body: jsonBody({ videos: selected, attestation_id: attestationID, consent_granted: true }),
+    });
+    toast("Đã xếp hàng Download", selected.length + " video đã được lưu yêu cầu và chuyển sang worker.", "success");
+    await loadMediaLibrary();
   } finally {
-    state.sourceMode = priorMode;
     setBusy(button, false);
   }
+}
+
+async function loadMediaLibrary() {
+  const data = await api("/api/v1/library/media");
+  state.mediaLibrary = Array.isArray(data.media) ? data.media : [];
+  renderMediaLibrary();
+}
+
+function renderMediaLibrary() {
+  const node = $("#media-library");
+  const status = $("#library-status");
+  if (!node) return;
+  if (status) {
+    const downloaded = state.mediaLibrary.filter((item) => item.acquisition_state === "downloaded").length;
+    const failed = state.mediaLibrary.filter((item) => item.acquisition_state === "failed").length;
+    status.textContent = state.mediaLibrary.length + " file · " + downloaded + " downloaded · " + failed + " failed";
+  }
+  if (!state.mediaLibrary.length) {
+    node.innerHTML = '<div class="empty-state compact-empty"><strong>Chưa có file</strong><span>Download video từ Cào ngay hoặc Theo dõi kênh.</span></div>';
+    return;
+  }
+  node.innerHTML = state.mediaLibrary.map((item) => {
+    const asset = item.asset;
+    const production = Array.isArray(item.production) ? item.production : [];
+    const handoff = production.find((entry) => entry.run_id) || null;
+    const failure = item.failure ? (" · " + (item.failure.code || "FAILED")) : "";
+    const size = asset ? Math.round(Number(asset.byte_size || 0) / 1024 / 1024 * 10) / 10 + " MB" : "chưa có local file";
+    const local = asset?.local_available ? "local" : "remote/pending";
+    const thumbnailURL = item.thumbnail?.url || item.thumbnail?.fallback_url || item.cover_url || "";
+    return '<article class="discovery-card" data-library-source="' + esc(item.source_id) + '">' +
+      (thumbnailURL ? '<img src="' + esc(thumbnailURL) + '" alt="">' : '<div class="discovery-cover-placeholder">DY</div>') +
+      '<div class="discovery-card-body"><strong>' + esc(item.title || item.aweme_id || item.source_id) + '</strong>' +
+      '<span>' + esc(item.acquisition_state || "none") + failure + '</span>' +
+      '<small>' + esc(size) + ' · ' + esc(local) + (item.legacy_fallback ? " · migrated" : "") + '</small></div>' +
+      (item.acquisition_state === "failed" && item.aweme_id ? '<button class="secondary-button" data-library-retry="' + esc(item.aweme_id) + '" type="button">Retry</button>' : '') +
+      (handoff ? '<button class="primary-button" data-library-run="' + esc(handoff.run_id) + '" data-library-view="' + esc(handoff.view || "jobs") + '" type="button">Mở production</button>' : '') +
+      '</article>';
+  }).join("");
 }
 
 function showError(error) {
@@ -2909,6 +2959,19 @@ function bindEvents() {
   $("#discovery-download")?.addEventListener("click", () => downloadSelectedDiscovery().catch(showError));
   $("#discovery-follow")?.addEventListener("click", () => followDiscoveryCreator().catch(showError));
   $("#followed-refresh")?.addEventListener("click", () => loadFollowedWorkspace().catch(showError));
+  $("#library-refresh")?.addEventListener("click", () => loadMediaLibrary().catch(showError));
+  $("#media-library")?.addEventListener("click", (event) => {
+    const retry = event.target.closest("[data-library-retry]");
+    if (retry) {
+      api("/api/v1/library/media/" + encodeURIComponent(retry.dataset.libraryRetry) + "/retry", { method: "POST", body: jsonBody({}) })
+        .then(loadMediaLibrary).catch(showError);
+      return;
+    }
+    const handoff = event.target.closest("[data-library-run]");
+    if (handoff) {
+      selectRun(handoff.dataset.libraryRun, handoff.dataset.libraryView || "jobs").catch(showError);
+    }
+  });
   $("#followed-creators")?.addEventListener("click", (event) => {
     const loadOlder = event.target.closest("[data-load-older]");
     if (loadOlder) {

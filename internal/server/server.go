@@ -21,6 +21,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +44,7 @@ type Server struct {
 	ingest          *service.IngestService
 	acquisition     *service.AcquisitionService
 	discovery       *service.DiscoveryService
+	workstation     *service.WorkstationService
 	registry        *provider.Registry
 	policySvc       *governance.PolicyService
 	licenseSvc      *governance.LicenseService
@@ -79,6 +81,7 @@ type Config struct {
 	Ingest          *service.IngestService
 	Acquisition     *service.AcquisitionService // Douyin URL acquisition ladder (T05)
 	Discovery       *service.DiscoveryService   // transient Douyin search/lookup (Issue #128)
+	Workstation     *service.WorkstationService // durable Download -> Media Library lifecycle (#131)
 	Registry        *provider.Registry
 	PolicySvc       *governance.PolicyService
 	LicenseSvc      *governance.LicenseService
@@ -135,6 +138,9 @@ func New(cfg Config) *Server {
 	if cfg.BundleSvc == nil && cfg.DB != nil && cfg.CASStore != nil {
 		cfg.BundleSvc = service.NewBundleService(cfg.DB, cfg.CASStore, cfg.LicenseSvc)
 	}
+	if cfg.Workstation == nil && cfg.DB != nil && cfg.Acquisition != nil {
+		cfg.Workstation = service.NewWorkstationService(cfg.DB, cfg.Acquisition, cfg.CredSvc)
+	}
 
 	// Wire router-backed speech defaults when both are available.
 	// Speech service defaults are set here so main.go does not need to
@@ -188,6 +194,7 @@ func New(cfg Config) *Server {
 		ingest:         cfg.Ingest,
 		acquisition:    cfg.Acquisition,
 		discovery:      cfg.Discovery,
+		workstation:    cfg.Workstation,
 		registry:       cfg.Registry,
 		policySvc:      cfg.PolicySvc,
 		licenseSvc:     cfg.LicenseSvc,
@@ -209,6 +216,11 @@ func New(cfg Config) *Server {
 		mux:            http.NewServeMux(),
 	}
 	s.routes()
+	if s.workstation != nil {
+		if err := s.workstation.Start(); err != nil {
+			log.Printf("[Workstation] download worker startup failed: %v", err)
+		}
+	}
 
 	// Start background serial queue consumer if enabled.
 	if cfg.AutoRunExecutor {
@@ -356,6 +368,9 @@ func (s *Server) Start() error {
 
 // Shutdown gracefully stops the HTTP server.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.workstation != nil {
+		s.workstation.Stop()
+	}
 	if s.consumerCancel != nil {
 		s.consumerCancel()
 		s.consumerWg.Wait()
@@ -1383,8 +1398,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/followed-creators", s.handleFollowCreator)
 	s.mux.HandleFunc("DELETE /api/v1/followed-creators/{sec_uid}", s.handleUnfollowCreator)
 	s.mux.HandleFunc("POST /api/v1/followed-creators/{sec_uid}/load-older", s.handleLoadOlderCreatorVideos)
+	s.mux.HandleFunc("GET /api/v1/library/media", s.handleListMediaLibrary)
 	s.mux.HandleFunc("POST /api/v1/library/media/downloads", s.handleRequestDouyinDownloads)
+	s.mux.HandleFunc("POST /api/v1/library/media/{aweme_id}/retry", s.handleRetryDouyinDownload)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}", s.handleGetAsset)
+	s.mux.HandleFunc("GET /api/v1/assets/{id}/thumbnail", s.handleGetAssetThumbnail)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/preflight", s.handleGetAssetPreflight)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/audio-role-plan", s.handleSaveAudioRolePlan)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/audio-role-plan/generate", s.handleGenerateAudioRolePlan)
@@ -1853,27 +1871,60 @@ func (s *Server) handlePatchDouyinVideo(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleRequestDouyinDownloads(w http.ResponseWriter, r *http.Request) {
-	if s.discovery == nil {
-		writeError(w, http.StatusServiceUnavailable, "Douyin discovery is not configured")
+	if s.workstation == nil {
+		writeError(w, http.StatusServiceUnavailable, "workstation service is not configured")
 		return
 	}
-	var req struct {
-		AwemeIDs []string `json:"aweme_ids"`
-	}
+	var req service.DownloadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
 		return
 	}
-	if len(req.AwemeIDs) == 0 {
-		writeError(w, http.StatusBadRequest, "aweme_ids is required")
-		return
-	}
-	videos, err := s.discovery.RequestDownloads(r.Context(), req.AwemeIDs)
+	videos, err := s.workstation.QueueDownloads(r.Context(), req)
 	if err != nil {
-		writeDiscoveryError(w, err)
+		writeWorkstationError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"videos": videos})
+}
+
+func (s *Server) handleRetryDouyinDownload(w http.ResponseWriter, r *http.Request) {
+	if s.workstation == nil {
+		writeError(w, http.StatusServiceUnavailable, "workstation service is not configured")
+		return
+	}
+	video, err := s.workstation.Retry(r.Context(), r.PathValue("aweme_id"))
+	if err != nil {
+		writeWorkstationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"video": video})
+}
+
+func (s *Server) handleListMediaLibrary(w http.ResponseWriter, r *http.Request) {
+	if s.workstation == nil {
+		writeError(w, http.StatusServiceUnavailable, "workstation service is not configured")
+		return
+	}
+	media, err := s.workstation.ListMedia(r.Context())
+	if err != nil {
+		writeWorkstationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"media": media})
+}
+
+func writeWorkstationError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, storage.ErrNotFound), errors.Is(err, domain.ErrAssetNotFound):
+		writeError(w, http.StatusNotFound, "not found")
+	case errors.Is(err, domain.ErrRightsAttestationRequired), errors.Is(err, domain.ErrInvalidDiscoveryRequest), errors.Is(err, domain.ErrRawSecretForbidden):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, domain.ErrPolicyBlocked), errors.Is(err, domain.ErrConsentRequired), errors.Is(err, domain.ErrAuthRequired), errors.Is(err, domain.ErrNoEligibleProvider):
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, err.Error())
+	}
 }
 
 func writeDiscoveryError(w http.ResponseWriter, err error) {
@@ -1906,6 +1957,31 @@ func (s *Server) handleGetAsset(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"asset": asset})
+}
+
+func (s *Server) handleGetAssetThumbnail(w http.ResponseWriter, r *http.Request) {
+	asset, err := s.db.GetSourceAsset(r.Context(), r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) || errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	cmd := exec.CommandContext(r.Context(), "ffmpeg",
+		"-v", "error", "-ss", "0", "-i", asset.CASPath,
+		"-frames:v", "1", "-vf", "scale=480:-2",
+		"-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1")
+	thumb, err := cmd.Output()
+	if err != nil || len(thumb) == 0 {
+		writeError(w, http.StatusServiceUnavailable, "local thumbnail unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(thumb)
 }
 
 func (s *Server) handleGetAssetPreflight(w http.ResponseWriter, r *http.Request) {

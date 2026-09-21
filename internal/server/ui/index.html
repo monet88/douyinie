@@ -32,16 +32,20 @@
           <span class="nav-index">03</span>
           <span><strong>Theo dõi kênh</strong><small>Baseline · New / Seen / Ignored</small></span>
         </button>
-        <button class="nav-item" data-view-target="jobs" type="button">
+        <button class="nav-item" data-view-target="library" type="button">
           <span class="nav-index">04</span>
+          <span><strong>File đã tải</strong><small>Download · Retry · Production</small></span>
+        </button>
+        <button class="nav-item" data-view-target="jobs" type="button">
+          <span class="nav-index">05</span>
           <span><strong>Jobs & Queue</strong><small>Tiến độ · 1 active slot</small></span>
         </button>
         <button class="nav-item" data-view-target="inspector" type="button">
-          <span class="nav-index">05</span>
+          <span class="nav-index">06</span>
           <span><strong>Review Workspace</strong><small>Speaker · Timeline · Review</small></span>
         </button>
         <button class="nav-item" data-view-target="result" type="button">
-          <span class="nav-index">06</span>
+          <span class="nav-index">07</span>
           <span><strong>Kết quả</strong><small>Preview & final render</small></span>
         </button>
       </nav>
@@ -287,7 +291,20 @@
           </div>
         </section>
 
-        <!-- VIEW 03: JOBS & QUEUE -->
+        <section class="view" data-view="library" aria-labelledby="library-title">
+          <div class="section-header-row">
+            <div>
+              <p class="section-kicker">Media Library</p>
+              <h2 id="library-title">File đã tải</h2>
+              <p class="lead compact-lead">Trạng thái Download được ghép với SourceAsset local và trạng thái production hiện có.</p>
+            </div>
+            <button class="secondary-button" id="library-refresh" type="button">Refresh</button>
+          </div>
+          <div class="discovery-status" id="library-status">Chưa tải dữ liệu.</div>
+          <div class="discovery-results" id="media-library"></div>
+        </section>
+
+        <!-- JOBS & QUEUE -->
         <section class="view" data-view="jobs" aria-labelledby="jobs-title">
           <div class="section-header-row">
             <div>

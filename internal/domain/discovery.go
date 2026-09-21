@@ -87,6 +87,7 @@ type FollowedCreator struct {
 	ReviewPosture        string                `json:"review_posture"`
 	CoverColor           string                `json:"cover_color"`
 	ConfiguredBy         string                `json:"configured_by"`
+	RightsAttestationID  string                `json:"rights_attestation_id,omitempty"`
 	LastSuccessfulPollAt *time.Time            `json:"last_successful_poll_at,omitempty"`
 	LastAttemptAt        *time.Time            `json:"last_attempt_at,omitempty"`
 	NextCheckAt          *time.Time            `json:"next_check_at,omitempty"`
@@ -107,10 +108,75 @@ type DouyinVideo struct {
 	Origin                  DiscoveryOrigin      `json:"origin"`
 	Disposition             DiscoveryDisposition `json:"disposition"`
 	AcquisitionRequestState string               `json:"acquisition_request_state"`
-	AcquisitionFailureCode  string               `json:"acquisition_failure_code,omitempty"`
+	AcquisitionFailure      *WorkstationFailure  `json:"acquisition_failure,omitempty"`
 	AutomationFailureCode   string               `json:"automation_failure_code,omitempty"`
+	RightsAttestationID     string               `json:"rights_attestation_id,omitempty"`
+	CredentialRef           string               `json:"credential_ref,omitempty"`
+	ConsentGranted          bool                 `json:"consent_granted,omitempty"`
 	LibraryVisible          bool                 `json:"library_visible"`
 	RemovedAt               *time.Time           `json:"removed_at,omitempty"`
 	CreatedAt               time.Time            `json:"created_at"`
 	UpdatedAt               time.Time            `json:"updated_at"`
+}
+
+const (
+	AcquisitionRequestNone        = "none"
+	AcquisitionRequestQueued      = "queued"
+	AcquisitionRequestDownloading = "downloading"
+	AcquisitionRequestDownloaded  = "downloaded"
+	AcquisitionRequestFailed      = "failed"
+)
+
+// WorkstationFailure is safe durable operator-facing failure state. Detail must
+// never contain credential/session material.
+type WorkstationFailure struct {
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	ProviderID string `json:"provider_id,omitempty"`
+}
+
+// MediaLibraryEntry projects workstation browsing state onto canonical
+// AcquisitionProvenance/SourceAsset truth. It is not a second media aggregate.
+type MediaLibraryEntry struct {
+	AwemeID          string              `json:"aweme_id"`
+	SourceID         string              `json:"source_id"`
+	CanonicalURL     string              `json:"canonical_url"`
+	Title            string              `json:"title,omitempty"`
+	CoverURL         string              `json:"cover_url,omitempty"`
+	PublishedAt      *time.Time          `json:"published_at,omitempty"`
+	LikeCount        *int64              `json:"like_count,omitempty"`
+	DurationMs       *int64              `json:"duration_ms,omitempty"`
+	AcquisitionState string              `json:"acquisition_state"`
+	Failure          *WorkstationFailure `json:"failure,omitempty"`
+	LegacyFallback   bool                `json:"legacy_fallback,omitempty"`
+	Asset            *MediaLibraryAsset  `json:"asset,omitempty"`
+	Thumbnail        MediaThumbnail      `json:"thumbnail"`
+	Production       []ProductionHandoff `json:"production,omitempty"`
+}
+
+type MediaLibraryAsset struct {
+	ID             string `json:"id"`
+	SHA256         string `json:"sha256"`
+	ByteSize       int64  `json:"byte_size"`
+	MimeType       string `json:"mime_type"`
+	LocalAvailable bool   `json:"local_available"`
+}
+
+// MediaThumbnail describes a durable local thumbnail recipe. No expiring CDN
+// URL is required after a SourceAsset exists; callers can regenerate frame 0
+// from the immutable asset.
+type MediaThumbnail struct {
+	Kind        string `json:"kind"`
+	AssetID     string `json:"asset_id,omitempty"`
+	URL         string `json:"url,omitempty"`
+	FallbackURL string `json:"fallback_url,omitempty"`
+}
+
+type ProductionHandoff struct {
+	TargetLanguage string `json:"target_language"`
+	JobID          string `json:"job_id"`
+	JobStatus      string `json:"job_status"`
+	RunID          string `json:"run_id,omitempty"`
+	RunStatus      string `json:"run_status,omitempty"`
+	View           string `json:"view"`
 }
