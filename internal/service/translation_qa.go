@@ -323,7 +323,7 @@ var semanticFactAnchors = []SemanticFactAnchor{
 }
 
 // ValidateSegment evaluates a single source/target translation pair.
-func (g *MeaningFirstQAGate) ValidateSegment(source, target, srcLang, tgtLang string) QAResult {
+func (g *MeaningFirstQAGate) ValidateSegment(source, target, srcLang, tgtLang string, glossary ...[]domain.GlossaryEntry) QAResult {
 	src := strings.TrimSpace(source)
 	tgt := strings.TrimSpace(target)
 
@@ -507,7 +507,8 @@ func (g *MeaningFirstQAGate) ValidateSegment(source, target, srcLang, tgtLang st
 				expected = ent.EN
 			}
 			// Check if target contains the expected translation or exact ZH brand/name
-			if !strings.Contains(strings.ToLower(tgt), strings.ToLower(expected)) &&
+			glossaryEquivalent := glossaryEquivalentPresent(src, tgt, ent.ZH, glossary)
+			if !glossaryEquivalent && !strings.Contains(strings.ToLower(tgt), strings.ToLower(expected)) &&
 				!strings.Contains(tgt, ent.ZH) {
 				violations = append(violations, fmt.Sprintf("entity '%s' expected '%s' in target", ent.ZH, expected))
 			}
@@ -525,7 +526,7 @@ func (g *MeaningFirstQAGate) ValidateSegment(source, target, srcLang, tgtLang st
 			facts = append(facts, "name:"+tok)
 			lowerTgt := strings.ToLower(tgt)
 			lowerTok := strings.ToLower(tok)
-			if !strings.Contains(lowerTgt, lowerTok) && !strings.Contains(stripDiacritics(lowerTgt), stripDiacritics(lowerTok)) {
+			if !strings.Contains(lowerTgt, lowerTok) && !strings.Contains(stripDiacritics(lowerTgt), stripDiacritics(lowerTok)) && !glossaryEquivalentPresent(src, tgt, tok, glossary) {
 				// If not found in knownEntities either
 				foundInKnown := false
 				for _, ent := range knownEntities {
@@ -559,6 +560,20 @@ func (g *MeaningFirstQAGate) ValidateSegment(source, target, srcLang, tgtLang st
 		ExtractedFacts:   facts,
 		NegationPolarity: srcNeg,
 	}
+}
+
+func glossaryEquivalentPresent(source, target, protectedSource string, sets [][]domain.GlossaryEntry) bool {
+	for _, entries := range sets {
+		for _, e := range entries {
+			if !glossaryTermMatches(source, e.Source) || !strings.EqualFold(normalizeGlossarySource(e.Source), normalizeGlossarySource(protectedSource)) {
+				continue
+			}
+			if strings.Contains(strings.ToLower(target), strings.ToLower(strings.TrimSpace(e.Target))) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // extractNumbers finds all numeric values in a string (both digits and language words).

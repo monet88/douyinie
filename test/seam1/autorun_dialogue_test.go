@@ -449,13 +449,14 @@ func TestSeam1_AutoRun_Dialogue_SoundtrackPreservation_NonSpeechPreserved(t *tes
 		t.Errorf("expected SoundtrackPreserved=true")
 	}
 
-	// Verify speech window is strictly [0, 800]
+	// Suppression follows the canonical source speech member, not the broader
+	// narration classification window or any borrowed playback allowance.
 	if len(mix.PreservationPlan.SpeechWindows) != 1 {
 		t.Fatalf("expected exactly 1 speech window, got %d", len(mix.PreservationPlan.SpeechWindows))
 	}
 	speechWin := mix.PreservationPlan.SpeechWindows[0]
-	if speechWin.Action != "suppress_dialogue" || speechWin.StartMs != 0 || speechWin.EndMs != 800 {
-		t.Errorf("unexpected speech window %+v; expected [0, 800] suppress_dialogue", speechWin)
+	if speechWin.Action != "suppress_dialogue" || speechWin.StartMs != 0 || speechWin.EndMs != 300 {
+		t.Errorf("unexpected speech window %+v; expected canonical [0, 300] suppress_dialogue", speechWin)
 	}
 
 	// Verify singing window is preserved untouched as [800, 1400]

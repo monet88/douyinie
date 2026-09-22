@@ -329,7 +329,9 @@ func TestSeam1_AcceptanceGate_NormativeInvariants(t *testing.T) {
 			h := setupHarness(t)
 			configureFixtureProviders(t, h, fg)
 
-			jobID, runID := createJobAndRun(t, h)
+			// The canonical fixtures exercise source windows out to ~30s; give the
+			// synthetic media enough real sample extent for the waveform-safe mixer gate.
+			jobID, runID := createJobAndRunWithDuration(t, h, 35.0)
 			job := getJobViaAPI(t, h, jobID)
 			assetID := job.SourceAssetID
 			targetLang := domain.TargetLanguageVI
@@ -396,7 +398,8 @@ func TestSeam1_AcceptanceGate_NormativeInvariants(t *testing.T) {
 			}
 			respMix, mix := runAudioMix(t, h, assetID, mixPayload)
 			if respMix.StatusCode != http.StatusCreated {
-				t.Fatalf("audio-mix failed: status=%d", respMix.StatusCode)
+				body, _ := io.ReadAll(respMix.Body)
+				t.Fatalf("audio-mix failed: status=%d body=%s", respMix.StatusCode, string(body))
 			}
 			if fg.expectDub && dubSegments != nil && mix.DubSegmentsCAS != dubSegments.CASHash {
 				t.Errorf("audio mix DubSegmentsCAS %q != synthesized dub segments CAS %q (lineage breach)",
@@ -459,6 +462,7 @@ func configureFixtureProviders(t *testing.T, h *testHarness, fg fixtureGate) {
 // segments (the fixture's immutable source speech windows).
 func runFixtureTranslation(t *testing.T, h *testHarness, assetID, runID string, segments []domain.TranslationInputSegment, evidence string) *domain.TranslationVariant {
 	t.Helper()
+	pinSeam1TranscriptForSegments(t, h, runID, assetID, segments)
 	resp, v := runTranslation(t, h, assetID, map[string]any{
 		"run_id":          runID,
 		"target_language": domain.TargetLanguageVI,

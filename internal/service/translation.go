@@ -19,7 +19,10 @@ import (
 	"github.com/monet88/douyinie/internal/storage"
 )
 
-const translationMeaningContractVersion = "facts_names_numbers_negation_v4"
+const (
+	translationMeaningContractVersion = "facts_names_numbers_negation_v4"
+	TranslationContractID             = translationMeaningContractVersion + "+request_glossary_v1"
+)
 
 // TranslationInvokeFunc executes one translation provider attempt.
 type TranslationInvokeFunc func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error)
@@ -84,6 +87,24 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 	}
 	in.SourceLanguage = sourceLang
 
+	// A run-scoped direct translation request may already provide canonical segments,
+	// but the resulting artifact must still pin the source transcript it came from.
+	// Prefer run evidence only; never infer this lineage from an unrelated asset-latest run.
+	if strings.TrimSpace(in.TranscriptArtifactCAS) == "" && s.db != nil {
+		if casHash, err := s.db.GetStageArtifactHash(ctx, in.RunID, "speech_understand"); err == nil && casHash != "" {
+			in.TranscriptArtifactCAS = casHash
+		} else if err != nil {
+			return nil, fmt.Errorf("resolve run speech artifact for translation: %w", err)
+		} else if idx, err := s.db.GetTranscriptArtifactIndexByRun(ctx, in.RunID); err == nil && idx != nil {
+			if idx.AssetID != in.AssetID {
+				return nil, fmt.Errorf("run transcript lineage mismatch: %s != %s", idx.AssetID, in.AssetID)
+			}
+			in.TranscriptArtifactCAS = idx.CASHash
+		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("resolve run transcript lineage for translation: %w", err)
+		}
+	}
+
 	// 1. Resolve segments: if none provided, load SpeechBlocks from TranscriptArtifact.
 	// Preserve the transcript CAS hash as a content input to deterministic cache identity.
 	if len(in.Segments) == 0 {
@@ -109,6 +130,36 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 
 	if len(in.Segments) == 0 {
 		return nil, domain.ErrEmptyTranslationInput
+	}
+	if strings.TrimSpace(in.TranscriptArtifactCAS) == "" && s.db != nil && s.cas != nil {
+		if idx, err := s.db.GetTranscriptArtifactIndex(ctx, in.AssetID); err == nil && idx != nil && idx.CASHash != "" {
+			candidateSegments, _, loadErr := s.loadSegmentsFromTranscript(ctx, in.AssetID, idx.CASHash)
+			if loadErr == nil && translationSegmentsExactlyMatch(in.Segments, candidateSegments) {
+				in.TranscriptArtifactCAS = idx.CASHash
+			}
+		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("resolve compatible transcript lineage for translation: %w", err)
+		}
+	}
+	if len(in.Glossary) == 0 && s.db != nil && strings.TrimSpace(in.RunID) != "" {
+		if run, err := s.db.GetRun(ctx, in.RunID); err == nil && run != nil && strings.TrimSpace(run.ConfigSnapshotJSON) != "" {
+			var cfg struct {
+				Glossary []domain.GlossaryEntry `json:"glossary"`
+			}
+			if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
+				return nil, fmt.Errorf("decode frozen run glossary: %w", err)
+			}
+			in.Glossary = cfg.Glossary
+		}
+	}
+	effective, err := effectiveGlossary(in.Glossary, in.Segments)
+	if err != nil {
+		return nil, fmt.Errorf("invalid glossary: %w", err)
+	}
+	in.EffectiveGlossary = effective
+	inputHash, err := s.computeTranslationInputHash(in)
+	if err != nil {
+		return nil, fmt.Errorf("compute translation input identity: %w", err)
 	}
 
 	// 2. Resolve provider policy/capability/health/profile ordering before cache lookup.
@@ -143,7 +194,7 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 					data, err := io.ReadAll(rc)
 					if err == nil {
 						var cachedVariant domain.TranslationVariant
-						if err := json.Unmarshal(data, &cachedVariant); err == nil {
+						if err := json.Unmarshal(data, &cachedVariant); err == nil && cachedVariant.SchemaVersion == domain.TranslationSchemaVersion && cachedVariant.ContractID == TranslationContractID && cachedVariant.EffectiveGlossary.Hash == in.EffectiveGlossary.Hash && cachedVariant.InputHash == inputHash && cachedVariant.TranscriptArtifactCAS == in.TranscriptArtifactCAS {
 							if cachedVariant.AssetID != in.AssetID {
 								cachedVariant.ID = uuid.NewString()
 								cachedVariant.AssetID = in.AssetID
@@ -225,23 +276,27 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 
 	// 6. Build immutable TranslationVariant
 	variant := &domain.TranslationVariant{
-		ID:                uuid.NewString(),
-		SchemaVersion:     domain.TranslationSchemaVersion,
-		AssetID:           in.AssetID,
-		RunID:             in.RunID,
-		JobID:             in.JobID,
-		SourceLanguage:    in.SourceLanguage,
-		TargetLanguage:    in.TargetLanguage,
-		Segments:          validatedSegments,
-		ProviderID:        provID,
-		ModelName:         modelName,
-		ModelVersion:      modelVersion,
-		ServiceBaselineID: serviceBaselineID,
-		ObservedModel:     observedModel,
-		SystemFingerprint: systemFingerprint,
-		ProvenanceHash:    provenanceHash,
-		OverallQAScore:    overallQAScore,
-		CreatedAt:         time.Now().UTC(),
+		ID:                    uuid.NewString(),
+		SchemaVersion:         domain.TranslationSchemaVersion,
+		AssetID:               in.AssetID,
+		RunID:                 in.RunID,
+		JobID:                 in.JobID,
+		SourceLanguage:        in.SourceLanguage,
+		TargetLanguage:        in.TargetLanguage,
+		ContractID:            TranslationContractID,
+		EffectiveGlossary:     in.EffectiveGlossary,
+		TranscriptArtifactCAS: in.TranscriptArtifactCAS,
+		InputHash:             inputHash,
+		Segments:              validatedSegments,
+		ProviderID:            provID,
+		ModelName:             modelName,
+		ModelVersion:          modelVersion,
+		ServiceBaselineID:     serviceBaselineID,
+		ObservedModel:         observedModel,
+		SystemFingerprint:     systemFingerprint,
+		ProvenanceHash:        provenanceHash,
+		OverallQAScore:        overallQAScore,
+		CreatedAt:             time.Now().UTC(),
 	}
 
 	// 7. Persist to CAS & SQLite index
@@ -296,6 +351,75 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 	}
 
 	return variant, nil
+}
+
+func translationSegmentsExactlyMatch(a, b []domain.TranslationInputSegment) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Index != b[i].Index ||
+			strings.TrimSpace(a[i].SourceText) != strings.TrimSpace(b[i].SourceText) ||
+			a[i].SpeakerID != b[i].SpeakerID ||
+			a[i].StartMs != b[i].StartMs ||
+			a[i].EndMs != b[i].EndMs {
+			return false
+		}
+	}
+	return true
+}
+
+// CanReuseVariant verifies that a persisted translation artifact proves the current
+// request-local translation contract and canonical source input. It performs no mutation.
+func (s *TranslationService) CanReuseVariant(ctx context.Context, in domain.TranslationJobInput, variant *domain.TranslationVariant) bool {
+	if variant == nil || variant.SchemaVersion != domain.TranslationSchemaVersion || variant.ContractID != TranslationContractID {
+		return false
+	}
+	if s.TranslateInvoke != nil || s.router == nil {
+		return false
+	}
+	in.TargetLanguage = strings.ToLower(strings.TrimSpace(in.TargetLanguage))
+	in.SourceLanguage = strings.ToLower(strings.TrimSpace(in.SourceLanguage))
+	if in.SourceLanguage == "" {
+		in.SourceLanguage = "zh"
+	}
+	if len(in.Glossary) == 0 && s.db != nil && strings.TrimSpace(in.RunID) != "" {
+		run, err := s.db.GetRun(ctx, in.RunID)
+		if err != nil || run == nil {
+			return false
+		}
+		var cfg struct {
+			Glossary []domain.GlossaryEntry `json:"glossary"`
+		}
+		if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
+			return false
+		}
+		in.Glossary = cfg.Glossary
+	}
+	effective, err := effectiveGlossary(in.Glossary, in.Segments)
+	if err != nil {
+		return false
+	}
+	in.EffectiveGlossary = effective
+	inputHash, err := s.computeTranslationInputHash(in)
+	if err != nil {
+		return false
+	}
+	routeRes, err := s.router.Route(ctx, translationRouteRequest(in))
+	if err != nil || routeRes == nil || routeRes.SelectedProvider == nil {
+		return false
+	}
+	expectedProvenance, err := s.computeProvenanceHash(in, routeRes.SelectedProvider)
+	if err != nil {
+		return false
+	}
+	return variant.AssetID == in.AssetID &&
+		strings.EqualFold(variant.SourceLanguage, in.SourceLanguage) &&
+		strings.EqualFold(variant.TargetLanguage, in.TargetLanguage) &&
+		variant.TranscriptArtifactCAS == in.TranscriptArtifactCAS &&
+		variant.EffectiveGlossary.Hash == effective.Hash &&
+		variant.InputHash == inputHash &&
+		variant.ProvenanceHash == expectedProvenance
 }
 
 // loadSegmentsFromTranscript loads SpeechBlocks from TranscriptArtifact in CAS/DB.
@@ -370,8 +494,10 @@ func (s *TranslationService) computeProvenanceHash(in domain.TranslationJobInput
 		InputHashes: inputHashes,
 		SemanticConfig: func() map[string]any {
 			cfg := map[string]any{
-				"source_language":  in.SourceLanguage,
-				"meaning_contract": translationMeaningContractVersion,
+				"source_language":    in.SourceLanguage,
+				"meaning_contract":   translationMeaningContractVersion,
+				"contract_id":        TranslationContractID,
+				"effective_glossary": in.EffectiveGlossary.Hash,
 			}
 			if bp, ok := p.(interface{ ServiceBaselineID() string }); ok {
 				if baseline := strings.TrimSpace(bp.ServiceBaselineID()); baseline != "" {
@@ -393,11 +519,13 @@ func (s *TranslationService) computeProvenanceHash(in domain.TranslationJobInput
 // deliberately excluded from the reusable stage identity.
 func (s *TranslationService) computeTranslationInputHash(in domain.TranslationJobInput) (string, error) {
 	payload := struct {
-		SourceLanguage string                           `json:"source_language"`
-		Segments       []domain.TranslationInputSegment `json:"segments"`
+		SourceLanguage        string                           `json:"source_language"`
+		Segments              []domain.TranslationInputSegment `json:"segments"`
+		EffectiveGlossaryHash string                           `json:"effective_glossary_hash,omitempty"`
 	}{
-		SourceLanguage: strings.ToLower(strings.TrimSpace(in.SourceLanguage)),
-		Segments:       in.Segments,
+		SourceLanguage:        strings.ToLower(strings.TrimSpace(in.SourceLanguage)),
+		Segments:              in.Segments,
+		EffectiveGlossaryHash: in.EffectiveGlossary.Hash,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -562,7 +690,7 @@ func (s *TranslationService) validateMeaningQA(in domain.TranslationJobInput, se
 	var firstViolation error
 
 	for _, seg := range segments {
-		qaRes := s.qaGate.ValidateSegment(seg.SourceText, seg.TargetText, in.SourceLanguage, in.TargetLanguage)
+		qaRes := s.qaGate.ValidateSegment(seg.SourceText, seg.TargetText, in.SourceLanguage, in.TargetLanguage, glossaryForSource(in.EffectiveGlossary, seg.SourceText))
 
 		seg.PassedQAGate = qaRes.Passed
 		seg.QAConfidence = qaRes.Confidence
@@ -652,6 +780,7 @@ func (s *TranslationService) invokeProvider(ctx context.Context, p provider.Prov
 		SourceLanguage:        in.SourceLanguage,
 		TargetLanguage:        in.TargetLanguage,
 		Segments:              in.Segments,
+		EffectiveGlossary:     in.EffectiveGlossary,
 		AuthorizedCredentials: in.AuthorizedCredentials,
 	}
 
@@ -742,7 +871,15 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 	for i, seg := range transVariant.Segments {
 		slotDurationMs := seg.EndMs - seg.StartMs
 		if slotDurationMs <= 0 {
-			slotDurationMs = 1000
+			dubSegments = append(dubSegments, domain.DubScriptSegment{
+				Index: seg.Index, SourceText: seg.SourceText, MeaningText: seg.TargetText, SpokenText: seg.TargetText,
+				SpeakerID: seg.SpeakerID, StartMs: seg.StartMs, EndMs: seg.EndMs, SlotDurationMs: slotDurationMs,
+				KeyFacts: seg.KeyFacts, PassedQAGate: seg.PassedQAGate, QAConfidence: seg.QAConfidence,
+				RequiresReview: true, ReviewReason: "INVALID_SOURCE_TIMING",
+			})
+			variantRequiresReview = true
+			totalConfidence += seg.QAConfidence
+			continue
 		}
 
 		srcCPS := provider.EstimateSourceSpeakingRate(seg.SourceText, in.SourceLanguage, slotDurationMs)
@@ -756,6 +893,7 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 		}
 
 		meaningText := seg.TargetText
+		applicableGlossary := glossaryForSource(transVariant.EffectiveGlossary, seg.SourceText)
 		adaptRes, err := adapter.AdaptSpokenScript(ctx, provider.SpokenScriptAdaptationRequest{
 			SourceText:            seg.SourceText,
 			SourceLanguage:        in.SourceLanguage,
@@ -765,6 +903,7 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 			SourceSpeakingRateCPS: srcCPS,
 			SourceGapAfterMs:      sourceGapAfterMs,
 			HasNextTurn:           hasNextTurn,
+			ProtectedTerms:        applicableGlossary,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("adapt spoken script for segment %d: %w", seg.Index, err)
@@ -783,7 +922,7 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 
 		// Run Translation QA Gate to guarantee facts/names/numbers/negation survive.
 		// A violation flags the segment for operator review; it never aborts the stage.
-		qaRes := s.qaGate.ValidateSegment(seg.SourceText, spokenText, in.SourceLanguage, in.TargetLanguage)
+		qaRes := s.qaGate.ValidateSegment(seg.SourceText, spokenText, in.SourceLanguage, in.TargetLanguage, applicableGlossary)
 		if !qaRes.Passed {
 			if isShortened {
 				// Fallback to unshortened meaningText if shortened version corrupted facts
@@ -798,7 +937,7 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 				requiresReview = true
 				reviewReason = "QA_GATE_FALLBACK_UNSHORTENED"
 
-				qaRes = s.qaGate.ValidateSegment(seg.SourceText, spokenText, in.SourceLanguage, in.TargetLanguage)
+				qaRes = s.qaGate.ValidateSegment(seg.SourceText, spokenText, in.SourceLanguage, in.TargetLanguage, applicableGlossary)
 			}
 			if !qaRes.Passed {
 				requiresReview = true
@@ -956,6 +1095,9 @@ func (s *TranslationService) loadTranslationVariant(ctx context.Context, assetID
 	}
 	if !strings.EqualFold(variant.TargetLanguage, targetLang) {
 		return nil, "", fmt.Errorf("translation variant target_language mismatch: expected %s, got %s", targetLang, variant.TargetLanguage)
+	}
+	if variant.SchemaVersion != domain.TranslationSchemaVersion || variant.ContractID != TranslationContractID || variant.InputHash == "" || variant.ProvenanceHash == "" {
+		return nil, "", fmt.Errorf("translation variant does not satisfy current translation contract")
 	}
 
 	variant.CASHash = resolvedCAS

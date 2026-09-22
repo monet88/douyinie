@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/monet88/douyinie/internal/domain"
@@ -123,5 +124,42 @@ func TestFitController_Review_WhenUnresolvableOverrun(t *testing.T) {
 	}
 	if res.ReviewReason != "DURATION_OVERRUN" {
 		t.Errorf("expected ReviewReason=DURATION_OVERRUN, got %s", res.ReviewReason)
+	}
+}
+
+func TestFitController_PlaybackWindowBorrowsOnlyReservedGap(t *testing.T) {
+	fc := service.NewFitController()
+	playbackEnd, reserve, policyID := fc.ResolvePlaybackWindow(1000, 2000)
+	if playbackEnd != 1700 || reserve != 300 || policyID == "" {
+		t.Fatalf("playback window = end %d reserve %d policy %q, want 1700/300/non-empty", playbackEnd, reserve, policyID)
+	}
+	res := fc.EvaluateCandidate(context.Background(), service.FitEvaluationInput{
+		SegmentIndex: 0, StartMs: 0, EndMs: 1000, MeasuredDurationMs: 1500,
+		DubPlaybackEndMs: playbackEnd, EffectiveReserveMs: reserve, AttemptNumber: 1,
+	})
+	if res.Decision != domain.FitActionAccept || res.DubPlaybackEndMs != 1700 {
+		t.Fatalf("borrowed-window candidate should ACCEPT, got %+v", res)
+	}
+}
+
+func TestFitController_NoBoundaryAndInvalidTimingFailClosed(t *testing.T) {
+	fc := service.NewFitController()
+	playbackEnd, reserve, _ := fc.ResolvePlaybackWindow(1000, 0)
+	if playbackEnd != 1000 || reserve != 0 {
+		t.Fatalf("media tail must not be borrowed: end=%d reserve=%d", playbackEnd, reserve)
+	}
+	res := fc.EvaluateCandidate(context.Background(), service.FitEvaluationInput{StartMs: 1000, EndMs: 1000, MeasuredDurationMs: 500})
+	if res.Decision != domain.FitActionReview || !res.RequiresReview || res.SlotDurationMs != 0 {
+		t.Fatalf("invalid zero slot must fail closed without fallback: %+v", res)
+	}
+
+	for _, tc := range []service.FitEvaluationInput{
+		{StartMs: -1, EndMs: 1000, MeasuredDurationMs: 500},
+		{StartMs: math.MaxInt64, EndMs: math.MinInt64, MeasuredDurationMs: 500},
+	} {
+		res = fc.EvaluateCandidate(context.Background(), tc)
+		if res.Decision != domain.FitActionReview || !res.RequiresReview || res.SlotDurationMs != 0 || res.ReviewReason != "INVALID_TIMING" {
+			t.Fatalf("negative/overflowing source timing must fail closed without arithmetic fallback: input=%+v result=%+v", tc, res)
+		}
 	}
 }

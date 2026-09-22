@@ -69,6 +69,7 @@ func testBenchmarkIdentity() benchmark.SessionIdentityInput {
 // 5. Resumption with a mismatched identity strictly fails closed with ErrIdentityMismatch.
 func TestSeam1_BenchmarkRunner_ResumableSession(t *testing.T) {
 	h := setupHarness(t)
+	defaultVITTSFake(t, h).DurationMs = 200
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 

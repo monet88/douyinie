@@ -12,6 +12,7 @@ type TranslationRequest struct {
 	SourceLanguage        string
 	TargetLanguage        string
 	Segments              []domain.TranslationInputSegment
+	EffectiveGlossary     domain.EffectiveGlossary
 	AuthorizedCredentials []string
 }
 

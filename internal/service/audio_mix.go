@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -297,7 +299,7 @@ func (s *AudioMixService) SeparateAudio(ctx context.Context, input AudioSeparati
 //
 // Invariants (CapCap-derived, locked by #16 §5-§6, #18, #37):
 // - Mixer purity: deterministic executor, no invented rescue policy, no anchor alteration.
-// - Mixer refusal: strictly REFUSES candidate segments whose measured duration overruns the slot (zero overrun).
+// - Mixer refusal: strictly REFUSES candidates that violate accepted playback, lineage, waveform, or coverage evidence.
 // - Preserves BGM, SFX, ambience, and music-vocal outside and through dialogue windows.
 // - Suppresses source dialogue inside speech windows with smooth crossfades (15-30ms).
 // unresolvedDubReason explains a dub-eligible mix that has no clip to place, naming the dub stage's own
@@ -326,6 +328,54 @@ func unresolvedDubReason(dubSegments *domain.DubSegmentsVariant, dubArtifactErr 
 	}
 	return fmt.Sprintf("dubbing is required but no candidate dub segment could be placed: %d candidate(s) require review and %d lack an accepted fit",
 		len(dubSegments.ReviewSegments), unacceptedCount)
+}
+
+func (s *AudioMixService) loadMixTranscript(casHash, assetID string) (*domain.TranscriptArtifact, error) {
+	if strings.TrimSpace(casHash) == "" {
+		return nil, errors.New("dub artifact does not pin transcript_artifact_cas")
+	}
+	r, err := s.cas.Get(casHash)
+	if err != nil {
+		return nil, fmt.Errorf("read pinned transcript %s: %w", casHash, err)
+	}
+	defer r.Close()
+	var transcript domain.TranscriptArtifact
+	if err := json.NewDecoder(r).Decode(&transcript); err != nil {
+		return nil, fmt.Errorf("decode pinned transcript %s: %w", casHash, err)
+	}
+	if transcript.AssetID != "" && transcript.AssetID != assetID {
+		return nil, fmt.Errorf("pinned transcript asset mismatch: %s != %s", transcript.AssetID, assetID)
+	}
+	return &transcript, nil
+}
+
+func eligibleSpeechBlocks(transcript *domain.TranscriptArtifact, rolePlan *domain.AudioRolePlan) map[int]domain.SpeechBlock {
+	out := make(map[int]domain.SpeechBlock)
+	if transcript == nil || rolePlan == nil {
+		return out
+	}
+	for _, b := range transcript.SpeechBlocks {
+		if b.SegmentType != "" && b.SegmentType != domain.SpeechBlockTypeSpeech {
+			continue
+		}
+		hasDialogue := false
+		blockedByProtectedVocal := false
+		for _, seg := range rolePlan.Segments {
+			if b.StartMs >= seg.EndMs || b.EndMs <= seg.StartMs {
+				continue
+			}
+			switch seg.Role {
+			case domain.AudioRoleNarrationDialogue:
+				hasDialogue = true
+			case domain.AudioRoleSingingMusicVocal, domain.AudioRoleUncertain:
+				blockedByProtectedVocal = true
+			}
+		}
+		if hasDialogue && !blockedByProtectedVocal {
+			out[b.Index] = b
+		}
+	}
+	return out
 }
 
 func (s *AudioMixService) loadDubSpeechClip(seg domain.DubSegment) (media.DubSpeechClip, error) {
@@ -519,20 +569,8 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 				stemsArtifact.CASHash = stemsCASRef
 			}
 		}
-	}
-	if stemsArtifact == nil {
-		stemsIdx, err := s.db.GetAudioStemsArtifactIndex(ctx, input.AssetID)
-		if err == nil && stemsIdx != nil && stemsIdx.CASHash != "" {
-			stemsCASRef = stemsIdx.CASHash
-			r, err := s.cas.Get(stemsIdx.CASHash)
-			if err == nil {
-				defer r.Close()
-				var a domain.AudioStemArtifacts
-				if err := json.NewDecoder(r).Decode(&a); err == nil {
-					stemsArtifact = &a
-					stemsArtifact.CASHash = stemsCASRef
-				}
-			}
+		if stemsArtifact == nil {
+			return nil, fmt.Errorf("explicit audio stems CAS %s is unreadable or invalid", input.AudioStemsCAS)
 		}
 	}
 	if stemsArtifact == nil {
@@ -555,6 +593,9 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 	// the coverage gate below carries this reason into the refusal.
 	var dubArtifactErr string
 	if hasDubEligibleSpeech {
+		if input.DubSegmentsCAS == "" {
+			dubArtifactErr = "dub_segments_cas is required for dub-eligible mixing; latest indexed artifacts are not accepted"
+		}
 		if input.DubSegmentsCAS != "" {
 			dubSegmentsCASRef = input.DubSegmentsCAS
 			r, err := s.cas.Get(input.DubSegmentsCAS)
@@ -569,31 +610,6 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 				}
 			} else {
 				dubArtifactErr = fmt.Sprintf("dub segments CAS %s is unreadable: %v", dubSegmentsCASRef, err)
-			}
-		}
-		if dubSegments == nil {
-			dubIdx, err := s.db.GetDubSegmentsVariantIndex(ctx, input.AssetID, input.TargetLanguage)
-			if err == nil && dubIdx != nil && dubIdx.CASHash != "" {
-				dubSegmentsCASRef = dubIdx.CASHash
-				r, err := s.cas.Get(dubIdx.CASHash)
-				if err == nil {
-					defer r.Close()
-					var d domain.DubSegmentsVariant
-					if err := json.NewDecoder(r).Decode(&d); err == nil {
-						dubSegments = &d
-						dubSegments.CASHash = dubSegmentsCASRef
-					} else if dubArtifactErr == "" {
-						dubArtifactErr = fmt.Sprintf("dub segments CAS %s could not be decoded: %v", dubSegmentsCASRef, err)
-					}
-				} else if dubArtifactErr == "" {
-					dubArtifactErr = fmt.Sprintf("dub segments CAS %s is unreadable: %v", dubSegmentsCASRef, err)
-				}
-			} else if dubArtifactErr == "" {
-				if err != nil {
-					dubArtifactErr = fmt.Sprintf("dub segments artifact index lookup failed: %v", err)
-				} else {
-					dubArtifactErr = fmt.Sprintf("no dub segments artifact is indexed for asset %s (language %s)", input.AssetID, input.TargetLanguage)
-				}
 			}
 		}
 	}
@@ -617,13 +633,7 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 
 	if rolePlan != nil {
 		for _, seg := range rolePlan.Segments {
-			if seg.Role == domain.AudioRoleNarrationDialogue {
-				preservationPlan.SpeechWindows = append(preservationPlan.SpeechWindows, domain.PreservationWindow{
-					StartMs: seg.StartMs,
-					EndMs:   seg.EndMs,
-					Action:  "suppress_dialogue",
-				})
-			} else if seg.Role == domain.AudioRoleSingingMusicVocal {
+			if seg.Role == domain.AudioRoleSingingMusicVocal {
 				preservationPlan.SingingWindows = append(preservationPlan.SingingWindows, domain.PreservationWindow{
 					StartMs: seg.StartMs,
 					EndMs:   seg.EndMs,
@@ -681,32 +691,160 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 		}
 		return &refusedArtifact, fmt.Errorf("%w: %s", domain.ErrMixerOverrunRefused, reason)
 	}
+	if hasDubEligibleSpeech && dubSegments == nil {
+		return refuse(dubArtifactErr)
+	}
+	if hasDubEligibleSpeech {
+		if rolePlan.CASHash == "" {
+			return refuse("audio role plan is not pinned to CAS")
+		}
+		if err := verifyPinnedAudioRolePlan(s.cas, rolePlan, rolePlan.CASHash); err != nil {
+			return refuse(err.Error())
+		}
+	}
 
 	speechClips := make([]media.DubSpeechClip, 0)
+	speechClipSegments := make([]domain.DubSegment, 0)
 	if dubSegments != nil {
-		for _, seg := range dubSegments.Segments {
-			// Skip clips outside accepted speech suppression windows (defensively ignored by mixer)
-			insideSuppression := false
-			for _, w := range preservationPlan.SpeechWindows {
-				if w.Action == "suppress_dialogue" && seg.StartMs >= w.StartMs && seg.EndMs <= w.EndMs {
-					insideSuppression = true
-					break
-				}
+		if dubSegments.SchemaVersion != domain.DubSegmentsSchemaVersion || dubSegments.AssetID != input.AssetID || !strings.EqualFold(dubSegments.TargetLanguage, input.TargetLanguage) {
+			return refuse(fmt.Sprintf("dub artifact lineage mismatch: schema=%d asset=%s language=%s", dubSegments.SchemaVersion, dubSegments.AssetID, dubSegments.TargetLanguage))
+		}
+		if dubSegments.OverallStatus != "PASS" {
+			reason := unresolvedDubReason(dubSegments, "")
+			if reason == "" {
+				reason = fmt.Sprintf("dub artifact is not mixable: overall_status=%q", dubSegments.OverallStatus)
 			}
-			if !insideSuppression {
+			return refuse(reason)
+		}
+		if input.RunID != "" && dubSegments.RunID != input.RunID {
+			return refuse(fmt.Sprintf("dub artifact run lineage mismatch: %s != %s", dubSegments.RunID, input.RunID))
+		}
+		if input.RunID != "" {
+			dubScriptIdx, err := s.db.GetDubScriptVariantIndexByRun(ctx, input.RunID)
+			if err != nil || dubScriptIdx == nil || dubScriptIdx.CASHash == "" || dubSegments.DubScriptVariantCAS != dubScriptIdx.CASHash {
+				return refuse(fmt.Sprintf("dub script lineage mismatch: dub=%q current=%q", dubSegments.DubScriptVariantCAS, func() string {
+					if dubScriptIdx == nil {
+						return ""
+					}
+					return dubScriptIdx.CASHash
+				}()))
+			}
+			voiceIdx, err := s.db.GetVoiceAssignmentIndexByRunID(ctx, input.RunID)
+			if err != nil || voiceIdx == nil || voiceIdx.CASHash == "" || dubSegments.VoiceAssignmentCAS != voiceIdx.CASHash {
+				return refuse(fmt.Sprintf("voice assignment lineage mismatch: dub=%q current=%q", dubSegments.VoiceAssignmentCAS, func() string {
+					if voiceIdx == nil {
+						return ""
+					}
+					return voiceIdx.CASHash
+				}()))
+			}
+		}
+		if err := s.validatePinnedDubbingLineage(input, dubSegments); err != nil {
+			return refuse(err.Error())
+		}
+		if dubSegments.AudioRolePlanCAS == "" || rolePlan.CASHash == "" || dubSegments.AudioRolePlanCAS != rolePlan.CASHash {
+			return refuse(fmt.Sprintf("audio role plan lineage mismatch: dub=%q current=%q", dubSegments.AudioRolePlanCAS, rolePlan.CASHash))
+		}
+		if strings.TrimSpace(dubSegments.FitPolicyID) == "" {
+			return refuse("dub artifact is missing frozen fit policy identity")
+		}
+		fitByIndex := make(map[int]domain.DubbingFitPlan, len(dubSegments.FitPlans))
+		for _, fp := range dubSegments.FitPlans {
+			if _, exists := fitByIndex[fp.SegmentIndex]; exists {
+				return refuse(fmt.Sprintf("duplicate fit evidence for segment %d", fp.SegmentIndex))
+			}
+			fitByIndex[fp.SegmentIndex] = fp
+		}
+		transcript, err := s.loadMixTranscript(dubSegments.TranscriptArtifactCAS, input.AssetID)
+		if err != nil {
+			return refuse(err.Error())
+		}
+		eligible := eligibleSpeechBlocks(transcript, rolePlan)
+		if len(eligible) == 0 {
+			return refuse("pinned transcript contains no dub-eligible source speech members")
+		}
+		// Suppression follows the exact eligible canonical SpeechBlock union, never
+		// the wider AudioRolePlan dialogue ranges and never a borrowed/group envelope.
+		preservationPlan.SpeechWindows = preservationPlan.SpeechWindows[:0]
+		for _, block := range transcript.SpeechBlocks {
+			if block.SegmentType != "" && block.SegmentType != domain.SpeechBlockTypeSpeech {
 				continue
 			}
-			slotDuration := seg.EndMs - seg.StartMs
-			// Mixer refusal: if measured audio exceeds immutable source window (measured duration > slot duration)
-			if seg.MeasuredDurationMs > slotDuration {
-				return refuse(fmt.Sprintf("segment %d measured duration %dms exceeds immutable slot %dms (start: %dms, end: %dms)",
-					seg.Index, seg.MeasuredDurationMs, slotDuration, seg.StartMs, seg.EndMs))
+			if eligibleBlock, ok := eligible[block.Index]; ok && eligibleBlock.StartMs == block.StartMs && eligibleBlock.EndMs == block.EndMs {
+				preservationPlan.SpeechWindows = append(preservationPlan.SpeechWindows, domain.PreservationWindow{
+					StartMs: block.StartMs, EndMs: block.EndMs, Action: "suppress_dialogue",
+				})
+			}
+		}
+		currentFit := NewFitController()
+		currentPolicyID := currentFit.policyID()
+		if currentPolicyID == "" || dubSegments.FitPolicyID != currentPolicyID {
+			return refuse(fmt.Sprintf("dub artifact fit policy mismatch: dub=%q current=%q", dubSegments.FitPolicyID, currentPolicyID))
+		}
+		covered := make(map[int]bool, len(eligible))
+		for _, seg := range dubSegments.Segments {
+			if seg.RequiresReview || seg.FitDecision != domain.FitActionAccept {
+				return refuse(fmt.Sprintf("segment %d is not an accepted mix candidate", seg.Index))
+			}
+			fp, ok := fitByIndex[seg.Index]
+			if !ok || fp.Decision != domain.FitActionAccept || fp.FitPolicyID != dubSegments.FitPolicyID || fp.DubPlaybackEndMs != seg.DubPlaybackEndMs || fp.EffectiveReserveMs != seg.EffectiveReserveMs || !slices.Equal(fp.SpeechBlockIndices, seg.SpeechBlockIndices) {
+				return refuse(fmt.Sprintf("segment %d fit evidence does not match selected playback contract", seg.Index))
+			}
+			if len(seg.SpeechBlockIndices) == 0 {
+				return refuse(fmt.Sprintf("segment %d has no canonical source membership", seg.Index))
+			}
+			minStart, maxEnd := int64(0), int64(0)
+			var lastBlock domain.SpeechBlock
+			for _, member := range seg.SpeechBlockIndices {
+				block, ok := eligible[member]
+				if !ok {
+					return refuse(fmt.Sprintf("segment %d references foreign or non-dub-eligible source member %d", seg.Index, member))
+				}
+				if covered[member] {
+					return refuse(fmt.Sprintf("source member %d is covered more than once", member))
+				}
+				covered[member] = true
+				if minStart == 0 || block.StartMs < minStart {
+					minStart = block.StartMs
+				}
+				if block.EndMs > maxEnd {
+					maxEnd = block.EndMs
+					lastBlock = block
+				}
+			}
+			if seg.StartMs != minStart || seg.EndMs != maxEnd {
+				return refuse(fmt.Sprintf("segment %d source envelope %d-%d does not match member envelope %d-%d", seg.Index, seg.StartMs, seg.EndMs, minStart, maxEnd))
+			}
+			if seg.DubPlaybackEndMs < seg.EndMs || seg.DubPlaybackEndMs <= seg.StartMs {
+				return refuse(fmt.Sprintf("segment %d has invalid playback end %d", seg.Index, seg.DubPlaybackEndMs))
+			}
+			nextBoundary, err := playbackBoundaryForBlock(lastBlock.Index, lastBlock.StartMs, lastBlock.EndMs, transcript, rolePlan)
+			if err != nil {
+				return refuse(err.Error())
+			}
+			expectedEnd, expectedReserve, expectedPolicyID := currentFit.ResolvePlaybackWindow(seg.EndMs, nextBoundary)
+			if expectedPolicyID != dubSegments.FitPolicyID || seg.DubPlaybackEndMs != expectedEnd || seg.EffectiveReserveMs != expectedReserve {
+				return refuse(fmt.Sprintf("segment %d playback policy evidence mismatch: end=%d/%d reserve=%d/%d", seg.Index, seg.DubPlaybackEndMs, expectedEnd, seg.EffectiveReserveMs, expectedReserve))
 			}
 			clip, err := s.loadDubSpeechClip(seg)
 			if err != nil {
 				return refuse(fmt.Sprintf("segment %d audio load or decode failure: %v", seg.Index, err))
 			}
+			if clip.SampleRate <= 0 || clip.Channels <= 0 || len(clip.Samples)%clip.Channels != 0 {
+				return refuse(fmt.Sprintf("segment %d decoded waveform has invalid format", seg.Index))
+			}
+			frames := int64(len(clip.Samples) / clip.Channels)
+			allowedMs := seg.DubPlaybackEndMs - seg.StartMs
+			if frames*1000 > allowedMs*int64(clip.SampleRate) {
+				return refuse(fmt.Sprintf("segment %d decoded waveform exceeds playback window", seg.Index))
+			}
 			speechClips = append(speechClips, clip)
+			speechClipSegments = append(speechClipSegments, seg)
+		}
+		for member := range eligible {
+			if !covered[member] {
+				return refuse(fmt.Sprintf("dub-eligible source member %d has no accepted replacement clip", member))
+			}
 		}
 	}
 	// The dub artifact this mix consumed is what proves the dub lane ran for these slots: a run whose dub
@@ -749,6 +887,34 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 	channels := int(bgHeader.NumChannels)
 	if sampleRate <= 0 || channels <= 0 {
 		return nil, fmt.Errorf("%w: invalid background stem format: sample rate %d, channels %d", domain.ErrSoundtrackPreservationFailed, sampleRate, channels)
+	}
+	if len(bgSamples)%channels != 0 {
+		return nil, fmt.Errorf("%w: background stem sample count is not channel aligned", domain.ErrSoundtrackPreservationFailed)
+	}
+	bgFrames := int64(len(bgSamples) / channels)
+	order := make([]int, len(speechClips))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(i, j int) bool {
+		return speechClipSegments[order[i]].StartMs < speechClipSegments[order[j]].StartMs
+	})
+	for pos, idx := range order {
+		clip := speechClips[idx]
+		seg := speechClipSegments[idx]
+		frames := int64(len(clip.Samples) / clip.Channels)
+		// Compare exact rational sample extents instead of millisecond-rounded metadata.
+		clipEndNumerator := (seg.StartMs*int64(clip.SampleRate) + frames*1000) * int64(sampleRate)
+		mediaEndNumerator := bgFrames * int64(clip.SampleRate) * 1000
+		if clipEndNumerator > mediaEndNumerator {
+			return refuse(fmt.Sprintf("segment %d decoded waveform extends past source media end", seg.Index))
+		}
+		if pos+1 < len(order) {
+			next := speechClipSegments[order[pos+1]]
+			if seg.StartMs*int64(clip.SampleRate)+frames*1000 > next.StartMs*int64(clip.SampleRate) {
+				return refuse(fmt.Sprintf("segment %d decoded waveform collides with localized segment %d", seg.Index, next.Index))
+			}
+		}
 	}
 
 	var vocalsSamples []int16
@@ -797,6 +963,10 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 		input.DuckingGainDb,
 	)
 	mixedWAV := media.EncodePCM16Samples(mixedSamples, sampleRate, channels)
+	verifiedMixed, mixedHeader, err := media.ExtractPCM16Samples(mixedWAV)
+	if err != nil || int(mixedHeader.SampleRate) != sampleRate || int(mixedHeader.NumChannels) != channels || len(verifiedMixed) != len(mixedSamples) {
+		return nil, fmt.Errorf("%w: mixed output format/sample extent verification failed", domain.ErrSoundtrackPreservationFailed)
+	}
 	mixedDurationMs, _ := media.ProbeWAVBytes(mixedWAV)
 	if mixedDurationMs <= 0 {
 		mixedDurationMs = bgHeader.DurationMs
@@ -873,4 +1043,54 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 	}
 	_ = asset
 	return &mixArtifact, nil
+}
+
+func (s *AudioMixService) validatePinnedDubbingLineage(input AudioMixInput, dubSegments *domain.DubSegmentsVariant) error {
+	if s.cas == nil || dubSegments == nil {
+		return errors.New("pinned dubbing lineage requires CAS")
+	}
+	if strings.TrimSpace(dubSegments.DubScriptVariantCAS) == "" || strings.TrimSpace(dubSegments.VoiceAssignmentCAS) == "" {
+		return errors.New("dub artifact is missing pinned script or voice assignment lineage")
+	}
+
+	dsRC, err := s.cas.Get(dubSegments.DubScriptVariantCAS)
+	if err != nil {
+		return fmt.Errorf("read pinned dub script %s: %w", dubSegments.DubScriptVariantCAS, err)
+	}
+	var dubScript domain.DubScriptVariant
+	decodeErr := json.NewDecoder(dsRC).Decode(&dubScript)
+	dsRC.Close()
+	if decodeErr != nil {
+		return fmt.Errorf("decode pinned dub script %s: %w", dubSegments.DubScriptVariantCAS, decodeErr)
+	}
+	if dubScript.SchemaVersion != domain.DubScriptSchemaVersion || dubScript.AssetID != input.AssetID || !strings.EqualFold(dubScript.TargetLanguage, input.TargetLanguage) {
+		return fmt.Errorf("pinned dub script lineage mismatch: schema=%d asset=%s language=%s", dubScript.SchemaVersion, dubScript.AssetID, dubScript.TargetLanguage)
+	}
+	if input.RunID != "" && dubScript.RunID != input.RunID {
+		return fmt.Errorf("pinned dub script run lineage mismatch: %s != %s", dubScript.RunID, input.RunID)
+	}
+
+	vaRC, err := s.cas.Get(dubSegments.VoiceAssignmentCAS)
+	if err != nil {
+		return fmt.Errorf("read pinned voice assignment %s: %w", dubSegments.VoiceAssignmentCAS, err)
+	}
+	var voiceAssignment domain.VoiceAssignment
+	decodeErr = json.NewDecoder(vaRC).Decode(&voiceAssignment)
+	vaRC.Close()
+	if decodeErr != nil {
+		return fmt.Errorf("decode pinned voice assignment %s: %w", dubSegments.VoiceAssignmentCAS, decodeErr)
+	}
+	if voiceAssignment.SchemaVersion != domain.VoiceAssignmentSchemaVersion || voiceAssignment.AssetID != input.AssetID || !strings.EqualFold(voiceAssignment.TargetLanguage, input.TargetLanguage) {
+		return fmt.Errorf("pinned voice assignment lineage mismatch: schema=%d asset=%s language=%s", voiceAssignment.SchemaVersion, voiceAssignment.AssetID, voiceAssignment.TargetLanguage)
+	}
+	if input.RunID != "" && voiceAssignment.RunID != input.RunID {
+		return fmt.Errorf("pinned voice assignment run lineage mismatch: %s != %s", voiceAssignment.RunID, input.RunID)
+	}
+	if voiceAssignment.DubScriptVariantCAS != dubSegments.DubScriptVariantCAS {
+		return fmt.Errorf("voice assignment dub script lineage mismatch: voice=%q dub=%q", voiceAssignment.DubScriptVariantCAS, dubSegments.DubScriptVariantCAS)
+	}
+	if voiceAssignment.TranscriptArtifactCAS != dubSegments.TranscriptArtifactCAS {
+		return fmt.Errorf("voice assignment transcript lineage mismatch: voice=%q dub=%q", voiceAssignment.TranscriptArtifactCAS, dubSegments.TranscriptArtifactCAS)
+	}
+	return nil
 }

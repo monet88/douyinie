@@ -736,11 +736,40 @@ func (r *BenchmarkRunner) ExecuteQualityCase(ctx context.Context, input QualityC
 		}
 		transcriptCAS = r.session.QualityCases[input.CaseID].Stages["speech_understand"].OutputCASHash
 	}
+	canonicalSegments := input.Segments
+	if !input.IsNoDub {
+		if qc.StageArtifacts.Transcript == nil {
+			return qc, fmt.Errorf("quality case %s is missing current transcript evidence", input.CaseID)
+		}
+		var rolePlan *domain.AudioRolePlan
+		if len(input.AudioRoleSegments) > 0 {
+			rolePlan = &domain.AudioRolePlan{AssetID: qc.SourceAssetID, Segments: input.AudioRoleSegments}
+		}
+		canonicalSegments = make([]domain.TranslationInputSegment, 0, len(qc.StageArtifacts.Transcript.SpeechBlocks))
+		for _, block := range qc.StageArtifacts.Transcript.SpeechBlocks {
+			if block.SegmentType != "" && block.SegmentType != domain.SpeechBlockTypeSpeech {
+				continue
+			}
+			if rolePlan != nil && !domain.IsInsideDialogueWindow(block.StartMs, block.EndMs, rolePlan) {
+				continue
+			}
+			if strings.TrimSpace(block.SourceText) == "" {
+				continue
+			}
+			canonicalSegments = append(canonicalSegments, domain.TranslationInputSegment{
+				Index: block.Index, SourceText: block.SourceText, SpeakerID: block.SpeakerID,
+				StartMs: block.StartMs, EndMs: block.EndMs,
+			})
+		}
+		if len(canonicalSegments) == 0 {
+			return qc, fmt.Errorf("quality case %s transcript has no canonical speech segments", input.CaseID)
+		}
+	}
 	// Stage 3: Translation
 	var translationCAS string
 	if !input.IsNoDub {
 		err := runStage("translate", func() (string, error) {
-			variant, err := r.client.RunTranslation(ctx, qc.SourceAssetID, qc.RunID, qc.JobID, input.TargetLanguage, input.Segments, routeOpts)
+			variant, err := r.client.RunTranslation(ctx, qc.SourceAssetID, qc.RunID, qc.JobID, input.TargetLanguage, canonicalSegments, routeOpts)
 			if err != nil {
 				return "", err
 			}
@@ -757,7 +786,7 @@ func (r *BenchmarkRunner) ExecuteQualityCase(ctx context.Context, input QualityC
 	var dubScriptCAS string
 	if !input.IsNoDub {
 		err := runStage("dub_script", func() (string, error) {
-			variant, err := r.client.RunDubScript(ctx, qc.SourceAssetID, qc.RunID, qc.JobID, input.TargetLanguage, translationCAS, input.Segments, routeOpts)
+			variant, err := r.client.RunDubScript(ctx, qc.SourceAssetID, qc.RunID, qc.JobID, input.TargetLanguage, translationCAS, canonicalSegments, routeOpts)
 			if err != nil {
 				return "", err
 			}

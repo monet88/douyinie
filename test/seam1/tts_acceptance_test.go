@@ -10,6 +10,7 @@ import (
 	"github.com/monet88/douyinie/internal/governance"
 	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/provider"
+	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
 	"net/http"
 	"testing"
@@ -19,6 +20,7 @@ import (
 // Helper to run translation and dub-script adaptation to produce DubScriptVariant
 func setupDubScriptForSeam1(t *testing.T, h *testHarness, runID, assetID string, segments []domain.TranslationInputSegment) (*domain.TranslationVariant, *domain.DubScriptVariant) {
 	t.Helper()
+	pinSeam1TranscriptForSegments(t, h, runID, assetID, segments)
 
 	// 1. Audio role plan with narration/dialogue
 	planPayload := map[string]any{
@@ -60,6 +62,128 @@ func setupDubScriptForSeam1(t *testing.T, h *testHarness, runID, assetID string,
 	return transVariant, dubVariant
 }
 
+func pinSeam1TranscriptForSegments(t *testing.T, h *testHarness, runID, assetID string, segments []domain.TranslationInputSegment) string {
+	t.Helper()
+	blocks := make([]domain.SpeechBlock, 0, len(segments))
+	for _, seg := range segments {
+		blocks = append(blocks, domain.SpeechBlock{
+			Index: seg.Index, StartMs: seg.StartMs, EndMs: seg.EndMs,
+			SpeakerID: seg.SpeakerID, SourceText: seg.SourceText, SegmentType: domain.SpeechBlockTypeSpeech,
+		})
+	}
+	artifact := domain.TranscriptArtifact{
+		ID: "seam1-transcript-" + uuid.NewString(), AssetID: assetID, RunID: runID,
+		SourceLanguage: "zh", SpeechBlocks: blocks, CreatedAt: time.Now().UTC(),
+	}
+	b, err := json.Marshal(artifact)
+	if err != nil {
+		t.Fatalf("marshal seam1 transcript: %v", err)
+	}
+	obj, err := h.casStore.Put(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("put seam1 transcript: %v", err)
+	}
+	if err := h.db.SaveTranscriptArtifactIndex(context.Background(), storage.TranscriptArtifactIndex{
+		ID: artifact.ID, AssetID: assetID, RunID: runID, CASHash: obj.SHA256,
+		ProvenanceHash: "seam1-transcript-prov-" + uuid.NewString(), CreatedAt: artifact.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save seam1 transcript index: %v", err)
+	}
+	return obj.SHA256
+}
+
+type seam1DubLineage struct {
+	TranscriptCAS      string
+	AudioRolePlanCAS   string
+	DubScriptCAS       string
+	VoiceAssignmentCAS string
+}
+
+// pinSeam1DubLineage materializes the current run-scoped lineage required by the
+// #153 mixer contract while preserving the caller's already-frozen AudioRolePlan.
+func pinSeam1DubLineage(t *testing.T, h *testHarness, runID, assetID, targetLang string, segments []domain.TranslationInputSegment) seam1DubLineage {
+	t.Helper()
+	transcriptCAS := pinSeam1TranscriptForSegments(t, h, runID, assetID, segments)
+	rolePlan, err := h.db.GetAudioRolePlan(context.Background(), assetID)
+	if err != nil {
+		t.Fatalf("get seam1 audio role plan: %v", err)
+	}
+	respTrans, transVariant := runTranslation(t, h, assetID, map[string]any{
+		"run_id": runID, "target_language": targetLang, "segments": segments,
+	})
+	if respTrans.StatusCode != http.StatusCreated || transVariant == nil {
+		t.Fatalf("create seam1 translation lineage: status %d", respTrans.StatusCode)
+	}
+	respDub, dubScript := runDubScript(t, h, assetID, map[string]any{
+		"run_id": runID, "target_language": targetLang, "translation_variant_cas": transVariant.CASHash,
+	})
+	if respDub.StatusCode != http.StatusCreated || dubScript == nil {
+		t.Fatalf("create seam1 dub-script lineage: status %d", respDub.StatusCode)
+	}
+	respVoice, voice := runAssignVoices(t, h, assetID, map[string]any{
+		"run_id": runID, "target_language": targetLang,
+		"dub_script_variant_cas": dubScript.CASHash, "transcript_artifact_cas": transcriptCAS,
+	})
+	if respVoice.StatusCode != http.StatusCreated && respVoice.StatusCode != http.StatusOK {
+		t.Fatalf("create seam1 voice lineage: status %d", respVoice.StatusCode)
+	}
+	if voice == nil || voice.CASHash == "" {
+		t.Fatal("create seam1 voice lineage returned no CAS")
+	}
+	return seam1DubLineage{
+		TranscriptCAS: transcriptCAS, AudioRolePlanCAS: rolePlan.CASHash,
+		DubScriptCAS: dubScript.CASHash, VoiceAssignmentCAS: voice.CASHash,
+	}
+}
+
+func putAcceptedSeam1DubSegments(t *testing.T, h *testHarness, assetID, runID, targetLang string, lineage seam1DubLineage, source []domain.TranslationInputSegment) string {
+	t.Helper()
+	fc := service.NewFitController()
+	_, _, fitPolicyID := fc.ResolvePlaybackWindow(1, 0)
+	segments := make([]domain.DubSegment, 0, len(source))
+	fitPlans := make([]domain.DubbingFitPlan, 0, len(source))
+	for i, src := range source {
+		duration := src.EndMs - src.StartMs
+		wav := media.GeneratePCM16WAV(16000, 1, duration)
+		obj, err := h.casStore.Put(bytes.NewReader(wav))
+		if err != nil {
+			t.Fatalf("put seam1 accepted dub clip: %v", err)
+		}
+		nextStart := int64(0)
+		if i+1 < len(source) && source[i+1].StartMs > src.EndMs {
+			nextStart = source[i+1].StartMs
+		}
+		playbackEnd, reserve, policyID := fc.ResolvePlaybackWindow(src.EndMs, nextStart)
+		segments = append(segments, domain.DubSegment{
+			Index: src.Index, SpeechBlockIndices: []int{src.Index}, SpeakerID: src.SpeakerID,
+			StartMs: src.StartMs, EndMs: src.EndMs, SlotDurationMs: duration, MeasuredDurationMs: duration,
+			AudioSHA256: obj.SHA256, Voice: domain.VoiceProfile{ID: "seam1_voice", Language: targetLang},
+			FitDecision: domain.FitActionAccept, DubPlaybackEndMs: playbackEnd, EffectiveReserveMs: reserve,
+		})
+		fitPlans = append(fitPlans, domain.DubbingFitPlan{
+			SegmentIndex: src.Index, SpeakerID: src.SpeakerID, SlotDurationMs: playbackEnd - src.StartMs, UsableSlotMs: playbackEnd - src.StartMs,
+			MeasuredDurationMs: duration, DubPlaybackEndMs: playbackEnd, EffectiveReserveMs: reserve,
+			FitPolicyID: policyID, SpeechBlockIndices: []int{src.Index}, Decision: domain.FitActionAccept,
+		})
+	}
+	variant := domain.DubSegmentsVariant{
+		ID: "seam1-dub-segments-" + uuid.NewString(), SchemaVersion: domain.DubSegmentsSchemaVersion,
+		AssetID: assetID, RunID: runID, TargetLanguage: targetLang,
+		DubScriptVariantCAS: lineage.DubScriptCAS, VoiceAssignmentCAS: lineage.VoiceAssignmentCAS,
+		TranscriptArtifactCAS: lineage.TranscriptCAS, AudioRolePlanCAS: lineage.AudioRolePlanCAS,
+		FitPolicyID: fitPolicyID, Segments: segments, FitPlans: fitPlans, OverallStatus: "PASS", CreatedAt: time.Now().UTC(),
+	}
+	b, err := json.Marshal(variant)
+	if err != nil {
+		t.Fatalf("marshal seam1 accepted dub variant: %v", err)
+	}
+	obj, err := h.casStore.Put(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("put seam1 accepted dub variant: %v", err)
+	}
+	return obj.SHA256
+}
+
 func runAssignVoices(t *testing.T, h *testHarness, assetID string, payload map[string]any) (*http.Response, *domain.VoiceAssignment) {
 	t.Helper()
 	body, _ := json.Marshal(payload)
@@ -79,6 +203,14 @@ func runAssignVoices(t *testing.T, h *testHarness, assetID string, payload map[s
 
 func runDubSynthesize(t *testing.T, h *testHarness, assetID string, payload map[string]any) (*http.Response, *domain.DubSegmentsVariant) {
 	t.Helper()
+	if _, ok := payload["transcript_artifact_cas"]; !ok {
+		runID, _ := payload["run_id"].(string)
+		idx, err := h.db.GetTranscriptArtifactIndexByRun(context.Background(), runID)
+		if err != nil || idx == nil || idx.CASHash == "" {
+			t.Fatalf("dub-synthesize fixture requires canonical run transcript: %v", err)
+		}
+		payload["transcript_artifact_cas"] = idx.CASHash
+	}
 	body, _ := json.Marshal(payload)
 	resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/dub-synthesize", "application/json", bytes.NewReader(body))
 	if err != nil {

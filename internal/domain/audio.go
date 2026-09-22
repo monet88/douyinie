@@ -10,8 +10,9 @@ import (
 )
 
 var (
-	// ErrMixerOverrunRefused is returned when AudioMixService encounters a candidate segment whose measured duration exceeds its immutable slot.
-	ErrMixerOverrunRefused = errors.New("audio mixer refused: candidate duration overruns immutable source slot")
+	// ErrMixerOverrunRefused is returned when AudioMixService cannot prove the accepted
+	// playback/coverage contract for the replacement waveform.
+	ErrMixerOverrunRefused = errors.New("audio mixer refused: replacement violates accepted playback or coverage contract")
 	// ErrMixerAnchorDrift is returned when AudioMixService detects attempt to shift or alter source timing anchors.
 	ErrMixerAnchorDrift = errors.New("audio mixer refused: source timing anchor alteration is prohibited")
 	// ErrSoundtrackPreservationFailed is returned when soundtrack preservation cannot be satisfied.
@@ -31,7 +32,7 @@ var (
 const (
 	AudioRolePlanSchemaVersion = 1
 	AudioStemsSchemaVersion    = 2
-	DubMixSchemaVersion        = 1
+	DubMixSchemaVersion        = 2
 )
 
 // AudioRolePlanProvenance captures deterministic provenance for AudioRolePlan.

@@ -14,7 +14,7 @@ import (
 var (
 	// ErrEngineHoppingForbidden is returned when different providers/engines are mixed across sentences for a single speaker.
 	ErrEngineHoppingForbidden = errors.New("engine hopping across sentences for a single speaker is strictly prohibited")
-	// ErrTTSDurationOverrun is returned when synthesized audio exceeds its immutable source window.
+	// ErrTTSDurationOverrun is returned when synthesized audio exceeds its accepted playback window.
 	ErrTTSDurationOverrun = errors.New("tts synthesized duration overruns immutable source window")
 	// ErrOverlongCandidateNotSelectable is returned when an overlong measured candidate is rejected from selection.
 	ErrOverlongCandidateNotSelectable = errors.New("overlong measured candidate cannot be selected into final dub")
@@ -43,11 +43,10 @@ var (
 const (
 	VoiceAssignmentSchemaVersion = 1
 	// DubSegmentsSchemaVersion is part of the TTS stage cache identity, so it must move
-	// whenever a DubSegmentsVariant's persisted contract or the synthesis behavior that
-	// produces it changes. Issue #94 added whole-speaker escalation plus the Escalations
-	// and FixedRateSpeakers evidence: a variant cached under version 1 predates both and
-	// must never satisfy a request that now requires them.
-	DubSegmentsSchemaVersion = 2
+	// whenever a DubSegmentsVariant's persisted contract or synthesis semantics change.
+	// Version 3 adds the pinned playback-window, canonical source-membership, transcript,
+	// audio-role-plan, and fit-policy evidence required by the current mixing contract.
+	DubSegmentsSchemaVersion = 3
 )
 
 // VoiceProfile represents a preset or cloned voice configuration.
@@ -203,7 +202,11 @@ type DubbingFitPlan struct {
 	DurationDeltaMs    int64     `json:"duration_delta_ms"` // MeasuredDurationMs - UsableSlotMs (>0 means overrun)
 	SpeedFactor        float64   `json:"speed_factor"`      // Speed adjustment multiplier applied
 	NaturalGapMs       int64     `json:"natural_gap_ms"`    // Inter-turn silence preserved
-	Decision           FitAction `json:"decision"`          // ACCEPT | RESYNTH | REWRITE | REGROUP | REVIEW
+	DubPlaybackEndMs   int64     `json:"dub_playback_end_ms"`
+	EffectiveReserveMs int64     `json:"effective_reserve_ms"`
+	FitPolicyID        string    `json:"fit_policy_id"`
+	SpeechBlockIndices []int     `json:"speech_block_indices,omitempty"`
+	Decision           FitAction `json:"decision"` // ACCEPT | RESYNTH | REWRITE | REGROUP | REVIEW
 	DecisionReason     string    `json:"decision_reason,omitempty"`
 	AttemptCount       int       `json:"attempt_count"`
 }
@@ -225,7 +228,7 @@ type TTSCandidate struct {
 }
 
 // DubSegment is the selected audio candidate for a speech segment.
-// It covers 1..N same-speaker SpeechBlocks and is strictly fit-gated (zero overrun).
+// It covers 1..N same-speaker SpeechBlocks and is strictly fit-gated against its accepted playback window.
 type DubSegment struct {
 	Index              int          `json:"index"`
 	SpeechBlockIndices []int        `json:"speech_block_indices,omitempty"`
@@ -243,11 +246,14 @@ type DubSegment struct {
 	ReviewReason       string       `json:"review_reason,omitempty"`
 	RequiresReview     bool         `json:"requires_review,omitempty"`
 	NaturalGapAfterMs  int64        `json:"natural_gap_after_ms"`
+	DubPlaybackEndMs   int64        `json:"dub_playback_end_ms"`
+	EffectiveReserveMs int64        `json:"effective_reserve_ms"`
 }
 
 // DubSegmentReview records an unselected candidate or segment flagged for operator review.
 type DubSegmentReview struct {
 	Index              int          `json:"index"`
+	SpeechBlockIndices []int        `json:"speech_block_indices,omitempty"`
 	SpeakerID          string       `json:"speaker_id"`
 	StartMs            int64        `json:"start_ms"`
 	EndMs              int64        `json:"end_ms"`
@@ -261,10 +267,12 @@ type DubSegmentReview struct {
 	FitDecision        FitAction    `json:"fit_decision"`
 	ReviewReason       string       `json:"review_reason"`
 	AttemptCount       int          `json:"attempt_count"`
+	DubPlaybackEndMs   int64        `json:"dub_playback_end_ms"`
+	EffectiveReserveMs int64        `json:"effective_reserve_ms"`
 }
 
 // VoiceEscalationReasonFixedRateOverrun is the deterministic reason recorded when a
-// fixed-rate preset lane (ZeroTTS) could not fit an immutable source slot after the
+// fixed-rate preset lane (ZeroTTS) could not fit its accepted playback window after the
 // bounded natural-speed rewrite/regroup remedies were exhausted (Issue #94).
 const VoiceEscalationReasonFixedRateOverrun = "UNRESOLVED_FIXED_RATE_DURATION_OVERRUN"
 
@@ -295,17 +303,20 @@ type VoiceProviderEscalation struct {
 
 // DubSegmentsVariant is the immutable target-language dubbing artifact containing all selected DubSegments.
 type DubSegmentsVariant struct {
-	ID                  string             `json:"id"`
-	SchemaVersion       int                `json:"schema_version"`
-	AssetID             string             `json:"asset_id"`
-	RunID               string             `json:"run_id"`
-	JobID               string             `json:"job_id,omitempty"`
-	TargetLanguage      string             `json:"target_language"` // "vi" or "en"
-	DubScriptVariantCAS string             `json:"dub_script_variant_cas,omitempty"`
-	VoiceAssignmentCAS  string             `json:"voice_assignment_cas,omitempty"`
-	Segments            []DubSegment       `json:"segments"`                  // Strictly ACCEPTED fit-gated segments (mixer inputs)
-	ReviewSegments      []DubSegmentReview `json:"review_segments,omitempty"` // Flagged unselected candidates requiring review
-	FitPlans            []DubbingFitPlan   `json:"fit_plans,omitempty"`
+	ID                    string             `json:"id"`
+	SchemaVersion         int                `json:"schema_version"`
+	AssetID               string             `json:"asset_id"`
+	RunID                 string             `json:"run_id"`
+	JobID                 string             `json:"job_id,omitempty"`
+	TargetLanguage        string             `json:"target_language"` // "vi" or "en"
+	DubScriptVariantCAS   string             `json:"dub_script_variant_cas,omitempty"`
+	VoiceAssignmentCAS    string             `json:"voice_assignment_cas,omitempty"`
+	TranscriptArtifactCAS string             `json:"transcript_artifact_cas,omitempty"`
+	AudioRolePlanCAS      string             `json:"audio_role_plan_cas,omitempty"`
+	FitPolicyID           string             `json:"fit_policy_id"`
+	Segments              []DubSegment       `json:"segments"`                  // Strictly ACCEPTED fit-gated segments (mixer inputs)
+	ReviewSegments        []DubSegmentReview `json:"review_segments,omitempty"` // Flagged unselected candidates requiring review
+	FitPlans              []DubbingFitPlan   `json:"fit_plans,omitempty"`
 	// Escalations records whole-speaker provider escalations performed while
 	// generating this variant (Issue #94): empty for the single-pass case.
 	Escalations []VoiceProviderEscalation `json:"escalations,omitempty"`
@@ -369,6 +380,8 @@ type DubbingJobInput struct {
 	TargetLanguage        string           `json:"target_language"` // "vi" or "en"
 	DubScriptVariantCAS   string           `json:"dub_script_variant_cas,omitempty"`
 	VoiceAssignmentCAS    string           `json:"voice_assignment_cas,omitempty"`
+	TranscriptArtifactCAS string           `json:"transcript_artifact_cas,omitempty"`
+	AudioRolePlanCAS      string           `json:"audio_role_plan_cas,omitempty"`
 	ExecutionProfile      ExecutionProfile `json:"execution_profile,omitempty"`
 	AuthorizedCredentials []string         `json:"authorized_credentials,omitempty"`
 }

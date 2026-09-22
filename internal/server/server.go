@@ -3,7 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -826,20 +828,37 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 
 		// 2b. Translation (T06)
 		var transVariant *domain.TranslationVariant
+		var dialogueSegments []domain.TranslationInputSegment
+		for _, b := range transcriptArtifact.SpeechBlocks {
+			if b.SegmentType != "" && b.SegmentType != domain.SpeechBlockTypeSpeech {
+				continue
+			}
+			if rolePlan != nil && len(rolePlan.Segments) > 0 && !domain.IsInsideDialogueWindow(b.StartMs, b.EndMs, rolePlan) {
+				continue
+			}
+			text := strings.TrimSpace(b.SourceText)
+			if text == "" || domain.IsPathologicalRepetitionNoise(text) {
+				continue
+			}
+			dialogueSegments = append(dialogueSegments, domain.TranslationInputSegment{
+				Index: b.Index, SourceText: text, SpeakerID: b.SpeakerID, StartMs: b.StartMs, EndMs: b.EndMs,
+			})
+		}
+		translationInput := domain.TranslationJobInput{
+			RunID: runID, AssetID: assetID, JobID: jobID, TargetLanguage: targetLang,
+			TranscriptArtifactCAS: transcriptArtifact.CASHash, Segments: dialogueSegments,
+		}
 		if reusable, casHash := isStageReusable("translation"); reusable {
-			if s.casStore != nil {
+			if s.casStore != nil && s.translationSvc != nil {
 				rc, err := s.casStore.Get(casHash)
 				if err == nil {
 					var tv domain.TranslationVariant
-					if err := json.NewDecoder(rc).Decode(&tv); err == nil {
+					if err := json.NewDecoder(rc).Decode(&tv); err == nil && s.translationSvc.CanReuseVariant(ctx, translationInput, &tv) {
 						tv.CASHash = casHash
 						transVariant = &tv
 					}
 					rc.Close()
 				}
-			}
-			if transVariant == nil && s.casStore == nil {
-				transVariant = &domain.TranslationVariant{CASHash: casHash}
 			}
 		}
 		if transVariant == nil {
@@ -856,35 +875,7 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 				return s.failRun(ctx, runID, "translation", fmt.Sprintf("failed to record stage start: %v", err))
 			}
 
-			var dialogueSegments []domain.TranslationInputSegment
-			for _, b := range transcriptArtifact.SpeechBlocks {
-				if b.SegmentType != "" && b.SegmentType != domain.SpeechBlockTypeSpeech {
-					continue
-				}
-				if rolePlan != nil && len(rolePlan.Segments) > 0 && !domain.IsInsideDialogueWindow(b.StartMs, b.EndMs, rolePlan) {
-					continue
-				}
-				text := strings.TrimSpace(b.SourceText)
-				if text == "" || domain.IsPathologicalRepetitionNoise(text) {
-					continue
-				}
-				dialogueSegments = append(dialogueSegments, domain.TranslationInputSegment{
-					Index:      b.Index,
-					SourceText: text,
-					SpeakerID:  b.SpeakerID,
-					StartMs:    b.StartMs,
-					EndMs:      b.EndMs,
-				})
-			}
-
-			variant, transErr := s.translationSvc.Translate(ctx, domain.TranslationJobInput{
-				RunID:                 runID,
-				AssetID:               assetID,
-				JobID:                 jobID,
-				TargetLanguage:        targetLang,
-				TranscriptArtifactCAS: transcriptArtifact.CASHash,
-				Segments:              dialogueSegments,
-			})
+			variant, transErr := s.translationSvc.Translate(ctx, translationInput)
 			if transErr != nil {
 				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 					return err
@@ -1026,9 +1017,38 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 
 		// 2e. TTS / Dub Synthesis (T14)
 		if reusable, casHash := isStageReusable("dub_synthesize"); reusable {
-			dubSegmentsCAS = casHash
-		} else {
-			canReuse = false
+			if s.casStore != nil && s.dubbingSvc != nil {
+				rc, err := s.casStore.Get(casHash)
+				if err == nil {
+					var dv domain.DubSegmentsVariant
+					if err := json.NewDecoder(rc).Decode(&dv); err == nil && s.dubbingSvc.CanReuseVariant(ctx, domain.DubbingJobInput{
+						RunID: runID, AssetID: assetID, JobID: jobID, TargetLanguage: targetLang,
+						DubScriptVariantCAS: dubScriptVariant.CASHash, VoiceAssignmentCAS: voiceAssignment.CASHash,
+						TranscriptArtifactCAS: transcriptArtifact.CASHash,
+					}, &dv) {
+						dv.CASHash = casHash
+						dubSegmentsCAS = casHash
+						if dv.OverallStatus == "REVIEW_REQUIRED" {
+							if err := s.db.UpdateJobStatus(ctx, jobID, "review_required"); err != nil {
+								rc.Close()
+								return fmt.Errorf("mark job %s review_required: %w", jobID, err)
+							}
+							if err := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusPaused, domain.RunStatusPaused); err != nil {
+								rc.Close()
+								return fmt.Errorf("pause run %s for dubbing timing review: %w", runID, err)
+							}
+							rc.Close()
+							return nil
+						}
+					}
+					rc.Close()
+				}
+			}
+			if dubSegmentsCAS == "" {
+				canReuse = false
+			}
+		}
+		if dubSegmentsCAS == "" {
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 				return err
 			}
@@ -1039,12 +1059,13 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 			}
 
 			dubSegmentsVariant, ttsErr := s.dubbingSvc.SynthesizeAndFit(ctx, domain.DubbingJobInput{
-				RunID:               runID,
-				AssetID:             assetID,
-				JobID:               jobID,
-				TargetLanguage:      targetLang,
-				DubScriptVariantCAS: dubScriptVariant.CASHash,
-				VoiceAssignmentCAS:  voiceAssignment.CASHash,
+				RunID:                 runID,
+				AssetID:               assetID,
+				JobID:                 jobID,
+				TargetLanguage:        targetLang,
+				DubScriptVariantCAS:   dubScriptVariant.CASHash,
+				VoiceAssignmentCAS:    voiceAssignment.CASHash,
+				TranscriptArtifactCAS: transcriptArtifact.CASHash,
 			})
 			if ttsErr != nil {
 				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
@@ -1064,6 +1085,15 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 			seTTS.UpdatedAt = nowTTSFin
 			if err := s.db.UpdateStageExecution(ctx, *seTTS); err != nil {
 				return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("failed to record stage completion: %v", err))
+			}
+			if dubSegmentsVariant.OverallStatus == "REVIEW_REQUIRED" {
+				if err := s.db.UpdateJobStatus(ctx, jobID, "review_required"); err != nil {
+					return fmt.Errorf("mark job %s review_required: %w", jobID, err)
+				}
+				if err := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusPaused, domain.RunStatusPaused); err != nil {
+					return fmt.Errorf("pause run %s for dubbing timing review: %w", runID, err)
+				}
+				return nil
 			}
 		}
 	}
@@ -2001,7 +2031,8 @@ func (s *Server) handleGetAssetPreflight(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleSaveAudioRolePlan(w http.ResponseWriter, r *http.Request) {
 	assetID := r.PathValue("id")
-	if _, err := s.db.GetSourceAsset(r.Context(), assetID); err != nil {
+	asset, err := s.db.GetSourceAsset(r.Context(), assetID)
+	if err != nil {
 		if errors.Is(err, domain.ErrAssetNotFound) {
 			writeError(w, http.StatusNotFound, "asset not found")
 			return
@@ -2038,8 +2069,46 @@ func (s *Server) handleSaveAudioRolePlan(w http.ResponseWriter, r *http.Request)
 		Segments:  body.Segments,
 		CreatedAt: time.Now().UTC(),
 	}
+	if s.casStore == nil {
+		writeError(w, http.StatusInternalServerError, "CAS store is required to pin audio role plan lineage")
+		return
+	}
+	segmentsJSON, err := json.Marshal(body.Segments)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "marshal audio role plan: "+err.Error())
+		return
+	}
+	configDigest := sha256.Sum256(segmentsJSON)
+	plan.ProviderID = "operator"
+	plan.ModelName = "manual-role-plan"
+	plan.ModelVersion = "1"
+	plan.ProvenanceHash = domain.ComputeAudioRolePlanProvenanceHash(asset.SHA256, "", plan.ProviderID, plan.ModelName, plan.ModelVersion, hex.EncodeToString(configDigest[:]))
+	artifactBytes, err := json.Marshal(plan)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "marshal audio role plan artifact: "+err.Error())
+		return
+	}
+	obj, err := s.casStore.Put(bytes.NewReader(artifactBytes))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store audio role plan artifact: "+err.Error())
+		return
+	}
+	plan.CASHash = obj.SHA256
 
 	if err := s.db.SaveAudioRolePlan(r.Context(), plan); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := s.db.SaveAudioRolePlanIndex(r.Context(), storage.AudioRolePlanIndex{
+		ID:             plan.ID,
+		AssetID:        plan.AssetID,
+		ProviderID:     plan.ProviderID,
+		ModelName:      plan.ModelName,
+		ModelVersion:   plan.ModelVersion,
+		CASHash:        plan.CASHash,
+		ProvenanceHash: plan.ProvenanceHash,
+		CreatedAt:      plan.CreatedAt,
+	}); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -2299,6 +2368,7 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 		TargetLanguage        string                           `json:"target_language"`
 		SourceLanguage        string                           `json:"source_language,omitempty"`
 		Segments              []domain.TranslationInputSegment `json:"segments,omitempty"`
+		Glossary              json.RawMessage                  `json:"glossary,omitempty"`
 		ExecutionProfile      domain.ExecutionProfile          `json:"execution_profile,omitempty"`
 		AuthorizedCredentials []string                         `json:"authorized_credentials,omitempty"`
 		ConsentGranted        bool                             `json:"consent_granted,omitempty"`
@@ -2316,6 +2386,23 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "target_language is required")
 		return
 	}
+	var glossary []domain.GlossaryEntry
+	if len(body.Glossary) > 0 && string(body.Glossary) != "null" {
+		if len(body.Glossary) > 256<<10 {
+			writeError(w, http.StatusBadRequest, "invalid glossary: raw glossary JSON exceeds 256 KiB")
+			return
+		}
+		if err := json.Unmarshal(body.Glossary, &glossary); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid glossary: "+err.Error())
+			return
+		}
+		normalized, err := service.ValidateGlossaryEntries(glossary)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid glossary: "+err.Error())
+			return
+		}
+		glossary = normalized
+	}
 
 	in := domain.TranslationJobInput{
 		RunID:                 body.RunID,
@@ -2324,6 +2411,7 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 		SourceLanguage:        body.SourceLanguage,
 		TargetLanguage:        body.TargetLanguage,
 		Segments:              body.Segments,
+		Glossary:              glossary,
 		ExecutionProfile:      body.ExecutionProfile,
 		AuthorizedCredentials: body.AuthorizedCredentials,
 		ConsentGranted:        body.ConsentGranted,
@@ -2754,6 +2842,10 @@ func (s *Server) handleAuditionVoice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
 		return
 	}
+	if body.IsContextual && strings.TrimSpace(body.RunID) == "" {
+		writeError(w, http.StatusBadRequest, "run_id is required for contextual audition")
+		return
+	}
 
 	in := domain.VoiceAuditionInput{
 		RunID:          body.RunID,
@@ -2820,6 +2912,7 @@ func (s *Server) handleRunDubSynthesize(w http.ResponseWriter, r *http.Request) 
 		TargetLanguage        string                  `json:"target_language"`
 		DubScriptVariantCAS   string                  `json:"dub_script_variant_cas,omitempty"`
 		VoiceAssignmentCAS    string                  `json:"voice_assignment_cas,omitempty"`
+		TranscriptArtifactCAS string                  `json:"transcript_artifact_cas,omitempty"`
 		ExecutionProfile      domain.ExecutionProfile `json:"execution_profile,omitempty"`
 		AuthorizedCredentials []string                `json:"authorized_credentials,omitempty"`
 	}
@@ -2844,6 +2937,7 @@ func (s *Server) handleRunDubSynthesize(w http.ResponseWriter, r *http.Request) 
 		TargetLanguage:        body.TargetLanguage,
 		DubScriptVariantCAS:   body.DubScriptVariantCAS,
 		VoiceAssignmentCAS:    body.VoiceAssignmentCAS,
+		TranscriptArtifactCAS: body.TranscriptArtifactCAS,
 		ExecutionProfile:      body.ExecutionProfile,
 		AuthorizedCredentials: body.AuthorizedCredentials,
 	}
@@ -3010,17 +3104,42 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	if body.ConfigSnapshotJSON == "" {
 		body.ConfigSnapshotJSON = "{}"
 	}
+	var rawCfg map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body.ConfigSnapshotJSON), &rawCfg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid config_snapshot_json: "+err.Error())
+		return
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(body.ConfigSnapshotJSON), &cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid config_snapshot_json: "+err.Error())
+		return
+	}
+	if cfg == nil {
+		cfg = make(map[string]any)
+	}
+	if raw, ok := rawCfg["glossary"]; ok {
+		if len(raw) > 256<<10 {
+			writeError(w, http.StatusBadRequest, "invalid glossary: glossary JSON exceeds 256 KiB or cannot be encoded")
+			return
+		}
+		var entries []domain.GlossaryEntry
+		if err := json.Unmarshal(raw, &entries); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid glossary: "+err.Error())
+			return
+		}
+		normalized, err := service.ValidateGlossaryEntries(entries)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid glossary: "+err.Error())
+			return
+		}
+		cfg["glossary"] = normalized
+	}
 
 	if body.Posture != "" {
-		var cfg map[string]any
-		_ = json.Unmarshal([]byte(body.ConfigSnapshotJSON), &cfg)
-		if cfg == nil {
-			cfg = make(map[string]any)
-		}
 		cfg["posture"] = body.Posture
-		if b, err := json.Marshal(cfg); err == nil {
-			body.ConfigSnapshotJSON = string(b)
-		}
+	}
+	if b, err := json.Marshal(cfg); err == nil {
+		body.ConfigSnapshotJSON = string(b)
 	}
 
 	run := domain.LocalizationRun{
@@ -4544,6 +4663,10 @@ func (s *Server) handleReviewOverride(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
 		return
 	}
+	if strings.TrimSpace(in.RunID) == "" {
+		writeError(w, http.StatusBadRequest, "run_id is required for manual review override; use the run-scoped review endpoint when possible")
+		return
+	}
 
 	in.AssetID = assetID
 	override, err := s.reviewSvc.RecordManualOverride(r.Context(), in)
@@ -4644,6 +4767,10 @@ func (s *Server) handleInspectorCorrectText(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
 		return
 	}
+	if strings.TrimSpace(in.RunID) == "" {
+		writeError(w, http.StatusBadRequest, "run_id is required for target text correction; use the run-scoped inspector endpoint when possible")
+		return
+	}
 
 	in.AssetID = assetID
 	result, err := s.reviewSvc.CorrectTargetText(r.Context(), in)
@@ -4722,6 +4849,10 @@ func (s *Server) handleInspectorReassignVoice(w http.ResponseWriter, r *http.Req
 	var in service.VoiceReassignCorrectionInput
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(in.RunID) == "" {
+		writeError(w, http.StatusBadRequest, "run_id is required for voice reassignment")
 		return
 	}
 

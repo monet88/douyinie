@@ -33,6 +33,7 @@ func defaultVITTSFake(t *testing.T, h *testHarness) *provider.FakeTTSProvider {
 // setupDubScriptForSeam1Lang mirrors setupDubScriptForSeam1 for an explicit target language.
 func setupDubScriptForSeam1Lang(t *testing.T, h *testHarness, runID, assetID, targetLang string, segments []domain.TranslationInputSegment) *domain.DubScriptVariant {
 	t.Helper()
+	pinSeam1TranscriptForSegments(t, h, runID, assetID, segments)
 
 	planBody, _ := json.Marshal(map[string]any{
 		"segments": []domain.AudioSegment{

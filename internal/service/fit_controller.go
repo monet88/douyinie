@@ -2,7 +2,11 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"math"
 
 	"github.com/monet88/douyinie/internal/domain"
 )
@@ -14,6 +18,8 @@ type FitControllerConfig struct {
 	MaxNaturalGapMs      int64   // Maximum natural pause margin (default 400ms)
 	DefaultNaturalGapMs  int64   // Default natural pause margin (default 150ms)
 	AllowRegroupSameTurn bool    // Whether to attempt same-speaker regrouping on overrun
+	ReserveRatio         float64 // Fraction of a genuine following vocal gap reserved as silence.
+	PolicyVersion        string  // Versioned identity for playback-window semantics.
 }
 
 // DefaultFitControllerConfig returns the standard fit controller configuration.
@@ -24,6 +30,8 @@ func DefaultFitControllerConfig() FitControllerConfig {
 		MaxNaturalGapMs:      400,
 		DefaultNaturalGapMs:  150,
 		AllowRegroupSameTurn: true,
+		ReserveRatio:         0.30,
+		PolicyVersion:        "playback-window-v1",
 	}
 }
 
@@ -56,6 +64,8 @@ type FitEvaluationInput struct {
 	CanShortenText     bool    `json:"can_shorten_text"`     // Whether text can be further condensed
 	SupportsSpeedFit   bool    `json:"supports_speed_fit"`   // Whether provider supports native speed adjustment
 	FixedRateVoice     bool    `json:"fixed_rate_voice"`     // Whether a non-1.0 speed request fails closed (preset-voice lanes)
+	DubPlaybackEndMs   int64   `json:"dub_playback_end_ms"`  // Accepted playback ceiling; source EndMs when borrowing is unavailable.
+	EffectiveReserveMs int64   `json:"effective_reserve_ms"`
 }
 
 // FitEvaluationResult contains the controller's decision and fit metrics.
@@ -70,45 +80,73 @@ type FitEvaluationResult struct {
 	Reason             string           `json:"reason"`
 	RequiresReview     bool             `json:"requires_review"`
 	ReviewReason       string           `json:"review_reason,omitempty"`
+	DubPlaybackEndMs   int64            `json:"dub_playback_end_ms"`
+	EffectiveReserveMs int64            `json:"effective_reserve_ms"`
+	FitPolicyID        string           `json:"fit_policy_id"`
+}
+
+func (fc *FitController) policyID() string {
+	cfg := fc.config
+	if cfg.PolicyVersion == "" || !isFinitePositive(cfg.ReserveRatio) || cfg.ReserveRatio > 1 || cfg.MinNaturalGapMs < 0 || cfg.MaxNaturalGapMs < cfg.MinNaturalGapMs {
+		return ""
+	}
+	b, _ := json.Marshal(struct {
+		Version string  `json:"version"`
+		Ratio   float64 `json:"ratio"`
+		Min     int64   `json:"min_ms"`
+		Max     int64   `json:"max_ms"`
+	}{cfg.PolicyVersion, cfg.ReserveRatio, cfg.MinNaturalGapMs, cfg.MaxNaturalGapMs})
+	h := sha256.Sum256(b)
+	return cfg.PolicyVersion + ":" + hex.EncodeToString(h[:])
+}
+
+func isFinitePositive(v float64) bool { return v > 0 && !math.IsNaN(v) && !math.IsInf(v, 0) }
+
+// ResolvePlaybackWindow computes the only allowed silence borrowing: a genuine
+// gap before the next canonical speech/vocal boundary, minus the frozen reserve.
+func (fc *FitController) ResolvePlaybackWindow(sourceEndMs, nextVocalStartMs int64) (playbackEndMs, reserveMs int64, policyID string) {
+	policyID = fc.policyID()
+	if sourceEndMs <= 0 || nextVocalStartMs <= sourceEndMs || policyID == "" {
+		return sourceEndMs, 0, policyID
+	}
+	gap := nextVocalStartMs - sourceEndMs
+	reserve := int64(float64(gap) * fc.config.ReserveRatio)
+	if reserve < fc.config.MinNaturalGapMs {
+		reserve = fc.config.MinNaturalGapMs
+	}
+	if reserve > fc.config.MaxNaturalGapMs {
+		reserve = fc.config.MaxNaturalGapMs
+	}
+	if reserve > gap {
+		reserve = gap
+	}
+	end := nextVocalStartMs - reserve
+	if end < sourceEndMs {
+		end = sourceEndMs
+	}
+	return end, reserve, policyID
 }
 
 // EvaluateCandidate evaluates a measured synthesized audio candidate against immutable source constraints.
 func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluationInput) FitEvaluationResult {
-	slotDurationMs := in.EndMs - in.StartMs
+	if in.StartMs < 0 || in.EndMs <= in.StartMs || in.MeasuredDurationMs <= 0 {
+		return FitEvaluationResult{Decision: domain.FitActionReview, SlotDurationMs: 0, MeasuredDurationMs: in.MeasuredDurationMs, RequiresReview: true, ReviewReason: "INVALID_TIMING", Reason: "invalid source timing or measured duration", DubPlaybackEndMs: in.EndMs, FitPolicyID: fc.policyID()}
+	}
+	playbackEndMs := in.DubPlaybackEndMs
+	if playbackEndMs < in.EndMs {
+		playbackEndMs = in.EndMs
+	}
+	if playbackEndMs == 0 {
+		playbackEndMs = in.EndMs
+	}
+	slotDurationMs := playbackEndMs - in.StartMs
 	if slotDurationMs <= 0 {
-		slotDurationMs = 1000
+		return FitEvaluationResult{Decision: domain.FitActionReview, SlotDurationMs: slotDurationMs, MeasuredDurationMs: in.MeasuredDurationMs, RequiresReview: true, ReviewReason: "INVALID_TIMING", Reason: "invalid playback window", DubPlaybackEndMs: playbackEndMs, FitPolicyID: fc.policyID()}
 	}
 
 	// 1. Calculate natural inter-turn breathing gap
-	var naturalGapMs int64
-	if in.NextTurnStartMs > in.EndMs {
-		gap := in.NextTurnStartMs - in.EndMs
-		// Reserve roughly 30% of silence gap, clamped between MinNaturalGapMs and MaxNaturalGapMs
-		reserved := int64(float64(gap) * 0.30)
-		if reserved < fc.config.MinNaturalGapMs {
-			reserved = fc.config.MinNaturalGapMs
-		}
-		if reserved > fc.config.MaxNaturalGapMs {
-			reserved = fc.config.MaxNaturalGapMs
-		}
-		if gap < reserved {
-			reserved = gap
-		}
-		naturalGapMs = reserved
-	} else if in.SourceGapAfterMs > 0 {
-		naturalGapMs = in.SourceGapAfterMs
-		if naturalGapMs > fc.config.MaxNaturalGapMs {
-			naturalGapMs = fc.config.MaxNaturalGapMs
-		}
-	} else {
-		// Single turn or no gap
-		naturalGapMs = 0
-	}
-
-	usableSlotMs := slotDurationMs - naturalGapMs
-	if usableSlotMs <= 0 {
-		usableSlotMs = slotDurationMs
-	}
+	naturalGapMs := in.EffectiveReserveMs
+	usableSlotMs := slotDurationMs
 
 	deltaMs := in.MeasuredDurationMs - usableSlotMs
 	hardOverrunMs := in.MeasuredDurationMs - slotDurationMs
@@ -125,13 +163,13 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 			NaturalGapMs:       naturalGapMs,
 			Reason:             "fits within usable slot preserving natural breathing gap",
 			RequiresReview:     false,
+			DubPlaybackEndMs:   playbackEndMs, EffectiveReserveMs: naturalGapMs, FitPolicyID: fc.policyID(),
 		}
 	}
 
-	// Case 2: Fits within raw source slot (tts_finish <= source_end), but slightly pinches the natural gap
+	// Case 2: Compatibility branch for a candidate that still fits the accepted playback window.
 	if in.MeasuredDurationMs <= slotDurationMs {
-		// If measured duration is strictly <= slotDurationMs, zero overrun is satisfied!
-		// Preserves perceptible turn gap
+		// Preserve the remaining playback-window margin as perceptual gap evidence.
 		remainingGap := slotDurationMs - in.MeasuredDurationMs
 		return FitEvaluationResult{
 			Decision:           domain.FitActionAccept,
@@ -141,12 +179,13 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 			DurationDeltaMs:    deltaMs,
 			RecommendedSpeed:   1.0,
 			NaturalGapMs:       remainingGap,
-			Reason:             fmt.Sprintf("fits within immutable source slot (remaining pause %dms)", remainingGap),
+			Reason:             fmt.Sprintf("fits within accepted playback window (remaining pause %dms)", remainingGap),
 			RequiresReview:     false,
+			DubPlaybackEndMs:   playbackEndMs, EffectiveReserveMs: naturalGapMs, FitPolicyID: fc.policyID(),
 		}
 	}
 
-	// Case 3: Overruns immutable source slot (hardOverrunMs > 0).
+	// Case 3: Overruns the accepted playback window (hardOverrunMs > 0).
 	// Must not accept without remediation!
 
 	// Strategy A: RESYNTH via measured speed-fit
@@ -170,6 +209,7 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 			NaturalGapMs:       naturalGapMs,
 			Reason:             fmt.Sprintf("overrun by %dms: requesting resynth with calibrated speed %.2fx", hardOverrunMs, speedFactor),
 			RequiresReview:     false,
+			DubPlaybackEndMs:   playbackEndMs, EffectiveReserveMs: naturalGapMs, FitPolicyID: fc.policyID(),
 		}
 	}
 
@@ -185,6 +225,7 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 			NaturalGapMs:       naturalGapMs,
 			Reason:             fmt.Sprintf("overrun by %dms: speed-fit limit reached, requesting shorten-first rewrite", hardOverrunMs),
 			RequiresReview:     false,
+			DubPlaybackEndMs:   playbackEndMs, EffectiveReserveMs: naturalGapMs, FitPolicyID: fc.policyID(),
 		}
 	}
 
@@ -200,6 +241,7 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 			NaturalGapMs:       naturalGapMs,
 			Reason:             fmt.Sprintf("overrun by %dms: requesting same-speaker turn regrouping across %dms gap", hardOverrunMs, in.SourceGapAfterMs),
 			RequiresReview:     false,
+			DubPlaybackEndMs:   playbackEndMs, EffectiveReserveMs: naturalGapMs, FitPolicyID: fc.policyID(),
 		}
 	}
 
@@ -215,5 +257,6 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 		Reason:             fmt.Sprintf("unresolvable duration overrun: measured %dms exceeds slot %dms by %dms", in.MeasuredDurationMs, slotDurationMs, hardOverrunMs),
 		RequiresReview:     true,
 		ReviewReason:       "DURATION_OVERRUN",
+		DubPlaybackEndMs:   playbackEndMs, EffectiveReserveMs: naturalGapMs, FitPolicyID: fc.policyID(),
 	}
 }

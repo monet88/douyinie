@@ -78,6 +78,45 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 		return nil, fmt.Errorf("unsupported target language '%s': must be 'vi' or 'en'", in.TargetLanguage)
 	}
 	in.TargetLanguage = targetLang
+	if s.db != nil {
+		if strings.TrimSpace(in.DubScriptVariantCAS) == "" {
+			if idx, err := s.db.GetDubScriptVariantIndexByRun(ctx, in.RunID); err == nil && idx != nil {
+				if idx.AssetID != in.AssetID || !strings.EqualFold(idx.TargetLanguage, targetLang) {
+					return nil, fmt.Errorf("run %s dub script lineage mismatch for voice assignment", in.RunID)
+				}
+				in.DubScriptVariantCAS = idx.CASHash
+			} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+				return nil, fmt.Errorf("resolve run dub script lineage for voice assignment: %w", err)
+			}
+		}
+		if strings.TrimSpace(in.TranscriptArtifactCAS) == "" {
+			if casHash, err := s.db.GetStageArtifactHash(ctx, in.RunID, "speech_understand"); err == nil && casHash != "" {
+				in.TranscriptArtifactCAS = casHash
+			} else if err != nil {
+				return nil, fmt.Errorf("resolve run speech artifact for voice assignment: %w", err)
+			} else if idx, err := s.db.GetTranscriptArtifactIndexByRun(ctx, in.RunID); err == nil && idx != nil {
+				if idx.AssetID != in.AssetID {
+					return nil, fmt.Errorf("run %s transcript lineage mismatch for voice assignment", in.RunID)
+				}
+				in.TranscriptArtifactCAS = idx.CASHash
+			} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+				return nil, fmt.Errorf("resolve run transcript lineage for voice assignment: %w", err)
+			}
+		}
+		if strings.TrimSpace(in.TranscriptArtifactCAS) == "" && strings.TrimSpace(in.DubScriptVariantCAS) != "" {
+			dubScript, _, err := s.loadDubScriptVariant(ctx, in.AssetID, targetLang, in.DubScriptVariantCAS)
+			if err != nil {
+				return nil, fmt.Errorf("resolve dub script lineage for voice assignment: %w", err)
+			}
+			if strings.TrimSpace(dubScript.TranslationVariantCAS) != "" {
+				transcriptCAS, err := s.transcriptCASFromTranslationVariant(in.AssetID, targetLang, dubScript.TranslationVariantCAS)
+				if err != nil {
+					return nil, err
+				}
+				in.TranscriptArtifactCAS = transcriptCAS
+			}
+		}
+	}
 
 	// Check if video has audio role plan with no dub-eligible dialogue (no-speech bypass)
 	if s.db != nil && in.AssetID != "" {
@@ -130,6 +169,9 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 					if !ok || !domain.VoiceProfileEquivalent(existingProf, custom) {
 						return nil, domain.ErrVoiceAssignmentFrozen
 					}
+				}
+				if existing.DubScriptVariantCAS != in.DubScriptVariantCAS || existing.TranscriptArtifactCAS != in.TranscriptArtifactCAS {
+					return s.supersedeVoiceAssignment(ctx, &existing, in)
 				}
 				return &existing, nil
 			}
@@ -339,6 +381,12 @@ func (s *DubbingService) ReassignVoice(ctx context.Context, in domain.VoiceAssig
 // The base assignment object itself is never mutated.
 func (s *DubbingService) supersedeVoiceAssignment(ctx context.Context, existing *domain.VoiceAssignment, in domain.VoiceAssignmentInput) (*domain.VoiceAssignment, error) {
 	targetLang := in.TargetLanguage
+	if in.DubScriptVariantCAS == "" {
+		in.DubScriptVariantCAS = existing.DubScriptVariantCAS
+	}
+	if in.TranscriptArtifactCAS == "" {
+		in.TranscriptArtifactCAS = existing.TranscriptArtifactCAS
+	}
 
 	// 2. Build new assignments
 	newAssignments := make(map[string]domain.VoiceProfile)
@@ -378,7 +426,8 @@ func (s *DubbingService) supersedeVoiceAssignment(ctx context.Context, existing 
 	}
 	// 3. Compute affected speakers
 	affected := domain.AffectedSpeakers(existing.Assignments, newAssignments)
-	if len(affected) == 0 && existing.UseSameVoiceForAll == in.UseSameVoiceForAll {
+	lineageUnchanged := existing.DubScriptVariantCAS == in.DubScriptVariantCAS && existing.TranscriptArtifactCAS == in.TranscriptArtifactCAS
+	if len(affected) == 0 && existing.UseSameVoiceForAll == in.UseSameVoiceForAll && lineageUnchanged {
 		// Idempotent: nothing changed
 		return existing, nil
 	}
@@ -391,21 +440,23 @@ func (s *DubbingService) supersedeVoiceAssignment(ctx context.Context, existing 
 	distinguishabilityQC := domain.EvaluateVoiceDistinguishability(newAssignments, in.UseSameVoiceForAll)
 	now := time.Now().UTC()
 	newAssignment := &domain.VoiceAssignment{
-		ID:                  uuid.NewString(),
-		SchemaVersion:       domain.VoiceAssignmentSchemaVersion,
-		AssetID:             in.AssetID,
-		RunID:               in.RunID,
-		JobID:               in.JobID,
-		TargetLanguage:      targetLang,
-		Assignments:         newAssignments,
-		UseSameVoiceForAll:  in.UseSameVoiceForAll,
-		SupersedesCAS:       existing.CASHash,
-		InvalidatedSpeakers: affected,
-		InvalidationScope:   domain.VoiceChangeInvalidationStages(),
-		Distinguishability:  distinguishabilityQC,
-		ProvenanceHash:      provenanceHash,
-		FrozenAt:            now,
-		CreatedAt:           now,
+		ID:                    uuid.NewString(),
+		SchemaVersion:         domain.VoiceAssignmentSchemaVersion,
+		AssetID:               in.AssetID,
+		RunID:                 in.RunID,
+		JobID:                 in.JobID,
+		TargetLanguage:        targetLang,
+		Assignments:           newAssignments,
+		UseSameVoiceForAll:    in.UseSameVoiceForAll,
+		DubScriptVariantCAS:   in.DubScriptVariantCAS,
+		TranscriptArtifactCAS: in.TranscriptArtifactCAS,
+		SupersedesCAS:         existing.CASHash,
+		InvalidatedSpeakers:   affected,
+		InvalidationScope:     domain.VoiceChangeInvalidationStages(),
+		Distinguishability:    distinguishabilityQC,
+		ProvenanceHash:        provenanceHash,
+		FrozenAt:              now,
+		CreatedAt:             now,
 	}
 
 	// 4. Commit new assignment to CAS and SQLite index
@@ -557,6 +608,7 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 
 	var sampleText string
 	var startMs int64
+	var sourceEndMs int64
 	var slotEndMs int64
 	var slotDurationMs int64 = 5000
 	// For contextual audition (IsContextual=true):
@@ -567,31 +619,21 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 		if s.cas == nil || s.db == nil || strings.TrimSpace(in.AssetID) == "" {
 			return nil, fmt.Errorf("%w: missing required storage/database for contextual audition", domain.ErrSoundtrackPreservationFailed)
 		}
+		if strings.TrimSpace(in.RunID) == "" {
+			return nil, errors.New("run_id is required for contextual audition")
+		}
 		if rolePlan == nil {
 			return nil, fmt.Errorf("%w: audio role plan required to prove dialogue suppression", domain.ErrAudioRolePlanRequired)
 		}
-		// Resolve the translated segment from the DubScriptVariant this audition targets.
-		// A run-pinned caller (RunID set) must read that run's variant; only a legacy
-		// asset-scoped caller with no run_id falls back to the latest variant for the
-		// asset/language. An asset-scoped lookup for a run-pinned request would let a
-		// newer variant from another run bleed its segment text into this audition, and
-		// SegmentIndex is positional into the run's own segment list.
-		var dIdx *storage.DubScriptVariantIndex
-		if runID := strings.TrimSpace(in.RunID); runID != "" {
-			runIdx, loadErr := s.db.GetDubScriptVariantIndexByRun(ctx, runID)
-			if loadErr != nil || runIdx == nil || runIdx.CASHash == "" {
-				return nil, fmt.Errorf("%w: dub script variant not found for run %s", domain.ErrDubScriptVariantNotFound, runID)
-			}
-			if runIdx.AssetID != in.AssetID || !strings.EqualFold(runIdx.TargetLanguage, targetLang) {
-				return nil, fmt.Errorf("dub script variant run binding mismatch for run %s", runID)
-			}
-			dIdx = runIdx
-		} else {
-			assetIdx, loadErr := s.db.GetDubScriptVariantIndex(ctx, in.AssetID, targetLang)
-			if loadErr != nil || assetIdx == nil || assetIdx.CASHash == "" {
-				return nil, fmt.Errorf("%w: dub script variant not found for asset %s (%s)", domain.ErrDubScriptVariantNotFound, in.AssetID, targetLang)
-			}
-			dIdx = assetIdx
+		// Contextual audition is run-scoped: never substitute an asset-latest script
+		// from another run just because the requested run is missing its own binding.
+		runID := strings.TrimSpace(in.RunID)
+		dIdx, loadErr := s.db.GetDubScriptVariantIndexByRun(ctx, runID)
+		if loadErr != nil || dIdx == nil || dIdx.CASHash == "" {
+			return nil, fmt.Errorf("%w: dub script variant not found for run %s", domain.ErrDubScriptVariantNotFound, runID)
+		}
+		if dIdx.AssetID != in.AssetID || !strings.EqualFold(dIdx.TargetLanguage, targetLang) {
+			return nil, fmt.Errorf("dub script variant run binding mismatch for run %s", runID)
 		}
 		rc, err := s.cas.Get(dIdx.CASHash)
 		if err != nil {
@@ -601,6 +643,9 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 		var dubScript domain.DubScriptVariant
 		if err := json.NewDecoder(rc).Decode(&dubScript); err != nil || len(dubScript.Segments) == 0 {
 			return nil, fmt.Errorf("%w: dub script has no translated segments", domain.ErrDubScriptVariantNotFound)
+		}
+		if dubScript.SchemaVersion != domain.DubScriptSchemaVersion || dubScript.AssetID != in.AssetID || !strings.EqualFold(dubScript.TargetLanguage, targetLang) {
+			return nil, fmt.Errorf("%w: dub script does not satisfy current audition contract", domain.ErrDubScriptVariantNotFound)
 		}
 		segIdx := in.SegmentIndex
 		if segIdx < 0 || segIdx >= len(dubScript.Segments) {
@@ -623,8 +668,49 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 			return nil, fmt.Errorf("%w: inconsistent segment slot duration %d != end-start (%d-%d=%d)", domain.ErrSoundtrackPreservationFailed, seg.SlotDurationMs, seg.EndMs, seg.StartMs, canonicalSlotDur)
 		}
 		startMs = seg.StartMs
-		slotEndMs = seg.EndMs
+		sourceEndMs = seg.EndMs
+		slotEndMs = sourceEndMs
 		slotDurationMs = canonicalSlotDur
+
+		// Borrowing is optional and evidence-gated. When this run pins a transcript,
+		// contextual audition uses the same canonical next-vocal boundary and frozen
+		// FitController policy as full synthesis. Without that run proof it simply
+		// falls back to the immutable source end; it never consults asset-latest state.
+		var transcriptCAS string
+		if casHash, stageErr := s.db.GetStageArtifactHash(ctx, runID, "speech_understand"); stageErr == nil && casHash != "" {
+			transcriptCAS = casHash
+		} else if stageErr != nil {
+			return nil, fmt.Errorf("resolve run speech artifact for contextual audition: %w", stageErr)
+		} else if idx, idxErr := s.db.GetTranscriptArtifactIndexByRun(ctx, runID); idxErr == nil && idx != nil && idx.AssetID == in.AssetID {
+			transcriptCAS = idx.CASHash
+		} else if idxErr != nil && !errors.Is(idxErr, storage.ErrNotFound) {
+			return nil, fmt.Errorf("resolve run transcript for contextual audition: %w", idxErr)
+		}
+		if transcriptCAS != "" {
+			if rolePlan.CASHash == "" {
+				return nil, errors.New("contextual audition requires a CAS-pinned audio role plan")
+			}
+			transcript, pinnedRolePlan, loadErr := s.loadPlaybackTimeline(ctx, domain.DubbingJobInput{
+				RunID: runID, AssetID: in.AssetID, TargetLanguage: targetLang,
+				TranscriptArtifactCAS: transcriptCAS, AudioRolePlanCAS: rolePlan.CASHash,
+			})
+			if loadErr != nil {
+				return nil, loadErr
+			}
+			nextBoundary, boundaryErr := playbackBoundaryForBlock(seg.Index, seg.StartMs, seg.EndMs, transcript, pinnedRolePlan)
+			if boundaryErr != nil {
+				return nil, boundaryErr
+			}
+			fc := s.fitController
+			if fc == nil {
+				fc = NewFitController()
+			}
+			playbackEndMs, _, policyID := fc.ResolvePlaybackWindow(sourceEndMs, nextBoundary)
+			if policyID != "" && playbackEndMs >= sourceEndMs {
+				slotEndMs = playbackEndMs
+				slotDurationMs = slotEndMs - startMs
+			}
+		}
 	} else {
 		sampleText = in.SampleText
 		if sampleText == "" {
@@ -666,6 +752,9 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 		if err != nil || stemsIdx == nil || stemsIdx.CASHash == "" {
 			return nil, fmt.Errorf("%w: stems artifact index not found for asset %s", domain.ErrAudioStemsNotFound, in.AssetID)
 		}
+		if stemsIdx.AssetID != in.AssetID {
+			return nil, fmt.Errorf("%w: stems index belongs to asset %s, expected %s", domain.ErrAudioStemsNotFound, stemsIdx.AssetID, in.AssetID)
+		}
 
 		r, err := s.cas.Get(stemsIdx.CASHash)
 		if err != nil {
@@ -676,6 +765,9 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 		var stemArtifacts domain.AudioStemArtifacts
 		if err := json.NewDecoder(r).Decode(&stemArtifacts); err != nil {
 			return nil, fmt.Errorf("%w: decode stems artifact: %v", domain.ErrSoundtrackPreservationFailed, err)
+		}
+		if stemArtifacts.SchemaVersion != domain.AudioStemsSchemaVersion || stemArtifacts.AssetID != in.AssetID {
+			return nil, fmt.Errorf("%w: stems artifact is incompatible with current asset/schema", domain.ErrSoundtrackPreservationFailed)
 		}
 
 		var bgStem, vocalsStem domain.AudioStem
@@ -766,14 +858,19 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 			return nil, fmt.Errorf("%w: synthesized speech interval [%d, %d]ms exceeds source audio duration %dms", domain.ErrSoundtrackPreservationFailed, startMs, speechEndMs, totalBgDurMs)
 		}
 
-		// Fail closed if speech overruns canonical segment slot window
+		// Fail closed if speech overruns the accepted playback window. Source anchors
+		// remain immutable; only proven post-speech silence may extend this ceiling.
 		if speechEndMs > slotEndMs {
-			return nil, fmt.Errorf("%w: synthesized speech interval [%d, %d]ms overruns canonical segment slot [%d, %d]ms (duration %dms > slot %dms)", domain.ErrTTSDurationOverrun, startMs, speechEndMs, startMs, slotEndMs, speechDurMs, slotDurationMs)
+			return nil, fmt.Errorf("%w: synthesized speech interval [%d, %d]ms overruns accepted playback window [%d, %d]ms (duration %dms > slot %dms)", domain.ErrTTSDurationOverrun, startMs, speechEndMs, startMs, slotEndMs, speechDurMs, slotDurationMs)
 		}
-		// Prove that the entire speech interval [startMs, speechEndMs] is strictly covered
-		// by verified dialogue suppression windows from AudioRolePlan (prevent unsuppressed dialogue collision)
-		if !isSpeechIntervalCoveredBySuppression(startMs, speechEndMs, rolePlan.Segments) {
-			return nil, fmt.Errorf("%w: speech interval [%d, %d]ms is not fully covered by verified dialogue suppression intervals in audio role plan", domain.ErrSoundtrackPreservationFailed, startMs, speechEndMs)
+		// Only the immutable source speech window is suppressed. Any accepted tail
+		// borrowing remains over preserved background/ambience, matching the final mixer.
+		suppressionEndMs := speechEndMs
+		if suppressionEndMs > sourceEndMs {
+			suppressionEndMs = sourceEndMs
+		}
+		if !isSpeechIntervalCoveredBySuppression(startMs, suppressionEndMs, rolePlan.Segments) {
+			return nil, fmt.Errorf("%w: source speech interval [%d, %d]ms is not fully covered by verified dialogue suppression intervals in audio role plan", domain.ErrSoundtrackPreservationFailed, startMs, suppressionEndMs)
 		}
 
 		// Determine preview-local window containing the synthesized speech segment without truncation.
@@ -994,26 +1091,64 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 	if !domain.IsDubEligible(rolePlan) {
 		return nil, domain.ErrNoDubbingRequired
 	}
+	if rolePlan.CASHash == "" {
+		return nil, fmt.Errorf("audio role plan for asset %s is not pinned to CAS", in.AssetID)
+	}
+	in.AudioRolePlanCAS = rolePlan.CASHash
 
-	// 1. Load DubScriptVariant
+	// 1. Load the exact dub script and voice assignment before resolving any omitted
+	// transcript reference. Their persisted lineage is an allowed current-run proof;
+	// asset-latest state is not.
 	dubScript, dubScriptCAS, err := s.loadDubScriptVariant(ctx, in.AssetID, targetLang, in.DubScriptVariantCAS)
 	if err != nil {
 		return nil, fmt.Errorf("load dub script for synthesis: %w", err)
 	}
 	in.DubScriptVariantCAS = dubScriptCAS
-	// 2. Load frozen VoiceAssignment
 	voiceAssign, voiceAssignCAS, err := s.loadVoiceAssignment(ctx, in.AssetID, in.RunID, targetLang, in.VoiceAssignmentCAS)
 	if err != nil {
 		return nil, fmt.Errorf("load voice assignment for synthesis: %w", err)
 	}
 	in.VoiceAssignmentCAS = voiceAssignCAS
+	if strings.TrimSpace(in.TranscriptArtifactCAS) == "" {
+		if casHash, err := s.db.GetStageArtifactHash(ctx, in.RunID, "speech_understand"); err == nil && casHash != "" {
+			in.TranscriptArtifactCAS = casHash
+		} else if err != nil {
+			return nil, fmt.Errorf("resolve run speech artifact for playback-window derivation: %w", err)
+		} else if idx, err := s.db.GetTranscriptArtifactIndexByRun(ctx, in.RunID); err == nil && idx != nil {
+			if idx.AssetID != in.AssetID {
+				return nil, fmt.Errorf("run transcript lineage mismatch: %s != %s", idx.AssetID, in.AssetID)
+			}
+			in.TranscriptArtifactCAS = idx.CASHash
+		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("resolve run transcript artifact for playback-window derivation: %w", err)
+		}
+	}
+	if strings.TrimSpace(in.TranscriptArtifactCAS) == "" && strings.TrimSpace(voiceAssign.TranscriptArtifactCAS) != "" {
+		in.TranscriptArtifactCAS = voiceAssign.TranscriptArtifactCAS
+	}
+	if strings.TrimSpace(in.TranscriptArtifactCAS) == "" && strings.TrimSpace(dubScript.TranslationVariantCAS) != "" {
+		transcriptCAS, err := s.transcriptCASFromTranslationVariant(in.AssetID, targetLang, dubScript.TranslationVariantCAS)
+		if err != nil {
+			return nil, err
+		}
+		in.TranscriptArtifactCAS = transcriptCAS
+	}
+	if strings.TrimSpace(in.TranscriptArtifactCAS) == "" {
+		return nil, fmt.Errorf("pinned transcript artifact is required for playback-window derivation")
+	}
+	if voiceAssign.DubScriptVariantCAS == "" || voiceAssign.DubScriptVariantCAS != dubScriptCAS {
+		return nil, fmt.Errorf("voice assignment dub script lineage mismatch: voice=%q dub=%q", voiceAssign.DubScriptVariantCAS, dubScriptCAS)
+	}
+	if voiceAssign.TranscriptArtifactCAS == "" || voiceAssign.TranscriptArtifactCAS != in.TranscriptArtifactCAS {
+		return nil, fmt.Errorf("voice assignment transcript lineage mismatch: voice=%q transcript=%q", voiceAssign.TranscriptArtifactCAS, in.TranscriptArtifactCAS)
+	}
 
 	pass, err := s.synthesizeSegmentsPass(ctx, in, dubScript, dubScriptCAS, voiceAssign, voiceAssignCAS, nil, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	// Issue #94: a speaker whose immutable source slot is still overrun by a
+	// Issue #94: a speaker whose accepted playback window is still overrun by a
 	// fixed-rate preset lane (ZeroTTS) after the bounded rewrite/regroup remedies
 	// are exhausted escalates once, at whole-speaker scope, to the duration-controlled
 	// fallback lane (CosyVoice3). The escalation supersedes that speaker's frozen
@@ -1035,6 +1170,179 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 	return pass, nil
 }
 
+// CanReuseVariant proves that a persisted dub artifact belongs to the exact
+// current playback/voice/script lineage and fit-policy identity. It is read-only.
+func (s *DubbingService) CanReuseVariant(ctx context.Context, in domain.DubbingJobInput, variant *domain.DubSegmentsVariant) bool {
+	if variant == nil || variant.SchemaVersion != domain.DubSegmentsSchemaVersion || s.db == nil || s.cas == nil {
+		return false
+	}
+	in.TargetLanguage = strings.ToLower(strings.TrimSpace(in.TargetLanguage))
+	rolePlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID)
+	if err != nil || rolePlan == nil || rolePlan.CASHash == "" {
+		return false
+	}
+	in.AudioRolePlanCAS = rolePlan.CASHash
+	if in.TranscriptArtifactCAS == "" {
+		if idx, err := s.db.GetTranscriptArtifactIndexByRun(ctx, in.RunID); err == nil && idx != nil {
+			in.TranscriptArtifactCAS = idx.CASHash
+		}
+	}
+	if in.TranscriptArtifactCAS == "" || variant.AssetID != in.AssetID || variant.RunID != in.RunID ||
+		!strings.EqualFold(variant.TargetLanguage, in.TargetLanguage) || variant.DubScriptVariantCAS != in.DubScriptVariantCAS ||
+		variant.VoiceAssignmentCAS != in.VoiceAssignmentCAS || variant.TranscriptArtifactCAS != in.TranscriptArtifactCAS ||
+		variant.AudioRolePlanCAS != in.AudioRolePlanCAS {
+		return false
+	}
+	fc := s.fitController
+	if fc == nil {
+		fc = NewFitController()
+	}
+	if variant.FitPolicyID == "" || variant.FitPolicyID != fc.policyID() {
+		return false
+	}
+	dubScript, dubCAS, err := s.loadDubScriptVariant(ctx, in.AssetID, in.TargetLanguage, in.DubScriptVariantCAS)
+	if err != nil || dubCAS != in.DubScriptVariantCAS {
+		return false
+	}
+	voiceAssign, voiceCAS, err := s.loadVoiceAssignment(ctx, in.AssetID, in.RunID, in.TargetLanguage, in.VoiceAssignmentCAS)
+	if err != nil || voiceCAS != in.VoiceAssignmentCAS {
+		return false
+	}
+	expected, err := s.computeDubSegmentsProvenanceHash(in, dubScript, voiceAssign)
+	return err == nil && variant.ProvenanceHash != "" && variant.ProvenanceHash == expected
+}
+
+func (s *DubbingService) loadPlaybackTimeline(ctx context.Context, in domain.DubbingJobInput) (*domain.TranscriptArtifact, *domain.AudioRolePlan, error) {
+	if s.cas == nil || s.db == nil {
+		return nil, nil, errors.New("database and CAS are required for playback-window derivation")
+	}
+	rc, err := s.cas.Get(in.TranscriptArtifactCAS)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read pinned transcript artifact %s: %w", in.TranscriptArtifactCAS, err)
+	}
+	defer rc.Close()
+	var transcript domain.TranscriptArtifact
+	if err := json.NewDecoder(rc).Decode(&transcript); err != nil {
+		return nil, nil, fmt.Errorf("decode pinned transcript artifact %s: %w", in.TranscriptArtifactCAS, err)
+	}
+	if transcript.AssetID != "" && transcript.AssetID != in.AssetID {
+		return nil, nil, fmt.Errorf("pinned transcript asset mismatch: %s != %s", transcript.AssetID, in.AssetID)
+	}
+	rolePlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID)
+	if err != nil || rolePlan == nil {
+		return nil, nil, domain.ErrAudioRolePlanRequired
+	}
+	if in.AudioRolePlanCAS == "" || rolePlan.CASHash == "" || rolePlan.CASHash != in.AudioRolePlanCAS {
+		return nil, nil, fmt.Errorf("audio role plan lineage mismatch: pinned=%q current=%q", in.AudioRolePlanCAS, rolePlan.CASHash)
+	}
+	if err := verifyPinnedAudioRolePlan(s.cas, rolePlan, in.AudioRolePlanCAS); err != nil {
+		return nil, nil, err
+	}
+	return &transcript, rolePlan, nil
+}
+
+func verifyPinnedAudioRolePlan(store *cas.Store, current *domain.AudioRolePlan, casHash string) error {
+	if store == nil || current == nil || strings.TrimSpace(casHash) == "" {
+		return errors.New("pinned audio role plan artifact is required")
+	}
+	r, err := store.Get(casHash)
+	if err != nil {
+		return fmt.Errorf("read pinned audio role plan %s: %w", casHash, err)
+	}
+	defer r.Close()
+	var pinned domain.AudioRolePlan
+	if err := json.NewDecoder(r).Decode(&pinned); err != nil {
+		return fmt.Errorf("decode pinned audio role plan %s: %w", casHash, err)
+	}
+	if pinned.AssetID != current.AssetID {
+		return fmt.Errorf("pinned audio role plan asset mismatch: %s != %s", pinned.AssetID, current.AssetID)
+	}
+	pinnedSegments, _ := json.Marshal(pinned.Segments)
+	currentSegments, _ := json.Marshal(current.Segments)
+	if !bytes.Equal(pinnedSegments, currentSegments) {
+		return errors.New("pinned audio role plan content does not match current canonical plan")
+	}
+	if current.ProvenanceHash != "" && pinned.ProvenanceHash != current.ProvenanceHash {
+		return errors.New("pinned audio role plan provenance mismatch")
+	}
+	return nil
+}
+
+func (s *DubbingService) loadDubTranslationContract(dubScript *domain.DubScriptVariant) (*domain.TranslationVariant, error) {
+	if s.cas == nil || dubScript == nil || strings.TrimSpace(dubScript.TranslationVariantCAS) == "" {
+		return nil, errors.New("dub script must pin a translation variant for glossary/QA contract")
+	}
+	r, err := s.cas.Get(dubScript.TranslationVariantCAS)
+	if err != nil {
+		return nil, fmt.Errorf("read pinned translation variant %s: %w", dubScript.TranslationVariantCAS, err)
+	}
+	defer r.Close()
+	var v domain.TranslationVariant
+	if err := json.NewDecoder(r).Decode(&v); err != nil {
+		return nil, fmt.Errorf("decode pinned translation variant %s: %w", dubScript.TranslationVariantCAS, err)
+	}
+	if v.SchemaVersion != domain.TranslationSchemaVersion || v.ContractID != TranslationContractID || v.AssetID != dubScript.AssetID || !strings.EqualFold(v.TargetLanguage, dubScript.TargetLanguage) {
+		return nil, fmt.Errorf("pinned translation variant does not satisfy current translation contract")
+	}
+	return &v, nil
+}
+
+func glossaryTargetsPreserved(original, candidate string, terms []domain.GlossaryEntry) bool {
+	lowerOriginal := strings.ToLower(original)
+	lowerCandidate := strings.ToLower(candidate)
+	for _, term := range terms {
+		target := strings.ToLower(strings.TrimSpace(term.Target))
+		if target != "" && strings.Contains(lowerOriginal, target) && !strings.Contains(lowerCandidate, target) {
+			return false
+		}
+	}
+	return true
+}
+
+func playbackBoundaryForBlock(blockIndex int, sourceStartMs, sourceEndMs int64, transcript *domain.TranscriptArtifact, rolePlan *domain.AudioRolePlan) (int64, error) {
+	if sourceStartMs < 0 || sourceEndMs <= sourceStartMs || transcript == nil || rolePlan == nil {
+		return 0, errors.New("invalid playback boundary inputs")
+	}
+	found := false
+	next := int64(0)
+	for _, b := range transcript.SpeechBlocks {
+		// Silence/noise blocks are timeline evidence, not canonical speech members.
+		// Silence blocks historically carry the zero-value Index, so checking Index
+		// before SegmentType can alias them to speech block 0 and invent a timing mismatch.
+		if b.SegmentType != "" && b.SegmentType != domain.SpeechBlockTypeSpeech {
+			continue
+		}
+		if b.Index == blockIndex {
+			if b.StartMs != sourceStartMs || b.EndMs != sourceEndMs {
+				return 0, fmt.Errorf("speech block %d source timing mismatch: transcript=%d-%d script=%d-%d", blockIndex, b.StartMs, b.EndMs, sourceStartMs, sourceEndMs)
+			}
+			found = true
+			continue
+		}
+		if b.StartMs < sourceEndMs && b.EndMs > sourceEndMs {
+			return sourceEndMs, nil
+		}
+		if b.StartMs >= sourceEndMs && (next == 0 || b.StartMs < next) {
+			next = b.StartMs
+		}
+	}
+	if !found {
+		return 0, fmt.Errorf("speech block %d is not present in pinned transcript", blockIndex)
+	}
+	for _, a := range rolePlan.Segments {
+		if a.Role != domain.AudioRoleSingingMusicVocal && a.Role != domain.AudioRoleUncertain {
+			continue
+		}
+		if a.StartMs < sourceEndMs && a.EndMs > sourceEndMs {
+			return sourceEndMs, nil
+		}
+		if a.StartMs >= sourceEndMs && (next == 0 || a.StartMs < next) {
+			next = a.StartMs
+		}
+	}
+	return next, nil
+}
+
 // speakerEscalationPlan carries a whole-speaker escalation to the duration-controlled
 // fallback lane plus the audit evidence to record on the regenerated variant.
 type speakerEscalationPlan struct {
@@ -1050,6 +1358,14 @@ type speakerEscalationPlan struct {
 // over in memory instead of relying on the asset-scoped index lookup.
 func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.DubbingJobInput, dubScript *domain.DubScriptVariant, dubScriptCAS string, voiceAssign *domain.VoiceAssignment, voiceAssignCAS string, priorHint *domain.DubSegmentsVariant, escalations []domain.VoiceProviderEscalation) (*domain.DubSegmentsVariant, error) {
 	targetLang := in.TargetLanguage
+	transcript, rolePlan, err := s.loadPlaybackTimeline(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	translationContract, err := s.loadDubTranslationContract(dubScript)
+	if err != nil {
+		return nil, err
+	}
 	// 3. Compute deterministic provenance hash
 	provenanceHash, err := s.computeDubSegmentsProvenanceHash(in, dubScript, voiceAssign)
 	if err != nil {
@@ -1229,10 +1545,32 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 		}
 
 		actualSlotDur := seg.EndMs - seg.StartMs
-		slotDurationMs := actualSlotDur
-		if slotDurationMs <= 0 {
-			slotDurationMs = 1000
+		if actualSlotDur <= 0 {
+			fitPolicyID := fc.policyID()
+			fitPlans = append(fitPlans, domain.DubbingFitPlan{
+				SegmentIndex: seg.Index, SpeakerID: spkID, SlotDurationMs: actualSlotDur,
+				UsableSlotMs: actualSlotDur, DubPlaybackEndMs: seg.EndMs, FitPolicyID: fitPolicyID,
+				SpeechBlockIndices: []int{seg.Index}, Decision: domain.FitActionReview,
+				DecisionReason: "INVALID_TIMING",
+			})
+			reviewSegments = append(reviewSegments, domain.DubSegmentReview{
+				Index: seg.Index, SpeechBlockIndices: []int{seg.Index}, SpeakerID: spkID,
+				StartMs: seg.StartMs, EndMs: seg.EndMs, SlotDurationMs: actualSlotDur,
+				SourceText: seg.SourceText, SpokenText: seg.SpokenText, FitDecision: domain.FitActionReview,
+				ReviewReason: "INVALID_TIMING", DubPlaybackEndMs: seg.EndMs,
+			})
+			overallStatus = "REVIEW_REQUIRED"
+			continue
 		}
+		nextVocalStartMs, err := playbackBoundaryForBlock(seg.Index, seg.StartMs, seg.EndMs, transcript, rolePlan)
+		if err != nil {
+			return nil, err
+		}
+		playbackEndMs, effectiveReserveMs, fitPolicyID := fc.ResolvePlaybackWindow(seg.EndMs, nextVocalStartMs)
+		if playbackEndMs < seg.EndMs || playbackEndMs <= seg.StartMs {
+			return nil, fmt.Errorf("invalid playback window for segment %d: %d-%d", seg.Index, seg.StartMs, playbackEndMs)
+		}
+		slotDurationMs := playbackEndMs - seg.StartMs
 
 		var nextTurnStartMs int64
 		var nextTurnSpkID string
@@ -1245,6 +1583,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 		if currentText == "" {
 			currentText = seg.MeaningText
 		}
+		protectedTerms := glossaryForSource(translationContract.EffectiveGlossary, seg.SourceText)
 
 		attempt := 1
 		currentSpeed := 1.0
@@ -1314,6 +1653,8 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				CanShortenText:     len(strings.Fields(currentText)) > 3,
 				SupportsSpeedFit:   supportsSpeedFit,
 				FixedRateVoice:     fixedRateVoice,
+				DubPlaybackEndMs:   playbackEndMs,
+				EffectiveReserveMs: effectiveReserveMs,
 			}
 
 			evalRes := fc.EvaluateCandidate(ctx, evalInput)
@@ -1329,6 +1670,10 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				Decision:           evalRes.Decision,
 				DecisionReason:     evalRes.Reason,
 				AttemptCount:       attempt,
+				DubPlaybackEndMs:   evalRes.DubPlaybackEndMs,
+				EffectiveReserveMs: evalRes.EffectiveReserveMs,
+				FitPolicyID:        fitPolicyID,
+				SpeechBlockIndices: []int{seg.Index},
 			}
 
 			candidate := &domain.TTSCandidate{
@@ -1359,6 +1704,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				attempt++
 			} else if evalRes.Decision == domain.FitActionRewrite {
 				// Shorten phrasing
+				previousText := currentText
 				if s.spokenAdapter != nil {
 					adaptRes, err := s.spokenAdapter.AdaptSpokenScript(ctx, provider.SpokenScriptAdaptationRequest{
 						SourceText:            seg.SourceText,
@@ -1369,6 +1715,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 						SourceSpeakingRateCPS: seg.SourceSpeakingRateCPS,
 						SourceGapAfterMs:      seg.SourceGapAfterMs,
 						HasNextTurn:           nextTurnStartMs > 0,
+						ProtectedTerms:        protectedTerms,
 					})
 					if err == nil && adaptRes.SpokenText != "" && adaptRes.SpokenText != currentText {
 						currentText = adaptRes.SpokenText
@@ -1376,9 +1723,22 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 						// Simple trim fallback
 						words := strings.Fields(currentText)
 						if len(words) > 2 {
-							currentText = strings.Join(words[:len(words)-1], " ")
+							candidateText := strings.Join(words[:len(words)-1], " ")
+							if glossaryTargetsPreserved(currentText, candidateText, protectedTerms) {
+								currentText = candidateText
+							}
 						}
 					}
+				}
+				qa := NewMeaningFirstQAGate().ValidateSegment(seg.SourceText, currentText, dubScript.SourceLanguage, targetLang, protectedTerms)
+				if !qa.Passed {
+					// The measured rewrite is only a candidate. If shortening damages
+					// meaning, keep the last meaning-valid text/evidence and let the
+					// bounded fit loop advance to its remaining regroup/review remedy.
+					// Never turn a failed rewrite attempt into the canonical spoken text.
+					currentText = previousText
+					attempt++
+					continue
 				}
 				attempt++
 			} else {
@@ -1406,6 +1766,10 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 			var lastRegroupCombinedEndMs int64
 			var lastRegroupCombinedSourceText string
 			var lastRegroupCombinedSpokenText string
+			var lastRegroupPlaybackEndMs int64
+			var lastRegroupReserveMs int64
+			var lastRegroupFitPolicyID string
+			var lastRegroupIndices []int
 			lastRegroupReviewReason := "DURATION_OVERRUN"
 
 			currIdx := i
@@ -1427,12 +1791,41 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 
 				combinedEndMs = nextSeg.EndMs
 				combinedSlotMs := combinedEndMs - combinedStartMs
+				nextBoundaryMs, boundaryErr := playbackBoundaryForBlock(nextSeg.Index, nextSeg.StartMs, nextSeg.EndMs, transcript, rolePlan)
+				if boundaryErr != nil {
+					return nil, boundaryErr
+				}
+				groupPlaybackEndMs, groupReserveMs, groupFitPolicyID := fc.ResolvePlaybackWindow(combinedEndMs, nextBoundaryMs)
+				groupPlaybackDurationMs := groupPlaybackEndMs - combinedStartMs
+				if groupPlaybackDurationMs <= 0 {
+					return nil, fmt.Errorf("invalid regroup playback window for segment %d", seg.Index)
+				}
 				combinedSourceText = strings.TrimSpace(combinedSourceText + " " + nextSeg.SourceText)
 				nextSpoken := nextSeg.SpokenText
 				if nextSpoken == "" {
 					nextSpoken = nextSeg.MeaningText
 				}
 				combinedSpokenText = strings.TrimSpace(combinedSpokenText + " " + nextSpoken)
+				groupProtectedTerms := glossaryForSource(translationContract.EffectiveGlossary, combinedSourceText)
+				groupQA := NewMeaningFirstQAGate().ValidateSegment(combinedSourceText, combinedSpokenText, dubScript.SourceLanguage, targetLang, groupProtectedTerms)
+				if !groupQA.Passed {
+					lastRegroupCombinedSlotMs = combinedSlotMs
+					lastRegroupCombinedStartMs = combinedStartMs
+					lastRegroupCombinedEndMs = combinedEndMs
+					lastRegroupCombinedSourceText = combinedSourceText
+					lastRegroupCombinedSpokenText = combinedSpokenText
+					lastRegroupPlaybackEndMs = groupPlaybackEndMs
+					lastRegroupReserveMs = groupReserveMs
+					lastRegroupFitPolicyID = groupFitPolicyID
+					lastRegroupIndices = append([]int(nil), consumedIndices...)
+					lastRegroupReviewReason = qaReviewReason(seg.Index, groupQA)
+					lastRegroupEvalRes = FitEvaluationResult{
+						Decision: domain.FitActionReview, SlotDurationMs: groupPlaybackDurationMs, UsableSlotMs: groupPlaybackDurationMs,
+						RequiresReview: true, ReviewReason: lastRegroupReviewReason, Reason: "regrouped text failed meaning/glossary QA",
+						DubPlaybackEndMs: groupPlaybackEndMs, EffectiveReserveMs: groupReserveMs, FitPolicyID: groupFitPolicyID,
+					}
+					break
+				}
 
 				var nextNextTurnStartMs int64
 				var nextNextTurnSpkID string
@@ -1450,8 +1843,8 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 					Language:       targetLang,
 					Voice:          voice,
 					Speed:          1.0,
-					SlotDurationMs: combinedSlotMs,
-					UsableSlotMs:   combinedSlotMs,
+					SlotDurationMs: groupPlaybackDurationMs,
+					UsableSlotMs:   groupPlaybackDurationMs,
 					AttemptNumber:  1,
 				}
 
@@ -1484,6 +1877,8 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 					CanShortenText:     len(strings.Fields(combinedSpokenText)) > 4,
 					SupportsSpeedFit:   supportsSpeedFit,
 					FixedRateVoice:     fixedRateVoice,
+					DubPlaybackEndMs:   groupPlaybackEndMs,
+					EffectiveReserveMs: groupReserveMs,
 				}
 				regroupEvalRes := fc.EvaluateCandidate(ctx, regroupEvalInput)
 
@@ -1495,9 +1890,13 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				lastRegroupCombinedEndMs = combinedEndMs
 				lastRegroupCombinedSourceText = combinedSourceText
 				lastRegroupCombinedSpokenText = combinedSpokenText
+				lastRegroupPlaybackEndMs = groupPlaybackEndMs
+				lastRegroupReserveMs = groupReserveMs
+				lastRegroupFitPolicyID = groupFitPolicyID
+				lastRegroupIndices = append([]int(nil), consumedIndices...)
 				lastRegroupReviewReason = regroupEvalRes.ReviewReason
 
-				if regroupEvalRes.Decision == domain.FitActionAccept && !regroupEvalRes.RequiresReview && probedCombinedMs <= combinedSlotMs {
+				if regroupEvalRes.Decision == domain.FitActionAccept && !regroupEvalRes.RequiresReview && probedCombinedMs <= groupPlaybackDurationMs {
 					// Successfully fit and accepted!
 					var audioPath, audioSHA string
 					if s.cas != nil {
@@ -1528,6 +1927,8 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 						ReviewReason:       "",
 						RequiresReview:     false,
 						NaturalGapAfterMs:  regroupEvalRes.NaturalGapMs,
+						DubPlaybackEndMs:   groupPlaybackEndMs,
+						EffectiveReserveMs: groupReserveMs,
 					}
 					selectedSegments = append(selectedSegments, dubSeg)
 
@@ -1543,6 +1944,10 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 						Decision:           domain.FitActionAccept,
 						DecisionReason:     "regrouped same-speaker turn into combined slot",
 						AttemptCount:       1,
+						DubPlaybackEndMs:   groupPlaybackEndMs,
+						EffectiveReserveMs: groupReserveMs,
+						FitPolicyID:        groupFitPolicyID,
+						SpeechBlockIndices: append([]int(nil), consumedIndices...),
 					}
 					fitPlans = append(fitPlans, combinedFitPlan)
 
@@ -1580,6 +1985,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 
 				revSeg := domain.DubSegmentReview{
 					Index:              seg.Index,
+					SpeechBlockIndices: append([]int(nil), lastRegroupIndices...),
 					SpeakerID:          spkID,
 					StartMs:            lastRegroupCombinedStartMs,
 					EndMs:              lastRegroupCombinedEndMs,
@@ -1593,6 +1999,8 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 					FitDecision:        domain.FitActionReview,
 					ReviewReason:       revReason,
 					AttemptCount:       1,
+					DubPlaybackEndMs:   lastRegroupPlaybackEndMs,
+					EffectiveReserveMs: lastRegroupReserveMs,
 				}
 				reviewSegments = append(reviewSegments, revSeg)
 				overallStatus = "REVIEW_REQUIRED"
@@ -1609,6 +2017,10 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 					Decision:           domain.FitActionReview,
 					DecisionReason:     "regrouped same-speaker turn still overruns combined slot",
 					AttemptCount:       1,
+					DubPlaybackEndMs:   lastRegroupPlaybackEndMs,
+					EffectiveReserveMs: lastRegroupReserveMs,
+					FitPolicyID:        lastRegroupFitPolicyID,
+					SpeechBlockIndices: append([]int(nil), lastRegroupIndices...),
 				}
 				fitPlans = append(fitPlans, combinedFitPlan)
 
@@ -1620,16 +2032,12 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 			continue
 		}
 
-		// Check zero overrun selection gate:
-		// A candidate that strictly overruns the slot or has non-positive duration cannot be accepted into selected Segments
-		if actualSlotDur <= 0 || finalCandidate.MeasuredDurationMs > actualSlotDur {
+		// Check playback-window selection gate: a candidate that exceeds the accepted
+		// window or has non-positive duration cannot be selected for mixing.
+		if finalCandidate == nil || finalCandidate.MeasuredDurationMs <= 0 || finalCandidate.MeasuredDurationMs > slotDurationMs {
 			finalRequiresReview = true
 			if finalReviewReason == "" {
-				if actualSlotDur <= 0 {
-					finalReviewReason = "ZERO_DURATION_SLOT"
-				} else {
-					finalReviewReason = "DURATION_OVERRUN"
-				}
+				finalReviewReason = "DURATION_OVERRUN"
 			}
 			finalDecision = domain.FitActionReview
 			overallStatus = "REVIEW_REQUIRED"
@@ -1645,7 +2053,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 			naturalGapAfter = nextTurnStartMs - (seg.StartMs + finalCandidate.MeasuredDurationMs)
 		}
 
-		if finalDecision == domain.FitActionAccept && !finalRequiresReview && actualSlotDur > 0 && finalCandidate.MeasuredDurationMs <= actualSlotDur {
+		if finalDecision == domain.FitActionAccept && !finalRequiresReview && finalCandidate.MeasuredDurationMs <= slotDurationMs {
 			dubSeg := domain.DubSegment{
 				Index:              seg.Index,
 				SpeechBlockIndices: []int{seg.Index},
@@ -1663,12 +2071,15 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				ReviewReason:       "",
 				RequiresReview:     false,
 				NaturalGapAfterMs:  naturalGapAfter,
+				DubPlaybackEndMs:   playbackEndMs,
+				EffectiveReserveMs: effectiveReserveMs,
 			}
 			selectedSegments = append(selectedSegments, dubSeg)
 		} else {
 			// Record in ReviewSegments — overlong/review audio is NOT selected and cannot reach mixer
 			revSeg := domain.DubSegmentReview{
 				Index:              seg.Index,
+				SpeechBlockIndices: []int{seg.Index},
 				SpeakerID:          spkID,
 				StartMs:            seg.StartMs,
 				EndMs:              seg.EndMs,
@@ -1681,6 +2092,8 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				Voice:              voice,
 				FitDecision:        finalDecision,
 				ReviewReason:       finalReviewReason,
+				DubPlaybackEndMs:   playbackEndMs,
+				EffectiveReserveMs: effectiveReserveMs,
 			}
 			reviewSegments = append(reviewSegments, revSeg)
 			overallStatus = "REVIEW_REQUIRED"
@@ -1700,23 +2113,60 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 		}
 	}
 
+	// Prove complete canonical replacement coverage before committing PASS. Every
+	// dub-eligible source SpeechBlock must appear exactly once across selected or
+	// review evidence; otherwise RuntimeHost must pause for review before mixing.
+	eligibleMembers := eligibleSpeechBlocks(transcript, rolePlan)
+	coveredMembers := make(map[int]int, len(eligibleMembers))
+	for _, seg := range selectedSegments {
+		for _, member := range seg.SpeechBlockIndices {
+			coveredMembers[member]++
+		}
+	}
+	for _, seg := range reviewSegments {
+		for _, member := range seg.SpeechBlockIndices {
+			coveredMembers[member]++
+		}
+	}
+	for member, count := range coveredMembers {
+		if _, ok := eligibleMembers[member]; !ok || count != 1 {
+			overallStatus = "REVIEW_REQUIRED"
+		}
+	}
+	for member, block := range eligibleMembers {
+		if coveredMembers[member] != 0 {
+			continue
+		}
+		reviewSegments = append(reviewSegments, domain.DubSegmentReview{
+			Index: member, SpeechBlockIndices: []int{member}, SpeakerID: block.SpeakerID,
+			StartMs: block.StartMs, EndMs: block.EndMs, SlotDurationMs: block.EndMs - block.StartMs,
+			SourceText: block.SourceText, FitDecision: domain.FitActionReview,
+			ReviewReason: "MISSING_REPLACEMENT", AttemptCount: 0,
+			DubPlaybackEndMs: block.EndMs,
+		})
+		overallStatus = "REVIEW_REQUIRED"
+	}
+
 	variant := &domain.DubSegmentsVariant{
-		ID:                  uuid.NewString(),
-		SchemaVersion:       domain.DubSegmentsSchemaVersion,
-		AssetID:             in.AssetID,
-		RunID:               in.RunID,
-		JobID:               in.JobID,
-		TargetLanguage:      targetLang,
-		DubScriptVariantCAS: dubScriptCAS,
-		VoiceAssignmentCAS:  voiceAssignCAS,
-		Segments:            selectedSegments,
-		ReviewSegments:      reviewSegments,
-		FitPlans:            fitPlans,
-		ProvenanceHash:      provenanceHash,
-		OverallStatus:       overallStatus,
-		Escalations:         resolveEscalationOutcomes(escalations, reviewSegments),
-		FixedRateSpeakers:   slices.Sorted(maps.Keys(fixedRateSpeakers)),
-		CreatedAt:           time.Now().UTC(),
+		ID:                    uuid.NewString(),
+		SchemaVersion:         domain.DubSegmentsSchemaVersion,
+		AssetID:               in.AssetID,
+		RunID:                 in.RunID,
+		JobID:                 in.JobID,
+		TargetLanguage:        targetLang,
+		DubScriptVariantCAS:   dubScriptCAS,
+		VoiceAssignmentCAS:    voiceAssignCAS,
+		TranscriptArtifactCAS: in.TranscriptArtifactCAS,
+		AudioRolePlanCAS:      in.AudioRolePlanCAS,
+		FitPolicyID:           fc.policyID(),
+		Segments:              selectedSegments,
+		ReviewSegments:        reviewSegments,
+		FitPlans:              fitPlans,
+		ProvenanceHash:        provenanceHash,
+		OverallStatus:         overallStatus,
+		Escalations:           resolveEscalationOutcomes(escalations, reviewSegments),
+		FixedRateSpeakers:     slices.Sorted(maps.Keys(fixedRateSpeakers)),
+		CreatedAt:             time.Now().UTC(),
 	}
 
 	// 7. Commit to CAS and SQLite
@@ -1771,7 +2221,7 @@ func resolveEscalationOutcomes(escalations []domain.VoiceProviderEscalation, rev
 
 // planSpeakerEscalation decides which speakers may escalate to the duration-controlled
 // fallback lane. A speaker qualifies only when a fixed-rate lane produced its candidate
-// and the immutable source slot is still overrun after rewrite/regroup exhaustion, the
+// and the accepted playback window is still overrun after rewrite/regroup exhaustion, the
 // affected speaker is not already on the fallback lane, and that lane is policy/license/
 // runtime eligible for this run. Everything else keeps the existing review outcome.
 func (s *DubbingService) planSpeakerEscalation(ctx context.Context, in domain.DubbingJobInput, voiceAssign *domain.VoiceAssignment, pass *domain.DubSegmentsVariant) *speakerEscalationPlan {
@@ -2086,6 +2536,31 @@ func (s *DubbingService) resolveSpeakers(ctx context.Context, in domain.VoiceAss
 	return speakers, nil
 }
 
+func (s *DubbingService) transcriptCASFromTranslationVariant(assetID, targetLang, translationCAS string) (string, error) {
+	if s.cas == nil || strings.TrimSpace(translationCAS) == "" {
+		return "", errors.New("translation artifact is required to resolve transcript lineage")
+	}
+	rc, err := s.cas.Get(translationCAS)
+	if err != nil {
+		return "", fmt.Errorf("read translation artifact %s for transcript lineage: %w", translationCAS, err)
+	}
+	defer rc.Close()
+	var variant domain.TranslationVariant
+	if err := json.NewDecoder(rc).Decode(&variant); err != nil {
+		return "", fmt.Errorf("decode translation artifact %s for transcript lineage: %w", translationCAS, err)
+	}
+	if variant.AssetID != assetID || !strings.EqualFold(variant.TargetLanguage, targetLang) {
+		return "", fmt.Errorf("translation artifact lineage mismatch while resolving transcript")
+	}
+	if variant.SchemaVersion != domain.TranslationSchemaVersion || variant.ContractID != TranslationContractID || variant.InputHash == "" || variant.ProvenanceHash == "" {
+		return "", fmt.Errorf("translation artifact does not satisfy current translation contract")
+	}
+	if strings.TrimSpace(variant.TranscriptArtifactCAS) == "" {
+		return "", fmt.Errorf("translation artifact is missing transcript lineage")
+	}
+	return variant.TranscriptArtifactCAS, nil
+}
+
 // loadDubScriptVariant loads the DubScriptVariant from CAS or SQLite.
 func (s *DubbingService) loadDubScriptVariant(ctx context.Context, assetID, targetLang, explicitCAS string) (*domain.DubScriptVariant, string, error) {
 	if s.cas == nil || s.db == nil {
@@ -2212,12 +2687,23 @@ func (s *DubbingService) computeDubSegmentsProvenanceHash(in domain.DubbingJobIn
 	if voiceAssign != nil && voiceAssign.CASHash != "" {
 		inputHashes = append(inputHashes, voiceAssign.CASHash)
 	}
+	if in.TranscriptArtifactCAS != "" {
+		inputHashes = append(inputHashes, in.TranscriptArtifactCAS)
+	}
+	if in.AudioRolePlanCAS != "" {
+		inputHashes = append(inputHashes, in.AudioRolePlanCAS)
+	}
+	fc := s.fitController
+	if fc == nil {
+		fc = NewFitController()
+	}
 
 	return cas.ComputeStageCacheKey(domain.StageCacheIdentityInput{
 		Stage:       string(provider.TypeTTS),
 		InputHashes: inputHashes,
 		SemanticConfig: map[string]any{
-			"zero_overrun_fit":     "measured_media_truth_v1",
+			"zero_overrun_fit":     "measured_playback_window_v2",
+			"fit_policy_id":        fc.policyID(),
 			"tts_runtime_identity": provider.TTSRuntimeIdentities(),
 		},
 		Language:      in.TargetLanguage,

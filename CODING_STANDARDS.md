@@ -123,7 +123,8 @@ The operator queue is exception-only. Passing, auto-resolved, and manually overr
 
 - Predicted/WPM duration is planning evidence only.
 - A selectable TTS candidate must be checked against **actual synthesized audio duration**.
-- Enforce `tts_finish <= immutable_source_window_end`.
+- Keep immutable source start/end anchors separate from playback acceptance. A selected dub may extend only to its persisted `DubPlaybackEndMs`, derived from proven source silence before the next canonical speech/vocal boundary with a frozen reserve.
+- Validate the decoded waveform/sample extent against that playback end and against neighboring localized clip placement; metadata duration alone is not acceptance proof.
 - An overlong candidate must not reach the final mixer.
 - Resolve overrun through the approved adaptation loop: rewrite/resynthesize/rate/mild stretch/local regroup within the same speaker turn.
 - Never fix one overrun by shifting later source speech.

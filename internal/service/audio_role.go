@@ -440,6 +440,20 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 	if err := s.db.SaveAudioRolePlan(ctx, plan); err != nil {
 		return nil, fmt.Errorf("persist audio role plan: %w", err)
 	}
+	if plan.CASHash != "" {
+		if err := s.db.SaveAudioRolePlanIndex(ctx, storage.AudioRolePlanIndex{
+			ID:             plan.ID,
+			AssetID:        plan.AssetID,
+			ProviderID:     plan.ProviderID,
+			ModelName:      plan.ModelName,
+			ModelVersion:   plan.ModelVersion,
+			CASHash:        plan.CASHash,
+			ProvenanceHash: plan.ProvenanceHash,
+			CreatedAt:      plan.CreatedAt,
+		}); err != nil {
+			return nil, fmt.Errorf("persist audio role plan CAS index: %w", err)
+		}
+	}
 
 	_ = asset
 	return &plan, nil

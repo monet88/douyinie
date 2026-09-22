@@ -23,13 +23,29 @@ const (
 	// ReviewReason and the rule that a segment failing the meaning gate is persisted
 	// with passed_qa_gate=false for operator review instead of rejecting the candidate:
 	// a variant cached under version 1 predates both.
-	TranslationSchemaVersion = 2
+	TranslationSchemaVersion = 3
 	DubScriptSchemaVersion   = 2
 
 	// ReviewReasonMeaningCorrupted marks a dub script segment whose spoken text failed
 	// the meaning-first gate. The operator corrects it or records a manual override.
 	ReviewReasonMeaningCorrupted = "meaning_corrupted"
 )
+
+// GlossaryEntry is one ordered request-local terminology rule. It is frozen with
+// the run config and never becomes a shared mutable catalog.
+type GlossaryEntry struct {
+	Source string `json:"source"`
+	Target string `json:"target"`
+	Note   string `json:"note,omitempty"`
+}
+
+// EffectiveGlossary is the resolved subset that actually matches the current
+// translation input. Its order is semantic and therefore participates in cache identity.
+type EffectiveGlossary struct {
+	Entries        []GlossaryEntry `json:"entries,omitempty"`
+	OmittedMatches int             `json:"omitted_matches,omitempty"`
+	Hash           string          `json:"hash,omitempty"`
+}
 
 // TranslationSegment represents a single translated unit (typically mapped 1:1 to a SpeechBlock or visual text region).
 type TranslationSegment struct {
@@ -52,24 +68,28 @@ type TranslationSegment struct {
 // TranslationVariant is the immutable target-language meaning-preserving artifact.
 // Consumed explicitly by downstream stages: T10 (visual text localization) and T13 (dubbing translation).
 type TranslationVariant struct {
-	ID                string               `json:"id"`
-	SchemaVersion     int                  `json:"schema_version"`
-	AssetID           string               `json:"asset_id"`
-	RunID             string               `json:"run_id"`
-	JobID             string               `json:"job_id,omitempty"`
-	SourceLanguage    string               `json:"source_language"` // e.g. "zh"
-	TargetLanguage    string               `json:"target_language"` // "vi" or "en"
-	Segments          []TranslationSegment `json:"segments"`
-	ProviderID        string               `json:"provider_id"`
-	ModelName         string               `json:"model_name"`
-	ModelVersion      string               `json:"model_version"`
-	ServiceBaselineID string               `json:"service_baseline_id,omitempty"`
-	ObservedModel     string               `json:"observed_model,omitempty"`
-	SystemFingerprint string               `json:"system_fingerprint,omitempty"`
-	CASHash           string               `json:"cas_hash,omitempty"`
-	ProvenanceHash    string               `json:"provenance_hash,omitempty"`
-	OverallQAScore    float64              `json:"overall_qa_score"`
-	CreatedAt         time.Time            `json:"created_at"`
+	ID                    string               `json:"id"`
+	SchemaVersion         int                  `json:"schema_version"`
+	AssetID               string               `json:"asset_id"`
+	RunID                 string               `json:"run_id"`
+	JobID                 string               `json:"job_id,omitempty"`
+	SourceLanguage        string               `json:"source_language"` // e.g. "zh"
+	TargetLanguage        string               `json:"target_language"` // "vi" or "en"
+	ContractID            string               `json:"contract_id"`
+	EffectiveGlossary     EffectiveGlossary    `json:"effective_glossary,omitempty"`
+	TranscriptArtifactCAS string               `json:"transcript_artifact_cas,omitempty"`
+	InputHash             string               `json:"input_hash"`
+	Segments              []TranslationSegment `json:"segments"`
+	ProviderID            string               `json:"provider_id"`
+	ModelName             string               `json:"model_name"`
+	ModelVersion          string               `json:"model_version"`
+	ServiceBaselineID     string               `json:"service_baseline_id,omitempty"`
+	ObservedModel         string               `json:"observed_model,omitempty"`
+	SystemFingerprint     string               `json:"system_fingerprint,omitempty"`
+	CASHash               string               `json:"cas_hash,omitempty"`
+	ProvenanceHash        string               `json:"provenance_hash,omitempty"`
+	OverallQAScore        float64              `json:"overall_qa_score"`
+	CreatedAt             time.Time            `json:"created_at"`
 }
 
 // TranslationInputSegment is a text input segment for translation.
@@ -88,6 +108,8 @@ type TranslationJobInput struct {
 	JobID                 string                    `json:"job_id,omitempty"`
 	SourceLanguage        string                    `json:"source_language"`
 	TargetLanguage        string                    `json:"target_language"`
+	Glossary              []GlossaryEntry           `json:"glossary,omitempty"`
+	EffectiveGlossary     EffectiveGlossary         `json:"effective_glossary,omitempty"`
 	Segments              []TranslationInputSegment `json:"segments"`
 	TranscriptArtifactCAS string                    `json:"transcript_artifact_cas,omitempty"`
 	ExecutionProfile      ExecutionProfile          `json:"execution_profile,omitempty"`

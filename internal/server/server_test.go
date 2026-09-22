@@ -242,6 +242,26 @@ func TestVoiceAuditionReturnsBrowserPlayableAudioWithoutLocalPath(t *testing.T) 
 	}
 }
 
+func TestVoiceAuditionContextualRequiresRunID(t *testing.T) {
+	t.Parallel()
+	wav := media.GeneratePCM16WAV(16000, 1, 500)
+	s, assetID, _ := newAuditionTestServer(t, wav)
+	body, err := json.Marshal(map[string]any{
+		"target_language": "vi", "is_contextual": true, "segment_index": 0,
+		"voice": domain.VoiceProfile{ID: "voice-audition", ProviderID: "fake-tts", VoiceID: "voice-1", Name: "Voice 1", Language: "vi"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/assets/"+assetID+"/voice-audition", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "run_id is required") {
+		t.Fatalf("contextual audition without run_id status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestOperatorUIUploadsLocalMediaWithoutExposingFilesystemPath(t *testing.T) {
 	t.Parallel()
 
