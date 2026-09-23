@@ -1430,3 +1430,253 @@ func TestAudioMixService_GroupedSegmentStartingAt0ms_Accepted(t *testing.T) {
 		t.Fatalf("expected mix OverallStatus PASS, got %+v", mix)
 	}
 }
+
+// frameExactFixture pairs the mixer's frame-exact window with the fit evidence for the same
+// clip, so one fixture can drive both sides of the acceptance rule.
+type frameExactFixture struct {
+	assetID        string
+	runID          string
+	stemsCAS       string
+	dubSegmentsCAS string
+	clipProbeMs    int64
+	sampleRate     int
+	speechStartMs  int64
+	playbackEndMs  int64
+	reserveMs      int64
+	policyID       string
+}
+
+// buildFrameExactFixture builds an asset whose single dub-eligible speech window is
+// [speechStartMs, speechEndMs] mixed at 44.1kHz, with one accepted dub clip of exactly
+// clipFrames output frames pinned in CAS.
+func buildFrameExactFixture(t *testing.T, db *storage.DB, casStore *cas.Store, clipFrames, speechStartMs, speechEndMs int64) frameExactFixture {
+	t.Helper()
+	ctx := context.Background()
+	const sampleRate = 44100
+	assetID := "asset_frames_" + uuid.NewString()[:8]
+	runID := "run-frames-" + uuid.NewString()[:8]
+
+	attID := uuid.NewString()
+	if err := db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION", TermsAccepted: true, ConfirmedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID: assetID, RightsAttestationID: attID, SHA256: "mock-sha-" + assetID, ByteSize: 1024, CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create source asset: %v", err)
+	}
+
+	fitCtrl := service.NewFitController()
+	playbackEndMs, reserveMs, policyID := fitCtrl.ResolvePlaybackWindow(speechEndMs, 0)
+	if playbackEndMs != speechEndMs || reserveMs != 0 {
+		t.Fatalf("fixture expects an unborrowed window ending at %d, got end %d reserve %d", speechEndMs, playbackEndMs, reserveMs)
+	}
+
+	bgObj, err := casStore.Put(bytes.NewReader(media.GeneratePCM16WAV(sampleRate, 1, 5000)))
+	if err != nil {
+		t.Fatalf("put background stem: %v", err)
+	}
+	stems := domain.AudioStemArtifacts{
+		ID:            "stems-" + runID,
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		Stems: []domain.AudioStem{
+			{Type: domain.StemTypeBackground, AudioCASHash: bgObj.SHA256, SampleRate: sampleRate, Channels: 1, Format: "wav", DurationMs: 5000},
+			{Type: domain.StemTypeVocals, AudioCASHash: bgObj.SHA256, SampleRate: sampleRate, Channels: 1, Format: "wav", DurationMs: 5000},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	stemsBytes, _ := json.Marshal(stems)
+	stemsObj, _ := casStore.Put(bytes.NewReader(stemsBytes))
+
+	rolePlan := domain.AudioRolePlan{
+		ID:             "role-" + runID,
+		AssetID:        assetID,
+		Segments:       []domain.AudioSegment{{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleNarrationDialogue}},
+		ProvenanceHash: "prov-role-" + runID,
+		CreatedAt:      time.Now().UTC(),
+	}
+	roleBytes, _ := json.Marshal(rolePlan)
+	roleObj, _ := casStore.Put(bytes.NewReader(roleBytes))
+	rolePlan.CASHash = roleObj.SHA256
+	if err := db.SaveAudioRolePlan(ctx, rolePlan); err != nil {
+		t.Fatalf("save audio role plan: %v", err)
+	}
+
+	transcript := domain.TranscriptArtifact{
+		AssetID: assetID,
+		SpeechBlocks: []domain.SpeechBlock{
+			{Index: 0, StartMs: speechStartMs, EndMs: speechEndMs, SourceText: "测试", SpeakerID: "SPEAKER_00", SegmentType: domain.SpeechBlockTypeSpeech},
+		},
+	}
+	tBytes, _ := json.Marshal(transcript)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+
+	dubScript := domain.DubScriptVariant{
+		ID: uuid.NewString(), SchemaVersion: domain.DubScriptSchemaVersion, AssetID: assetID, RunID: runID,
+		SourceLanguage: "zh", TargetLanguage: "vi", ProvenanceHash: "prov-ds-" + runID,
+		Segments: []domain.DubScriptSegment{
+			{Index: 0, SpeakerID: "SPEAKER_00", StartMs: speechStartMs, EndMs: speechEndMs, SlotDurationMs: speechEndMs - speechStartMs, SourceText: "测试", SpokenText: "thử"},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dsBytes, _ := json.Marshal(dubScript)
+	dsObj, _ := casStore.Put(bytes.NewReader(dsBytes))
+	if err := db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID: dubScript.ID, AssetID: assetID, RunID: runID, TargetLanguage: "vi", CASHash: dsObj.SHA256,
+		ProvenanceHash: dubScript.ProvenanceHash, CreatedAt: dubScript.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save dub script index: %v", err)
+	}
+
+	va := domain.VoiceAssignment{
+		ID: uuid.NewString(), SchemaVersion: domain.VoiceAssignmentSchemaVersion, AssetID: assetID, RunID: runID, TargetLanguage: "vi",
+		Assignments:           map[string]domain.VoiceProfile{"SPEAKER_00": {ID: "v1", Language: "vi"}},
+		DubScriptVariantCAS:   dsObj.SHA256,
+		TranscriptArtifactCAS: tObj.SHA256,
+		ProvenanceHash:        "prov-va-" + runID,
+		CreatedAt:             time.Now().UTC(),
+	}
+	vaBytes, _ := json.Marshal(va)
+	vaObj, _ := casStore.Put(bytes.NewReader(vaBytes))
+	if err := db.SaveVoiceAssignmentIndex(ctx, storage.VoiceAssignmentIndex{
+		ID: va.ID, AssetID: assetID, RunID: runID, TargetLanguage: "vi", CASHash: vaObj.SHA256,
+		ProvenanceHash: va.ProvenanceHash, CreatedAt: va.CreatedAt,
+	}); err != nil {
+		t.Fatalf("save voice assignment index: %v", err)
+	}
+
+	clipWAV := media.EncodePCM16Samples(make([]int16, clipFrames), sampleRate, 1)
+	clipProbeMs, err := media.ProbeWAVBytes(clipWAV)
+	if err != nil {
+		t.Fatalf("probe clip fixture: %v", err)
+	}
+	clipObj, err := casStore.Put(bytes.NewReader(clipWAV))
+	if err != nil {
+		t.Fatalf("put clip: %v", err)
+	}
+
+	dubVariant := domain.DubSegmentsVariant{
+		ID:                    "dub-frames-" + runID,
+		SchemaVersion:         domain.DubSegmentsSchemaVersion,
+		AssetID:               assetID,
+		RunID:                 runID,
+		TargetLanguage:        "vi",
+		DubScriptVariantCAS:   dsObj.SHA256,
+		VoiceAssignmentCAS:    vaObj.SHA256,
+		TranscriptArtifactCAS: tObj.SHA256,
+		AudioRolePlanCAS:      rolePlan.CASHash,
+		FitPolicyID:           policyID,
+		OverallStatus:         "PASS",
+		Segments: []domain.DubSegment{
+			{
+				Index:              0,
+				SpeechBlockIndices: []int{0},
+				SpeakerID:          "SPEAKER_00",
+				StartMs:            speechStartMs,
+				EndMs:              speechEndMs,
+				SlotDurationMs:     speechEndMs - speechStartMs,
+				MeasuredDurationMs: clipProbeMs,
+				AudioSHA256:        clipObj.SHA256,
+				AudioCASPath:       clipObj.Path,
+				FitDecision:        domain.FitActionAccept,
+				DubPlaybackEndMs:   playbackEndMs,
+				EffectiveReserveMs: reserveMs,
+			},
+		},
+		FitPlans: []domain.DubbingFitPlan{
+			{
+				SegmentIndex: 0, SpeakerID: "SPEAKER_00", SlotDurationMs: speechEndMs - speechStartMs,
+				UsableSlotMs: speechEndMs - speechStartMs, MeasuredDurationMs: clipProbeMs,
+				DubPlaybackEndMs: playbackEndMs, EffectiveReserveMs: reserveMs,
+				FitPolicyID: policyID, SpeechBlockIndices: []int{0}, Decision: domain.FitActionAccept,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dvBytes, _ := json.Marshal(dubVariant)
+	dvObj, _ := casStore.Put(bytes.NewReader(dvBytes))
+
+	return frameExactFixture{
+		assetID: assetID, runID: runID, stemsCAS: stemsObj.SHA256, dubSegmentsCAS: dvObj.SHA256,
+		clipProbeMs: clipProbeMs, sampleRate: sampleRate, speechStartMs: speechStartMs,
+		playbackEndMs: playbackEndMs, reserveMs: reserveMs, policyID: policyID,
+	}
+}
+
+func (f frameExactFixture) mix(t *testing.T, mixSvc *service.AudioMixService) (*domain.DubMixArtifact, error) {
+	t.Helper()
+	return mixSvc.MixAudio(context.Background(), service.AudioMixInput{
+		RunID:          f.runID,
+		AssetID:        f.assetID,
+		TargetLanguage: "vi",
+		AudioStemsCAS:  f.stemsCAS,
+		DubSegmentsCAS: f.dubSegmentsCAS,
+	})
+}
+
+func (f frameExactFixture) fitInput(measuredFrames int64) service.FitEvaluationInput {
+	return service.FitEvaluationInput{
+		SegmentIndex:       0,
+		SpeakerID:          "SPEAKER_00",
+		StartMs:            f.speechStartMs,
+		EndMs:              f.playbackEndMs,
+		DubPlaybackEndMs:   f.playbackEndMs,
+		EffectiveReserveMs: f.reserveMs,
+		MeasuredDurationMs: f.clipProbeMs,
+		MeasuredFrames:     measuredFrames,
+		MeasuredSampleRate: f.sampleRate,
+		OutputSampleRate:   f.sampleRate,
+		AttemptNumber:      3,
+		FixedRateVoice:     true,
+	}
+}
+
+// The fit and the mixer must agree at the frame-exact window boundary: the fit may only ACCEPT
+// what the frame-exact mixer will place.
+func TestAudioMixAndFit_AgreeOnFrameExactPlaybackWindow(t *testing.T) {
+	ctx := context.Background()
+	const windowFrames = 44100 // 1000ms at 44.1kHz
+
+	// 1. A clip that fills the window exactly is mixed, and the fit accepts it from exact geometry.
+	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
+	fitted := buildFrameExactFixture(t, db, casStore, windowFrames, 1000, 2000)
+	mix, err := fitted.mix(t, mixSvc)
+	if err != nil {
+		t.Fatalf("a clip exactly filling the window must mix, got error: %v", err)
+	}
+	if mix == nil || mix.OverallStatus != "PASS" {
+		t.Fatalf("expected mixed PASS artifact, got %+v", mix)
+	}
+	fitRes := service.NewFitController().EvaluateCandidate(ctx, fitted.fitInput(windowFrames))
+	if fitRes.Decision != domain.FitActionAccept {
+		t.Fatalf("fit must ACCEPT the exactly-placeable clip: %+v", fitRes)
+	}
+
+	// 2. One frame past the window: the mixer refuses it, and the fit must not hand it over. Its
+	// floored probe still reads 1000ms, which is the whole slot - the pre-fix fit accepted on that
+	// probe alone.
+	overflowing := buildFrameExactFixture(t, db, casStore, windowFrames+1, 1000, 2000)
+	if overflowing.clipProbeMs != 1000 {
+		t.Fatalf("one frame more must still floor to a 1000ms probe, got %dms", overflowing.clipProbeMs)
+	}
+	_, err = overflowing.mix(t, mixSvc)
+	if !errors.Is(err, domain.ErrMixerOverrunRefused) {
+		t.Fatalf("expected the frame-exact mixer to refuse one frame past the window, got %v", err)
+	}
+	fitRes = service.NewFitController().EvaluateCandidate(ctx, overflowing.fitInput(windowFrames+1))
+	if fitRes.Decision == domain.FitActionAccept {
+		t.Fatalf("fit must not ACCEPT a clip the mixer refuses: %+v", fitRes)
+	}
+
+	// 3. The same fixture without exact geometry keeps the conservative probe bound, which cannot
+	// prove the 1ms-boundary candidate either.
+	probeOnly := overflowing.fitInput(windowFrames + 1)
+	probeOnly.MeasuredFrames = 0
+	probeOnly.MeasuredSampleRate = 0
+	if res := service.NewFitController().EvaluateCandidate(ctx, probeOnly); res.Decision == domain.FitActionAccept {
+		t.Fatalf("a floored probe equal to the window must not ACCEPT: %+v", res)
+	}
+}

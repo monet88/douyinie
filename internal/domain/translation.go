@@ -21,6 +21,15 @@ var (
 	ErrDubScriptVariantNotFound     = errors.New("dub script variant not found")
 	ErrTranslationOwnershipMismatch = errors.New("translation ownership mismatch")
 	ErrGlossaryConflict             = errors.New("request glossary conflicts with frozen run snapshot")
+	// ErrTranscriptLineageMissing is returned when a run has no pinned speech_understand transcript
+	// lineage and the caller cannot supply one. Transport layers classify it as a bad request.
+	ErrTranscriptLineageMissing = errors.New("missing pinned speech_understand transcript lineage")
+	// ErrTranscriptLineageMismatch is returned when a supplied or pinned transcript lineage does not
+	// match the run, job, or asset it is being used for.
+	ErrTranscriptLineageMismatch = errors.New("transcript lineage mismatch")
+	// ErrTranscriptLineageProofFailed is returned when the pinned-lineage proof itself could not be
+	// completed (storage/DB failure). It must not be treated as "no pinned transcript exists".
+	ErrTranscriptLineageProofFailed = errors.New("transcript lineage proof failed")
 )
 
 const (

@@ -2113,3 +2113,274 @@ func TestHandleRunTranslation_AssetRunBindingAndFrozenGlossary(t *testing.T) {
 		t.Fatalf("expected 2 provider invocations, got %d", invocations)
 	}
 }
+
+// TestReviewItemOverrideRequiresRunID pins finding 3: a review item id alone cannot prove which
+// run's pending queue it belongs to, so the direct override endpoint must reject a missing run_id
+// instead of silently falling back to the asset-latest queue (which could accept a stale item from
+// a superseded run). The guard must also reject a whitespace-only run_id.
+func TestReviewItemOverrideRequiresRunID(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	db, err := storage.Open(filepath.Join(root, "douyinie.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	casStore, err := cas.NewStore(filepath.Join(root, "cas"))
+	if err != nil {
+		t.Fatalf("open cas: %v", err)
+	}
+
+	// ReviewSvc is auto-constructed from DB + CASStore, mirroring production wiring.
+	s := New(Config{Addr: "127.0.0.1:0", DB: db, CASStore: casStore})
+
+	for name, body := range map[string]string{
+		"missing run_id": `{}`,
+		"blank run_id":   `{"run_id":"   "}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/review-items/item-1/override", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: expected 400, got %d: %s", name, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "run_id is required") {
+			t.Fatalf("%s: expected the run_id requirement, got %s", name, rec.Body.String())
+		}
+	}
+}
+
+// TestSpeechUnderstandRejectsUnprovenRunLineage pins finding 4: the speech_understand stage
+// execution and the transcript artifact index are both pinned to the client-supplied run_id, so a
+// run that does not exist, or that belongs to a different asset, must be rejected before any
+// lineage is written - otherwise the run's transcript lineage could be poisoned with another
+// asset's media.
+func TestSpeechUnderstandRejectsUnprovenRunLineage(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	db, err := storage.Open(filepath.Join(root, "douyinie.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	casStore, err := cas.NewStore(filepath.Join(root, "cas"))
+	if err != nil {
+		t.Fatalf("open cas: %v", err)
+	}
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	attestation := domain.RightsAttestation{
+		ID:              "attestation-speech-own-1",
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		DeclaredBy:      "tester",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	}
+	_ = db.CreateRightsAttestation(ctx, attestation)
+
+	for _, id := range []string{"asset-owned", "asset-other"} {
+		_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+			ID:                  id,
+			SHA256:              "sha-" + id,
+			ByteSize:            100,
+			RightsAttestationID: attestation.ID,
+			CreatedAt:           now,
+		})
+	}
+	_ = db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             "job-other",
+		SourceAssetID:  "asset-other",
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      now,
+	})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        "run-other",
+		JobID:     "job-other",
+		Status:    "running",
+		CreatedAt: now,
+	})
+
+	speechSvc := service.NewSpeechService(db, casStore)
+	s := New(Config{Addr: "127.0.0.1:0", DB: db, CASStore: casStore, SpeechSvc: speechSvc})
+
+	cases := []struct {
+		name         string
+		body         string
+		wantContains string
+	}{
+		{"missing run_id", `{}`, "run_id is required"},
+		{"unknown run", `{"run_id":"run-absent"}`, "not found"},
+		{"run owned by another asset", `{"run_id":"run-other"}`, "belongs to asset asset-other"},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/assets/asset-owned/speech-understand", strings.NewReader(tc.body))
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: expected 400, got %d: %s", tc.name, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), tc.wantContains) {
+			t.Fatalf("%s: expected response to mention %q, got %s", tc.name, tc.wantContains, rec.Body.String())
+		}
+	}
+
+	// No lineage may be written by a rejected request: not for the foreign run, not for the asset.
+	stages, err := db.ListStageExecutions(ctx, "run-other")
+	if err != nil {
+		t.Fatalf("list stage executions: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("rejected speech-understand wrote lineage for run-other: %+v", stages)
+	}
+	if idx, err := db.GetTranscriptArtifactIndex(ctx, "asset-owned"); err == nil && idx != nil {
+		t.Fatalf("rejected speech-understand persisted a transcript index for asset-owned: %+v", idx)
+	}
+}
+
+// TestRunGlossaryConflictCountSurvivesIngress pins finding 11 end to end: a run glossary frozen at
+// create-run keeps conflicting duplicates, so the variant produced for that run reports the
+// omitted-conflict count the operator UI turns into feedback. Persisting only the deduped list would
+// make EffectiveGlossary report zero conflicts for the frozen run and the feedback would never fire.
+// The same ingress must reject an invisible format rune before any mutation.
+func TestRunGlossaryConflictCountSurvivesIngress(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	db, err := storage.Open(filepath.Join(root, "douyinie.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	casStore, err := cas.NewStore(filepath.Join(root, "cas"))
+	if err != nil {
+		t.Fatalf("open cas: %v", err)
+	}
+
+	transSvc := service.NewTranslationService(db, casStore)
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		target := req.Segments[0].SourceText
+		if len(req.Glossary) > 0 {
+			target = req.Glossary[0].Target
+		}
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "fake_model",
+			ModelVersion: "1",
+			Segments: []domain.TranslationSegment{
+				{Index: 0, SourceText: req.Segments[0].SourceText, TargetText: target},
+			},
+		}, nil
+	}
+	s := New(Config{Addr: "127.0.0.1:0", DB: db, CASStore: casStore, TranslationSvc: transSvc})
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              "attestation-glossary-conflict",
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		DeclaredBy:      "tester",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  "asset-glossary",
+		SHA256:              "sha-glossary",
+		ByteSize:            100,
+		RightsAttestationID: "attestation-glossary-conflict",
+		CreatedAt:           now,
+	})
+	_ = db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             "job-glossary",
+		SourceAssetID:  "asset-glossary",
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      now,
+	})
+
+	// Invisible format rune: the request must be rejected before any run is created.
+	badBody, _ := json.Marshal(map[string]any{
+		"config_snapshot_json": `{"glossary":[{"source":"ke\u200byword","target":"x"}]}`,
+	})
+	recBad := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recBad, httptest.NewRequest(http.MethodPost, "/api/v1/jobs/job-glossary/runs", bytes.NewReader(badBody)))
+	if recBad.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a glossary source with an invisible format rune, got %d: %s", recBad.Code, recBad.Body.String())
+	}
+	if !strings.Contains(recBad.Body.String(), "format character") {
+		t.Fatalf("expected the format-character rejection to be reported, got %s", recBad.Body.String())
+	}
+
+	// Conflicting duplicates: same source, different targets. First entry wins.
+	runBody, _ := json.Marshal(map[string]any{
+		"config_snapshot_json": `{"glossary":[{"source":"SUPOR","target":"Nồi Supor"},{"source":"ｓｕｐｏｒ","target":"Supor"}]}`,
+	})
+	recRun := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recRun, httptest.NewRequest(http.MethodPost, "/api/v1/jobs/job-glossary/runs", bytes.NewReader(runBody)))
+	if recRun.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating the run, got %d: %s", recRun.Code, recRun.Body.String())
+	}
+	var created struct {
+		Run domain.LocalizationRun `json:"run"`
+	}
+	if err := json.NewDecoder(recRun.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created run: %v", err)
+	}
+	if created.Run.ID == "" {
+		t.Fatalf("expected a run id in the create response: %s", recRun.Body.String())
+	}
+
+	// The frozen snapshot must still carry both conflicting entries, otherwise the count is unrecoverable.
+	if !strings.Contains(created.Run.ConfigSnapshotJSON, "Supor") {
+		t.Fatalf("frozen run snapshot dropped the conflicting duplicate: %s", created.Run.ConfigSnapshotJSON)
+	}
+
+	// Translation requires pinned speech_understand transcript lineage for the run.
+	tObj, err := casStore.Put(bytes.NewReader([]byte(`{"asset_id":"asset-glossary"}`)))
+	if err != nil {
+		t.Fatalf("put transcript artifact: %v", err)
+	}
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             "se-glossary-transcript",
+		RunID:          created.Run.ID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObj.SHA256,
+		CreatedAt:      now,
+	}); err != nil {
+		t.Fatalf("pin transcript lineage: %v", err)
+	}
+
+	translateBody, _ := json.Marshal(map[string]any{
+		"run_id":          created.Run.ID,
+		"job_id":          "job-glossary",
+		"target_language": "vi",
+		"segments":        []map[string]any{{"index": 0, "source_text": "SUPOR 你好"}},
+	})
+	recTrans := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recTrans, httptest.NewRequest(http.MethodPost, "/api/v1/assets/asset-glossary/translate", bytes.NewReader(translateBody)))
+	if recTrans.Code != http.StatusCreated {
+		t.Fatalf("expected 201 translating with the frozen run glossary, got %d: %s", recTrans.Code, recTrans.Body.String())
+	}
+	var translated struct {
+		Variant domain.TranslationVariant `json:"translation_variant"`
+	}
+	if err := json.NewDecoder(recTrans.Body).Decode(&translated); err != nil {
+		t.Fatalf("decode translation variant: %v", err)
+	}
+	if got := translated.Variant.EffectiveGlossary.OmittedConflicts; got != 1 {
+		t.Fatalf("expected the operator-visible conflict count 1 from the frozen run glossary, got %d (effective glossary %+v)",
+			got, translated.Variant.EffectiveGlossary)
+	}
+	entries := translated.Variant.EffectiveGlossary.Entries
+	if len(entries) != 1 || entries[0].Target != "Nồi Supor" {
+		t.Fatalf("expected first-wins to keep the first conflicting entry, got %+v", entries)
+	}
+}

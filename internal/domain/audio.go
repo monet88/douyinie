@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -21,6 +22,9 @@ var (
 	ErrAudioStemsNotFound = errors.New("audio stem artifacts not found")
 	// ErrDubMixNotFound is returned when DubMixArtifact is not found.
 	ErrDubMixNotFound = errors.New("dub mix artifact not found")
+	// ErrDubMixSchemaStale is returned when a decoded DubMixArtifact predates the current
+	// playback/coverage acceptance contract, so its PASS evidence cannot be trusted.
+	ErrDubMixSchemaStale = errors.New("dub mix artifact schema is stale")
 	// ErrSeparatorFailed is returned when vocal separator fails to isolate stems.
 	ErrSeparatorFailed = errors.New("audio separation failed to produce stems")
 	// ErrAudioRolePreflightRequired is returned when preflight metadata is required to generate an AudioRolePlan.
@@ -186,6 +190,17 @@ type DubMixArtifact struct {
 	OverallStatus       string                     `json:"overall_status"` // "PASS", "REVIEW_REQUIRED", "REFUSED"
 	RefusalReason       string                     `json:"refusal_reason,omitempty"`
 	CreatedAt           time.Time                  `json:"created_at"`
+}
+
+// ValidateCurrentSchema rejects a decoded DubMixArtifact that predates the current playback/coverage
+// acceptance contract. Legacy rows stay readable as historical evidence, but must never supply
+// re-usable PASS evidence to render, review, bundle, or benchmark consumers: their PASS was decided
+// under superseded playback/coverage rules and could bypass the current acceptance.
+func (d DubMixArtifact) ValidateCurrentSchema() error {
+	if d.SchemaVersion != DubMixSchemaVersion {
+		return fmt.Errorf("%w: artifact schema %d, current %d", ErrDubMixSchemaStale, d.SchemaVersion, DubMixSchemaVersion)
+	}
+	return nil
 }
 
 // ComputeAudioStemsProvenanceHash computes deterministic hash for AudioStemArtifacts.

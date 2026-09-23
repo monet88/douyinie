@@ -209,6 +209,131 @@ func TestMeaningGateGlossaryEquivalenceIsScoped(t *testing.T) {
 	}
 }
 
+func TestGlossaryRejectsInvisibleFormatRunesExceptJoiners(t *testing.T) {
+	// Bug premise: NFKC + TrimSpace is the only normalization applied to a glossary source and it
+	// leaves zero-width formatters intact. A term carrying U+200B therefore validates as a legitimate
+	// entry yet can never match the rendered source text, silently consuming a glossary slot forever —
+	// rejection at ingress is the smallest deterministic contract that prevents that.
+	zwsp := "ke\u200byword"
+	if !strings.ContainsRune(domain.NormalizeGlossarySource(zwsp), '\u200b') {
+		t.Fatalf("premise broken: normalization now strips U+200B from %q", zwsp)
+	}
+	if domain.GlossaryTermMatches("keyword", zwsp) {
+		t.Fatalf("premise broken: %q unexpectedly matches its rendered form 'keyword'", zwsp)
+	}
+
+	entries := []domain.GlossaryEntry{{Source: zwsp, Target: "Từ khóa"}}
+	resolved, conflicts, err := ValidateGlossaryEntriesWithReport(entries)
+	if err == nil {
+		t.Fatalf("expected U+200B source to be rejected, got %+v", resolved)
+	}
+	if resolved != nil || conflicts != 0 {
+		t.Fatalf("rejected glossary must not be partially returned, got %+v/%d", resolved, conflicts)
+	}
+	if !strings.Contains(err.Error(), "disallowed format character") {
+		t.Fatalf("expected disallowed-format-character error, got %v", err)
+	}
+	// The non-report variant is the ingress contract for a run snapshot: reject with zero mutation.
+	if got, err := ValidateGlossaryEntries(entries); err == nil || got != nil {
+		t.Fatalf("expected ValidateGlossaryEntries to reject U+200B with zero mutation, got %+v/%v", got, err)
+	}
+
+	// ZWNJ/ZWJ are genuine script joiners and must never be over-rejected.
+	joiners := []domain.GlossaryEntry{
+		{Source: "می\u200cخواهم", Target: "tôi muốn"},
+		{Source: "👨\u200d👩", Target: "đôi"},
+	}
+	kept, err := ValidateGlossaryEntries(joiners)
+	if err != nil {
+		t.Fatalf("expected ZWNJ/ZWJ sources to be accepted, got %v", err)
+	}
+	if len(kept) != len(joiners) {
+		t.Fatalf("expected both joiner entries kept, got %+v", kept)
+	}
+	for i, joiner := range []rune{'\u200c', '\u200d'} {
+		if !strings.ContainsRune(kept[i].Source, joiner) {
+			t.Fatalf("joiner entry %d lost U+%04X: %q", i, joiner, kept[i].Source)
+		}
+	}
+}
+
+func TestGlossaryOmittedConflictCountRequiresOriginalRequest(t *testing.T) {
+	// Conflicting duplicates (same normalized source, different target/note): first-wins, count 1.
+	conflicting := []domain.GlossaryEntry{
+		{Source: "SUPOR", Target: "Nồi Supor", Note: "first"},
+		{Source: "ｓｕｐｏｒ", Target: "Supor khác", Note: "second"},
+	}
+	deduped, conflicts, err := ValidateGlossaryEntriesWithReport(conflicting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conflicts != 1 {
+		t.Fatalf("expected 1 omitted conflict, got %d", conflicts)
+	}
+	if len(deduped) != 1 || deduped[0].Target != "Nồi Supor" || deduped[0].Note != "first" {
+		t.Fatalf("expected deterministic first-wins entry, got %+v", deduped)
+	}
+	plain, err := ValidateGlossaryEntries(conflicting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !CanonicalGlossaryEqual(plain, deduped) {
+		t.Fatalf("count-dropping variant diverged from report variant: %+v vs %+v", plain, deduped)
+	}
+
+	// Identical duplicates are deduped but are NOT conflicts.
+	identical, identicalConflicts, err := ValidateGlossaryEntriesWithReport([]domain.GlossaryEntry{
+		{Source: "北京", Target: "Bắc Kinh", Note: "city"},
+		{Source: "北京", Target: "Bắc Kinh", Note: "city"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identicalConflicts != 0 {
+		t.Fatalf("expected identical duplicates to report 0 conflicts, got %d", identicalConflicts)
+	}
+	if len(identical) != 1 {
+		t.Fatalf("expected identical duplicates deduped to 1 entry, got %+v", identical)
+	}
+
+	// Bug premise: the deduped list alone cannot reproduce the count, and the semantic hash is
+	// identical either way — so an ingress that freezes a run glossary MUST persist the count
+	// returned alongside the list, or EffectiveGlossary reports 0 conflicts for the frozen run.
+	segments := []domain.TranslationInputSegment{{Index: 0, SourceText: "SUPOR"}}
+	fromDeduped, err := effectiveGlossary(deduped, segments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromOriginal, err := effectiveGlossary(conflicting, segments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromDeduped.OmittedConflicts != 0 {
+		t.Fatalf("expected deduped list to report 0 conflicts, got %d", fromDeduped.OmittedConflicts)
+	}
+	if fromOriginal.OmittedConflicts != 1 {
+		t.Fatalf("expected original request to report 1 conflict, got %d", fromOriginal.OmittedConflicts)
+	}
+	if fromDeduped.Hash != fromOriginal.Hash {
+		t.Fatalf("conflict count is not recoverable from semantics: hash %s != %s", fromDeduped.Hash, fromOriginal.Hash)
+	}
+
+	// Invalid input still fails with zero mutation (nil list, zero count).
+	for _, bad := range [][]domain.GlossaryEntry{
+		{{Source: "", Target: "x"}},
+		{{Source: "x", Target: ""}},
+		{{Source: strings.Repeat("界", maxGlossarySourceRunes+1), Target: "x"}},
+	} {
+		res, count, err := ValidateGlossaryEntriesWithReport(bad)
+		if err == nil {
+			t.Fatalf("expected error for %+v", bad)
+		}
+		if res != nil || count != 0 {
+			t.Fatalf("invalid input must not mutate or return state, got %+v/%d", res, count)
+		}
+	}
+}
+
 func TestGlossaryMatchesLatinNextToCJK(t *testing.T) {
 	entries := []domain.GlossaryEntry{
 		{Source: "AI", Target: "Trí tuệ nhân tạo"},

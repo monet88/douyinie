@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/monet88/douyinie/internal/domain"
@@ -26,33 +27,30 @@ func normalizeGlossarySource(s string) string {
 	return domain.NormalizeGlossarySource(s)
 }
 
+// glossarySourceHasFormatRune reports whether s contains a Unicode format (Cf) rune other than the
+// genuine script joiners ZWNJ/ZWJ. NFKC + TrimSpace leaves these runes intact, so a term such as
+// "ke\u200byword" validates but can never match any source text: it would silently consume a glossary
+// slot and never apply. Rejecting is the smallest deterministic contract that keeps provenance semantics.
+func glossarySourceHasFormatRune(s string) bool {
+	return strings.ContainsFunc(s, func(r rune) bool {
+		switch r {
+		case '\u200c', '\u200d': // ZWNJ / ZWJ are meaningful joiners in Arabic/Persian/Indic scripts.
+			return false
+		}
+		return unicode.In(r, unicode.Cf)
+	})
+}
+
 func validateGlossaryEntriesWithReport(entries []domain.GlossaryEntry) ([]domain.GlossaryEntry, int, error) {
-	if len(entries) > maxGlossaryEntries {
-		return nil, 0, fmt.Errorf("glossary has %d entries; maximum is %d", len(entries), maxGlossaryEntries)
-	}
-	if raw, err := json.Marshal(entries); err != nil {
-		return nil, 0, fmt.Errorf("marshal glossary: %w", err)
-	} else if len(raw) > maxRawGlossaryBytes {
-		return nil, 0, fmt.Errorf("glossary JSON is %d bytes; maximum is %d", len(raw), maxRawGlossaryBytes)
+	normalized, err := normalizeGlossaryEntries(entries)
+	if err != nil {
+		return nil, 0, err
 	}
 
-	resolved := make([]domain.GlossaryEntry, 0, len(entries))
-	bySource := make(map[string]domain.GlossaryEntry, len(entries))
+	resolved := make([]domain.GlossaryEntry, 0, len(normalized))
+	bySource := make(map[string]domain.GlossaryEntry, len(normalized))
 	omittedConflicts := 0
-	for i, raw := range entries {
-		if utf8.RuneCountInString(raw.Source) > maxGlossarySourceRunes || utf8.RuneCountInString(raw.Target) > maxGlossaryTargetRunes || utf8.RuneCountInString(raw.Note) > maxGlossaryNoteRunes {
-			return nil, 0, fmt.Errorf("glossary entry %d exceeds source/target/note limits", i)
-		}
-		// Only source keys participate in NFKC matching. Target/note are operator-owned
-		// output semantics: trim surrounding whitespace, but otherwise preserve exact
-		// Unicode and case so a compatibility-character change invalidates provenance.
-		e := domain.GlossaryEntry{Source: norm.NFKC.String(strings.TrimSpace(raw.Source)), Target: strings.TrimSpace(raw.Target), Note: strings.TrimSpace(raw.Note)}
-		if e.Source == "" || e.Target == "" {
-			return nil, 0, fmt.Errorf("glossary entry %d requires non-empty source and target", i)
-		}
-		if utf8.RuneCountInString(e.Source) > maxGlossarySourceRunes || utf8.RuneCountInString(e.Target) > maxGlossaryTargetRunes || utf8.RuneCountInString(e.Note) > maxGlossaryNoteRunes {
-			return nil, 0, fmt.Errorf("normalized glossary entry %d exceeds source/target/note limits", i)
-		}
+	for _, e := range normalized {
 		key := normalizeGlossarySource(e.Source)
 		if prior, ok := bySource[key]; ok {
 			if prior.Target != e.Target || prior.Note != e.Note {
@@ -66,6 +64,43 @@ func validateGlossaryEntriesWithReport(entries []domain.GlossaryEntry) ([]domain
 	return resolved, omittedConflicts, nil
 }
 
+// normalizeGlossaryEntries validates and normalizes an ordered request-local glossary while keeping
+// every entry, including conflicting duplicates. First-wins conflict resolution happens later in
+// validateGlossaryEntriesWithReport, so callers that freeze a request glossary persist this form and
+// nothing about the request is lost. Invalid input returns an error and mutates nothing.
+func normalizeGlossaryEntries(entries []domain.GlossaryEntry) ([]domain.GlossaryEntry, error) {
+	if len(entries) > maxGlossaryEntries {
+		return nil, fmt.Errorf("glossary has %d entries; maximum is %d", len(entries), maxGlossaryEntries)
+	}
+	if raw, err := json.Marshal(entries); err != nil {
+		return nil, fmt.Errorf("marshal glossary: %w", err)
+	} else if len(raw) > maxRawGlossaryBytes {
+		return nil, fmt.Errorf("glossary JSON is %d bytes; maximum is %d", len(raw), maxRawGlossaryBytes)
+	}
+
+	normalized := make([]domain.GlossaryEntry, 0, len(entries))
+	for i, raw := range entries {
+		if utf8.RuneCountInString(raw.Source) > maxGlossarySourceRunes || utf8.RuneCountInString(raw.Target) > maxGlossaryTargetRunes || utf8.RuneCountInString(raw.Note) > maxGlossaryNoteRunes {
+			return nil, fmt.Errorf("glossary entry %d exceeds source/target/note limits", i)
+		}
+		// Only source keys participate in NFKC matching. Target/note are operator-owned
+		// output semantics: trim surrounding whitespace, but otherwise preserve exact
+		// Unicode and case so a compatibility-character change invalidates provenance.
+		e := domain.GlossaryEntry{Source: norm.NFKC.String(strings.TrimSpace(raw.Source)), Target: strings.TrimSpace(raw.Target), Note: strings.TrimSpace(raw.Note)}
+		if e.Source == "" || e.Target == "" {
+			return nil, fmt.Errorf("glossary entry %d requires non-empty source and target", i)
+		}
+		if glossarySourceHasFormatRune(e.Source) {
+			return nil, fmt.Errorf("glossary entry %d source contains a disallowed format character", i)
+		}
+		if utf8.RuneCountInString(e.Source) > maxGlossarySourceRunes || utf8.RuneCountInString(e.Target) > maxGlossaryTargetRunes || utf8.RuneCountInString(e.Note) > maxGlossaryNoteRunes {
+			return nil, fmt.Errorf("normalized glossary entry %d exceeds source/target/note limits", i)
+		}
+		normalized = append(normalized, e)
+	}
+	return normalized, nil
+}
+
 func validateGlossaryEntries(entries []domain.GlossaryEntry) ([]domain.GlossaryEntry, error) {
 	resolved, _, err := validateGlossaryEntriesWithReport(entries)
 	return resolved, err
@@ -75,6 +110,23 @@ func validateGlossaryEntries(entries []domain.GlossaryEntry) ([]domain.GlossaryE
 // RuntimeHost uses it before persisting a run snapshot so invalid input causes zero mutation.
 func ValidateGlossaryEntries(entries []domain.GlossaryEntry) ([]domain.GlossaryEntry, error) {
 	return validateGlossaryEntries(entries)
+}
+
+// ValidateGlossaryEntriesWithReport is ValidateGlossaryEntries plus the number of entries dropped as
+// conflicting duplicates (first-wins). The deduped list alone cannot reproduce that count, so an
+// ingress that freezes a request glossary must persist it; otherwise EffectiveGlossary reports zero
+// conflicts for the frozen run and the operator conflict feedback never fires.
+func ValidateGlossaryEntriesWithReport(entries []domain.GlossaryEntry) ([]domain.GlossaryEntry, int, error) {
+	return validateGlossaryEntriesWithReport(entries)
+}
+
+// NormalizeGlossaryEntries validates and normalizes an ordered request-local glossary while keeping
+// conflicting duplicates; first-wins resolution is applied later, when the effective glossary for a
+// concrete input is computed. Ingress that freezes or forwards a request glossary must use this form:
+// a de-duplicated list cannot reproduce how many entries were dropped as conflicts, so the run's
+// EffectiveGlossary would report 0 conflicts and operator conflict feedback would never fire.
+func NormalizeGlossaryEntries(entries []domain.GlossaryEntry) ([]domain.GlossaryEntry, error) {
+	return normalizeGlossaryEntries(entries)
 }
 
 // CanonicalGlossaryEqual reports whether two glossary entry lists are canonically equivalent:
@@ -99,14 +151,6 @@ func CanonicalGlossaryEqual(a, b []domain.GlossaryEntry) bool {
 		}
 	}
 	return true
-}
-
-func hasCJK(s string) bool {
-	return domain.HasCJK(s)
-}
-
-func glossaryWordRune(r rune) bool {
-	return domain.GlossaryWordRune(r)
 }
 
 func glossaryTermMatches(sourceText, term string) bool {

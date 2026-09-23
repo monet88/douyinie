@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -658,4 +659,218 @@ func TestExecuteAcquisitionCorpus_ContextCancellationAndPerEntryFailure(t *testi
 			t.Fatalf("expected failed entries to be recorded in summary, got %d", summary.FailedEntries)
 		}
 	})
+}
+
+func TestIsReusableCurrentSchemaBenchmarkQualityResult(t *testing.T) {
+	currentQR := domain.QualityResult{
+		ID:             "qr-bench-current",
+		RunID:          "run-1",
+		JobID:          "job-1",
+		AssetID:        "asset-1",
+		TargetLanguage: "vi",
+		Stage:          "multimodal_qc",
+		Details: map[string]any{
+			benchmark.BenchmarkQCProducerKey: benchmark.BenchmarkQCProducerValue,
+			benchmark.BenchmarkQCSchemaKey:   benchmark.BenchmarkQCSchemaVersion,
+		},
+	}
+	if !benchmark.IsReusableCurrentSchemaBenchmarkQualityResult(currentQR, "run-1", "job-1", "asset-1", "vi") {
+		t.Fatalf("expected current-schema benchmark QR to be reusable")
+	}
+
+	// Legacy schema rows stay benchmark-owned (audit visibility) but must never be reused as the
+	// run's current automatic QC evidence.
+	for _, legacySchema := range []any{1, float64(1), "1", json.Number("1")} {
+		legacyQR := currentQR
+		legacyQR.ID = "qr-bench-legacy"
+		legacyQR.Details = map[string]any{
+			benchmark.BenchmarkQCProducerKey: benchmark.BenchmarkQCProducerValue,
+			benchmark.BenchmarkQCSchemaKey:   legacySchema,
+		}
+		if !benchmark.IsBenchmarkOwnedQualityResult(legacyQR, "run-1", "job-1", "asset-1", "vi") {
+			t.Errorf("legacy schema %v must remain benchmark-owned for audit", legacySchema)
+		}
+		if benchmark.IsReusableCurrentSchemaBenchmarkQualityResult(legacyQR, "run-1", "job-1", "asset-1", "vi") {
+			t.Errorf("legacy schema %v must not be reusable as current QC evidence", legacySchema)
+		}
+	}
+
+	// Scope mismatches and unowned results are not reusable.
+	if benchmark.IsReusableCurrentSchemaBenchmarkQualityResult(currentQR, "run-2", "job-1", "asset-1", "vi") {
+		t.Errorf("mismatched runID must not be reusable")
+	}
+	unownedQR := currentQR
+	unownedQR.Details = map[string]any{"source": "production_human"}
+	if benchmark.IsReusableCurrentSchemaBenchmarkQualityResult(unownedQR, "run-1", "job-1", "asset-1", "vi") {
+		t.Errorf("unowned QR must not be reusable")
+	}
+}
+
+// TestBenchmarkRunner_ExecuteQualityCase_LegacySchemaRowIsNotReused proves the resume contract for
+// benchmark-owned QC evidence: a legacy schema-1 row for the same run/job/asset/language stays
+// recognized as benchmark-owned but must never become autoQRID. The runner derives and posts
+// exactly one current-schema row on the first resume, then reuses that row on every later resume.
+func TestBenchmarkRunner_ExecuteQualityCase_LegacySchemaRowIsNotReused(t *testing.T) {
+	legacy := domain.QualityResult{
+		ID:             "qr-benchmark-legacy-01",
+		RunID:          "run-resume-01",
+		JobID:          "job-resume-01",
+		AssetID:        "asset-resume-01",
+		TargetLanguage: "vi",
+		Stage:          "multimodal_qc",
+		OverallStatus:  domain.QualityStatusPass,
+		CreatedAt:      time.Now().UTC(),
+		Details: map[string]any{
+			benchmark.BenchmarkQCProducerKey: benchmark.BenchmarkQCProducerValue,
+			benchmark.BenchmarkQCSchemaKey:   1,
+		},
+	}
+
+	var mu sync.Mutex
+	stored := []domain.QualityResult{legacy}
+	postCount := 0
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/quality-results":
+			var qr domain.QualityResult
+			_ = json.NewDecoder(r.Body).Decode(&qr)
+			mu.Lock()
+			stored = append(stored, qr)
+			postCount++
+			mu.Unlock()
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"quality_result": qr})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/quality-results"):
+			mu.Lock()
+			rows := append([]domain.QualityResult(nil), stored...)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"quality_results": rows, "count": len(rows)})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/review-items"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []domain.ReviewItem{}, "count": 0})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"cas_hash": "cas-resume-hash",
+				"id":       "mock-id",
+				"cues":     []domain.SubtitleCue{},
+			})
+		}
+	})
+
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	storeDir := filepath.Join(t.TempDir(), "sessions")
+	store, err := benchmark.NewFileStore(storeDir)
+	if err != nil {
+		t.Fatalf("new file store: %v", err)
+	}
+	sess, err := benchmark.NewSession(benchmark.SessionIdentityInput{ExecutionProfile: "local"})
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	client := benchmark.NewRuntimeHostClient(server.URL, server.Client())
+	runner, err := benchmark.NewBenchmarkRunner(benchmark.RunnerConfig{Client: client, Store: store, Session: sess})
+	if err != nil {
+		t.Fatalf("new benchmark runner: %v", err)
+	}
+
+	input := benchmark.QualityCaseInput{
+		CaseID:          "case-resume-schema",
+		SourceVideoID:   "video-resume-01",
+		SourceAssetID:   legacy.AssetID,
+		PrimaryCategory: "lifestyle_narration",
+		TargetLanguage:  legacy.TargetLanguage,
+		Profile:         "local",
+		IsNoDub:         true,
+	}
+	// Pre-seed the case so the runner attaches to the existing run/job/asset rather than creating
+	// new native entities, mirroring a real resume of the same case.
+	pre := benchmark.QualityCaseEvidence{
+		CaseID:          input.CaseID,
+		SourceVideoID:   input.SourceVideoID,
+		PrimaryCategory: input.PrimaryCategory,
+		TargetLanguage:  input.TargetLanguage,
+		Profile:         "local",
+		Status:          "IN_PROGRESS",
+		CreatedAt:       time.Now().UTC(),
+		SourceAssetID:   legacy.AssetID,
+		JobID:           legacy.JobID,
+		RunID:           legacy.RunID,
+		Stages:          make(map[string]benchmark.StageExecutionEvidence),
+	}
+	sess.RecordQualityCase(pre)
+
+	if !benchmark.IsBenchmarkOwnedQualityResult(legacy, legacy.RunID, legacy.JobID, legacy.AssetID, legacy.TargetLanguage) {
+		t.Fatalf("legacy schema-1 row must stay benchmark-owned for audit visibility")
+	}
+	if benchmark.IsReusableCurrentSchemaBenchmarkQualityResult(legacy, legacy.RunID, legacy.JobID, legacy.AssetID, legacy.TargetLanguage) {
+		t.Fatalf("legacy schema-1 row must not be reusable")
+	}
+
+	// Resume 1: only a legacy row exists -> derive and post exactly one current-schema row.
+	qcEv, err := runner.ExecuteQualityCase(context.Background(), input)
+	if err != nil {
+		t.Fatalf("resume 1 failed: %v", err)
+	}
+	rowsAfter1 := snapshotRows(&mu, &stored)
+	if len(rowsAfter1) != 2 || postCount != 1 {
+		t.Fatalf("resume 1 must append exactly one current-schema row (rows=%d posts=%d)", len(rowsAfter1), postCount)
+	}
+	var currentRow domain.QualityResult
+	currentRows := 0
+	for _, qr := range rowsAfter1 {
+		if qr.ID == legacy.ID {
+			continue
+		}
+		if !benchmark.IsReusableCurrentSchemaBenchmarkQualityResult(qr, qcEv.RunID, qcEv.JobID, qcEv.SourceAssetID, qcEv.TargetLanguage) {
+			t.Fatalf("resume 1 posted row %s is not reusable current-schema evidence: %+v", qr.ID, qr.Details)
+		}
+		currentRow = qr
+		currentRows++
+	}
+	if currentRows != 1 {
+		t.Fatalf("expected exactly one current-schema row after resume 1, got %d", currentRows)
+	}
+	if currentRow.ID == legacy.ID {
+		t.Fatalf("legacy row must not be reused as autoQRID")
+	}
+	if !containsID(qcEv.RelationalQC.QualityResultIDs, currentRow.ID) {
+		t.Fatalf("expected posted row %s captured in relational QC evidence, got %v", currentRow.ID, qcEv.RelationalQC.QualityResultIDs)
+	}
+
+	// Resume 2 and 3: the current-schema row is reused, no further appends.
+	for resume := 2; resume <= 3; resume++ {
+		qcEv.Status = "IN_PROGRESS"
+		sess.RecordQualityCase(*qcEv)
+		qcEv, err = runner.ExecuteQualityCase(context.Background(), input)
+		if err != nil {
+			t.Fatalf("resume %d failed: %v", resume, err)
+		}
+		rows := snapshotRows(&mu, &stored)
+		if len(rows) != 2 || postCount != 1 {
+			t.Fatalf("resume %d must reuse the current-schema row without appending (rows=%d posts=%d)", resume, len(rows), postCount)
+		}
+		for _, qr := range rows {
+			if qr.ID != legacy.ID && qr.ID != currentRow.ID {
+				t.Fatalf("resume %d produced unexpected quality result %s", resume, qr.ID)
+			}
+		}
+	}
+}
+
+func snapshotRows(mu *sync.Mutex, stored *[]domain.QualityResult) []domain.QualityResult {
+	mu.Lock()
+	defer mu.Unlock()
+	return append([]domain.QualityResult(nil), *stored...)
+}
+
+func containsID(ids []string, want string) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
 }

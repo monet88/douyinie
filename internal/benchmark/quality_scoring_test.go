@@ -1328,10 +1328,201 @@ func TestQualityScoring_LegitimateBorrowedSilencePlayback_Passes(t *testing.T) {
 	if metrics.DubbingTimingWithin200Ms != 1.0 {
 		t.Fatalf("expected DubbingTimingWithin200Ms 1.0, got %f (status: %s, fails: %v)", metrics.DubbingTimingWithin200Ms, metrics.Status, metrics.FailReasons)
 	}
-	if metrics.CumulativeDriftMs != 50 {
-		t.Fatalf("expected CumulativeDriftMs 50, got %d", metrics.CumulativeDriftMs)
+	// The finish sits inside the accepted playback interval [StartMs, DubPlaybackEndMs], so it
+	// carries zero deviation: measuring the 50ms still unused before the borrowed-silence
+	// ceiling reported a false error against a contract-compliant finish.
+	if metrics.CumulativeDriftMs != 0 {
+		t.Fatalf("expected CumulativeDriftMs 0 for a finish inside the accepted interval, got %d", metrics.CumulativeDriftMs)
 	}
 	if metrics.Status != "PASS" {
 		t.Fatalf("expected PASS status, got %s: %v", metrics.Status, metrics.FailReasons)
 	}
+}
+
+// dubTimingCase builds a quality case whose measured artifacts are the given dub segments plus a
+// transcript that mirrors the reference pack timing and text. ASR, forced-alignment, and
+// critical-item gates therefore stay clean, isolating dubbing-timing scoring assertions.
+func dubTimingCase(caseID string, pack *benchmark.ReferenceAnnotationPack, segs []domain.DubSegment) *benchmark.QualityCaseEvidence {
+	blocks := make([]domain.SpeechBlock, 0, len(pack.ChineseTranscript))
+	for i, rs := range pack.ChineseTranscript {
+		blocks = append(blocks, domain.SpeechBlock{
+			Index:       i,
+			StartMs:     rs.StartMs,
+			EndMs:       rs.EndMs,
+			SourceText:  rs.ChineseText,
+			SegmentType: domain.SpeechBlockTypeSpeech,
+		})
+	}
+	return &benchmark.QualityCaseEvidence{
+		CaseID:          caseID,
+		SourceVideoID:   pack.AssetID,
+		PrimaryCategory: string(benchmark.CategoryCleanSingleSpeaker),
+		TargetLanguage:  "vi",
+		Profile:         "hybrid",
+		Status:          "COMPLETED",
+		StageArtifacts: &benchmark.CaseMeasuredStageArtifacts{
+			Transcript:  &domain.TranscriptArtifact{SpeechBlocks: blocks},
+			DubSegments: &domain.DubSegmentsVariant{Segments: segs},
+		},
+		Telemetry: []benchmark.ResourceTelemetrySample{
+			{Stage: "translate", RTF: 1.0, DevicePeakVRAMBytes: 1000},
+		},
+	}
+}
+
+func TestEvaluateCaseQuality_BorrowedSilenceInsideAcceptedWindowScoresZeroDeviation(t *testing.T) {
+	pack := &benchmark.ReferenceAnnotationPack{
+		PackID:  "pack_borrow_window",
+		AssetID: "asset_borrow_window",
+		ChineseTranscript: []benchmark.ReferenceTranscriptSegment{
+			{SegmentID: "seg_01", ChineseText: "测试", StartMs: 1000, EndMs: 2000},
+			{SegmentID: "seg_02", ChineseText: "语句", StartMs: 3000, EndMs: 4000},
+		},
+	}
+	// Both finishes land 20ms/30ms past the immutable source anchor but inside the 300ms
+	// borrowed-silence ceiling. Scoring against the ceiling instead reported the unused 280ms and
+	// 270ms as error, which zeroed the within-±200ms rate and failed the case.
+	segs := []domain.DubSegment{
+		{Index: 0, StartMs: 1000, EndMs: 2000, DubPlaybackEndMs: 2300, MeasuredDurationMs: 1020, FitDecision: domain.FitActionAccept},
+		{Index: 1, StartMs: 3000, EndMs: 4000, DubPlaybackEndMs: 4300, MeasuredDurationMs: 1030, FitDecision: domain.FitActionAccept},
+	}
+
+	metrics := benchmark.EvaluateCaseQuality(dubTimingCase("case_borrow_window", pack, segs), pack)
+	if metrics.DubbingTimingWithin200Ms != 1.0 {
+		t.Fatalf("expected within-±200ms rate 1.0 for finishes inside the accepted window, got %f (status %s, fails %v)", metrics.DubbingTimingWithin200Ms, metrics.Status, metrics.FailReasons)
+	}
+	if metrics.CompliantDubbingBlocks != 2 || metrics.TotalDubbingBlocks != 2 {
+		t.Fatalf("expected 2/2 compliant blocks, got %d/%d", metrics.CompliantDubbingBlocks, metrics.TotalDubbingBlocks)
+	}
+	if metrics.CumulativeDriftMs != 0 {
+		t.Fatalf("expected cumulative drift 0 for a finish inside the accepted window, got %d", metrics.CumulativeDriftMs)
+	}
+	if metrics.Status != "PASS" {
+		t.Fatalf("expected PASS, got %s (fails %v, reviews %v)", metrics.Status, metrics.FailReasons, metrics.ReviewReasons)
+	}
+}
+
+func TestEvaluateCaseQuality_FinishBeyondBorrowedCeilingCountsOverrun(t *testing.T) {
+	pack := &benchmark.ReferenceAnnotationPack{
+		PackID:  "pack_past_ceiling",
+		AssetID: "asset_past_ceiling",
+		ChineseTranscript: []benchmark.ReferenceTranscriptSegment{
+			{SegmentID: "seg_01", ChineseText: "测试", StartMs: 0, EndMs: 1000},
+		},
+	}
+	// Finish 1350ms is 50ms past the borrowed-silence ceiling (1300ms) and 350ms past the source
+	// anchor: the ceiling is the error origin, so the deviation is 50ms and the block stays within
+	// the ±200ms tolerance.
+	segs := []domain.DubSegment{
+		{Index: 0, StartMs: 0, EndMs: 1000, DubPlaybackEndMs: 1300, MeasuredDurationMs: 1350, FitDecision: domain.FitActionAccept},
+	}
+
+	metrics := benchmark.EvaluateCaseQuality(dubTimingCase("case_past_ceiling", pack, segs), pack)
+	if metrics.CumulativeDriftMs != 50 {
+		t.Fatalf("expected deviation 50ms measured from the borrowed-silence ceiling, got %d", metrics.CumulativeDriftMs)
+	}
+	if metrics.DubbingTimingWithin200Ms != 1.0 {
+		t.Fatalf("expected within-±200ms rate 1.0 for a 50ms overrun, got %f", metrics.DubbingTimingWithin200Ms)
+	}
+	if metrics.Status != "PASS" {
+		t.Fatalf("expected PASS, got %s (fails %v)", metrics.Status, metrics.FailReasons)
+	}
+}
+
+func TestEvaluateCaseQuality_OverrunBeyondBorrowedCeilingAbove500MsTriggersReview(t *testing.T) {
+	pack := &benchmark.ReferenceAnnotationPack{
+		PackID:  "pack_past_ceiling_500",
+		AssetID: "asset_past_ceiling_500",
+		ChineseTranscript: []benchmark.ReferenceTranscriptSegment{
+			{SegmentID: "seg_01", ChineseText: "测试语句", StartMs: 0, EndMs: 20000},
+		},
+	}
+	// 20 blocks; block 5 finishes 1600ms past its borrowed-silence ceiling. The 19/20 = 0.95 rate
+	// sits exactly at the required floor (no rate FAIL), so the >500ms overrun must project
+	// REVIEW_REQUIRED, and the last (exact) block keeps cumulative drift at 0.
+	segs := make([]domain.DubSegment, 20)
+	for i := range segs {
+		st := int64(i * 1000)
+		segs[i] = domain.DubSegment{
+			Index: i, StartMs: st, EndMs: st + 1000, DubPlaybackEndMs: st + 1000,
+			MeasuredDurationMs: 1000, FitDecision: domain.FitActionAccept,
+		}
+	}
+	segs[5].DubPlaybackEndMs = 6300
+	segs[5].MeasuredDurationMs = 2900 // finish 7900 = 1600ms past the 6300ms ceiling
+
+	metrics := benchmark.EvaluateCaseQuality(dubTimingCase("case_past_ceiling_500", pack, segs), pack)
+	if metrics.DubbingTimingWithin200Ms != 0.95 {
+		t.Fatalf("expected within-±200ms rate 0.95, got %f", metrics.DubbingTimingWithin200Ms)
+	}
+	if metrics.CumulativeDriftMs != 0 {
+		t.Fatalf("expected cumulative drift 0 from the exact last block, got %d", metrics.CumulativeDriftMs)
+	}
+	if metrics.Status != "REVIEW_REQUIRED" {
+		t.Fatalf("expected REVIEW_REQUIRED for the 1600ms overrun, got %s (fails %v)", metrics.Status, metrics.FailReasons)
+	}
+}
+
+func TestEvaluateCaseQuality_FinishBeforeSourceAnchorCountsDeviation(t *testing.T) {
+	pack := &benchmark.ReferenceAnnotationPack{
+		PackID:  "pack_before_anchor",
+		AssetID: "asset_before_anchor",
+		ChineseTranscript: []benchmark.ReferenceTranscriptSegment{
+			{SegmentID: "seg_01", ChineseText: "测试", StartMs: 0, EndMs: 1000},
+		},
+	}
+	// No borrowing ceiling is recorded, so the accepted interval is the source anchor itself and a
+	// finish 150ms early is a real deviation — inside the ±200ms block tolerance, but past the
+	// 100ms cumulative-drift ceiling.
+	segs := []domain.DubSegment{
+		{Index: 0, StartMs: 0, EndMs: 1000, MeasuredDurationMs: 850},
+	}
+
+	metrics := benchmark.EvaluateCaseQuality(dubTimingCase("case_before_anchor", pack, segs), pack)
+	if metrics.DubbingTimingWithin200Ms != 1.0 {
+		t.Fatalf("expected within-±200ms rate 1.0 for a 150ms early finish, got %f", metrics.DubbingTimingWithin200Ms)
+	}
+	if metrics.CumulativeDriftMs != 150 {
+		t.Fatalf("expected deviation 150ms measured from the source anchor, got %d", metrics.CumulativeDriftMs)
+	}
+	if metrics.Status != "FAIL" || !containsReason(metrics.FailReasons, "cumulative drift 150 ms exceeds ceiling") {
+		t.Fatalf("expected drift FAIL with measured 150ms, got status %s fails %v", metrics.Status, metrics.FailReasons)
+	}
+}
+
+func TestEvaluateCaseQuality_CumulativeDriftUsesAcceptedIntervalForLastSegment(t *testing.T) {
+	pack := &benchmark.ReferenceAnnotationPack{
+		PackID:  "pack_drift_window",
+		AssetID: "asset_drift_window",
+		ChineseTranscript: []benchmark.ReferenceTranscriptSegment{
+			{SegmentID: "seg_01", ChineseText: "测试", StartMs: 0, EndMs: 1000},
+			{SegmentID: "seg_02", ChineseText: "语句", StartMs: 4000, EndMs: 5000},
+		},
+	}
+	// The last block finishes at 5080ms, inside its [4000, 5400] accepted interval. Scoring it
+	// against the ceiling reported 320ms of phantom cumulative drift and failed the whole video.
+	segs := []domain.DubSegment{
+		{Index: 0, StartMs: 0, EndMs: 1000, DubPlaybackEndMs: 1000, MeasuredDurationMs: 1000, FitDecision: domain.FitActionAccept},
+		{Index: 1, StartMs: 4000, EndMs: 5000, DubPlaybackEndMs: 5400, MeasuredDurationMs: 1080, FitDecision: domain.FitActionAccept},
+	}
+
+	metrics := benchmark.EvaluateCaseQuality(dubTimingCase("case_drift_window", pack, segs), pack)
+	if metrics.CumulativeDriftMs != 0 {
+		t.Fatalf("expected cumulative drift 0 from a last block finishing inside its accepted interval, got %d", metrics.CumulativeDriftMs)
+	}
+	if metrics.DubbingTimingWithin200Ms != 1.0 {
+		t.Fatalf("expected within-±200ms rate 1.0, got %f", metrics.DubbingTimingWithin200Ms)
+	}
+	if metrics.Status != "PASS" {
+		t.Fatalf("expected PASS, got %s (fails %v, reviews %v)", metrics.Status, metrics.FailReasons, metrics.ReviewReasons)
+	}
+}
+
+func containsReason(reasons []string, substr string) bool {
+	for _, r := range reasons {
+		if strings.Contains(r, substr) {
+			return true
+		}
+	}
+	return false
 }

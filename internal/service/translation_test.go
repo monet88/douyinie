@@ -943,3 +943,271 @@ func TestTranslationService_Translate_RunScopedMissingSpeechTranscriptCAS_FailsC
 		t.Fatalf("expected 1 provider invocation for standalone request, got %d", invocations)
 	}
 }
+
+// Canonical segmentation is resolved from the role plan the run consumed, so a later edit of the asset's
+// plan cannot re-segment an artifact the run already froze. A storage failure while resolving it is
+// returned: degrading to a nil plan would silently drop the dialogue filter and change the verdict.
+func TestTranslationService_ResolveCanonicalRolePlan_PinsRunLineageAndFailsClosed(t *testing.T) {
+	db, casStore, _, _ := setupTranslationTestEnv(t)
+	ctx := context.Background()
+	svc := service.NewTranslationService(db, casStore)
+
+	assetID := "asset-role-plan-pin"
+	runID := "run-role-plan-pin"
+	now := time.Now().UTC()
+	if err := db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID: "att-" + assetID, AttestationType: "user_owned", DeclaredBy: "tester", TermsAccepted: true, ConfirmedAt: now,
+	}); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID: assetID, SHA256: "sha-" + assetID, ByteSize: 1024, MimeType: "video/mp4",
+		OriginalFilename: "video.mp4", RightsAttestationID: "att-" + assetID, CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("create source asset: %v", err)
+	}
+	// The asset's newest plan admits the whole clip; the plan the run froze admits one short window.
+	saveAssetPlan := func(plan domain.AudioRolePlan) {
+		t.Helper()
+		b, err := json.Marshal(plan)
+		if err != nil {
+			t.Fatalf("marshal plan %s: %v", plan.ID, err)
+		}
+		obj, err := casStore.Put(bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("put plan %s: %v", plan.ID, err)
+		}
+		plan.CASHash = obj.SHA256
+		if err := db.SaveAudioRolePlan(ctx, plan); err != nil {
+			t.Fatalf("save plan %s: %v", plan.ID, err)
+		}
+	}
+	saveAssetPlan(domain.AudioRolePlan{
+		ID: "plan-asset", AssetID: assetID, ProvenanceHash: "prov-plan-asset", CreatedAt: now,
+		Segments: []domain.AudioSegment{{StartMs: 0, EndMs: 35000, Role: domain.AudioRoleNarrationDialogue}},
+	})
+	runPlanJSON, err := json.Marshal(domain.AudioRolePlan{
+		ID: "plan-run", AssetID: assetID, ProvenanceHash: "prov-plan-run", CreatedAt: now,
+		Segments: []domain.AudioSegment{{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue}},
+	})
+	if err != nil {
+		t.Fatalf("marshal run plan: %v", err)
+	}
+	runPlanObj, err := casStore.Put(bytes.NewReader(runPlanJSON))
+	if err != nil {
+		t.Fatalf("put run plan: %v", err)
+	}
+	if got := service.SeedRunTranscriptForTest(ctx, db, casStore, assetID, runID); got == "" {
+		t.Fatalf("seed run transcript: no artifact produced")
+	}
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID: uuid.NewString(), RunID: runID, Stage: "audio_role_plan", Status: domain.StageStatusSucceeded,
+		ArtifactSHA256: runPlanObj.SHA256, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("record run role plan stage: %v", err)
+	}
+
+	pinned, err := svc.ResolveCanonicalRolePlanForTest(ctx, assetID, runID)
+	if err != nil {
+		t.Fatalf("resolve pinned role plan: %v", err)
+	}
+	if pinned == nil || len(pinned.Segments) != 1 || pinned.Segments[0].EndMs != 1500 {
+		t.Fatalf("expected the run's frozen plan [0,1500], got %+v", pinned)
+	}
+
+	latest, err := svc.ResolveCanonicalRolePlanForTest(ctx, assetID, "")
+	if err != nil {
+		t.Fatalf("resolve asset-latest role plan: %v", err)
+	}
+	if latest == nil || latest.Segments[0].EndMs != 35000 {
+		t.Fatalf("expected the asset's newest plan [0,35000] without a run pin, got %+v", latest)
+	}
+
+	// A read failure is never reported as "no plan".
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	if plan, err := svc.ResolveCanonicalRolePlanForTest(ctx, assetID, ""); err == nil {
+		t.Fatalf("expected the storage failure to propagate, got plan %+v", plan)
+	}
+}
+
+// A frozen variant is reusable only while it still matches the lineage its run pinned. An operator's later
+// edit of the asset's AudioRolePlan re-segments the transcript, so the variant the asset's newest plan would
+// produce is not this run's translation; and a lineage that cannot be proven fails closed instead of being
+// silently replayed.
+func TestTranslationService_CanReuseVariant_RefusesChangedRolePlanAndUnprovenLineage(t *testing.T) {
+	db, casStore, router, reg := setupTranslationTestEnv(t)
+	svc := service.NewTranslationService(db, casStore)
+	svc.ConfigureRouter(router)
+	ctx := context.Background()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	jobID := "job-reuse-lineage"
+	attID := uuid.NewString()
+	now := time.Now().UTC()
+	if err := db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION", TermsAccepted: true, ConfirmedAt: now,
+	}); err != nil {
+		t.Fatalf("create attestation: %v", err)
+	}
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID: assetID, RightsAttestationID: attID, SHA256: "sha-reuse-lineage", ByteSize: 100, CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("create asset: %v", err)
+	}
+	if err := db.CreateJob(ctx, domain.LocalizationJob{
+		ID: jobID, SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{
+		ID: runID, JobID: jobID, Status: "running", ConfigSnapshotJSON: "{}", CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	transcript := domain.TranscriptArtifact{
+		ID:      "transcript-" + assetID,
+		AssetID: assetID,
+		SpeechBlocks: []domain.SpeechBlock{
+			{Index: 0, StartMs: 0, EndMs: 1500, SourceText: "你好", SpeakerID: "S1", SegmentType: domain.SpeechBlockTypeSpeech},
+			{Index: 1, StartMs: 3000, EndMs: 4000, SourceText: "关注", SpeakerID: "S1", SegmentType: domain.SpeechBlockTypeSpeech},
+		},
+	}
+	tBytes, _ := json.Marshal(transcript)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	if err := db.SaveTranscriptArtifactIndex(ctx, storage.TranscriptArtifactIndex{
+		ID: transcript.ID, AssetID: assetID, RunID: runID, CASHash: tObj.SHA256,
+		ProvenanceHash: "prov-transcript-" + assetID, CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("save transcript index: %v", err)
+	}
+	recordTranslationStage := func(stage, casHash string) {
+		t.Helper()
+		if err := db.CreateStageExecution(ctx, domain.StageExecution{
+			ID: uuid.NewString(), RunID: runID, Stage: stage, Status: domain.StageStatusSucceeded,
+			ArtifactSHA256: casHash, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("record %s stage: %v", stage, err)
+		}
+	}
+	recordTranslationStage("speech_understand", tObj.SHA256)
+
+	newPlan := func(id string, segments []domain.AudioSegment) domain.AudioRolePlan {
+		t.Helper()
+		b, err := json.Marshal(domain.AudioRolePlan{ID: id, AssetID: assetID, ProvenanceHash: "prov-" + id, Segments: segments, CreatedAt: now})
+		if err != nil {
+			t.Fatalf("marshal plan %s: %v", id, err)
+		}
+		obj, err := casStore.Put(bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("put plan %s: %v", id, err)
+		}
+		return domain.AudioRolePlan{ID: id, AssetID: assetID, CASHash: obj.SHA256, ProvenanceHash: "prov-" + id, Segments: segments, CreatedAt: now}
+	}
+	// The plan this run froze covers both blocks; the plan the asset now carries covers only the first, as an
+	// operator edit would leave it.
+	pinnedPlan := newPlan("plan-pinned", []domain.AudioSegment{
+		{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleNarrationDialogue},
+		{StartMs: 2500, EndMs: 4500, Role: domain.AudioRoleNarrationDialogue},
+	})
+	if err := db.SaveAudioRolePlan(ctx, newPlan("plan-asset-latest", []domain.AudioSegment{
+		{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleNarrationDialogue},
+	})); err != nil {
+		t.Fatalf("save asset role plan: %v", err)
+	}
+	recordTranslationStage("audio_role_plan", pinnedPlan.CASHash)
+
+	pinnedSegs := domain.CanonicalTranslationSegments(&transcript, &pinnedPlan)
+	if len(pinnedSegs) != 2 {
+		t.Fatalf("fixture must segment both blocks under the pinned plan, got %+v", pinnedSegs)
+	}
+
+	// The resume derives canonical input from the run's pinned plan, not from the asset's newest one.
+	resolved, err := svc.ResolveCanonicalRolePlanForTest(ctx, assetID, runID)
+	if err != nil {
+		t.Fatalf("resolve pinned role plan: %v", err)
+	}
+	if len(domain.CanonicalTranslationSegments(&transcript, resolved)) != 2 {
+		t.Fatalf("expected the run's pinned segmentation, got %+v", domain.CanonicalTranslationSegments(&transcript, resolved))
+	}
+	latest, err := svc.ResolveCanonicalRolePlanForTest(ctx, assetID, "")
+	if err != nil {
+		t.Fatalf("resolve asset role plan: %v", err)
+	}
+	latestSegs := domain.CanonicalTranslationSegments(&transcript, latest)
+	if len(latestSegs) != 1 {
+		t.Fatalf("fixture must re-segment under the asset's newest plan, got %+v", latestSegs)
+	}
+
+	// A variant frozen from the asset's newest plan does not match the run's pinned canonical input.
+	p, _ := reg.Get("fake_llm_translator")
+	modelName, modelVersion := p.ModelInfo()
+	eff, err := service.EffectiveGlossaryForTest(nil, latestSegs)
+	if err != nil {
+		t.Fatalf("effective glossary: %v", err)
+	}
+	reuseIn := domain.TranslationJobInput{
+		AssetID: assetID, RunID: runID, JobID: jobID, SourceLanguage: "zh", TargetLanguage: "vi",
+		Segments: latestSegs, EffectiveGlossary: eff, TranscriptArtifactCAS: tObj.SHA256,
+	}
+	staleHash, err := svc.ComputeTranslationInputHashForTest(reuseIn)
+	if err != nil {
+		t.Fatalf("compute stale input hash: %v", err)
+	}
+	staleVariant := domain.TranslationVariant{
+		ID: "trans-stale-plan", SchemaVersion: domain.TranslationSchemaVersion, ContractID: service.TranslationContractID,
+		AssetID: assetID, RunID: runID, JobID: jobID, SourceLanguage: "zh", TargetLanguage: "vi",
+		TranscriptArtifactCAS: tObj.SHA256, EffectiveGlossary: eff, InputHash: staleHash,
+		ProviderID: p.ID(), ModelName: modelName, ModelVersion: modelVersion,
+		ProvenanceHash: "stale-plan-provenance", OverallQAScore: 0.9,
+		Segments:  []domain.TranslationSegment{{Index: 0, SourceText: "你好", TargetText: "Xin chào", StartMs: 0, EndMs: 1500, QAConfidence: 0.9, PassedQAGate: true}},
+		CreatedAt: now,
+	}
+	reuseIn.Segments = pinnedSegs
+	if svc.CanReuseVariant(ctx, reuseIn, &staleVariant) {
+		t.Fatalf("a variant segmented under the asset's newest plan must not be reused as this run's translation")
+	}
+
+	// A run whose pinned transcript belongs to another asset is a lineage mismatch, not "no pinned
+	// transcript": the sentinel says which, and nothing is reused on an unproven lineage.
+	foreignAssetID := uuid.NewString()
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID: foreignAssetID, RightsAttestationID: attID, SHA256: "sha-reuse-foreign", ByteSize: 100, CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("create foreign asset: %v", err)
+	}
+	foreignRunID := uuid.NewString()
+	if err := db.CreateJob(ctx, domain.LocalizationJob{
+		ID: "job-reuse-foreign", SourceAssetID: foreignAssetID, TargetLanguage: "vi", CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("create foreign job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{
+		ID: foreignRunID, JobID: "job-reuse-foreign", Status: "running", ConfigSnapshotJSON: "{}", CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("create foreign run: %v", err)
+	}
+	if _, err := service.ResolveRunTranscriptCASForTest(ctx, db, foreignRunID, assetID, "reuse"); !errors.Is(err, domain.ErrTranscriptLineageMismatch) {
+		t.Fatalf("expected a typed lineage mismatch, got: %v", err)
+	}
+	foreignIn := reuseIn
+	foreignIn.RunID = foreignRunID
+	foreignIn.JobID = ""
+	if svc.CanReuseVariant(ctx, foreignIn, &staleVariant) {
+		t.Fatalf("a variant must not be reused for a run whose transcript lineage belongs to another asset")
+	}
+
+	// A verification failure is not "no pinned transcript" either: it fails closed with its own sentinel.
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	if _, err := service.ResolveRunTranscriptCASForTest(ctx, db, runID, assetID, "reuse"); !errors.Is(err, domain.ErrTranscriptLineageProofFailed) {
+		t.Fatalf("expected a typed proof failure, got: %v", err)
+	}
+	if svc.CanReuseVariant(ctx, reuseIn, &staleVariant) {
+		t.Fatalf("a variant must not be reused when its lineage cannot be verified")
+	}
+}

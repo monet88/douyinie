@@ -223,7 +223,7 @@ func ResamplePCM16(samples []int16, inRate, inChannels, outRate, outChannels int
 	if inFrames == 0 {
 		return nil
 	}
-	outFrames := int(math.Round(float64(inFrames) * float64(outRate) / float64(inRate)))
+	outFrames := int(ResampledPCM16Frames(int64(inFrames), inRate, outRate))
 	if outFrames == 0 {
 		return nil
 	}
@@ -256,6 +256,50 @@ func ResamplePCM16(samples []int16, inRate, inChannels, outRate, outChannels int
 	}
 
 	return outSamples
+}
+
+// ResampledPCM16Frames returns the exact frame count ResamplePCM16 produces for frames input
+// frames, so a caller can gate on the resampled length without decoding the waveform. It owns
+// the single rounding rule (half away from zero) and applies ResamplePCM16's rate defaults.
+func ResampledPCM16Frames(frames int64, inRate, outRate int) int64 {
+	if frames <= 0 {
+		return 0
+	}
+	if inRate <= 0 {
+		inRate = 16000
+	}
+	if outRate <= 0 {
+		outRate = inRate
+	}
+	return int64(math.Round(float64(frames) * float64(outRate) / float64(inRate)))
+}
+
+// WAVFrameGeometry returns the per-channel frame count and sample rate of standard 16-bit PCM
+// WAV bytes without decoding samples - the same geometry ExtractPCM16Samples yields, so a
+// header-only probe can never disagree with the waveform the mixer places.
+func WAVFrameGeometry(data []byte) (int64, int, error) {
+	info, err := ParseWAVHeader(data)
+	if err != nil {
+		return 0, 0, err
+	}
+	if info.BitsPerSample != 16 {
+		return 0, 0, fmt.Errorf("unsupported bits per sample: %d (expected 16-bit PCM)", info.BitsPerSample)
+	}
+	return int64(info.DataSize) / (int64(info.NumChannels) * 2), int(info.SampleRate), nil
+}
+
+// PlaybackWindowFrames returns how many output-rate frames a clip may occupy when placed at
+// startMs inside the accepted playback window ending at playbackEndMs. Both boundaries are
+// floored to a frame, so the window never spans a frame the mixer cannot fill.
+//
+// This is the single window arithmetic shared by the fit controller (which only has a floored
+// whole-millisecond probe) and the mixer (which measures the frame-exact waveform), so both
+// sides gate a candidate against the same accepted window.
+func PlaybackWindowFrames(startMs, playbackEndMs int64, sampleRate int) int64 {
+	if sampleRate <= 0 || playbackEndMs <= startMs {
+		return 0
+	}
+	return (playbackEndMs*int64(sampleRate))/1000 - (startMs*int64(sampleRate))/1000
 }
 
 // MixPCM16 mixes target dub speech into background stems with speech-window dialogue suppression and smooth crossfades.

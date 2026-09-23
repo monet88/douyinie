@@ -79,36 +79,12 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 	}
 	in.TargetLanguage = targetLang
 	if s.db != nil {
-		if strings.TrimSpace(in.DubScriptVariantCAS) == "" {
-			if idx, err := s.db.GetDubScriptVariantIndexByRun(ctx, in.RunID); err == nil && idx != nil {
-				if idx.AssetID != in.AssetID || !strings.EqualFold(idx.TargetLanguage, targetLang) {
-					return nil, fmt.Errorf("run %s dub script lineage mismatch for voice assignment", in.RunID)
-				}
-				in.DubScriptVariantCAS = idx.CASHash
-			} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
-				return nil, fmt.Errorf("resolve run dub script lineage for voice assignment: %w", err)
-			}
+		dubScriptCAS, transcriptCAS, err := s.resolveVoiceAssignmentLineageCAS(ctx, in, targetLang)
+		if err != nil {
+			return nil, err
 		}
-		if strings.TrimSpace(in.TranscriptArtifactCAS) == "" {
-			casHash, err := resolveRunTranscriptCAS(ctx, s.db, in.RunID, in.AssetID, "voice assignment")
-			if err != nil {
-				return nil, err
-			}
-			in.TranscriptArtifactCAS = casHash
-		}
-		if strings.TrimSpace(in.TranscriptArtifactCAS) == "" && strings.TrimSpace(in.DubScriptVariantCAS) != "" {
-			dubScript, _, err := s.loadDubScriptVariant(ctx, in.AssetID, targetLang, in.DubScriptVariantCAS)
-			if err != nil {
-				return nil, fmt.Errorf("resolve dub script lineage for voice assignment: %w", err)
-			}
-			if strings.TrimSpace(dubScript.TranslationVariantCAS) != "" {
-				transcriptCAS, err := s.transcriptCASFromTranslationVariant(in.AssetID, targetLang, dubScript.TranslationVariantCAS)
-				if err != nil {
-					return nil, err
-				}
-				in.TranscriptArtifactCAS = transcriptCAS
-			}
-		}
+		in.DubScriptVariantCAS = dubScriptCAS
+		in.TranscriptArtifactCAS = transcriptCAS
 	}
 
 	// Check if video has audio role plan with no dub-eligible dialogue (no-speech bypass)
@@ -321,6 +297,115 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 	}
 
 	return assignment, nil
+}
+
+// resolveVoiceAssignmentLineageCAS returns the run's authoritative dub-script and transcript CAS
+// lineage, proving any caller-supplied CAS against it rather than trusting it. Both values are
+// frozen onto the VoiceAssignment and decide whether a later call re-reads the frozen assignment
+// or supersedes it, so an unproven client value must never become lineage: run-resolved evidence
+// stays the single source of truth and every disagreement fails closed (CODING_STANDARDS §10).
+func (s *DubbingService) resolveVoiceAssignmentLineageCAS(ctx context.Context, in domain.VoiceAssignmentInput, targetLang string) (string, string, error) {
+	suppliedDubScriptCAS := strings.TrimSpace(in.DubScriptVariantCAS)
+	suppliedTranscriptCAS := strings.TrimSpace(in.TranscriptArtifactCAS)
+
+	authoritativeDubScriptCAS := ""
+	if idx, err := s.db.GetDubScriptVariantIndexByRun(ctx, in.RunID); err == nil && idx != nil {
+		if idx.AssetID != in.AssetID || !strings.EqualFold(idx.TargetLanguage, targetLang) {
+			return "", "", fmt.Errorf("%w: run %s dub script lineage mismatch for voice assignment", domain.ErrTranslationOwnershipMismatch, in.RunID)
+		}
+		authoritativeDubScriptCAS = idx.CASHash
+	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return "", "", fmt.Errorf("resolve run dub script lineage for voice assignment: %w", err)
+	}
+	if suppliedDubScriptCAS != "" {
+		if authoritativeDubScriptCAS != "" && suppliedDubScriptCAS != authoritativeDubScriptCAS {
+			return "", "", fmt.Errorf("%w: run %s dub script lineage mismatch for voice assignment: input=%s run=%s",
+				domain.ErrTranslationOwnershipMismatch, in.RunID, suppliedDubScriptCAS, authoritativeDubScriptCAS)
+		}
+		if authoritativeDubScriptCAS == "" && s.cas != nil {
+			// The run pins no script here, so the supplied artifact's own binding is the only proof left.
+			dubScript, _, err := s.loadDubScriptVariant(ctx, in.AssetID, targetLang, suppliedDubScriptCAS)
+			if err != nil {
+				return "", "", fmt.Errorf("prove supplied dub script lineage for voice assignment: %w", err)
+			}
+			if dubScript.RunID != "" && dubScript.RunID != in.RunID {
+				return "", "", fmt.Errorf("%w: supplied dub script %s belongs to run %s, not %s",
+					domain.ErrTranslationOwnershipMismatch, suppliedDubScriptCAS, dubScript.RunID, in.RunID)
+			}
+		}
+	}
+	dubScriptCAS := authoritativeDubScriptCAS
+	if dubScriptCAS == "" {
+		dubScriptCAS = suppliedDubScriptCAS
+	}
+
+	// A supplied CAS must first prove it is this asset's transcript: ownership is decided by the
+	// artifact itself, before the run's own lineage is consulted, so a foreign artifact is refused
+	// as a foreign artifact instead of being reported as a lineage mismatch with the run.
+	if suppliedTranscriptCAS != "" {
+		if err := s.proveTranscriptArtifactBinding(suppliedTranscriptCAS, in.AssetID); err != nil {
+			return "", "", err
+		}
+	}
+
+	authoritativeTranscriptCAS, err := resolveRunTranscriptCAS(ctx, s.db, in.RunID, in.AssetID, "voice assignment")
+	if err != nil {
+		return "", "", err
+	}
+	if authoritativeTranscriptCAS == "" && suppliedTranscriptCAS == "" && dubScriptCAS != "" {
+		// Nothing pins a transcript for this run: the dub script's translation contract still
+		// names the one it was built from. Only used to fill, never to override a supplied value.
+		dubScript, _, err := s.loadDubScriptVariant(ctx, in.AssetID, targetLang, dubScriptCAS)
+		if err != nil {
+			return "", "", fmt.Errorf("resolve dub script lineage for voice assignment: %w", err)
+		}
+		if strings.TrimSpace(dubScript.TranslationVariantCAS) != "" {
+			transcriptCAS, err := s.transcriptCASFromTranslationVariant(in.AssetID, targetLang, dubScript.TranslationVariantCAS)
+			if err != nil {
+				return "", "", err
+			}
+			authoritativeTranscriptCAS = transcriptCAS
+		}
+	}
+	if suppliedTranscriptCAS != "" && authoritativeTranscriptCAS != "" && suppliedTranscriptCAS != authoritativeTranscriptCAS {
+		return "", "", fmt.Errorf("%w: run %s transcript lineage mismatch for voice assignment: input=%s run=%s",
+			domain.ErrTranscriptLineageMismatch, in.RunID, suppliedTranscriptCAS, authoritativeTranscriptCAS)
+	}
+	if authoritativeTranscriptCAS != "" {
+		return dubScriptCAS, authoritativeTranscriptCAS, nil
+	}
+	return dubScriptCAS, suppliedTranscriptCAS, nil
+}
+
+// proveTranscriptArtifactBinding checks that a supplied transcript CAS really is this asset's
+// transcript artifact: it must decode, and it must not carry another asset's id. It is the ownership
+// proof a non-empty client CAS has to pass before it can become frozen VoiceAssignment lineage.
+//
+// The artifact's producer run id is deliberately NOT an ownership claim: transcript identity is
+// run-independent (content/provenance addressed), so a later run of the same asset legitimately reads
+// the artifact an earlier run persisted - see
+// test/seam1/autorun_dialogue_test.go TestSeam1_DubbingService_AssignVoices_ExplicitCAS_Validation/
+// CrossRunTranscriptCAS_ReusesAssetScopedArtifact. A run that pins its own transcript is still enforced
+// by the equality check in resolveVoiceAssignmentLineageCAS, and synthesis re-verifies the frozen
+// transcript against the run's pinned lineage.
+func (s *DubbingService) proveTranscriptArtifactBinding(casHash, assetID string) error {
+	if s.cas == nil {
+		return nil
+	}
+	rc, err := s.cas.Get(casHash)
+	if err != nil {
+		return fmt.Errorf("%w: read supplied transcript %s for voice assignment: %v", domain.ErrTranscriptLineageProofFailed, casHash, err)
+	}
+	defer rc.Close()
+	var transcript domain.TranscriptArtifact
+	if err := json.NewDecoder(rc).Decode(&transcript); err != nil {
+		return fmt.Errorf("%w: decode supplied transcript %s for voice assignment: %v", domain.ErrTranscriptLineageProofFailed, casHash, err)
+	}
+	if transcript.AssetID != "" && transcript.AssetID != assetID {
+		return fmt.Errorf("%w: supplied transcript %s belongs to asset %s, not %s",
+			domain.ErrTranslationOwnershipMismatch, casHash, transcript.AssetID, assetID)
+	}
+	return nil
 }
 
 // ReassignVoice explicitly changes one or more speakers' frozen voices for a run (Issue #40),
@@ -1438,6 +1523,11 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 	if fc == nil {
 		fc = NewFitController()
 	}
+	// The mixer resamples every candidate to the background stem rate, so that rate is the
+	// geometry the fit must prove its window against. It is resolved once per pass: a missing
+	// stems artifact, unreadable header, or report is not a synthesis failure, it only drops
+	// the fit back to the millisecond window (rate 0) while the mix stage keeps its own gate.
+	outputSampleRate := s.outputSampleRateForAsset(ctx, in.AssetID)
 
 	for i := 0; i < len(dubScript.Segments); i++ {
 		seg := dubScript.Segments[i]
@@ -1461,7 +1551,8 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 		// reuse the prior validated DubSegment and FitPlan directly without re-synthesizing ONLY IF:
 		// 0) The prior variant was produced under this exact stage cache identity (priorReusable).
 		// 1) Matching prior segment is present and valid with non-empty audio and accepted status.
-		// 2) Corresponding prior DubbingFitPlan exists, has decision ACCEPT, no review, and satisfies zero-overrun fit.
+		// 2) Corresponding prior DubbingFitPlan exists and was accepted with a measured
+		//    candidate (its own decision is the evidence, not a re-derived window).
 		// 3) Grouped SpeechBlockIndices / timing match the current dub script and speaker sequence.
 		if priorReusable && !invalidatedSpeakersSet[spkID] {
 			priorSeg, segExists := priorSegmentByIndex[seg.Index]
@@ -1472,10 +1563,11 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				priorSeg.AudioSHA256 != "" && priorSeg.AudioCASPath != "" &&
 				priorSeg.FitDecision == domain.FitActionAccept &&
 				!priorSeg.RequiresReview &&
+				// The plan's own accepted decision is the reuse evidence. Re-deriving the window
+				// from UsableSlotMs/DurationDeltaMs would reject Case-2 accepts, which fit the
+				// accepted playback window while consuming part of the reserved natural gap.
 				priorFP.Decision == domain.FitActionAccept &&
-				priorFP.DurationDeltaMs <= 0 &&
 				priorFP.MeasuredDurationMs > 0 &&
-				priorFP.MeasuredDurationMs <= priorFP.UsableSlotMs &&
 				priorSeg.StartMs == seg.StartMs {
 				validGrouping := true
 				groupCount := len(priorSeg.SpeechBlockIndices)
@@ -1621,6 +1713,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 			}
 
 			// Evaluate fit
+			measuredFrames, measuredSampleRate := candidateFrameGeometry(synthRes.AudioData)
 			evalInput := FitEvaluationInput{
 				SegmentIndex:       seg.Index,
 				SpeakerID:          spkID,
@@ -1637,6 +1730,9 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				FixedRateVoice:     fixedRateVoice,
 				DubPlaybackEndMs:   playbackEndMs,
 				EffectiveReserveMs: effectiveReserveMs,
+				OutputSampleRate:   outputSampleRate,
+				MeasuredFrames:     measuredFrames,
+				MeasuredSampleRate: measuredSampleRate,
 			}
 
 			evalRes := fc.EvaluateCandidate(ctx, evalInput)
@@ -1791,6 +1887,11 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				groupProtectedTerms := glossaryForSource(translationContract.EffectiveGlossary, combinedSourceText)
 				groupQA := NewMeaningFirstQAGate().ValidateSegment(combinedSourceText, combinedSpokenText, dubScript.SourceLanguage, targetLang, groupProtectedTerms)
 				if !groupQA.Passed {
+					// This group never reached synthesis, so any earlier (narrower) group's
+					// measured audio is not evidence for the text/timing recorded here and
+					// must not survive as this review candidate's audio or measured duration.
+					lastRegroupSynthRes = nil
+					lastRegroupProbedMs = 0
 					lastRegroupCombinedSlotMs = combinedSlotMs
 					lastRegroupCombinedStartMs = combinedStartMs
 					lastRegroupCombinedEndMs = combinedEndMs
@@ -1845,6 +1946,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 					fixedRateSpeakers[spkID] = true
 				}
 
+				regroupFrames, regroupSampleRate := candidateFrameGeometry(synthRes.AudioData)
 				regroupEvalInput := FitEvaluationInput{
 					SegmentIndex:       seg.Index,
 					SpeakerID:          spkID,
@@ -1861,6 +1963,9 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 					FixedRateVoice:     fixedRateVoice,
 					DubPlaybackEndMs:   groupPlaybackEndMs,
 					EffectiveReserveMs: groupReserveMs,
+					OutputSampleRate:   outputSampleRate,
+					MeasuredFrames:     regroupFrames,
+					MeasuredSampleRate: regroupSampleRate,
 				}
 				regroupEvalRes := fc.EvaluateCandidate(ctx, regroupEvalInput)
 
@@ -2181,6 +2286,58 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 	}
 
 	return variant, nil
+}
+
+// outputSampleRateForAsset resolves the rate the mixer resamples every candidate to: the
+// background stem's header rate (header-only, no decode), falling back to the preflight
+// report's probed rate. 0 means "unknown" and keeps the fit on its millisecond window.
+func (s *DubbingService) outputSampleRateForAsset(ctx context.Context, assetID string) int {
+	if s.db == nil || s.cas == nil || assetID == "" {
+		return 0
+	}
+	if idx, err := s.db.GetAudioStemsArtifactIndex(ctx, assetID); err == nil && idx != nil && idx.AssetID == assetID && idx.CASHash != "" {
+		if rc, err := s.cas.Get(idx.CASHash); err == nil {
+			var stems domain.AudioStemArtifacts
+			decodeErr := json.NewDecoder(rc).Decode(&stems)
+			rc.Close()
+			if decodeErr == nil && stems.SchemaVersion == domain.AudioStemsSchemaVersion && stems.AssetID == assetID {
+				for _, stem := range stems.Stems {
+					if stem.Type != domain.StemTypeBackground || stem.AudioCASHash == "" {
+						continue
+					}
+					bgRC, err := s.cas.Get(stem.AudioCASHash)
+					if err != nil {
+						break
+					}
+					bgBytes, readErr := io.ReadAll(bgRC)
+					bgRC.Close()
+					if readErr != nil {
+						break
+					}
+					if _, rate, err := media.WAVFrameGeometry(bgBytes); err == nil && rate > 0 {
+						return rate
+					}
+					break
+				}
+			}
+		}
+	}
+	report, err := s.db.GetPreflightReport(ctx, assetID)
+	if err != nil || report == nil || report.AudioSampleRate <= 0 {
+		return 0
+	}
+	return report.AudioSampleRate
+}
+
+// candidateFrameGeometry reports the header-only frame geometry of a synthesized waveform —
+// the very frames the mixer will place after resampling. A non-standard header degrades to
+// zero, which leaves the fit on its millisecond window instead of failing the synthesis pass.
+func candidateFrameGeometry(audio []byte) (int64, int) {
+	frames, rate, err := media.WAVFrameGeometry(audio)
+	if err != nil || frames <= 0 || rate <= 0 {
+		return 0, 0
+	}
+	return frames, rate
 }
 
 // resolveEscalationOutcomes marks whether a whole-speaker regeneration cleared every

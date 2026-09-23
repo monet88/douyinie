@@ -68,6 +68,11 @@ func (s *TranslationService) ConfigureSpokenAdapter(adapter provider.SpokenScrip
 
 // resolveRunTranscriptCAS resolves the pinned transcript artifact for a run from its stage execution
 // or run index, refusing any index entry that belongs to a different asset.
+//
+// The empty result means the run genuinely pins no transcript: callers may then fall back. Every error is
+// sentinel-classified so they never have to guess: wrong run/job/asset lineage wraps
+// domain.ErrTranscriptLineageMismatch, and a proof that could not be completed at all (storage failure)
+// wraps domain.ErrTranscriptLineageProofFailed, which never means "no pinned transcript exists".
 func resolveRunTranscriptCAS(ctx context.Context, db *storage.DB, runID, assetID, purpose string) (string, error) {
 	if db == nil || strings.TrimSpace(runID) == "" {
 		return "", nil
@@ -77,27 +82,27 @@ func resolveRunTranscriptCAS(ctx context.Context, db *storage.DB, runID, assetID
 			if run.JobID != "" {
 				if job, err := db.GetJob(ctx, run.JobID); err == nil && job != nil {
 					if job.SourceAssetID != "" && job.SourceAssetID != assetID {
-						return "", fmt.Errorf("run %s transcript lineage mismatch for %s: %s != %s", runID, purpose, job.SourceAssetID, assetID)
+						return "", fmt.Errorf("run %s %w for %s: %s != %s", runID, domain.ErrTranscriptLineageMismatch, purpose, job.SourceAssetID, assetID)
 					}
 				} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
-					return "", fmt.Errorf("resolve run job for %s: %w", purpose, err)
+					return "", fmt.Errorf("%w: resolve run job for %s: %w", domain.ErrTranscriptLineageProofFailed, purpose, err)
 				}
 			}
 		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return "", fmt.Errorf("resolve run %s for %s: %w", runID, purpose, err)
+			return "", fmt.Errorf("%w: resolve run %s for %s: %w", domain.ErrTranscriptLineageProofFailed, runID, purpose, err)
 		}
 	}
 	if casHash, err := db.GetStageArtifactHash(ctx, runID, "speech_understand"); err == nil && casHash != "" {
 		return casHash, nil
 	} else if err != nil {
-		return "", fmt.Errorf("resolve run speech artifact for %s: %w", purpose, err)
+		return "", fmt.Errorf("%w: resolve run speech artifact for %s: %w", domain.ErrTranscriptLineageProofFailed, purpose, err)
 	} else if idx, err := db.GetTranscriptArtifactIndexByRun(ctx, runID); err == nil && idx != nil {
 		if assetID != "" && idx.AssetID != assetID {
-			return "", fmt.Errorf("run %s transcript lineage mismatch for %s: %s != %s", runID, purpose, idx.AssetID, assetID)
+			return "", fmt.Errorf("run %s %w for %s: %s != %s", runID, domain.ErrTranscriptLineageMismatch, purpose, idx.AssetID, assetID)
 		}
 		return idx.CASHash, nil
 	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return "", fmt.Errorf("resolve run transcript lineage for %s: %w", purpose, err)
+		return "", fmt.Errorf("%w: resolve run transcript lineage for %s: %w", domain.ErrTranscriptLineageProofFailed, purpose, err)
 	}
 	return "", nil
 }
@@ -165,12 +170,12 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 			return nil, err
 		}
 		if transcriptCAS == "" {
-			return nil, fmt.Errorf("missing pinned speech_understand transcript lineage for run %s", in.RunID)
+			return nil, fmt.Errorf("%w for run %s", domain.ErrTranscriptLineageMissing, in.RunID)
 		}
 		if strings.TrimSpace(in.TranscriptArtifactCAS) == "" {
 			in.TranscriptArtifactCAS = transcriptCAS
 		} else if transcriptCAS != in.TranscriptArtifactCAS {
-			return nil, fmt.Errorf("run %s transcript lineage mismatch for translation: input=%s run=%s", in.RunID, in.TranscriptArtifactCAS, transcriptCAS)
+			return nil, fmt.Errorf("run %s %w for translation: input=%s run=%s", in.RunID, domain.ErrTranscriptLineageMismatch, in.TranscriptArtifactCAS, transcriptCAS)
 		}
 	}
 
@@ -178,9 +183,9 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 	// Preserve the transcript CAS hash as a content input to deterministic cache identity.
 	if len(in.Segments) == 0 {
 		if strings.TrimSpace(in.RunID) != "" && strings.TrimSpace(in.TranscriptArtifactCAS) == "" {
-			return nil, fmt.Errorf("missing pinned speech_understand transcript lineage for run %s", in.RunID)
+			return nil, fmt.Errorf("%w for run %s", domain.ErrTranscriptLineageMissing, in.RunID)
 		}
-		segments, transcriptCAS, err := s.loadSegmentsFromTranscript(ctx, in.AssetID, in.TranscriptArtifactCAS)
+		segments, transcriptCAS, err := s.loadSegmentsFromTranscript(ctx, in.AssetID, in.RunID, in.TranscriptArtifactCAS)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load source segments: %w", err)
 		}
@@ -207,7 +212,7 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 	// allow fallback to the asset's latest transcript index only when candidate segments exactly match.
 	if strings.TrimSpace(in.TranscriptArtifactCAS) == "" && strings.TrimSpace(in.RunID) == "" && s.db != nil && s.cas != nil {
 		if idx, err := s.db.GetTranscriptArtifactIndex(ctx, in.AssetID); err == nil && idx != nil && idx.CASHash != "" {
-			candidateSegments, _, loadErr := s.loadSegmentsFromTranscript(ctx, in.AssetID, idx.CASHash)
+			candidateSegments, _, loadErr := s.loadSegmentsFromTranscript(ctx, in.AssetID, in.RunID, idx.CASHash)
 			if loadErr == nil && translationSegmentsExactlyMatch(in.Segments, candidateSegments) {
 				in.TranscriptArtifactCAS = idx.CASHash
 			}
@@ -484,6 +489,9 @@ func (s *TranslationService) CanReuseVariant(ctx context.Context, in domain.Tran
 			}
 			if jobID != "" {
 				job, err := s.db.GetJob(ctx, jobID)
+				if err != nil && !errors.Is(err, storage.ErrNotFound) {
+					return false
+				}
 				if err == nil && job != nil && in.AssetID != "" && job.SourceAssetID != "" && job.SourceAssetID != in.AssetID {
 					return false
 				}
@@ -507,8 +515,13 @@ func (s *TranslationService) CanReuseVariant(ctx context.Context, in domain.Tran
 			}
 		}
 	}
+	// A job lineage that cannot be read is never treated as a job lineage that matches: the whole point of
+	// this proof is that the request's job belongs to the requested asset.
 	if s.db != nil && strings.TrimSpace(in.JobID) != "" {
 		job, err := s.db.GetJob(ctx, in.JobID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return false
+		}
 		if err == nil && job != nil && in.AssetID != "" && job.SourceAssetID != "" && job.SourceAssetID != in.AssetID {
 			return false
 		}
@@ -558,7 +571,10 @@ func (s *TranslationService) CanReuseVariant(ctx context.Context, in domain.Tran
 }
 
 // loadSegmentsFromTranscript loads SpeechBlocks from TranscriptArtifact in CAS/DB.
-func (s *TranslationService) loadSegmentsFromTranscript(ctx context.Context, assetID, explicitCAS string) ([]domain.TranslationInputSegment, string, error) {
+//
+// runID, when supplied, pins canonical segmentation to the AudioRolePlan lineage the run consumed, so a
+// later operator edit of the asset's plan cannot re-segment an artifact the run already froze.
+func (s *TranslationService) loadSegmentsFromTranscript(ctx context.Context, assetID, runID, explicitCAS string) ([]domain.TranslationInputSegment, string, error) {
 	if s.cas == nil {
 		return nil, "", fmt.Errorf("database and CAS required to load transcript")
 	}
@@ -590,12 +606,60 @@ func (s *TranslationService) loadSegmentsFromTranscript(ctx context.Context, ass
 		return nil, "", fmt.Errorf("transcript artifact %s belongs to asset %q, not %q", casHash, transcript.AssetID, assetID)
 	}
 
-	var rolePlan *domain.AudioRolePlan
-	if s.db != nil && assetID != "" {
-		rolePlan, _ = s.db.GetAudioRolePlan(ctx, assetID)
+	rolePlan, err := s.resolveCanonicalRolePlan(ctx, assetID, runID)
+	if err != nil {
+		return nil, "", err
 	}
 	segments := domain.CanonicalTranslationSegments(&transcript, rolePlan)
 	return segments, casHash, nil
+}
+
+// resolveCanonicalRolePlan resolves the AudioRolePlan governing canonical segmentation of a transcript.
+// A run pins the plan its stages consumed (the audio_role_plan stage execution), which is what its artifacts
+// were segmented from, so a correction re-derives the exact canonical input afterwards. Without a pinned run
+// plan the asset's newest plan applies, exactly as the run itself resolved it.
+//
+// A storage failure is returned rather than swallowed: silently degrading to a nil plan drops the dialogue
+// filter and changes the verdict the caller derives from these segments.
+func (s *TranslationService) resolveCanonicalRolePlan(ctx context.Context, assetID, runID string) (*domain.AudioRolePlan, error) {
+	if s.db == nil || strings.TrimSpace(assetID) == "" {
+		return nil, nil
+	}
+	if strings.TrimSpace(runID) != "" {
+		pinnedCAS, err := s.db.GetStageArtifactHash(ctx, runID, "audio_role_plan")
+		if err != nil {
+			return nil, fmt.Errorf("resolve run %s audio role plan lineage: %w", runID, err)
+		}
+		if pinnedCAS != "" {
+			return s.loadPinnedAudioRolePlan(pinnedCAS)
+		}
+	}
+	plan, err := s.db.GetAudioRolePlan(ctx, assetID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, nil // no plan for this asset: segmentation is unfiltered, as it was for the run
+		}
+		return nil, fmt.Errorf("load audio role plan for canonical segmentation: %w", err)
+	}
+	return plan, nil
+}
+
+// loadPinnedAudioRolePlan reads the role plan artifact a run recorded. It reads CAS only: the asset's plan
+// row is the operator's current plan and must never stand in for the frozen one.
+func (s *TranslationService) loadPinnedAudioRolePlan(casHash string) (*domain.AudioRolePlan, error) {
+	if s.cas == nil {
+		return nil, fmt.Errorf("CAS store required to load pinned audio role plan %s", casHash)
+	}
+	rc, err := s.cas.Get(casHash)
+	if err != nil {
+		return nil, fmt.Errorf("read pinned audio role plan from CAS (%s): %w", casHash, err)
+	}
+	defer rc.Close()
+	var plan domain.AudioRolePlan
+	if err := json.NewDecoder(rc).Decode(&plan); err != nil {
+		return nil, fmt.Errorf("decode pinned audio role plan (%s): %w", casHash, err)
+	}
+	return &plan, nil
 }
 
 // computeProvenanceHash computes deterministic cache identity for translation.

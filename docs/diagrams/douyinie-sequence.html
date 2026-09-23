@@ -5249,11 +5249,11 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
         </g>
         </g>
 
-        <g data-edge-from="worker" data-edge-to="cas" data-edge-label="CAS Put: WAV (zero overrun)" data-edge-key="8" data-edge-id="m9">
+        <g data-edge-from="worker" data-edge-to="cas" data-edge-label="CAS Put: WAV (playback window)" data-edge-key="8" data-edge-id="m9">
           <path data-composition-edge-from="worker" data-composition-edge-to="cas" data-composition-edge-id="m9" data-composition-points="810.9,399;965.5,399" d="M 810.9 399 L 965.5 399" class="a-dashed" data-animate="edge" style="--step:8" stroke-width="1.4" marker-end="url(#arrowhead-dashed)"/>
         <g data-detail="context">
-          <rect x="812" y="379" width="152.4" height="16" rx="3" class="c-mask"/>
-          <text x="888.2" y="389" class="t-messagebus" font-size="9" text-anchor="middle">CAS Put: WAV (zero overrun)</text>
+          <rect x="804.2" y="379" width="168" height="16" rx="3" class="c-mask"/>
+          <text x="888.2" y="389" class="t-messagebus" font-size="9" text-anchor="middle">CAS Put: WAV (playback window)</text>
         </g>
         </g>
 
@@ -5596,7 +5596,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
         </div>
         <ul>
           <li>&bull; Dịch thuật sản xuất bắt buộc qua Remote LLM Gateway (Gemini 3.8 Flash -&gt; DeepSeek v4.1 Flash), fail-closed</li>
-          <li>&bull; Quy chuẩn Zero Overrun nghiêm ngặt: tts_finish &lt;= source_end; tự động escalate CosyVoice3 nếu quá thời lượng</li>
+          <li>&bull; Quy chuẩn playback window: tts_finish nằm trong cửa sổ phát đã chấp nhận (được mượn silence nguồn đã chứng minh, không vượt DubPlaybackEndMs và không đè speech kế cận); tự động escalate CosyVoice3 nếu quá thời lượng</li>
           <li>&bull; Ở Review Posture, run hoàn tất nhưng job ở lại review_required chờ operator duyệt explicit render</li>
         </ul>
       </div>

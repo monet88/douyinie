@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -910,18 +911,32 @@ func (r *BenchmarkRunner) ExecuteQualityCase(ctx context.Context, input QualityC
 		return qc, fmt.Errorf("get run quality results for resume check: %w", err)
 	}
 
-	var existingBenchmarkQRs []domain.QualityResult
+	// Reuse-vs-derive and the ambiguity guard below are evaluated over CURRENT-SCHEMA rows only.
+	// Legacy schema rows stay recognized as benchmark-owned (IsBenchmarkOwnedQualityResult accepts
+	// schema 1 and 2 so historical rows remain audit-visible and are never mistaken for unowned
+	// production evidence), but they predate the current playback/coverage/scoring contract, so
+	// they are never reused as autoQRID and never count toward the ambiguity guard: otherwise a
+	// single upgrade would poison every later resume.
+	//
+	// A legacy row must NOT block appending the current-schema row either. Quality results are an
+	// append-only evidence log (SaveQualityResult, GetQualityResults/GetQualityResultsByRun return
+	// every row; GetLatestQualityResult is the only single-row reader), so one re-derived
+	// current-schema row beside a legacy row is legal evidence, not a duplicate: the legacy row
+	// keeps audit visibility while the run regains QC evidence under the current semantics.
+	// Letting a legacy row block the append would leave the run permanently pinned to superseded
+	// QC semantics and, because this guard runs on every resume, would fail closed forever.
+	var reusableBenchmarkQRs []domain.QualityResult
 	for _, qr := range existingQRs {
-		if IsBenchmarkOwnedQualityResult(qr, qc.RunID, qc.JobID, qc.SourceAssetID, qc.TargetLanguage) {
-			existingBenchmarkQRs = append(existingBenchmarkQRs, qr)
+		if IsReusableCurrentSchemaBenchmarkQualityResult(qr, qc.RunID, qc.JobID, qc.SourceAssetID, qc.TargetLanguage) {
+			reusableBenchmarkQRs = append(reusableBenchmarkQRs, qr)
 		}
 	}
 
 	var autoQRID string
-	if len(existingBenchmarkQRs) > 1 {
-		return qc, fmt.Errorf("fail-closed: multiple (%d) benchmark-owned multimodal_qc results already exist for run %s", len(existingBenchmarkQRs), qc.RunID)
-	} else if len(existingBenchmarkQRs) == 1 {
-		autoQRID = existingBenchmarkQRs[0].ID
+	if len(reusableBenchmarkQRs) > 1 {
+		return qc, fmt.Errorf("fail-closed: multiple (%d) benchmark-owned multimodal_qc results already exist for run %s (counts current-schema results only)", len(reusableBenchmarkQRs), qc.RunID)
+	} else if len(reusableBenchmarkQRs) == 1 {
+		autoQRID = reusableBenchmarkQRs[0].ID
 	} else {
 		autoQR := deriveAutomatedQualityResult(qc, input.ReferencePack, input.IsNoDub)
 		posted, err := r.client.PostQualityResult(ctx, autoQR)
@@ -1010,9 +1025,63 @@ const (
 	BenchmarkQCSchemaVersion = 2
 )
 
+// benchmarkQCSchemaVersion extracts the recorded benchmark QC schema version, accepting every
+// JSON encoding a Details map can round-trip through (int, float64, json.Number, string).
+// 0 means "no usable version recorded".
+func benchmarkQCSchemaVersion(details map[string]any) int {
+	schemaVal, ok := details[BenchmarkQCSchemaKey]
+	if !ok {
+		return 0
+	}
+	switch v := schemaVal.(type) {
+	case int:
+		return v
+	case float64:
+		return int(v)
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil {
+			return 0
+		}
+		return int(n)
+	case string:
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0
+		}
+		return n
+	default:
+		return 0
+	}
+}
+
 // IsBenchmarkOwnedQualityResult checks if a QualityResult is owned by the benchmark runner
 // and matches the current execution scope (runID, jobID, assetID, targetLanguage).
+// Ownership spans legacy schema rows: they are historical benchmark evidence for audit and
+// duplicate protection, even though they must not be reused as current QC evidence.
 func IsBenchmarkOwnedQualityResult(qr domain.QualityResult, runID, jobID, assetID, targetLanguage string) bool {
+	if !benchmarkQualityResultScopeMatches(qr, runID, jobID, assetID, targetLanguage) {
+		return false
+	}
+	v := benchmarkQCSchemaVersion(qr.Details)
+	return v == BenchmarkQCSchemaVersion || v == 1
+}
+
+// IsReusableCurrentSchemaBenchmarkQualityResult reports whether qr is benchmark-owned in the
+// given scope AND was derived under the current scoring semantics (BenchmarkQCSchemaVersion).
+// Only such a row may be reused as a run's automatic QC evidence: a legacy schema row predates
+// the current playback/coverage/scoring contract, so reusing it would silently suppress
+// re-derivation under the current semantics.
+func IsReusableCurrentSchemaBenchmarkQualityResult(qr domain.QualityResult, runID, jobID, assetID, targetLanguage string) bool {
+	if !benchmarkQualityResultScopeMatches(qr, runID, jobID, assetID, targetLanguage) {
+		return false
+	}
+	return benchmarkQCSchemaVersion(qr.Details) == BenchmarkQCSchemaVersion
+}
+
+// benchmarkQualityResultScopeMatches checks benchmark producer ownership and execution scope,
+// ignoring the recorded schema version.
+func benchmarkQualityResultScopeMatches(qr domain.QualityResult, runID, jobID, assetID, targetLanguage string) bool {
 	if qr.Stage != "multimodal_qc" {
 		return false
 	}
@@ -1023,26 +1092,7 @@ func IsBenchmarkOwnedQualityResult(qr domain.QualityResult, runID, jobID, assetI
 		return false
 	}
 	producer, ok := qr.Details[BenchmarkQCProducerKey]
-	if !ok || producer != BenchmarkQCProducerValue {
-		return false
-	}
-	schemaVal, ok := qr.Details[BenchmarkQCSchemaKey]
-	if !ok {
-		return false
-	}
-	switch v := schemaVal.(type) {
-	case int:
-		return v == BenchmarkQCSchemaVersion || v == 1
-	case float64:
-		return int(v) == BenchmarkQCSchemaVersion || int(v) == 1
-	case json.Number:
-		n, err := v.Int64()
-		return err == nil && (int(n) == BenchmarkQCSchemaVersion || int(n) == 1)
-	case string:
-		return v == "1" || v == "2"
-	default:
-		return false
-	}
+	return ok && producer == BenchmarkQCProducerValue
 }
 
 // deriveAutomatedQualityResult deterministically evaluates multimodal AV/QC signals

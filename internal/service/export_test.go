@@ -16,6 +16,11 @@ func ResolveRunTranscriptCASForTest(ctx context.Context, db *storage.DB, runID, 
 	return resolveRunTranscriptCAS(ctx, db, runID, assetID, purpose)
 }
 
+// ResolveCanonicalRolePlanForTest exposes resolveCanonicalRolePlan for whitebox testing in service_test.
+func (s *TranslationService) ResolveCanonicalRolePlanForTest(ctx context.Context, assetID, runID string) (*domain.AudioRolePlan, error) {
+	return s.resolveCanonicalRolePlan(ctx, assetID, runID)
+}
+
 // ComputeTranslationInputHashForTest exposes computeTranslationInputHash for whitebox testing in service_test.
 
 // EffectiveGlossaryForTest exposes effectiveGlossary for testing in service_test.

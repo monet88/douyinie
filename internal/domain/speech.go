@@ -422,10 +422,19 @@ func IsInsideDialogueWindow(startMs, endMs int64, plan *AudioRolePlan) bool {
 }
 
 // IsDubEligibleSpeechBlock checks whether a SpeechBlock represents canonical dialogue speech eligible for dubbing:
-// it must be a valid speech block, have dialogue overlap in AudioRolePlan, and not overlap protected vocal
-// or uncertain regions (singing/music-vocal, uncertain). Ordinary BGM/SFX/ambience do not disqualify (Issue #153).
+// it must be a valid speech block, carry real source text (not empty, not pathological repetition noise),
+// have dialogue overlap in AudioRolePlan, and not overlap protected vocal or uncertain regions
+// (singing/music-vocal, uncertain). Ordinary BGM/SFX/ambience do not disqualify (Issue #153).
+//
+// This is the single canonical eligibility predicate. Translation input, dub coverage, and mix coverage
+// must all agree on it: a block that translation drops as empty/noise must not still count as a required
+// dub member, otherwise the mix reports an impossible MISSING_REPLACEMENT blocker.
 func IsDubEligibleSpeechBlock(b SpeechBlock, plan *AudioRolePlan) bool {
 	if !IsSpeechBlock(b) {
+		return false
+	}
+	text := strings.TrimSpace(b.SourceText)
+	if text == "" || IsPathologicalRepetitionNoise(text) {
 		return false
 	}
 	if plan == nil || len(plan.Segments) == 0 {
@@ -445,13 +454,9 @@ func CanonicalTranslationSegments(transcript *TranscriptArtifact, plan *AudioRol
 		if !IsDubEligibleSpeechBlock(b, plan) {
 			continue
 		}
-		text := strings.TrimSpace(b.SourceText)
-		if text == "" || IsPathologicalRepetitionNoise(text) {
-			continue
-		}
 		segments = append(segments, TranslationInputSegment{
 			Index:      b.Index,
-			SourceText: text,
+			SourceText: strings.TrimSpace(b.SourceText),
 			SpeakerID:  b.SpeakerID,
 			StartMs:    b.StartMs,
 			EndMs:      b.EndMs,

@@ -149,7 +149,10 @@ func (s *ReviewService) validateTranslationCompatibility(ctx context.Context, re
 		if strings.TrimSpace(tVar.InputHash) == "" {
 			return fmt.Errorf("translation variant %s is missing input hash", transIdx.CASHash)
 		}
-		canonicalSegments, _, err := s.translationSvc.loadSegmentsFromTranscript(ctx, in.AssetID, tVar.TranscriptArtifactCAS)
+		// Canonical segmentation is re-derived from the run's own pinned role-plan lineage: the
+		// operator's current plan for the asset may have been edited since the run froze this
+		// variant, which must not re-segment (and so invalidate) an otherwise valid correction.
+		canonicalSegments, _, err := s.translationSvc.loadSegmentsFromTranscript(ctx, in.AssetID, requestedRunID, tVar.TranscriptArtifactCAS)
 		if err != nil {
 			return fmt.Errorf("load canonical segments for correction: %w", err)
 		}
@@ -194,11 +197,34 @@ func (s *ReviewService) validateTranslationCompatibility(ctx context.Context, re
 		if strings.TrimSpace(tVar.ProviderID) == "" {
 			return fmt.Errorf("translation variant %s is missing provider lineage", transIdx.CASHash)
 		}
-		if tVar.ProviderID != routeRes.SelectedProvider.ID() {
-			return fmt.Errorf("translation variant provider mismatch: variant=%s active=%s", tVar.ProviderID, routeRes.SelectedProvider.ID())
+		// The variant froze the provider that produced it. Translation's production ladder scores by exact
+		// provider ID and Router deliberately ignores PreferredProviderID for this stage, so the frozen
+		// provider is proven still eligible through the route result instead: selected, or standing among
+		// the eligible fallback candidates. Health, policy, license or credential loss removes it from both
+		// and the correction fails closed.
+		if !frozenProviderEligible(routeRes, tVar.ProviderID) {
+			return fmt.Errorf("translation variant provider mismatch: variant=%s not eligible in the current provider route (active=%s)", tVar.ProviderID, routeRes.SelectedProvider.ID())
 		}
 	}
 	return nil
+}
+
+// frozenProviderEligible reports whether the router still proves a frozen provider eligible for the stage:
+// it is the selected candidate or stands among the eligible fallback candidates. A provider the router
+// dropped (unhealthy, policy-blocked, unlicensed, unauthorized) is absent from both.
+func frozenProviderEligible(res *provider.RouteResult, providerID string) bool {
+	if res == nil || res.SelectedProvider == nil {
+		return false
+	}
+	if isProviderEquivalent(res.SelectedProvider.ID(), providerID) {
+		return true
+	}
+	for _, candidate := range res.FallbackOrdered {
+		if candidate != nil && isProviderEquivalent(candidate.ID(), providerID) {
+			return true
+		}
+	}
+	return false
 }
 
 // Invariant: Overrides are append-only audit records; historical QA scores and failures are never mutated or rewritten to PASS.
@@ -900,7 +926,12 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 
 	// 2. Reassign voice profile(s) for the run against the exact current script/transcript lineage.
 	// Historical assignments may predate these pins; a successor used by the current mixer must not.
-	transcriptCAS, _ := resolveRunTranscriptCAS(ctx, s.db, in.RunID, in.AssetID, "voice reassignment")
+	// The asset-latest fallback below applies only when the run genuinely pins no transcript: a run whose
+	// pinned-transcript proof failed must not silently adopt another run's transcript.
+	transcriptCAS, err := resolveRunTranscriptCAS(ctx, s.db, in.RunID, in.AssetID, "voice reassignment")
+	if err != nil {
+		return nil, fmt.Errorf("resolve run transcript lineage for voice reassignment: %w", err)
+	}
 	if strings.TrimSpace(transcriptCAS) == "" {
 		dubScript, _, loadErr := s.dubbingSvc.loadDubScriptVariant(ctx, in.AssetID, targetLang, dubScriptIdx.CASHash)
 		if loadErr != nil {
@@ -1539,7 +1570,16 @@ func (s *ReviewService) EvaluateFinalRenderHandoff(ctx context.Context, in domai
 		}, nil
 	}
 
-	// 2. Queue is zero
+	// 2. The run's own delivery lineage must still be current. A correction supersedes the dub mix or
+	// render plan for one run; until that run re-freezes them, a handoff would publish the artifacts the
+	// correction replaced, so the refusal here names them and keeps the run resumable.
+	if reason, err := s.staleDeliveryLineage(ctx, in.AssetID, in.TargetLanguage, in.RunID); err != nil {
+		return nil, err
+	} else if reason != "" {
+		return nil, errors.New(reason)
+	}
+
+	// 3. Queue is zero and the lineage is current.
 	result := &domain.FinalRenderHandoffResult{
 		AssetID:             in.AssetID,
 		RunID:               in.RunID,
@@ -1579,6 +1619,86 @@ func (s *ReviewService) EvaluateFinalRenderHandoff(ctx context.Context, in domai
 	}
 
 	return result, nil
+}
+
+// finalRenderDeliveryStages name the run stages whose artifacts a final render consumes, in pipeline order.
+// A correction that invalidates one of them leaves the run mid-delivery: the resumed pipeline rebuilds the
+// stage before the handoff stage runs again.
+var finalRenderDeliveryStages = []string{"audio_mix", "render_plan", "render_preview"}
+
+// staleDeliveryLineage reports why a run may not hand off for final render, or "" when its delivery lineage
+// is current. The explicit final render resolves the asset-latest render plan and executes the dub mix that
+// plan pins, so a correction that superseded this run's mix or render plan leaves the run holding artifacts
+// the correction replaced; handing off would publish them. Read failures are returned: a lineage this
+// cannot describe must never be reported as fresh.
+func (s *ReviewService) staleDeliveryLineage(ctx context.Context, assetID, targetLang, runID string) (string, error) {
+	if s.db == nil || strings.TrimSpace(runID) == "" {
+		return "", nil
+	}
+	stages, err := s.db.ListStageExecutions(ctx, runID)
+	if err != nil {
+		return "", fmt.Errorf("read run %s delivery lineage: %w", runID, err)
+	}
+	// ListStageExecutions is ordered by creation, so the last row per stage is its newest attempt.
+	newest := make(map[string]domain.StageExecution, len(finalRenderDeliveryStages))
+	for _, se := range stages {
+		for _, stage := range finalRenderDeliveryStages {
+			if se.Stage == stage {
+				newest[stage] = se
+			}
+		}
+	}
+	for _, stage := range finalRenderDeliveryStages {
+		if se, ok := newest[stage]; ok && se.Status == domain.StageStatusQueued {
+			return fmt.Sprintf("final render handoff refused: a correction invalidated the run's %s artifact and the run has not rebuilt it yet; resume the run to re-freeze the corrected lineage before final render", stage), nil
+		}
+	}
+
+	mixCAS := ""
+	if se, ok := newest["audio_mix"]; ok && se.Status == domain.StageStatusSucceeded {
+		mixCAS = strings.TrimSpace(se.ArtifactSHA256)
+	}
+	if mixCAS == "" {
+		idx, err := s.db.GetDubMixArtifactIndexByRun(ctx, runID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return "", fmt.Errorf("read run %s dub mix lineage: %w", runID, err)
+		}
+		if idx != nil {
+			mixCAS = strings.TrimSpace(idx.CASHash)
+		}
+	}
+
+	planCAS := ""
+	if se, ok := newest["render_plan"]; ok && se.Status == domain.StageStatusSucceeded {
+		planCAS = strings.TrimSpace(se.ArtifactSHA256)
+	}
+	if planCAS == "" {
+		// With no plan pinned to the run, the handoff renders the asset's latest plan.
+		idx, err := s.db.GetRenderPlanIndex(ctx, assetID, targetLang)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return "", fmt.Errorf("read asset %s render plan lineage: %w", assetID, err)
+		}
+		if idx != nil {
+			planCAS = strings.TrimSpace(idx.CASHash)
+		}
+	}
+	if mixCAS == "" || planCAS == "" {
+		return "", nil
+	}
+
+	rc, err := s.cas.Get(planCAS)
+	if err != nil {
+		return "", fmt.Errorf("read render plan %s for handoff lineage: %w", planCAS, err)
+	}
+	defer rc.Close()
+	var plan domain.RenderPlan
+	if err := json.NewDecoder(rc).Decode(&plan); err != nil {
+		return "", fmt.Errorf("decode render plan %s for handoff lineage: %w", planCAS, err)
+	}
+	if plan.DubMixCASHash != "" && plan.DubMixCASHash != mixCAS {
+		return fmt.Sprintf("final render handoff refused: render plan %s still pins dub mix %s but the run's current dub mix is %s; re-freeze the render plan from the corrected mix before final render", planCAS, plan.DubMixCASHash, mixCAS), nil
+	}
+	return "", nil
 }
 
 // ProjectReviewItems collects and projects all actionable review exceptions for a given asset and target language.

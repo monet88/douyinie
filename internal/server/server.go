@@ -2161,6 +2161,35 @@ func (s *Server) handleRunSpeechUnderstand(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Ownership proof before any lineage is persisted. The transcript artifact index and
+	// the speech_understand stage execution are both pinned to this run, so a caller-supplied
+	// run_id must be proven to belong to this asset; otherwise the run's lineage could be
+	// pointed at another asset's media/transcript.
+	run, err := s.db.GetRun(r.Context(), body.RunID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("run %s not found", body.RunID))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// A run with no resolvable job cannot prove which asset it belongs to, so this fails closed
+	// rather than pinning unverifiable lineage to this asset.
+	job, err := s.db.GetJob(r.Context(), run.JobID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("job %s for run %s not found", run.JobID, body.RunID))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if job.SourceAssetID != asset.ID {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("run %s belongs to asset %s, not %s", body.RunID, job.SourceAssetID, asset.ID))
+		return
+	}
+
 	// Load the audio role plan from the asset's CAS metadata. The pipeline
 	// fails closed when the plan is missing (ErrAudioRolePlanRequired).
 	var rolePlan *domain.AudioRolePlan
@@ -2231,16 +2260,6 @@ func (s *Server) handleRunSpeechUnderstand(w http.ResponseWriter, r *http.Reques
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
-	}
-	if s.db != nil && strings.TrimSpace(body.RunID) != "" {
-		_ = s.db.CreateStageExecution(r.Context(), domain.StageExecution{
-			ID:             uuid.NewString(),
-			RunID:          body.RunID,
-			Stage:          "speech_understand",
-			Status:         domain.StageStatusSucceeded,
-			ArtifactSHA256: artifact.CASHash,
-			CreatedAt:      time.Now().UTC(),
-		})
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]any{"transcript_artifact": artifact})
@@ -2397,7 +2416,9 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid glossary: "+err.Error())
 			return
 		}
-		normalized, err := service.ValidateGlossaryEntries(glossary)
+		// Keep conflicting duplicates in the forwarded request glossary so the produced variant's
+		// effective glossary can report the omitted-conflict count to the operator.
+		normalized, err := service.NormalizeGlossaryEntries(glossary)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid glossary: "+err.Error())
 			return
@@ -2438,8 +2459,8 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, domain.ErrEmptyTranslationInput) ||
 			errors.Is(err, domain.ErrGlossaryConflict) ||
 			errors.Is(err, domain.ErrTranslationOwnershipMismatch) ||
-			strings.Contains(err.Error(), "missing pinned speech_understand transcript lineage") ||
-			strings.Contains(err.Error(), "transcript lineage mismatch") {
+			errors.Is(err, domain.ErrTranscriptLineageMissing) ||
+			errors.Is(err, domain.ErrTranscriptLineageMismatch) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -3139,12 +3160,16 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid glossary: "+err.Error())
 			return
 		}
-		normalized, err := service.ValidateGlossaryEntries(entries)
+		// Persist the normalized entries in request order WITHOUT dropping conflicting
+		// duplicates: the frozen snapshot must stay the single source of truth for the
+		// request glossary, and EffectiveGlossary can only report omitted conflicts if the
+		// dropped entries are still present in the frozen input.
+		frozen, err := service.NormalizeGlossaryEntries(entries)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid glossary: "+err.Error())
 			return
 		}
-		cfg["glossary"] = normalized
+		cfg["glossary"] = frozen
 	}
 
 	if body.Posture != "" {
@@ -4755,6 +4780,14 @@ func (s *Server) handleReviewItemDirectOverride(w http.ResponseWriter, r *http.R
 	}
 
 	in.ReviewItemID = itemID
+	// A review item id alone cannot prove which run's pending queue it belongs to, so an
+	// override without run_id would fall back to the asset-latest queue and could accept a
+	// stale item from a superseded run. Every other correction/override entry point requires
+	// run_id; keep this one consistent.
+	if strings.TrimSpace(in.RunID) == "" {
+		writeError(w, http.StatusBadRequest, "run_id is required for manual review override; use the run-scoped review endpoint when possible")
+		return
+	}
 	override, err := s.reviewSvc.RecordManualOverride(r.Context(), in)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())

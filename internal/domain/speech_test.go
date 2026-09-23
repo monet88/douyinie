@@ -124,3 +124,66 @@ func TestSpeechBlock_DubEligibility_PermitsOrdinaryBGMAmbience_BlocksSingingUnce
 		t.Fatalf("expected exactly segment 0 to be extracted as canonical translation member, got %+v", canonical)
 	}
 }
+
+func TestCanonicalTranslationSegments_UnifiedEligibilityPredicate(t *testing.T) {
+	// Regression framing: before the predicate carried SourceText/noise checks,
+	// IsDubEligibleSpeechBlock reported the empty-text block (2) and the pathological-repetition
+	// block (3) as dub-eligible while CanonicalTranslationSegments dropped both itself. Dub/mix
+	// coverage then counted two required members that translation never produced, surfacing an
+	// unsatisfiable MISSING_REPLACEMENT blocker. Now both sides share one predicate.
+	plan := &domain.AudioRolePlan{
+		AssetID: "asset-mixed",
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 9000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 6000, EndMs: 8000, Role: domain.AudioRoleSingingMusicVocal},
+		},
+	}
+	blocks := []domain.SpeechBlock{
+		// 1. ordinary dialogue
+		{Index: 0, StartMs: 0, EndMs: 2000, SpeakerID: "s1", SourceText: "这是正常的对话", SegmentType: domain.SpeechBlockTypeSpeech},
+		// 2. dub-eligible timing, but empty source text
+		{Index: 1, StartMs: 2000, EndMs: 4000, SpeakerID: "s1", SourceText: "", SegmentType: domain.SpeechBlockTypeSpeech},
+		// 3. dub-eligible timing, but pathological repetition noise
+		{Index: 2, StartMs: 4000, EndMs: 6000, SpeakerID: "s1", SourceText: "啊啊啊啊啊啊啊", SegmentType: domain.SpeechBlockTypeSpeech},
+		// 4. protected singing/music-vocal region
+		{Index: 3, StartMs: 6000, EndMs: 8000, SpeakerID: "s2", SourceText: "singing lyric", SegmentType: domain.SpeechBlockTypeSpeech},
+		// 5. outside every plan segment
+		{Index: 4, StartMs: 10000, EndMs: 12000, SpeakerID: "s1", SourceText: "outside every plan segment", SegmentType: domain.SpeechBlockTypeSpeech},
+	}
+	transcript := &domain.TranscriptArtifact{SpeechBlocks: blocks}
+
+	wantEligible := []bool{true, false, false, false, false}
+	for i, b := range blocks {
+		if got := domain.IsDubEligibleSpeechBlock(b, plan); got != wantEligible[i] {
+			t.Fatalf("block %d %q: IsDubEligibleSpeechBlock=%v, want %v", i, b.SourceText, got, wantEligible[i])
+		}
+	}
+	canonical := domain.CanonicalTranslationSegments(transcript, plan)
+	if len(canonical) != 1 || canonical[0].Index != 0 || canonical[0].SourceText != "这是正常的对话" {
+		t.Fatalf("expected only the valid dialogue block as canonical translation input, got %+v", canonical)
+	}
+
+	// Predicate and translation input must agree block-by-block in both directions.
+	for i, b := range blocks {
+		inCanonical := false
+		for _, seg := range canonical {
+			if seg.Index == b.Index {
+				inCanonical = true
+			}
+		}
+		if eligible := domain.IsDubEligibleSpeechBlock(b, plan); inCanonical != eligible {
+			t.Fatalf("block %d: canonical membership=%v disagrees with predicate=%v", i, inCanonical, eligible)
+		}
+	}
+
+	// Explicit locks for the two former phantom required members.
+	if domain.IsDubEligibleSpeechBlock(blocks[1], plan) {
+		t.Fatal("empty SourceText block must not be dub-eligible")
+	}
+	if domain.IsDubEligibleSpeechBlock(blocks[2], plan) {
+		t.Fatal("pathological repetition block must not be dub-eligible")
+	}
+	if domain.IsDubEligibleSpeechBlock(domain.SpeechBlock{Index: 9, StartMs: 0, EndMs: 1000, SourceText: "   ", SegmentType: domain.SpeechBlockTypeSpeech}, plan) {
+		t.Fatal("whitespace-only SourceText block must not be dub-eligible")
+	}
+}

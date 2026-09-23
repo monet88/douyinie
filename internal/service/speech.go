@@ -368,14 +368,16 @@ func (s *SpeechService) persistTranscript(ctx context.Context, in domain.SpeechP
 			loaded.ProvenanceHash = existing.ProvenanceHash
 			*artifact = *loaded
 			if strings.TrimSpace(in.RunID) != "" {
-				_ = s.db.CreateStageExecution(ctx, domain.StageExecution{
+				if err := s.db.CreateStageExecution(ctx, domain.StageExecution{
 					ID:             uuid.NewString(),
 					RunID:          in.RunID,
 					Stage:          "speech_understand",
 					Status:         domain.StageStatusSucceeded,
 					ArtifactSHA256: existing.CASHash,
 					CreatedAt:      time.Now().UTC(),
-				})
+				}); err != nil {
+					return fmt.Errorf("record speech_understand stage for run %s: %w", in.RunID, err)
+				}
 			}
 			return nil
 		}
@@ -411,14 +413,16 @@ func (s *SpeechService) persistTranscript(ctx context.Context, in domain.SpeechP
 		return fmt.Errorf("persist transcript artifact index: %w", err)
 	}
 	if strings.TrimSpace(in.RunID) != "" {
-		_ = s.db.CreateStageExecution(ctx, domain.StageExecution{
+		if err := s.db.CreateStageExecution(ctx, domain.StageExecution{
 			ID:             uuid.NewString(),
 			RunID:          in.RunID,
 			Stage:          "speech_understand",
 			Status:         domain.StageStatusSucceeded,
 			ArtifactSHA256: obj.SHA256,
 			CreatedAt:      artifact.CreatedAt,
-		})
+		}); err != nil {
+			return fmt.Errorf("record speech_understand stage for run %s: %w", in.RunID, err)
+		}
 	}
 	return nil
 }

@@ -9,6 +9,7 @@ import (
 	"math"
 
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/media"
 )
 
 // FitControllerConfig holds parameters for the measured-duration fit controller.
@@ -50,6 +51,15 @@ type FitEvaluationInput struct {
 	FixedRateVoice     bool    `json:"fixed_rate_voice"`     // Whether a non-1.0 speed request fails closed (preset-voice lanes)
 	DubPlaybackEndMs   int64   `json:"dub_playback_end_ms"`  // Accepted playback ceiling; source EndMs when borrowing is unavailable.
 	EffectiveReserveMs int64   `json:"effective_reserve_ms"`
+	// OutputSampleRate is the sample rate of the mix this candidate lands in (the background stem
+	// rate the mixer resamples to); 0 = unknown, and the fit then falls back to the millisecond
+	// window instead of the frame-exact one.
+	OutputSampleRate int `json:"output_sample_rate,omitempty"`
+	// MeasuredFrames is the exact decoded frame count (per channel) of the candidate waveform;
+	// 0 = unknown.
+	MeasuredFrames int64 `json:"measured_frames,omitempty"`
+	// MeasuredSampleRate is the sample rate of that decoded waveform; 0 = unknown.
+	MeasuredSampleRate int `json:"measured_sample_rate,omitempty"`
 }
 
 // FitEvaluationResult contains the controller's decision and fit metrics.
@@ -114,6 +124,13 @@ func (fc *FitController) ResolvePlaybackWindow(sourceEndMs, nextVocalStartMs int
 
 // EvaluateCandidate evaluates a measured synthesized audio candidate against immutable source constraints.
 func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluationInput) FitEvaluationResult {
+	// A controller whose config cannot resolve a frozen policy identity cannot classify anything:
+	// nothing downstream (mixer lineage check, artifact evidence) can validate a verdict it stamps,
+	// so fail closed instead of resolving an ACCEPT the mix stage will refuse.
+	policyID := fc.policyID()
+	if policyID == "" {
+		return FitEvaluationResult{Decision: domain.FitActionReview, SlotDurationMs: 0, MeasuredDurationMs: in.MeasuredDurationMs, RequiresReview: true, ReviewReason: "INVALID_FIT_POLICY", Reason: "fit controller policy identity is not resolvable", DubPlaybackEndMs: in.EndMs, FitPolicyID: policyID}
+	}
 	if in.StartMs < 0 || in.EndMs <= in.StartMs || in.MeasuredDurationMs <= 0 {
 		return FitEvaluationResult{Decision: domain.FitActionReview, SlotDurationMs: 0, MeasuredDurationMs: in.MeasuredDurationMs, RequiresReview: true, ReviewReason: "INVALID_TIMING", Reason: "invalid source timing or measured duration", DubPlaybackEndMs: in.EndMs, FitPolicyID: fc.policyID()}
 	}
@@ -131,13 +148,40 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 
 	// 1. Calculate natural inter-turn breathing gap
 	naturalGapMs := in.EffectiveReserveMs
-	usableSlotMs := slotDurationMs
+
+	// The usable slot keeps the frozen natural reserve free, so Case 1 accepts only a candidate
+	// that also preserves that pause while Case 2 stays reachable for one that still fits the
+	// wider accepted window and merely consumes part of the reserve. A non-positive reserve
+	// leaves the usable slot equal to the accepted window, preserving the previous behavior.
+	usableSlotMs := slotDurationMs - in.EffectiveReserveMs
+	if usableSlotMs < 1 {
+		usableSlotMs = 1
+	}
+	if usableSlotMs > slotDurationMs {
+		usableSlotMs = slotDurationMs
+	}
 
 	deltaMs := in.MeasuredDurationMs - usableSlotMs
 	hardOverrunMs := in.MeasuredDurationMs - slotDurationMs
 
+	// The mixer enforces the accepted playback window frame-exactly. The fit proves the same
+	// window from the strongest evidence it was given, in one rule with three tiers:
+	//  1. exact waveform geometry: the frames the mixer will actually place, after resampling;
+	//  2. output rate only: a probe of D whole milliseconds can hide up to
+	//     floor((D+1)*rate/1000) frames (N*1000/rate < D+1), so that bound must fit the window;
+	//  3. no rate: the millisecond window alone, which cannot prove frame-exact placement.
+	fitsPlaybackWindow := in.MeasuredDurationMs <= slotDurationMs
+	if in.OutputSampleRate > 0 {
+		windowFrames := media.PlaybackWindowFrames(in.StartMs, playbackEndMs, in.OutputSampleRate)
+		if in.MeasuredFrames > 0 && in.MeasuredSampleRate > 0 {
+			fitsPlaybackWindow = media.ResampledPCM16Frames(in.MeasuredFrames, in.MeasuredSampleRate, in.OutputSampleRate) <= windowFrames
+		} else {
+			fitsPlaybackWindow = ((in.MeasuredDurationMs+1)*int64(in.OutputSampleRate))/1000 <= windowFrames
+		}
+	}
+
 	// Case 1: Fits comfortably within usable slot (including natural breathing room)
-	if in.MeasuredDurationMs <= usableSlotMs {
+	if in.MeasuredDurationMs <= usableSlotMs && fitsPlaybackWindow {
 		return FitEvaluationResult{
 			Decision:           domain.FitActionAccept,
 			UsableSlotMs:       usableSlotMs,
@@ -153,7 +197,7 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 	}
 
 	// Case 2: Compatibility branch for a candidate that still fits the accepted playback window.
-	if in.MeasuredDurationMs <= slotDurationMs {
+	if in.MeasuredDurationMs <= slotDurationMs && fitsPlaybackWindow {
 		// Preserve the remaining playback-window margin as perceptual gap evidence.
 		remainingGap := slotDurationMs - in.MeasuredDurationMs
 		return FitEvaluationResult{
@@ -170,8 +214,14 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 		}
 	}
 
-	// Case 3: Overruns the accepted playback window (hardOverrunMs > 0).
-	// Must not accept without remediation!
+	// Case 3: Overruns the accepted playback window, or fits it in milliseconds while the
+	// frame-exact placement inside it cannot be proven from the floored probe. The thresholds
+	// stay keyed to slotDurationMs, the accepted window itself. Must not accept without
+	// remediation!
+	overrunLabel := fmt.Sprintf("overrun by %dms", hardOverrunMs)
+	if hardOverrunMs <= 0 {
+		overrunLabel = "floored duration leaves no provable frame margin in the accepted window"
+	}
 
 	// Strategy A: RESYNTH via measured speed-fit
 	// Needed speed factor to fit inside usable slot
@@ -192,7 +242,7 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 			DurationDeltaMs:    deltaMs,
 			RecommendedSpeed:   speedFactor,
 			NaturalGapMs:       naturalGapMs,
-			Reason:             fmt.Sprintf("overrun by %dms: requesting resynth with calibrated speed %.2fx", hardOverrunMs, speedFactor),
+			Reason:             fmt.Sprintf("%s: requesting resynth with calibrated speed %.2fx", overrunLabel, speedFactor),
 			RequiresReview:     false,
 			DubPlaybackEndMs:   playbackEndMs, EffectiveReserveMs: naturalGapMs, FitPolicyID: fc.policyID(),
 		}
@@ -208,7 +258,7 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 			DurationDeltaMs:    deltaMs,
 			RecommendedSpeed:   1.0,
 			NaturalGapMs:       naturalGapMs,
-			Reason:             fmt.Sprintf("overrun by %dms: speed-fit limit reached, requesting shorten-first rewrite", hardOverrunMs),
+			Reason:             fmt.Sprintf("%s: speed-fit limit reached, requesting shorten-first rewrite", overrunLabel),
 			RequiresReview:     false,
 			DubPlaybackEndMs:   playbackEndMs, EffectiveReserveMs: naturalGapMs, FitPolicyID: fc.policyID(),
 		}
@@ -224,7 +274,7 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 			DurationDeltaMs:    deltaMs,
 			RecommendedSpeed:   1.0,
 			NaturalGapMs:       naturalGapMs,
-			Reason:             fmt.Sprintf("overrun by %dms: requesting same-speaker turn regrouping across %dms gap", hardOverrunMs, in.SourceGapAfterMs),
+			Reason:             fmt.Sprintf("%s: requesting same-speaker turn regrouping across %dms gap", overrunLabel, in.SourceGapAfterMs),
 			RequiresReview:     false,
 			DubPlaybackEndMs:   playbackEndMs, EffectiveReserveMs: naturalGapMs, FitPolicyID: fc.policyID(),
 		}
@@ -239,7 +289,7 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 		DurationDeltaMs:    deltaMs,
 		RecommendedSpeed:   speedFactor,
 		NaturalGapMs:       0,
-		Reason:             fmt.Sprintf("unresolvable duration overrun: measured %dms exceeds slot %dms by %dms", in.MeasuredDurationMs, slotDurationMs, hardOverrunMs),
+		Reason:             fmt.Sprintf("unresolvable duration overrun: %s (measured %dms, slot %dms)", overrunLabel, in.MeasuredDurationMs, slotDurationMs),
 		RequiresReview:     true,
 		ReviewReason:       "DURATION_OVERRUN",
 		DubPlaybackEndMs:   playbackEndMs, EffectiveReserveMs: naturalGapMs, FitPolicyID: fc.policyID(),

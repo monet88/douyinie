@@ -886,9 +886,10 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 				clip.Channels = channels
 			}
 
-			startFrame := (seg.StartMs * int64(sampleRate)) / 1000
+			// Frame-exact refusal, expressed through the same accepted-window arithmetic the
+			// fit controller proves a candidate against before marking it ACCEPT.
 			clipFrames := int64(len(clip.Samples) / clip.Channels)
-			if (startFrame+clipFrames)*1000 > seg.DubPlaybackEndMs*int64(sampleRate) {
+			if clipFrames > media.PlaybackWindowFrames(seg.StartMs, seg.DubPlaybackEndMs, sampleRate) {
 				return refuse(fmt.Sprintf("segment %d decoded waveform exceeds playback window", seg.Index))
 			}
 			speechClips = append(speechClips, clip)
