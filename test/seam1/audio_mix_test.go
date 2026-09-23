@@ -935,16 +935,16 @@ func TestSeam1_AudioMix_FractionalSampleRateRoundingOverrun_48kHzTo44kHz(t *test
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
-	// Audio role plan with narration/dialogue for 5ms: [1000ms, 1005ms]
+	// Audio role plan with narration/dialogue for 500ms: [1000ms, 1500ms]
 	planPayload := map[string]any{
 		"segments": []domain.AudioSegment{
-			{StartMs: 1000, EndMs: 1005, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 1000, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
 		},
 	}
 	planBody, _ := json.Marshal(planPayload)
 	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
 	source := []domain.TranslationInputSegment{{
-		Index: 0, SourceText: "short", SpeakerID: "SPEAKER_00", StartMs: 1000, EndMs: 1005,
+		Index: 0, SourceText: "exact end", SpeakerID: "SPEAKER_00", StartMs: 1000, EndMs: 1500,
 	}}
 	lineage := pinSeam1DubLineage(t, h, runID, assetID, "vi", source)
 
@@ -970,10 +970,10 @@ func TestSeam1_AudioMix_FractionalSampleRateRoundingOverrun_48kHzTo44kHz(t *test
 	stemsBytes, _ := json.Marshal(stemsArtifact)
 	stemsObj, _ := h.casStore.Put(bytes.NewReader(stemsBytes))
 
-	// 1. Positive case: 239 frames at 48kHz (239 * 44100 / 48000 = 219.58 -> 220 frames at 44.1kHz).
-	// In 44.1kHz: startFrame = 44100, endFrame = 44320. Allowed end = (1005 * 44100) / 1000 = 44320.5.
+	// 1. Positive case: 24000 frames @ 48kHz -> round(24000 * 44100 / 48000) = 22050 frames @ 44.1kHz.
+	// In 44.1kHz: startFrame = 44100, endFrame = 66150. Allowed end = (1500 * 44100) / 1000 = 66150.
 	// Exactly fits without exceeding playback window -> PASS.
-	passClipWAV := makePCM16WAVWithFrames(48000, 1, 239)
+	passClipWAV := makePCM16WAVWithFrames(48000, 1, 24000)
 	passClipObj, _ := h.casStore.Put(bytes.NewReader(passClipWAV))
 	passArtifact := domain.DubSegmentsVariant{
 		ID:                    "dub_resample_pass",
@@ -993,18 +993,18 @@ func TestSeam1_AudioMix_FractionalSampleRateRoundingOverrun_48kHzTo44kHz(t *test
 				SpeechBlockIndices: []int{0},
 				SpeakerID:          "SPEAKER_00",
 				StartMs:            1000,
-				EndMs:              1005,
-				SlotDurationMs:     5,
-				MeasuredDurationMs: 5,
+				EndMs:              1500,
+				SlotDurationMs:     500,
+				MeasuredDurationMs: 500,
 				AudioSHA256:        passClipObj.SHA256,
 				Voice:              domain.VoiceProfile{ID: "v1", Language: "vi"},
 				FitDecision:        domain.FitActionAccept,
-				DubPlaybackEndMs:   1005,
+				DubPlaybackEndMs:   1500,
 			},
 		},
 		FitPlans: []domain.DubbingFitPlan{{
-			SegmentIndex: 0, SpeakerID: "SPEAKER_00", SlotDurationMs: 5, UsableSlotMs: 5,
-			MeasuredDurationMs: 5, DubPlaybackEndMs: 1005, FitPolicyID: seam1CurrentFitPolicyID(t),
+			SegmentIndex: 0, SpeakerID: "SPEAKER_00", SlotDurationMs: 500, UsableSlotMs: 500,
+			MeasuredDurationMs: 500, DubPlaybackEndMs: 1500, FitPolicyID: seam1CurrentFitPolicyID(t),
 			SpeechBlockIndices: []int{0}, Decision: domain.FitActionAccept,
 		}},
 		CreatedAt: time.Now().UTC(),
@@ -1018,15 +1018,15 @@ func TestSeam1_AudioMix_FractionalSampleRateRoundingOverrun_48kHzTo44kHz(t *test
 		"dub_segments_cas": passObj.SHA256,
 	})
 	if respPass.StatusCode != http.StatusCreated || mixPass == nil || mixPass.OverallStatus != "PASS" {
-		t.Fatalf("expected 239 frames @ 48kHz to pass 44.1kHz mix, got status %d mix %+v", respPass.StatusCode, mixPass)
+		t.Fatalf("expected 24000 frames @ 48kHz to pass 44.1kHz mix, got status %d mix %+v", respPass.StatusCode, mixPass)
 	}
 
-	// 2. Negative counterexample: 240 frames at 48kHz (5.0ms exact @ 48kHz).
-	// Resampled to 44.1kHz: round(240 * 44100 / 48000) = 221 frames.
-	// In 44.1kHz: startFrame = 44100, endFrame = 44321.
-	// 44321 * 1000 = 44321000 > 1005 * 44100 = 44320500 -> 1 sample overrun!
+	// 2. Negative counterexample: 24001 frames @ 48kHz (500.02ms @ 48kHz).
+	// Resampled to 44.1kHz: round(24001 * 44100 / 48000) = round(22050.91875) = 22051 frames.
+	// In 44.1kHz: startFrame = 44100, endFrame = 66151.
+	// 66151 * 1000 = 66151000 > 1500 * 44100 = 66150000 -> 1 output sample overrun!
 	// Must fail closed with refusal.
-	failClipWAV := makePCM16WAVWithFrames(48000, 1, 240)
+	failClipWAV := makePCM16WAVWithFrames(48000, 1, 24001)
 	failClipObj, _ := h.casStore.Put(bytes.NewReader(failClipWAV))
 	failArtifact := passArtifact
 	failArtifact.ID = "dub_resample_fail"
@@ -1040,7 +1040,7 @@ func TestSeam1_AudioMix_FractionalSampleRateRoundingOverrun_48kHzTo44kHz(t *test
 		"dub_segments_cas": failObj.SHA256,
 	})
 	if respFail.StatusCode == http.StatusCreated && (mixFail != nil && mixFail.OverallStatus == "PASS") {
-		t.Fatalf("expected 240 frames @ 48kHz (resampled to 221 frames > 220 allowed) to be refused, got PASS")
+		t.Fatalf("expected 24001 frames @ 48kHz (resampled to 22051 frames > 22050 allowed) to be refused, got PASS")
 	}
 }
 
