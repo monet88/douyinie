@@ -142,6 +142,35 @@ func TestFitController_PlaybackWindowBorrowsOnlyReservedGap(t *testing.T) {
 	}
 }
 
+func TestFitController_PolicyIdentityCoversEveryEffectiveField(t *testing.T) {
+	baseCfg := service.DefaultFitControllerConfig()
+	_, _, baseID := service.NewFitController(baseCfg).ResolvePlaybackWindow(1000, 2000)
+	if baseID == "" {
+		t.Fatal("default fit config must produce a policy identity")
+	}
+	if _, _, again := service.NewFitController(baseCfg).ResolvePlaybackWindow(1000, 2000); again != baseID {
+		t.Fatalf("policy identity is not deterministic: %q != %q", again, baseID)
+	}
+
+	variants := map[string]func(*service.FitControllerConfig){
+		"max_speed_multiplier":    func(c *service.FitControllerConfig) { c.MaxSpeedMultiplier = 1.30 },
+		"allow_regroup_same_turn": func(c *service.FitControllerConfig) { c.AllowRegroupSameTurn = false },
+		"default_natural_gap_ms":  func(c *service.FitControllerConfig) { c.DefaultNaturalGapMs = 200 },
+		"min_natural_gap_ms":      func(c *service.FitControllerConfig) { c.MinNaturalGapMs = 60 },
+		"max_natural_gap_ms":      func(c *service.FitControllerConfig) { c.MaxNaturalGapMs = 500 },
+		"reserve_ratio":           func(c *service.FitControllerConfig) { c.ReserveRatio = 0.25 },
+		"policy_version":          func(c *service.FitControllerConfig) { c.PolicyVersion = "playback-window-v2" },
+	}
+	for name, mutate := range variants {
+		cfg := baseCfg
+		mutate(&cfg)
+		_, _, changedID := service.NewFitController(cfg).ResolvePlaybackWindow(1000, 2000)
+		if changedID == baseID {
+			t.Errorf("changing %s must change the frozen fit policy identity", name)
+		}
+	}
+}
+
 func TestFitController_NoBoundaryAndInvalidTimingFailClosed(t *testing.T) {
 	fc := service.NewFitController()
 	playbackEnd, reserve, _ := fc.ResolvePlaybackWindow(1000, 0)

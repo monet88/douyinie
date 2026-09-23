@@ -459,6 +459,64 @@ func (s *AudioRoleService) GenerateAudioRolePlan(ctx context.Context, in AudioRo
 	return &plan, nil
 }
 
+// SaveOperatorAudioRolePlan pins an operator-provided manual AudioRolePlan to CAS and persists it with its index.
+func (s *AudioRoleService) SaveOperatorAudioRolePlan(ctx context.Context, assetID string, segments []domain.AudioSegment) (*domain.AudioRolePlan, error) {
+	if s.db == nil {
+		return nil, errors.New("database is not configured")
+	}
+	if s.cas == nil {
+		return nil, errors.New("CAS store is required to pin audio role plan lineage")
+	}
+	asset, err := s.db.GetSourceAsset(ctx, assetID)
+	if err != nil {
+		return nil, err
+	}
+
+	plan := domain.AudioRolePlan{
+		ID:        uuid.NewString(),
+		AssetID:   assetID,
+		Segments:  segments,
+		CreatedAt: time.Now().UTC(),
+	}
+
+	segmentsJSON, err := json.Marshal(segments)
+	if err != nil {
+		return nil, fmt.Errorf("marshal audio role plan: %w", err)
+	}
+	configDigest := sha256.Sum256(segmentsJSON)
+	plan.ProviderID = "operator"
+	plan.ModelName = "manual-role-plan"
+	plan.ModelVersion = "1"
+	plan.ProvenanceHash = domain.ComputeAudioRolePlanProvenanceHash(asset.SHA256, "", plan.ProviderID, plan.ModelName, plan.ModelVersion, hex.EncodeToString(configDigest[:]))
+	artifactBytes, err := json.Marshal(plan)
+	if err != nil {
+		return nil, fmt.Errorf("marshal audio role plan artifact: %w", err)
+	}
+	obj, err := s.cas.Put(bytes.NewReader(artifactBytes))
+	if err != nil {
+		return nil, fmt.Errorf("store audio role plan artifact: %w", err)
+	}
+	plan.CASHash = obj.SHA256
+
+	if err := s.db.SaveAudioRolePlan(ctx, plan); err != nil {
+		return nil, fmt.Errorf("save audio role plan: %w", err)
+	}
+	if err := s.db.SaveAudioRolePlanIndex(ctx, storage.AudioRolePlanIndex{
+		ID:             plan.ID,
+		AssetID:        plan.AssetID,
+		ProviderID:     plan.ProviderID,
+		ModelName:      plan.ModelName,
+		ModelVersion:   plan.ModelVersion,
+		CASHash:        plan.CASHash,
+		ProvenanceHash: plan.ProvenanceHash,
+		CreatedAt:      plan.CreatedAt,
+	}); err != nil {
+		return nil, fmt.Errorf("save audio role plan index: %w", err)
+	}
+
+	return &plan, nil
+}
+
 func (s *AudioRoleService) loadAudioRolePlanArtifact(idx *storage.AudioRolePlanIndex) (*domain.AudioRolePlan, error) {
 	if s.cas == nil || idx == nil || idx.CASHash == "" {
 		return nil, errors.New("cached audio role plan artifact is unavailable")

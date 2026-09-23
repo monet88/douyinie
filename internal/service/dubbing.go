@@ -90,18 +90,11 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 			}
 		}
 		if strings.TrimSpace(in.TranscriptArtifactCAS) == "" {
-			if casHash, err := s.db.GetStageArtifactHash(ctx, in.RunID, "speech_understand"); err == nil && casHash != "" {
-				in.TranscriptArtifactCAS = casHash
-			} else if err != nil {
-				return nil, fmt.Errorf("resolve run speech artifact for voice assignment: %w", err)
-			} else if idx, err := s.db.GetTranscriptArtifactIndexByRun(ctx, in.RunID); err == nil && idx != nil {
-				if idx.AssetID != in.AssetID {
-					return nil, fmt.Errorf("run %s transcript lineage mismatch for voice assignment", in.RunID)
-				}
-				in.TranscriptArtifactCAS = idx.CASHash
-			} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
-				return nil, fmt.Errorf("resolve run transcript lineage for voice assignment: %w", err)
+			casHash, err := resolveRunTranscriptCAS(ctx, s.db, in.RunID, in.AssetID, "voice assignment")
+			if err != nil {
+				return nil, err
 			}
+			in.TranscriptArtifactCAS = casHash
 		}
 		if strings.TrimSpace(in.TranscriptArtifactCAS) == "" && strings.TrimSpace(in.DubScriptVariantCAS) != "" {
 			dubScript, _, err := s.loadDubScriptVariant(ctx, in.AssetID, targetLang, in.DubScriptVariantCAS)
@@ -677,14 +670,10 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 		// FitController policy as full synthesis. Without that run proof it simply
 		// falls back to the immutable source end; it never consults asset-latest state.
 		var transcriptCAS string
-		if casHash, stageErr := s.db.GetStageArtifactHash(ctx, runID, "speech_understand"); stageErr == nil && casHash != "" {
-			transcriptCAS = casHash
+		if resolvedCAS, stageErr := resolveRunTranscriptCAS(ctx, s.db, runID, in.AssetID, "contextual audition"); stageErr == nil && resolvedCAS != "" {
+			transcriptCAS = resolvedCAS
 		} else if stageErr != nil {
-			return nil, fmt.Errorf("resolve run speech artifact for contextual audition: %w", stageErr)
-		} else if idx, idxErr := s.db.GetTranscriptArtifactIndexByRun(ctx, runID); idxErr == nil && idx != nil && idx.AssetID == in.AssetID {
-			transcriptCAS = idx.CASHash
-		} else if idxErr != nil && !errors.Is(idxErr, storage.ErrNotFound) {
-			return nil, fmt.Errorf("resolve run transcript for contextual audition: %w", idxErr)
+			return nil, stageErr
 		}
 		if transcriptCAS != "" {
 			if rolePlan.CASHash == "" {
@@ -1110,18 +1099,11 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 	}
 	in.VoiceAssignmentCAS = voiceAssignCAS
 	if strings.TrimSpace(in.TranscriptArtifactCAS) == "" {
-		if casHash, err := s.db.GetStageArtifactHash(ctx, in.RunID, "speech_understand"); err == nil && casHash != "" {
-			in.TranscriptArtifactCAS = casHash
-		} else if err != nil {
-			return nil, fmt.Errorf("resolve run speech artifact for playback-window derivation: %w", err)
-		} else if idx, err := s.db.GetTranscriptArtifactIndexByRun(ctx, in.RunID); err == nil && idx != nil {
-			if idx.AssetID != in.AssetID {
-				return nil, fmt.Errorf("run transcript lineage mismatch: %s != %s", idx.AssetID, in.AssetID)
-			}
-			in.TranscriptArtifactCAS = idx.CASHash
-		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return nil, fmt.Errorf("resolve run transcript artifact for playback-window derivation: %w", err)
+		casHash, err := resolveRunTranscriptCAS(ctx, s.db, in.RunID, in.AssetID, "playback-window derivation")
+		if err != nil {
+			return nil, err
 		}
+		in.TranscriptArtifactCAS = casHash
 	}
 	if strings.TrimSpace(in.TranscriptArtifactCAS) == "" && strings.TrimSpace(voiceAssign.TranscriptArtifactCAS) != "" {
 		in.TranscriptArtifactCAS = voiceAssign.TranscriptArtifactCAS
@@ -1309,7 +1291,7 @@ func playbackBoundaryForBlock(blockIndex int, sourceStartMs, sourceEndMs int64, 
 		// Silence/noise blocks are timeline evidence, not canonical speech members.
 		// Silence blocks historically carry the zero-value Index, so checking Index
 		// before SegmentType can alias them to speech block 0 and invent a timing mismatch.
-		if b.SegmentType != "" && b.SegmentType != domain.SpeechBlockTypeSpeech {
+		if !domain.IsSpeechBlock(b) {
 			continue
 		}
 		if b.Index == blockIndex {

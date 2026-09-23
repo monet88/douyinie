@@ -66,6 +66,27 @@ func (s *TranslationService) ConfigureSpokenAdapter(adapter provider.SpokenScrip
 	s.spokenAdapter = adapter
 }
 
+// resolveRunTranscriptCAS resolves the pinned transcript artifact for a run from its stage execution
+// or run index, refusing any index entry that belongs to a different asset.
+func resolveRunTranscriptCAS(ctx context.Context, db *storage.DB, runID, assetID, purpose string) (string, error) {
+	if db == nil || strings.TrimSpace(runID) == "" {
+		return "", nil
+	}
+	if casHash, err := db.GetStageArtifactHash(ctx, runID, "speech_understand"); err == nil && casHash != "" {
+		return casHash, nil
+	} else if err != nil {
+		return "", fmt.Errorf("resolve run speech artifact for %s: %w", purpose, err)
+	} else if idx, err := db.GetTranscriptArtifactIndexByRun(ctx, runID); err == nil && idx != nil {
+		if assetID != "" && idx.AssetID != assetID {
+			return "", fmt.Errorf("run %s transcript lineage mismatch for %s: %s != %s", runID, purpose, idx.AssetID, assetID)
+		}
+		return idx.CASHash, nil
+	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return "", fmt.Errorf("resolve run transcript lineage for %s: %w", purpose, err)
+	}
+	return "", nil
+}
+
 // Translate executes the meaning-first translation pipeline and returns the immutable TranslationVariant.
 func (s *TranslationService) Translate(ctx context.Context, in domain.TranslationJobInput) (*domain.TranslationVariant, error) {
 	if strings.TrimSpace(in.RunID) == "" {
@@ -87,22 +108,17 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 	}
 	in.SourceLanguage = sourceLang
 
+	// resolveRunTranscriptCAS resolves the pinned transcript artifact for a run from its stage execution
+	// or run index, refusing any index entry that belongs to a different asset.
 	// A run-scoped direct translation request may already provide canonical segments,
 	// but the resulting artifact must still pin the source transcript it came from.
 	// Prefer run evidence only; never infer this lineage from an unrelated asset-latest run.
 	if strings.TrimSpace(in.TranscriptArtifactCAS) == "" && s.db != nil {
-		if casHash, err := s.db.GetStageArtifactHash(ctx, in.RunID, "speech_understand"); err == nil && casHash != "" {
-			in.TranscriptArtifactCAS = casHash
-		} else if err != nil {
-			return nil, fmt.Errorf("resolve run speech artifact for translation: %w", err)
-		} else if idx, err := s.db.GetTranscriptArtifactIndexByRun(ctx, in.RunID); err == nil && idx != nil {
-			if idx.AssetID != in.AssetID {
-				return nil, fmt.Errorf("run transcript lineage mismatch: %s != %s", idx.AssetID, in.AssetID)
-			}
-			in.TranscriptArtifactCAS = idx.CASHash
-		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return nil, fmt.Errorf("resolve run transcript lineage for translation: %w", err)
+		transcriptCAS, err := resolveRunTranscriptCAS(ctx, s.db, in.RunID, in.AssetID, "translation")
+		if err != nil {
+			return nil, err
 		}
+		in.TranscriptArtifactCAS = transcriptCAS
 	}
 
 	// 1. Resolve segments: if none provided, load SpeechBlocks from TranscriptArtifact.
@@ -131,6 +147,8 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 	if len(in.Segments) == 0 {
 		return nil, domain.ErrEmptyTranslationInput
 	}
+	// Explicit compatibility proof: when direct segments are provided without an explicit transcript CAS,
+	// allow fallback to the asset's latest transcript index only when candidate segments exactly match.
 	if strings.TrimSpace(in.TranscriptArtifactCAS) == "" && s.db != nil && s.cas != nil {
 		if idx, err := s.db.GetTranscriptArtifactIndex(ctx, in.AssetID); err == nil && idx != nil && idx.CASHash != "" {
 			candidateSegments, _, loadErr := s.loadSegmentsFromTranscript(ctx, in.AssetID, idx.CASHash)
@@ -457,7 +475,7 @@ func (s *TranslationService) loadSegmentsFromTranscript(ctx context.Context, ass
 
 	var segments []domain.TranslationInputSegment
 	for _, block := range transcript.SpeechBlocks {
-		if block.SegmentType != "" && block.SegmentType != domain.SpeechBlockTypeSpeech {
+		if !domain.IsSpeechBlock(block) {
 			continue
 		}
 		text := strings.TrimSpace(block.SourceText)

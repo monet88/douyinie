@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/monet88/douyinie/internal/domain"
@@ -24,7 +23,7 @@ const (
 )
 
 func normalizeGlossarySource(s string) string {
-	return strings.ToLower(norm.NFKC.String(strings.TrimSpace(s)))
+	return domain.NormalizeGlossarySource(s)
 }
 
 func validateGlossaryEntries(entries []domain.GlossaryEntry) ([]domain.GlossaryEntry, error) {
@@ -73,44 +72,15 @@ func ValidateGlossaryEntries(entries []domain.GlossaryEntry) ([]domain.GlossaryE
 }
 
 func hasCJK(s string) bool {
-	for _, r := range s {
-		if unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul) {
-			return true
-		}
-	}
-	return false
+	return domain.HasCJK(s)
 }
 
-func glossaryWordRune(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' }
+func glossaryWordRune(r rune) bool {
+	return domain.GlossaryWordRune(r)
+}
 
 func glossaryTermMatches(sourceText, term string) bool {
-	text := []rune(normalizeGlossarySource(sourceText))
-	needle := []rune(normalizeGlossarySource(term))
-	if len(needle) == 0 || len(text) < len(needle) {
-		return false
-	}
-	for i := 0; i+len(needle) <= len(text); i++ {
-		match := true
-		for j := range needle {
-			if text[i+j] != needle[j] {
-				match = false
-				break
-			}
-		}
-		if !match {
-			continue
-		}
-		if hasCJK(string(needle)) {
-			return true
-		}
-		leftOK := i == 0 || !glossaryWordRune(text[i-1])
-		right := i + len(needle)
-		rightOK := right == len(text) || !glossaryWordRune(text[right])
-		if leftOK && rightOK {
-			return true
-		}
-	}
-	return false
+	return domain.GlossaryTermMatches(sourceText, term)
 }
 
 func effectiveGlossary(entries []domain.GlossaryEntry, segments []domain.TranslationInputSegment) (domain.EffectiveGlossary, error) {

@@ -281,7 +281,7 @@ func (a *DefaultSpokenScriptAdapter) AdaptSpokenScript(_ context.Context, req Sp
 	if shouldShorten {
 		candidate := RewriteConciseSpokenText(meaningText, targetLang)
 		for _, term := range req.ProtectedTerms {
-			if strings.Contains(strings.ToLower(meaningText), strings.ToLower(term.Target)) && !strings.Contains(strings.ToLower(candidate), strings.ToLower(term.Target)) {
+			if domain.GlossaryTermMatches(meaningText, term.Target) && !domain.GlossaryTermMatches(candidate, term.Target) {
 				candidate = meaningText
 				break
 			}

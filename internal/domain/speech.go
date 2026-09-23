@@ -90,6 +90,12 @@ const (
 	SpeechBlockTypeNoise   = "noise"
 )
 
+// IsSpeechBlock reports whether b is a dialogue speech block. Unset SegmentType
+// defaults to speech for backward compatibility with legacy artifacts.
+func IsSpeechBlock(b SpeechBlock) bool {
+	return b.SegmentType == "" || b.SegmentType == SpeechBlockTypeSpeech
+}
+
 // IsPathologicalRepetitionNoise detects non-semantic repetitive ASR noise loops
 // (such as Whisper looping on BGM/ambient sound with 4+ identical n-grams or
 // single-character runaway loops). It protects production translation/dubbing

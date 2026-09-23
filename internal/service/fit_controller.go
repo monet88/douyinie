@@ -90,12 +90,13 @@ func (fc *FitController) policyID() string {
 	if cfg.PolicyVersion == "" || !isFinitePositive(cfg.ReserveRatio) || cfg.ReserveRatio > 1 || cfg.MinNaturalGapMs < 0 || cfg.MaxNaturalGapMs < cfg.MinNaturalGapMs {
 		return ""
 	}
-	b, _ := json.Marshal(struct {
-		Version string  `json:"version"`
-		Ratio   float64 `json:"ratio"`
-		Min     int64   `json:"min_ms"`
-		Max     int64   `json:"max_ms"`
-	}{cfg.PolicyVersion, cfg.ReserveRatio, cfg.MinNaturalGapMs, cfg.MaxNaturalGapMs})
+	// Identity covers the whole effective config: freezing and hashing "the effective
+	// reserve configuration" (#153) must not let a changed field (speed ceiling,
+	// regroup allowance, default gap) keep the previous identity.
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		return ""
+	}
 	h := sha256.Sum256(b)
 	return cfg.PolicyVersion + ":" + hex.EncodeToString(h[:])
 }

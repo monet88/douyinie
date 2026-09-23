@@ -2,7 +2,11 @@ package domain
 
 import (
 	"errors"
+	"strings"
 	"time"
+	"unicode"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // Translation domain errors.
@@ -45,6 +49,65 @@ type EffectiveGlossary struct {
 	Entries        []GlossaryEntry `json:"entries,omitempty"`
 	OmittedMatches int             `json:"omitted_matches,omitempty"`
 	Hash           string          `json:"hash,omitempty"`
+}
+
+// NormalizeGlossarySource canonicalizes a glossary source or target term for matching:
+// NFKC, trimmed, and lowercased.
+func NormalizeGlossarySource(s string) string {
+	return strings.ToLower(norm.NFKC.String(strings.TrimSpace(s)))
+}
+
+// HasCJK reports whether the string contains any CJK ideographs or kana/hangul runes.
+func HasCJK(s string) bool {
+	for _, r := range s {
+		if unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul) {
+			return true
+		}
+	}
+	return false
+}
+
+// GlossaryWordRune reports whether r is a Latin word rune, digit, or underscore.
+// Non-Latin scripts (such as CJK) return false so Latin boundaries do not block
+// matching adjacent to CJK or non-Latin characters (e.g. "AI" in "AI模型").
+func GlossaryWordRune(r rune) bool {
+	if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+		return true
+	}
+	return unicode.In(r, unicode.Latin)
+}
+
+// GlossaryTermMatches reports whether term appears in text according to the
+// request-local glossary matching contract: NFKC/lowercase normalization,
+// Latin/digit/underscore boundaries, and CJK substring matching.
+func GlossaryTermMatches(text, term string) bool {
+	normText := []rune(NormalizeGlossarySource(text))
+	needle := []rune(NormalizeGlossarySource(term))
+	if len(needle) == 0 || len(normText) < len(needle) {
+		return false
+	}
+	for i := 0; i+len(needle) <= len(normText); i++ {
+		match := true
+		for j := range needle {
+			if normText[i+j] != needle[j] {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		if HasCJK(string(needle)) {
+			return true
+		}
+		leftOK := i == 0 || !GlossaryWordRune(normText[i-1])
+		right := i + len(needle)
+		rightOK := right == len(normText) || !GlossaryWordRune(normText[right])
+		if leftOK && rightOK {
+			return true
+		}
+	}
+	return false
 }
 
 // TranslationSegment represents a single translated unit (typically mapped 1:1 to a SpeechBlock or visual text region).

@@ -120,3 +120,32 @@ func TestMeaningGateGlossaryEquivalenceIsScoped(t *testing.T) {
 		t.Fatalf("expected scoped glossary equivalence to satisfy SUPOR: %+v", res.Violations)
 	}
 }
+
+func TestGlossaryMatchesLatinNextToCJK(t *testing.T) {
+	entries := []domain.GlossaryEntry{
+		{Source: "AI", Target: "Trí tuệ nhân tạo"},
+	}
+	// "AI" adjacent to CJK rune "模" must match because CJK runes are not Latin word runes
+	segments := []domain.TranslationInputSegment{
+		{Index: 0, SourceText: "这是AI模型训练"},
+	}
+	eff, err := effectiveGlossary(entries, segments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eff.Entries) != 1 || eff.Entries[0].Target != "Trí tuệ nhân tạo" {
+		t.Fatalf("expected 'AI' to match in 'AI模型', got %+v", eff.Entries)
+	}
+
+	// "AI" inside Latin word "AIR" must NOT match
+	segmentsNeg := []domain.TranslationInputSegment{
+		{Index: 0, SourceText: "AIR condition"},
+	}
+	effNeg, err := effectiveGlossary(entries, segmentsNeg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(effNeg.Entries) != 0 {
+		t.Fatalf("expected 'AI' NOT to match in 'AIR', got %+v", effNeg.Entries)
+	}
+}

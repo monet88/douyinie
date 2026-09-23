@@ -355,7 +355,7 @@ func eligibleSpeechBlocks(transcript *domain.TranscriptArtifact, rolePlan *domai
 		return out
 	}
 	for _, b := range transcript.SpeechBlocks {
-		if b.SegmentType != "" && b.SegmentType != domain.SpeechBlockTypeSpeech {
+		if !domain.IsSpeechBlock(b) {
 			continue
 		}
 		hasDialogue := false
@@ -767,7 +767,7 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 		// the wider AudioRolePlan dialogue ranges and never a borrowed/group envelope.
 		preservationPlan.SpeechWindows = preservationPlan.SpeechWindows[:0]
 		for _, block := range transcript.SpeechBlocks {
-			if block.SegmentType != "" && block.SegmentType != domain.SpeechBlockTypeSpeech {
+			if !domain.IsSpeechBlock(block) {
 				continue
 			}
 			if eligibleBlock, ok := eligible[block.Index]; ok && eligibleBlock.StartMs == block.StartMs && eligibleBlock.EndMs == block.EndMs {

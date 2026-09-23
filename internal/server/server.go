@@ -3,9 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -830,7 +828,7 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		var transVariant *domain.TranslationVariant
 		var dialogueSegments []domain.TranslationInputSegment
 		for _, b := range transcriptArtifact.SpeechBlocks {
-			if b.SegmentType != "" && b.SegmentType != domain.SpeechBlockTypeSpeech {
+			if !domain.IsSpeechBlock(b) {
 				continue
 			}
 			if rolePlan != nil && len(rolePlan.Segments) > 0 && !domain.IsInsideDialogueWindow(b.StartMs, b.EndMs, rolePlan) {
@@ -2031,13 +2029,8 @@ func (s *Server) handleGetAssetPreflight(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleSaveAudioRolePlan(w http.ResponseWriter, r *http.Request) {
 	assetID := r.PathValue("id")
-	asset, err := s.db.GetSourceAsset(r.Context(), assetID)
-	if err != nil {
-		if errors.Is(err, domain.ErrAssetNotFound) {
-			writeError(w, http.StatusNotFound, "asset not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if s.audioRoleSvc == nil {
+		writeError(w, http.StatusInternalServerError, "audio role service is not configured")
 		return
 	}
 
@@ -2063,52 +2056,12 @@ func (s *Server) handleSaveAudioRolePlan(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	plan := domain.AudioRolePlan{
-		ID:        uuid.NewString(),
-		AssetID:   assetID,
-		Segments:  body.Segments,
-		CreatedAt: time.Now().UTC(),
-	}
-	if s.casStore == nil {
-		writeError(w, http.StatusInternalServerError, "CAS store is required to pin audio role plan lineage")
-		return
-	}
-	segmentsJSON, err := json.Marshal(body.Segments)
+	plan, err := s.audioRoleSvc.SaveOperatorAudioRolePlan(r.Context(), assetID, body.Segments)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "marshal audio role plan: "+err.Error())
-		return
-	}
-	configDigest := sha256.Sum256(segmentsJSON)
-	plan.ProviderID = "operator"
-	plan.ModelName = "manual-role-plan"
-	plan.ModelVersion = "1"
-	plan.ProvenanceHash = domain.ComputeAudioRolePlanProvenanceHash(asset.SHA256, "", plan.ProviderID, plan.ModelName, plan.ModelVersion, hex.EncodeToString(configDigest[:]))
-	artifactBytes, err := json.Marshal(plan)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "marshal audio role plan artifact: "+err.Error())
-		return
-	}
-	obj, err := s.casStore.Put(bytes.NewReader(artifactBytes))
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "store audio role plan artifact: "+err.Error())
-		return
-	}
-	plan.CASHash = obj.SHA256
-
-	if err := s.db.SaveAudioRolePlan(r.Context(), plan); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if err := s.db.SaveAudioRolePlanIndex(r.Context(), storage.AudioRolePlanIndex{
-		ID:             plan.ID,
-		AssetID:        plan.AssetID,
-		ProviderID:     plan.ProviderID,
-		ModelName:      plan.ModelName,
-		ModelVersion:   plan.ModelVersion,
-		CASHash:        plan.CASHash,
-		ProvenanceHash: plan.ProvenanceHash,
-		CreatedAt:      plan.CreatedAt,
-	}); err != nil {
+		if errors.Is(err, domain.ErrAssetNotFound) {
+			writeError(w, http.StatusNotFound, "asset not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

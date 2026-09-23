@@ -776,12 +776,7 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 
 	// 2. Reassign voice profile(s) for the run against the exact current script/transcript lineage.
 	// Historical assignments may predate these pins; a successor used by the current mixer must not.
-	transcriptCAS := ""
-	if casHash, stageErr := s.db.GetStageArtifactHash(ctx, in.RunID, "speech_understand"); stageErr == nil && casHash != "" {
-		transcriptCAS = casHash
-	} else if transcriptIdx, idxErr := s.db.GetTranscriptArtifactIndexByRun(ctx, in.RunID); idxErr == nil && transcriptIdx != nil {
-		transcriptCAS = transcriptIdx.CASHash
-	}
+	transcriptCAS, _ := resolveRunTranscriptCAS(ctx, s.db, in.RunID, in.AssetID, "voice reassignment")
 	if strings.TrimSpace(transcriptCAS) == "" {
 		dubScript, _, loadErr := s.dubbingSvc.loadDubScriptVariant(ctx, in.AssetID, targetLang, dubScriptIdx.CASHash)
 		if loadErr != nil {

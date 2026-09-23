@@ -747,7 +747,7 @@ func (r *BenchmarkRunner) ExecuteQualityCase(ctx context.Context, input QualityC
 		}
 		canonicalSegments = make([]domain.TranslationInputSegment, 0, len(qc.StageArtifacts.Transcript.SpeechBlocks))
 		for _, block := range qc.StageArtifacts.Transcript.SpeechBlocks {
-			if block.SegmentType != "" && block.SegmentType != domain.SpeechBlockTypeSpeech {
+			if !domain.IsSpeechBlock(block) {
 				continue
 			}
 			if rolePlan != nil && !domain.IsInsideDialogueWindow(block.StartMs, block.EndMs, rolePlan) {

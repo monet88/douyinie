@@ -568,7 +568,7 @@ func glossaryEquivalentPresent(source, target, protectedSource string, sets [][]
 			if !glossaryTermMatches(source, e.Source) || !strings.EqualFold(normalizeGlossarySource(e.Source), normalizeGlossarySource(protectedSource)) {
 				continue
 			}
-			if strings.Contains(strings.ToLower(target), strings.ToLower(strings.TrimSpace(e.Target))) {
+			if glossaryTermMatches(target, e.Target) {
 				return true
 			}
 		}
