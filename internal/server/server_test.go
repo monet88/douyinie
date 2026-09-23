@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
@@ -1888,5 +1889,227 @@ func TestTranslationAndVoiceAssignmentRunIsolation(t *testing.T) {
 	}
 	if !strings.Contains(recReview2.Body.String(), "Xin chào từ Run 2") || strings.Contains(recReview2.Body.String(), "Xin chào từ Run 1") {
 		t.Fatalf("run 2 review projection crossed run boundary: %s", recReview2.Body.String())
+	}
+}
+
+func TestHandleRunTranslation_AssetRunBindingAndFrozenGlossary(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	db, err := storage.Open(filepath.Join(root, "douyinie.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	casStore, err := cas.NewStore(filepath.Join(root, "cas"))
+	if err != nil {
+		t.Fatalf("open cas: %v", err)
+	}
+
+	transSvc := service.NewTranslationService(db, casStore)
+	invocations := 0
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		invocations++
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "fake_model",
+			ModelVersion: "1",
+			Segments: []domain.TranslationSegment{
+				{Index: 0, SourceText: req.Segments[0].SourceText, TargetText: "Chào Nồi Supor"},
+			},
+		}, nil
+	}
+
+	s := New(Config{Addr: "127.0.0.1:0", DB: db, CASStore: casStore, TranslationSvc: transSvc})
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	attestation := domain.RightsAttestation{
+		ID:              "attestation-bind-1",
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		DeclaredBy:      "tester",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	}
+	_ = db.CreateRightsAttestation(ctx, attestation)
+
+	assetA := domain.SourceAsset{
+		ID:                  "asset-A",
+		SHA256:              "sha-A",
+		ByteSize:            100,
+		RightsAttestationID: attestation.ID,
+		CreatedAt:           now,
+	}
+	_ = db.CreateSourceAsset(ctx, assetA)
+
+	assetB := domain.SourceAsset{
+		ID:                  "asset-B",
+		SHA256:              "sha-B",
+		ByteSize:            100,
+		RightsAttestationID: attestation.ID,
+		CreatedAt:           now,
+	}
+	_ = db.CreateSourceAsset(ctx, assetB)
+
+	jobA := domain.LocalizationJob{
+		ID:             "job-A",
+		SourceAssetID:  assetA.ID,
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      now,
+	}
+	_ = db.CreateJob(ctx, jobA)
+
+	jobB := domain.LocalizationJob{
+		ID:             "job-B",
+		SourceAssetID:  assetB.ID,
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      now,
+	}
+	_ = db.CreateJob(ctx, jobB)
+
+	runA := domain.LocalizationRun{
+		ID:                 "run-A",
+		JobID:              jobA.ID,
+		Status:             "running",
+		ConfigSnapshotJSON: `{"glossary":[{"source":"SUPOR","target":"Nồi Supor","note":"Brand"}]}`,
+		CreatedAt:          now,
+	}
+	_ = db.CreateRun(ctx, runA)
+	tObjA, _ := casStore.Put(bytes.NewReader([]byte(`{"asset_id":"asset-A"}`)))
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             "se-stage-runA",
+		RunID:          runA.ID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObjA.SHA256,
+		CreatedAt:      now,
+	})
+
+	runB := domain.LocalizationRun{
+		ID:                 "run-B",
+		JobID:              jobB.ID,
+		Status:             "running",
+		ConfigSnapshotJSON: `{"glossary":[{"source":"SUPOR","target":"Nồi Supor","note":"Brand"}]}`,
+		CreatedAt:          now,
+	}
+	_ = db.CreateRun(ctx, runB)
+
+	// 1. Cross-asset run_id must fail closed with 400 (runB passed to assetA URL)
+	reqCrossRun := httptest.NewRequest(http.MethodPost, "/api/v1/assets/asset-A/translate", strings.NewReader(`{
+		"run_id": "run-B",
+		"target_language": "vi",
+		"segments": [{"index": 0, "source_text": "SUPOR 你好"}]
+	}`))
+	recCrossRun := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recCrossRun, reqCrossRun)
+	if recCrossRun.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for cross-asset run_id, got %d: %s", recCrossRun.Code, recCrossRun.Body.String())
+	}
+	if !strings.Contains(recCrossRun.Body.String(), "belongs to asset asset-B, not asset-A") {
+		t.Fatalf("expected error message to name asset mismatch, got: %s", recCrossRun.Body.String())
+	}
+	if invocations != 0 {
+		t.Fatalf("expected 0 provider invocations on cross-asset run, got %d", invocations)
+	}
+
+	// 2. Mismatched job_id must fail closed with 400
+	reqMismatchedJob := httptest.NewRequest(http.MethodPost, "/api/v1/assets/asset-A/translate", strings.NewReader(`{
+		"run_id": "run-A",
+		"job_id": "job-B",
+		"target_language": "vi",
+		"segments": [{"index": 0, "source_text": "SUPOR 你好"}]
+	}`))
+	recMismatchedJob := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recMismatchedJob, reqMismatchedJob)
+	if recMismatchedJob.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for mismatched job_id, got %d: %s", recMismatchedJob.Code, recMismatchedJob.Body.String())
+	}
+	if invocations != 0 {
+		t.Fatalf("expected 0 provider invocations on mismatched job_id, got %d", invocations)
+	}
+
+	// 3. Conflicting glossary must fail closed with 400 before provider routing or mutation
+	reqConflictGlossary := httptest.NewRequest(http.MethodPost, "/api/v1/assets/asset-A/translate", strings.NewReader(`{
+		"run_id": "run-A",
+		"job_id": "job-A",
+		"target_language": "vi",
+		"segments": [{"index": 0, "source_text": "SUPOR 你好"}],
+		"glossary": [{"source": "SUPOR", "target": "Khác", "note": "Override attempt"}]
+	}`))
+	recConflictGlossary := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recConflictGlossary, reqConflictGlossary)
+	if recConflictGlossary.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for conflicting glossary, got %d: %s", recConflictGlossary.Code, recConflictGlossary.Body.String())
+	}
+	if !strings.Contains(recConflictGlossary.Body.String(), "request glossary conflicts with frozen run snapshot") {
+		t.Fatalf("expected error message to explain glossary conflict, got: %s", recConflictGlossary.Body.String())
+	}
+	if invocations != 0 {
+		t.Fatalf("expected 0 provider invocations on conflicting glossary, got %d", invocations)
+	}
+	if _, err := db.GetTranslationVariantIndexByRun(ctx, runA.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected zero mutation in storage on failure, got err=%v", err)
+	}
+
+	// 4. Inheriting frozen glossary with empty request glossary succeeds (201 Created)
+	reqInherit := httptest.NewRequest(http.MethodPost, "/api/v1/assets/asset-A/translate", strings.NewReader(`{
+		"run_id": "run-A",
+		"job_id": "job-A",
+		"target_language": "vi",
+		"segments": [{"index": 0, "source_text": "SUPOR 你好"}]
+	}`))
+	recInherit := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recInherit, reqInherit)
+	if recInherit.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for inheriting frozen glossary, got %d: %s", recInherit.Code, recInherit.Body.String())
+	}
+	if invocations != 1 {
+		t.Fatalf("expected 1 provider invocation, got %d", invocations)
+	}
+	var res1 struct {
+		Variant domain.TranslationVariant `json:"translation_variant"`
+	}
+	if err := json.Unmarshal(recInherit.Body.Bytes(), &res1); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(res1.Variant.EffectiveGlossary.Entries) != 1 || res1.Variant.EffectiveGlossary.Entries[0].Target != "Nồi Supor" {
+		t.Fatalf("expected effective glossary target 'Nồi Supor', got %+v", res1.Variant.EffectiveGlossary)
+	}
+
+	// 5. Canonically equivalent glossary succeeds (201 Created)
+	runA2 := domain.LocalizationRun{
+		ID:                 "run-A2",
+		JobID:              jobA.ID,
+		Status:             "running",
+		ConfigSnapshotJSON: `{"glossary":[{"source":"SUPOR","target":"Nồi Supor","note":"Brand"}]}`,
+		CreatedAt:          now.Add(time.Second),
+	}
+	_ = db.CreateRun(ctx, runA2)
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             "se-stage-runA2",
+		RunID:          runA2.ID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObjA.SHA256,
+		CreatedAt:      now,
+	})
+
+	reqCanon := httptest.NewRequest(http.MethodPost, "/api/v1/assets/asset-A/translate", strings.NewReader(`{
+		"run_id": "run-A2",
+		"job_id": "job-A",
+		"target_language": "vi",
+		"segments": [{"index": 0, "source_text": "SUPOR 你好"}],
+		"glossary": [{"source": " ｓｕｐｏｒ ", "target": "Nồi Supor", "note": "Brand"}]
+	}`))
+	recCanon := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recCanon, reqCanon)
+	if recCanon.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for canonically equivalent glossary, got %d: %s", recCanon.Code, recCanon.Body.String())
+	}
+	if invocations != 2 {
+		t.Fatalf("expected 2 provider invocations, got %d", invocations)
 	}
 }

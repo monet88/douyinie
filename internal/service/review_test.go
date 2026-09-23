@@ -3655,3 +3655,238 @@ func TestReviewService_ProjectAllReviewItems_DecodedArtifactOwnershipMismatch(t 
 		t.Fatalf("expected ownership mismatch error, got %v", err)
 	}
 }
+
+func TestReviewService_CorrectTargetText_InputHashMatchesWhenTranscriptHasExcludedMembers(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-correct-excluded"
+	jobID := seedReviewRun(t, db, assetID, runID)
+
+	// Role plan with dialogue [0-2000] and singing [3000-5000]
+	rolePlan := domain.AudioRolePlan{
+		ID:             "role-" + runID,
+		AssetID:        assetID,
+		ProvenanceHash: "prov-role-" + runID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 3000, EndMs: 5000, Role: domain.AudioRoleSingingMusicVocal},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	rpBytes, _ := json.Marshal(rolePlan)
+	rpObj, _ := casStore.Put(bytes.NewReader(rpBytes))
+	rolePlan.CASHash = rpObj.SHA256
+	_ = db.SaveAudioRolePlan(ctx, rolePlan)
+
+	// Pinned transcript with dialogue block (0) and singing block (1)
+	transcript := domain.TranscriptArtifact{
+		ID:      "transcript-" + runID,
+		AssetID: assetID,
+		SpeechBlocks: []domain.SpeechBlock{
+			{Index: 0, StartMs: 0, EndMs: 1500, SourceText: "点击右上角", SpeakerID: "SPEAKER_00", SegmentType: domain.SpeechBlockTypeSpeech},
+			{Index: 1, StartMs: 3200, EndMs: 4800, SourceText: "这是歌声", SpeakerID: "SPEAKER_00", SegmentType: domain.SpeechBlockTypeSpeech},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(transcript)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+
+	// Canonical translation segments from unified predicate contain ONLY segment 0
+	canonicalSegs := domain.CanonicalTranslationSegments(&transcript, &rolePlan)
+	if len(canonicalSegs) != 1 || canonicalSegs[0].Index != 0 {
+		t.Fatalf("expected only dialogue block 0 in canonical segments, got: %+v", canonicalSegs)
+	}
+
+	// Translation variant was built from canonical segment 0 only (as run translation does)
+	eff, _ := service.EffectiveGlossaryForTest(nil, canonicalSegs)
+	jobIn := domain.TranslationJobInput{
+		AssetID:               assetID,
+		RunID:                 runID,
+		SourceLanguage:        "zh",
+		TargetLanguage:        "vi",
+		Segments:              canonicalSegs,
+		EffectiveGlossary:     eff,
+		TranscriptArtifactCAS: tObj.SHA256,
+	}
+	transSvc := service.NewTranslationService(db, casStore)
+	expectedHash, err := transSvc.ComputeTranslationInputHashForTest(jobIn)
+	if err != nil {
+		t.Fatalf("compute input hash: %v", err)
+	}
+
+	transVar := domain.TranslationVariant{
+		ID:                    "trans-excl-1",
+		SchemaVersion:         domain.TranslationSchemaVersion,
+		ContractID:            service.TranslationContractID,
+		AssetID:               assetID,
+		RunID:                 runID,
+		JobID:                 jobID,
+		TargetLanguage:        "vi",
+		SourceLanguage:        "zh",
+		TranscriptArtifactCAS: tObj.SHA256,
+		EffectiveGlossary:     eff,
+		InputHash:             expectedHash,
+		ProvenanceHash:        "prov-trans-excl",
+		OverallQAScore:        0.5,
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "点击右上角", TargetText: "Nhấn vào góc trên bên phải của màn hình", StartMs: 0, EndMs: 1500, QAConfidence: 0.9, PassedQAGate: true},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tvBytes, _ := json.Marshal(transVar)
+	tvObj, _ := casStore.Put(bytes.NewReader(tvBytes))
+	_ = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             transVar.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		JobID:          jobID,
+		TargetLanguage: "vi",
+		CASHash:        tvObj.SHA256,
+		ProvenanceHash: transVar.ProvenanceHash,
+		OverallQAScore: transVar.OverallQAScore,
+		CreatedAt:      transVar.CreatedAt,
+	})
+
+	// DubScriptVariant for segment 0
+	dubScriptVar := domain.DubScriptVariant{
+		ID:                    "dubscript-excl-1",
+		AssetID:               assetID,
+		RunID:                 runID,
+		JobID:                 jobID,
+		TargetLanguage:        "vi",
+		SourceLanguage:        "zh",
+		TranslationVariantCAS: tvObj.SHA256,
+		ProvenanceHash:        "prov-ds-excl",
+		Segments: []domain.DubScriptSegment{
+			{Index: 0, SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 1500, SlotDurationMs: 1500, SourceText: "点击右上角", SpokenText: "Nhấn vào góc trên bên phải của màn hình", MeaningText: "Nhấn vào góc trên bên phải của màn hình"},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dsBytes, _ := json.Marshal(dubScriptVar)
+	dsObj, _ := casStore.Put(bytes.NewReader(dsBytes))
+	_ = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID: dubScriptVar.ID, AssetID: assetID, RunID: runID, TargetLanguage: "vi", CASHash: dsObj.SHA256,
+		ProvenanceHash: dubScriptVar.ProvenanceHash, CreatedAt: dubScriptVar.CreatedAt,
+	})
+
+	// CorrectTargetText must compute canonical segments using the unified predicate and succeed
+	res, err := svc.CorrectTargetText(ctx, service.TargetTextCorrectionInput{
+		RunID: runID, JobID: jobID, AssetID: assetID, TargetLanguage: "vi", SegmentIndex: 0,
+		NewTargetText: "Nhấn góc trên", SpokenTextOverride: "Nhấn góc trên", Reason: "Shortened", Operator: "tester",
+	})
+	if err != nil {
+		t.Fatalf("expected CorrectTargetText to succeed when transcript contains excluded singing members, got: %v", err)
+	}
+	if res.TranslationVariantCAS == "" {
+		t.Fatalf("expected updated translation variant CAS, got empty")
+	}
+}
+
+func TestReviewService_CorrectTargetText_FailsClosedOnMissingOrMalformedEvidence(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+
+	// 1. Missing transcript lineage on translation variant
+	runID1 := "run-failclosed-1"
+	jobID1 := seedReviewRun(t, db, assetID, runID1)
+	vMissingTranscript := domain.TranslationVariant{
+		ID: "v1", SchemaVersion: domain.TranslationSchemaVersion, ContractID: service.TranslationContractID,
+		AssetID: assetID, RunID: runID1, JobID: jobID1, TargetLanguage: "vi", SourceLanguage: "zh",
+		TranscriptArtifactCAS: "", // MISSING
+		EffectiveGlossary:     domain.EffectiveGlossary{Hash: "eff-hash"},
+		InputHash:             "inp-hash",
+		ProvenanceHash:        "prov-failclosed-1",
+		Segments:              []domain.TranslationSegment{{Index: 0, SourceText: "测试", TargetText: "Thử"}},
+	}
+	b1, _ := json.Marshal(vMissingTranscript)
+	o1, _ := casStore.Put(bytes.NewReader(b1))
+	_ = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID: vMissingTranscript.ID, AssetID: assetID, RunID: runID1, TargetLanguage: "vi", CASHash: o1.SHA256, ProvenanceHash: "prov-failclosed-1",
+	})
+	_, err := svc.CorrectTargetText(ctx, service.TargetTextCorrectionInput{
+		RunID: runID1, AssetID: assetID, TargetLanguage: "vi", SegmentIndex: 0, NewTargetText: "Sửa", Reason: "test", Operator: "op",
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing transcript lineage") {
+		t.Fatalf("expected missing transcript lineage failure, got %v", err)
+	}
+
+	// 2. Missing effective glossary evidence
+	runID2 := "run-failclosed-2"
+	jobID2 := seedReviewRun(t, db, assetID, runID2)
+	vMissingGlossary := domain.TranslationVariant{
+		ID: "v2", SchemaVersion: domain.TranslationSchemaVersion, ContractID: service.TranslationContractID,
+		AssetID: assetID, RunID: runID2, JobID: jobID2, TargetLanguage: "vi", SourceLanguage: "zh",
+		TranscriptArtifactCAS: "cas-trans-2",
+		EffectiveGlossary:     domain.EffectiveGlossary{Hash: ""}, // MISSING
+		InputHash:             "inp-hash",
+		ProvenanceHash:        "prov-failclosed-2",
+		Segments:              []domain.TranslationSegment{{Index: 0, SourceText: "测试", TargetText: "Thử"}},
+	}
+	b2, _ := json.Marshal(vMissingGlossary)
+	o2, _ := casStore.Put(bytes.NewReader(b2))
+	_ = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID: vMissingGlossary.ID, AssetID: assetID, RunID: runID2, TargetLanguage: "vi", CASHash: o2.SHA256, ProvenanceHash: "prov-failclosed-2",
+	})
+	_, err = svc.CorrectTargetText(ctx, service.TargetTextCorrectionInput{
+		RunID: runID2, AssetID: assetID, TargetLanguage: "vi", SegmentIndex: 0, NewTargetText: "Sửa", Reason: "test", Operator: "op",
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing effective glossary hash") {
+		t.Fatalf("expected missing effective glossary failure, got %v", err)
+	}
+
+	// 3. Missing input hash evidence
+	runID3 := "run-failclosed-3"
+	jobID3 := seedReviewRun(t, db, assetID, runID3)
+	tObj3, _ := casStore.Put(bytes.NewReader([]byte(`{"asset_id":"` + assetID + `","speech_blocks":[{"index":0,"start_ms":0,"end_ms":1000,"source_text":"测试","speaker_id":"S1","segment_type":"speech"}]}`)))
+	eff3, _ := service.EffectiveGlossaryForTest(nil, []domain.TranslationInputSegment{{Index: 0, SourceText: "测试"}})
+	vMissingInputHash := domain.TranslationVariant{
+		ID: "v3", SchemaVersion: domain.TranslationSchemaVersion, ContractID: service.TranslationContractID,
+		AssetID: assetID, RunID: runID3, JobID: jobID3, TargetLanguage: "vi", SourceLanguage: "zh",
+		TranscriptArtifactCAS: tObj3.SHA256,
+		EffectiveGlossary:     eff3,
+		InputHash:             "", // MISSING
+		ProvenanceHash:        "prov-failclosed-3",
+		Segments:              []domain.TranslationSegment{{Index: 0, SourceText: "测试", TargetText: "Thử"}},
+	}
+	b3, _ := json.Marshal(vMissingInputHash)
+	o3, _ := casStore.Put(bytes.NewReader(b3))
+	_ = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID: vMissingInputHash.ID, AssetID: assetID, RunID: runID3, TargetLanguage: "vi", CASHash: o3.SHA256, ProvenanceHash: "prov-failclosed-3",
+	})
+	_, err = svc.CorrectTargetText(ctx, service.TargetTextCorrectionInput{
+		RunID: runID3, AssetID: assetID, TargetLanguage: "vi", SegmentIndex: 0, NewTargetText: "Sửa", Reason: "test", Operator: "op",
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing input hash") {
+		t.Fatalf("expected missing input hash failure, got %v", err)
+	}
+
+	// 4. Malformed run config snapshot JSON
+	runID4 := "run-failclosed-4"
+	jobID4 := "job-failclosed-4"
+	_ = db.CreateJob(ctx, domain.LocalizationJob{
+		ID: jobID4, SourceAssetID: assetID, TargetLanguage: "vi", Status: "running", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{
+		ID: runID4, JobID: jobID4, Status: "running", ConfigSnapshotJSON: "{invalid-json", CreatedAt: time.Now().UTC(),
+	})
+	vMalformedRun := domain.TranslationVariant{
+		ID: "v4", SchemaVersion: domain.TranslationSchemaVersion, ContractID: service.TranslationContractID,
+		AssetID: assetID, RunID: runID4, JobID: jobID4, TargetLanguage: "vi", SourceLanguage: "zh",
+		TranscriptArtifactCAS: "cas-trans-4",
+		EffectiveGlossary:     domain.EffectiveGlossary{Hash: "eff-hash"},
+		InputHash:             "inp-hash",
+		ProvenanceHash:        "prov-failclosed-4",
+		Segments:              []domain.TranslationSegment{{Index: 0, SourceText: "测试", TargetText: "Thử"}},
+	}
+	b4, _ := json.Marshal(vMalformedRun)
+	o4, _ := casStore.Put(bytes.NewReader(b4))
+	_ = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID: vMalformedRun.ID, AssetID: assetID, RunID: runID4, TargetLanguage: "vi", CASHash: o4.SHA256, ProvenanceHash: "prov-failclosed-4",
+	})
+	_, err = svc.CorrectTargetText(ctx, service.TargetTextCorrectionInput{
+		RunID: runID4, AssetID: assetID, TargetLanguage: "vi", SegmentIndex: 0, NewTargetText: "Sửa", Reason: "test", Operator: "op",
+	})
+	if err == nil || !strings.Contains(err.Error(), "malformed run config snapshot JSON") {
+		t.Fatalf("expected malformed config failure, got %v", err)
+	}
+}

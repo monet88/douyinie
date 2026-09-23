@@ -120,6 +120,7 @@ func TestTranslationService_CacheIsolationAcrossServiceBaselines(t *testing.T) {
 		},
 	}
 
+	service.SeedRunTranscriptForTest(ctx, db, casStore, in.AssetID, in.RunID)
 	v1, err := svcA.Translate(ctx, in)
 	if err != nil {
 		t.Fatalf("Translate run 1 failed: %v", err)
@@ -134,6 +135,7 @@ func TestTranslationService_CacheIsolationAcrossServiceBaselines(t *testing.T) {
 	// 2. Second translation run with IDENTICAL input and Baseline A -> MUST HIT CACHE (callCount stays 1)
 	in2 := in
 	in2.RunID = uuid.NewString()
+	service.SeedRunTranscriptForTest(ctx, db, casStore, in2.AssetID, in2.RunID)
 	v2, err := svcA.Translate(ctx, in2)
 	if err != nil {
 		t.Fatalf("Translate run 2 failed: %v", err)
@@ -165,6 +167,7 @@ func TestTranslationService_CacheIsolationAcrossServiceBaselines(t *testing.T) {
 
 	in3 := in
 	in3.RunID = uuid.NewString()
+	service.SeedRunTranscriptForTest(ctx, db, casStore, in3.AssetID, in3.RunID)
 	v3, err := svcB.Translate(ctx, in3)
 	if err != nil {
 		t.Fatalf("Translate run 3 failed: %v", err)
@@ -223,6 +226,7 @@ func TestTranslationService_ConsentGatedRemoteTranslation(t *testing.T) {
 		},
 	}
 
+	service.SeedRunTranscriptForTest(ctx, db, casStore, in.AssetID, in.RunID)
 	// Must fail closed with ErrConsentRequired or ErrNoEligibleProvider
 	_, err = svc.Translate(ctx, in)
 	if err == nil {
@@ -287,6 +291,7 @@ func TestTranslationService_LocalExecution_FailsClosedIfSnapshotMissingOrInacces
 	}
 
 	// Since snapshot envelope is unverified in runtimehost, execution must fail closed!
+	service.SeedRunTranscriptForTest(ctx, db, casStore, in.AssetID, in.RunID)
 	_, err = svc.Translate(ctx, in)
 	if err == nil {
 		t.Fatal("expected fail-closed error when snapshot envelope is unverified, got nil")

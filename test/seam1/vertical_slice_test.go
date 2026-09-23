@@ -747,6 +747,15 @@ func TestSeam1_FullDub_SubtitleDubSemanticGrounding_Consistency(t *testing.T) {
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
+	tObj, _ := h.casStore.Put(bytes.NewReader([]byte(`{"asset_id":"` + assetID + `"}`)))
+	_ = h.db.CreateStageExecution(context.Background(), domain.StageExecution{
+		ID:             "se-grounding-" + runID,
+		RunID:          runID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObj.SHA256,
+		CreatedAt:      time.Now().UTC(),
+	})
 	// 1. Setup translation with distinct meaning vs adapted spoken copy
 	transSegments := []domain.TranslationInputSegment{
 		{Index: 0, SourceText: "今天天气很好。", StartMs: 1000, EndMs: 4000, SpeakerID: "spk_1"},

@@ -599,8 +599,11 @@ func EvaluateCaseQuality(caseEv *QualityCaseEvidence, pack *ReferenceAnnotationP
 
 		for _, ds := range segs {
 			finish := ds.StartMs + ds.MeasuredDurationMs
-			sourceEnd := ds.EndMs
-			diff := absInt64(finish - sourceEnd)
+			targetEnd := ds.EndMs
+			if finish > ds.EndMs && ds.DubPlaybackEndMs >= ds.EndMs && ds.DubPlaybackEndMs > ds.StartMs {
+				targetEnd = ds.DubPlaybackEndMs
+			}
+			diff := absInt64(finish - targetEnd)
 			if diff <= 200 {
 				within200Count++
 			}
@@ -630,8 +633,11 @@ func EvaluateCaseQuality(caseEv *QualityCaseEvidence, pack *ReferenceAnnotationP
 		if len(segs) > 0 {
 			lastSeg := segs[len(segs)-1]
 			lastFinish := lastSeg.StartMs + lastSeg.MeasuredDurationMs
-			lastSourceEnd := lastSeg.EndMs
-			cumDrift = absInt64(lastFinish - lastSourceEnd)
+			lastTargetEnd := lastSeg.EndMs
+			if lastFinish > lastSeg.EndMs && lastSeg.DubPlaybackEndMs >= lastSeg.EndMs && lastSeg.DubPlaybackEndMs > lastSeg.StartMs {
+				lastTargetEnd = lastSeg.DubPlaybackEndMs
+			}
+			cumDrift = absInt64(lastFinish - lastTargetEnd)
 		}
 		metrics.CumulativeDriftMs = cumDrift
 		if cumDrift > MaxCumulativeDriftMs {

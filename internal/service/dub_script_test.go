@@ -48,6 +48,7 @@ func TestTranslationService_AdaptDubScript_ShortensOverlongSpokenText(t *testing
 		Status:    "running",
 		CreatedAt: time.Now().UTC(),
 	})
+	service.SeedRunTranscriptForTest(ctx, db, casStore, assetID, runID)
 
 	_ = db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{
 		ID:        "plan-" + assetID,
@@ -214,6 +215,7 @@ func TestTranslationService_AdaptDubScript_English_ShortenFirst(t *testing.T) {
 		Status:    "running",
 		CreatedAt: time.Now().UTC(),
 	})
+	service.SeedRunTranscriptForTest(ctx, db, casStore, assetID, runID)
 	_ = db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{
 		ID:        "plan-" + assetID,
 		AssetID:   assetID,
@@ -324,6 +326,7 @@ func TestTranslationService_AdaptDubScript_CASAssetMismatch_FailsClosed(t *testi
 		Status:    "running",
 		CreatedAt: time.Now().UTC(),
 	})
+	service.SeedRunTranscriptForTest(ctx, db, casStore, assetA, runID)
 	_ = db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{
 		ID:        "plan-" + assetB,
 		AssetID:   assetB,
@@ -401,6 +404,7 @@ func TestTranslationService_AdaptDubScript_CASTargetLanguageMismatch_FailsClosed
 		Status:    "running",
 		CreatedAt: time.Now().UTC(),
 	})
+	service.SeedRunTranscriptForTest(ctx, db, casStore, assetID, runID)
 	_ = db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{
 		ID:        "plan-" + assetID,
 		AssetID:   assetID,
@@ -478,6 +482,7 @@ func TestTranslationService_AdaptDubScript_MissingAudioRolePlan_FailsClosed(t *t
 		Status:    "running",
 		CreatedAt: time.Now().UTC(),
 	})
+	service.SeedRunTranscriptForTest(ctx, db, casStore, assetID, runID)
 
 	transVariant, err := svc.Translate(ctx, domain.TranslationJobInput{
 		RunID:          runID,
@@ -546,6 +551,7 @@ func TestTranslationService_AdaptDubScript_NoDubPlan_ReturnsErrNoDubbingRequired
 		Status:    "running",
 		CreatedAt: time.Now().UTC(),
 	})
+	service.SeedRunTranscriptForTest(ctx, db, casStore, assetID, runID)
 
 	// Save AudioRolePlan with 0 dialogue segments (Instrumental BGM only)
 	_ = db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{

@@ -826,22 +826,7 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 
 		// 2b. Translation (T06)
 		var transVariant *domain.TranslationVariant
-		var dialogueSegments []domain.TranslationInputSegment
-		for _, b := range transcriptArtifact.SpeechBlocks {
-			if !domain.IsSpeechBlock(b) {
-				continue
-			}
-			if rolePlan != nil && len(rolePlan.Segments) > 0 && !domain.IsInsideDialogueWindow(b.StartMs, b.EndMs, rolePlan) {
-				continue
-			}
-			text := strings.TrimSpace(b.SourceText)
-			if text == "" || domain.IsPathologicalRepetitionNoise(text) {
-				continue
-			}
-			dialogueSegments = append(dialogueSegments, domain.TranslationInputSegment{
-				Index: b.Index, SourceText: text, SpeakerID: b.SpeakerID, StartMs: b.StartMs, EndMs: b.EndMs,
-			})
-		}
+		dialogueSegments := domain.CanonicalTranslationSegments(transcriptArtifact, rolePlan)
 		translationInput := domain.TranslationJobInput{
 			RunID: runID, AssetID: assetID, JobID: jobID, TargetLanguage: targetLang,
 			TranscriptArtifactCAS: transcriptArtifact.CASHash, Segments: dialogueSegments,
@@ -2247,6 +2232,16 @@ func (s *Server) handleRunSpeechUnderstand(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if s.db != nil && strings.TrimSpace(body.RunID) != "" {
+		_ = s.db.CreateStageExecution(r.Context(), domain.StageExecution{
+			ID:             uuid.NewString(),
+			RunID:          body.RunID,
+			Stage:          "speech_understand",
+			Status:         domain.StageStatusSucceeded,
+			ArtifactSHA256: artifact.CASHash,
+			CreatedAt:      time.Now().UTC(),
+		})
+	}
 
 	writeJSON(w, http.StatusCreated, map[string]any{"transcript_artifact": artifact})
 }
@@ -2339,6 +2334,59 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "target_language is required")
 		return
 	}
+	var frozenGlossary []domain.GlossaryEntry
+	hasExistingRun := false
+
+	run, err := s.db.GetRun(r.Context(), body.RunID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if run != nil {
+		hasExistingRun = true
+		if run.JobID != "" {
+			job, err := s.db.GetJob(r.Context(), run.JobID)
+			if err != nil {
+				if errors.Is(err, storage.ErrNotFound) {
+					writeError(w, http.StatusBadRequest, fmt.Sprintf("job %s for run %s not found", run.JobID, body.RunID))
+					return
+				}
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if job.SourceAssetID != asset.ID {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("run %s belongs to asset %s, not %s", body.RunID, job.SourceAssetID, asset.ID))
+				return
+			}
+			if strings.TrimSpace(body.JobID) != "" && body.JobID != job.ID {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("job_id %s does not match run %s job_id %s", body.JobID, body.RunID, job.ID))
+				return
+			}
+		}
+		if strings.TrimSpace(run.ConfigSnapshotJSON) != "" {
+			var cfg struct {
+				Glossary []domain.GlossaryEntry `json:"glossary"`
+			}
+			if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
+				writeError(w, http.StatusInternalServerError, "decode frozen run glossary: "+err.Error())
+				return
+			}
+			frozenGlossary = cfg.Glossary
+		}
+	}
+	if strings.TrimSpace(body.JobID) != "" {
+		job, err := s.db.GetJob(r.Context(), body.JobID)
+		if err == nil && job != nil {
+			if job.SourceAssetID != asset.ID {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("job %s belongs to asset %s, not %s", body.JobID, job.SourceAssetID, asset.ID))
+				return
+			}
+		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
 	var glossary []domain.GlossaryEntry
 	if len(body.Glossary) > 0 && string(body.Glossary) != "null" {
 		if len(body.Glossary) > 256<<10 {
@@ -2354,7 +2402,14 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid glossary: "+err.Error())
 			return
 		}
+		if hasExistingRun && !service.CanonicalGlossaryEqual(frozenGlossary, normalized) {
+			writeError(w, http.StatusBadRequest, "request glossary conflicts with frozen run snapshot")
+			return
+		}
 		glossary = normalized
+	}
+	if hasExistingRun {
+		glossary = frozenGlossary
 	}
 
 	in := domain.TranslationJobInput{
@@ -2380,8 +2435,12 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnprocessableEntity, "translation QA gate rejected: "+err.Error())
 			return
 		}
-		if errors.Is(err, domain.ErrEmptyTranslationInput) {
-			writeError(w, http.StatusBadRequest, "empty translation input: "+err.Error())
+		if errors.Is(err, domain.ErrEmptyTranslationInput) ||
+			errors.Is(err, domain.ErrGlossaryConflict) ||
+			errors.Is(err, domain.ErrTranslationOwnershipMismatch) ||
+			strings.Contains(err.Error(), "missing pinned speech_understand transcript lineage") ||
+			strings.Contains(err.Error(), "transcript lineage mismatch") {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if errors.Is(err, domain.ErrNoEligibleProvider) || strings.Contains(err.Error(), "no eligible provider") {

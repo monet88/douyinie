@@ -1285,3 +1285,53 @@ func TestDeriveAutomatedQualityResult_HonestSignalsAndFailClosed(t *testing.T) {
 		}
 	}
 }
+
+func TestQualityScoring_LegitimateBorrowedSilencePlayback_Passes(t *testing.T) {
+	pack := &benchmark.ReferenceAnnotationPack{
+		AssetID: "asset-borrowed-silence",
+		ChineseTranscript: []benchmark.ReferenceTranscriptSegment{
+			{SegmentID: "s1", StartMs: 1000, EndMs: 2000, ChineseText: "测试"},
+		},
+	}
+	// Segment has source EndMs: 2000, but accepted DubPlaybackEndMs: 2500 (borrowed silence).
+	// TTS finish: 1000 + 1450 = 2450ms.
+	// Compared to source EndMs (2000), diff would be 450ms (> 200ms -> fail).
+	// Compared to accepted DubPlaybackEndMs (2500), diff is 50ms (<= 200ms -> PASS).
+	caseEv := &benchmark.QualityCaseEvidence{
+		CaseID:          "case-borrowed-silence",
+		SourceVideoID:   "video-1",
+		PrimaryCategory: string(benchmark.CategoryCleanSingleSpeaker),
+		TargetLanguage:  "vi",
+		Profile:         "hybrid",
+		StageArtifacts: &benchmark.CaseMeasuredStageArtifacts{
+			Transcript: &domain.TranscriptArtifact{
+				SpeechBlocks: []domain.SpeechBlock{
+					{Index: 0, StartMs: 1000, EndMs: 2000, SourceText: "测试", SegmentType: domain.SpeechBlockTypeSpeech},
+				},
+			},
+			DubSegments: &domain.DubSegmentsVariant{
+				Segments: []domain.DubSegment{
+					{
+						Index:              0,
+						StartMs:            1000,
+						EndMs:              2000,
+						DubPlaybackEndMs:   2500,
+						MeasuredDurationMs: 1450,
+						FitDecision:        domain.FitActionAccept,
+					},
+				},
+			},
+		},
+	}
+
+	metrics := benchmark.EvaluateCaseQuality(caseEv, pack)
+	if metrics.DubbingTimingWithin200Ms != 1.0 {
+		t.Fatalf("expected DubbingTimingWithin200Ms 1.0, got %f (status: %s, fails: %v)", metrics.DubbingTimingWithin200Ms, metrics.Status, metrics.FailReasons)
+	}
+	if metrics.CumulativeDriftMs != 50 {
+		t.Fatalf("expected CumulativeDriftMs 50, got %d", metrics.CumulativeDriftMs)
+	}
+	if metrics.Status != "PASS" {
+		t.Fatalf("expected PASS status, got %s: %v", metrics.Status, metrics.FailReasons)
+	}
+}

@@ -15,7 +15,7 @@ var (
 	// ErrEngineHoppingForbidden is returned when different providers/engines are mixed across sentences for a single speaker.
 	ErrEngineHoppingForbidden = errors.New("engine hopping across sentences for a single speaker is strictly prohibited")
 	// ErrTTSDurationOverrun is returned when synthesized audio exceeds its accepted playback window.
-	ErrTTSDurationOverrun = errors.New("tts synthesized duration overruns immutable source window")
+	ErrTTSDurationOverrun = errors.New("tts synthesized duration overruns accepted playback window")
 	// ErrOverlongCandidateNotSelectable is returned when an overlong measured candidate is rejected from selection.
 	ErrOverlongCandidateNotSelectable = errors.New("overlong measured candidate cannot be selected into final dub")
 	// ErrVoiceAssignmentFrozen is returned when attempting to mutate an already frozen VoiceAssignment.

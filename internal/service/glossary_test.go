@@ -42,12 +42,100 @@ func TestGlossaryEffectiveMatchingUnicodeBoundariesAndIdentity(t *testing.T) {
 	}
 }
 
-func TestGlossaryRejectsConflictsAndLimits(t *testing.T) {
-	if _, err := validateGlossaryEntries([]domain.GlossaryEntry{{Source: "SUPOR", Target: "A"}, {Source: "ＳＵＰＯＲ", Target: "B"}}); err == nil {
-		t.Fatal("expected canonical duplicate conflict")
+func TestGlossaryDeterministicFirstWinnerAndLimits(t *testing.T) {
+	// First-winner: keep the first canonical entry, omit later duplicates with conflict reporting
+	res, conflicts, err := validateGlossaryEntriesWithReport([]domain.GlossaryEntry{
+		{Source: "SUPOR", Target: "A", Note: "First"},
+		{Source: "ＳＵＰＯＲ", Target: "B", Note: "Second"},
+	})
+	if err != nil {
+		t.Fatalf("expected duplicate conflict to resolve via first-winner without error, got: %v", err)
+	}
+	if len(res) != 1 || res[0].Target != "A" || res[0].Note != "First" {
+		t.Fatalf("expected first entry to win, got: %+v", res)
+	}
+	if conflicts != 1 {
+		t.Fatalf("expected 1 omitted conflict, got %d", conflicts)
+	}
+
+	// Explicit NFKC example: first {"ﬁle","A"} then {"file","B"} => winner A, conflict diagnosed
+	nfkcRes, nfkcConflicts, err := validateGlossaryEntriesWithReport([]domain.GlossaryEntry{
+		{Source: "ﬁle", Target: "A", Note: "Winner"},
+		{Source: "file", Target: "B", Note: "Omitted"},
+	})
+	if err != nil {
+		t.Fatalf("expected NFKC duplicate conflict to resolve via first-winner without error, got: %v", err)
+	}
+	if len(nfkcRes) != 1 || nfkcRes[0].Target != "A" || nfkcRes[0].Note != "Winner" {
+		t.Fatalf("expected first NFKC entry to win 'A', got: %+v", nfkcRes)
+	}
+	if nfkcConflicts != 1 {
+		t.Fatalf("expected 1 omitted conflict for NFKC duplicate, got %d", nfkcConflicts)
+	}
+
+	// Effective glossary reports omitted conflicts and keeps provenance identical to winner-only
+	segments := []domain.TranslationInputSegment{{Index: 0, SourceText: "ﬁle 测试"}}
+	effWithConflict, err := effectiveGlossary([]domain.GlossaryEntry{
+		{Source: "ﬁle", Target: "A", Note: "Winner"},
+		{Source: "file", Target: "B", Note: "Omitted"},
+	}, segments)
+	if err != nil {
+		t.Fatalf("effectiveGlossary failed: %v", err)
+	}
+	if effWithConflict.OmittedConflicts != 1 {
+		t.Fatalf("expected 1 omitted conflict, got %d", effWithConflict.OmittedConflicts)
+	}
+	if len(effWithConflict.Entries) != 1 || effWithConflict.Entries[0].Target != "A" {
+		t.Fatalf("expected first winner 'A', got %+v", effWithConflict.Entries)
+	}
+
+	effWinnerOnly, err := effectiveGlossary([]domain.GlossaryEntry{
+		{Source: "ﬁle", Target: "A", Note: "Winner"},
+	}, segments)
+	if err != nil {
+		t.Fatalf("effectiveGlossary winner-only failed: %v", err)
+	}
+	if effWithConflict.Hash != effWinnerOnly.Hash {
+		t.Fatalf("semantic hash must be based only on winners: %s != %s", effWithConflict.Hash, effWinnerOnly.Hash)
+	}
+
+	// Genuinely invalid entries are strictly rejected
+	if _, err := validateGlossaryEntries([]domain.GlossaryEntry{{Source: "", Target: "x"}}); err == nil {
+		t.Fatal("expected empty source rejection")
+	}
+	if _, err := validateGlossaryEntries([]domain.GlossaryEntry{{Source: "x", Target: ""}}); err == nil {
+		t.Fatal("expected empty target rejection")
 	}
 	if _, err := validateGlossaryEntries([]domain.GlossaryEntry{{Source: strings.Repeat("界", 301), Target: "x"}}); err == nil {
 		t.Fatal("expected source rune limit rejection")
+	}
+}
+
+func TestCanonicalGlossaryEqual_FirstWinner(t *testing.T) {
+	// Frozen glossary has winning entry; request has duplicates with conflict that normalize to same winner
+	frozen := []domain.GlossaryEntry{{Source: "ﬁle", Target: "A", Note: "Winner"}}
+	reqWithDuplicates := []domain.GlossaryEntry{
+		{Source: "ﬁle", Target: "A", Note: "Winner"},
+		{Source: "file", Target: "B", Note: "Omitted"},
+	}
+	if !CanonicalGlossaryEqual(frozen, reqWithDuplicates) {
+		t.Fatal("expected canonically equivalent glossary under first-winner normalization to be equal")
+	}
+}
+
+func TestCanonicalGlossaryEqual(t *testing.T) {
+	a := []domain.GlossaryEntry{{Source: "SUPOR", Target: "Nồi Supor", Note: "Brand"}}
+	b := []domain.GlossaryEntry{{Source: " ｓｕｐｏｒ ", Target: "Nồi Supor", Note: "Brand"}}
+	c := []domain.GlossaryEntry{{Source: "SUPOR", Target: "Khác", Note: "Brand"}}
+
+	if !CanonicalGlossaryEqual(a, b) {
+		t.Fatal("expected equivalent glossaries to be equal")
+	}
+	if CanonicalGlossaryEqual(a, c) {
+		t.Fatal("expected conflicting glossaries not to be equal")
+	}
+	if !CanonicalGlossaryEqual(nil, nil) {
+		t.Fatal("expected empty glossaries to be equal")
 	}
 }
 

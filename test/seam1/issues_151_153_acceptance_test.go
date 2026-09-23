@@ -62,14 +62,14 @@ func TestSeam1_Issue151_GlossaryIngressAndCanonicalSpeechVariant(t *testing.T) {
 	resp, invalidVariant := runTranslation(t, h, assetID, map[string]any{
 		"run_id": baselineRunID, "job_id": jobID, "source_language": "en", "target_language": "vi",
 		"segments": []domain.TranslationInputSegment{{Index: 0, SourceText: "OpenAI model", StartMs: 0, EndMs: 1000}},
-		"glossary": []domain.GlossaryEntry{{Source: "OpenAI", Target: "A"}, {Source: " openai ", Target: "B"}},
+		"glossary": []domain.GlossaryEntry{{Source: "OpenAI", Target: ""}},
 	})
 	for _, fake := range poisoned {
 		fake.InjectError = nil
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest || invalidVariant != nil {
-		t.Fatalf("direct conflicting glossary must fail at ingress before provider routing: status=%d variant=%v", resp.StatusCode, invalidVariant)
+		t.Fatalf("direct invalid glossary must fail at ingress before provider routing: status=%d variant=%v", resp.StatusCode, invalidVariant)
 	}
 	if _, err := h.db.GetTranslationVariantIndexByRun(context.Background(), baselineRunID); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("direct invalid glossary mutated translation state: %v", err)
@@ -85,16 +85,15 @@ func TestSeam1_Issue151_GlossaryIngressAndCanonicalSpeechVariant(t *testing.T) {
 		return resp
 	}
 
-	conflicting := `{"glossary":[{"source":"OpenAI","target":"A"},{"source":" openai ","target":"B"}]}`
-	resp = postRun(conflicting)
+	invalid := `{"glossary":[{"source":"OpenAI","target":""}]}`
+	resp = postRun(invalid)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("conflicting glossary should return 400, got %d", resp.StatusCode)
+		t.Fatalf("invalid glossary should return 400, got %d", resp.StatusCode)
 	}
 	if got := seam1QueueLen(t, h); got != baselineQueueLen {
 		t.Fatalf("rejected glossary mutated run queue: before=%d after=%d", baselineQueueLen, got)
 	}
-
 	oversizedConfigBytes, _ := json.Marshal(map[string]any{
 		"glossary": []map[string]string{{"source": "OpenAI", "target": strings.Repeat("x", 270000)}},
 	})
@@ -107,7 +106,7 @@ func TestSeam1_Issue151_GlossaryIngressAndCanonicalSpeechVariant(t *testing.T) {
 		t.Fatalf("oversized glossary mutated run queue: before=%d after=%d", baselineQueueLen, got)
 	}
 
-	validConfig := `{"glossary":[{"source":"OpenAI","target":"OPENAI_LOCK"}]}`
+	validConfig := `{"glossary":[{"source":"OpenAI","target":"OPENAI_LOCK"},{"source":" openai ","target":"IGNORE_CONFLICT"}]}`
 	resp = postRun(validConfig)
 	if resp.StatusCode != http.StatusCreated {
 		resp.Body.Close()
@@ -129,6 +128,18 @@ func TestSeam1_Issue151_GlossaryIngressAndCanonicalSpeechVariant(t *testing.T) {
 	}
 	fake := p.(*provider.FakeTranslationProvider)
 	fake.CustomTranslations["vi:OpenAI model"] = "OPENAI_LOCK mô hình"
+	transcriptObj, err := h.casStore.Put(bytes.NewReader([]byte(fmt.Sprintf(`{"asset_id":%q,"speech_blocks":[{"index":0,"start_ms":1000,"end_ms":2000,"source_text":"OpenAI model","speaker_id":"SPEAKER_00","segment_type":"speech"}]}`, assetID))))
+	if err != nil {
+		t.Fatalf("put transcript CAS: %v", err)
+	}
+	_ = h.db.CreateStageExecution(context.Background(), domain.StageExecution{
+		ID:             "se-trans-" + runID,
+		RunID:          runID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: transcriptObj.SHA256,
+		CreatedAt:      time.Now().UTC(),
+	})
 
 	resp, canonical := runTranslation(t, h, assetID, map[string]any{
 		"run_id":          runID,
@@ -151,7 +162,7 @@ func TestSeam1_Issue151_GlossaryIngressAndCanonicalSpeechVariant(t *testing.T) {
 	}
 
 	detectBody, _ := json.Marshal(map[string]any{"run_id": runID})
-	resp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/detect-text", h.server.URL, assetID), "application/json", bytes.NewReader(detectBody))
+	resp, err = http.Post(fmt.Sprintf("%s/api/v1/assets/%s/detect-text", h.server.URL, assetID), "application/json", bytes.NewReader(detectBody))
 	if err != nil {
 		t.Fatalf("POST detect-text: %v", err)
 	}

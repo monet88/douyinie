@@ -72,6 +72,21 @@ func resolveRunTranscriptCAS(ctx context.Context, db *storage.DB, runID, assetID
 	if db == nil || strings.TrimSpace(runID) == "" {
 		return "", nil
 	}
+	if assetID != "" {
+		if run, err := db.GetRun(ctx, runID); err == nil && run != nil {
+			if run.JobID != "" {
+				if job, err := db.GetJob(ctx, run.JobID); err == nil && job != nil {
+					if job.SourceAssetID != "" && job.SourceAssetID != assetID {
+						return "", fmt.Errorf("run %s transcript lineage mismatch for %s: %s != %s", runID, purpose, job.SourceAssetID, assetID)
+					}
+				} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+					return "", fmt.Errorf("resolve run job for %s: %w", purpose, err)
+				}
+			}
+		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return "", fmt.Errorf("resolve run %s for %s: %w", runID, purpose, err)
+		}
+	}
 	if casHash, err := db.GetStageArtifactHash(ctx, runID, "speech_understand"); err == nil && casHash != "" {
 		return casHash, nil
 	} else if err != nil {
@@ -89,9 +104,6 @@ func resolveRunTranscriptCAS(ctx context.Context, db *storage.DB, runID, assetID
 
 // Translate executes the meaning-first translation pipeline and returns the immutable TranslationVariant.
 func (s *TranslationService) Translate(ctx context.Context, in domain.TranslationJobInput) (*domain.TranslationVariant, error) {
-	if strings.TrimSpace(in.RunID) == "" {
-		return nil, fmt.Errorf("run_id is required")
-	}
 	if strings.TrimSpace(in.AssetID) == "" {
 		return nil, fmt.Errorf("asset_id is required")
 	}
@@ -108,22 +120,66 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 	}
 	in.SourceLanguage = sourceLang
 
+	if s.db != nil && strings.TrimSpace(in.RunID) != "" {
+		if run, err := s.db.GetRun(ctx, in.RunID); err == nil && run != nil {
+			if strings.TrimSpace(in.JobID) != "" && run.JobID != "" && in.JobID != run.JobID {
+				return nil, fmt.Errorf("%w: job_id mismatch for run %s: %s != %s", domain.ErrTranslationOwnershipMismatch, in.RunID, in.JobID, run.JobID)
+			}
+			jobID := run.JobID
+			if jobID == "" {
+				jobID = in.JobID
+			}
+			if jobID != "" {
+				job, err := s.db.GetJob(ctx, jobID)
+				if err == nil && job != nil {
+					if in.AssetID != "" && job.SourceAssetID != "" && job.SourceAssetID != in.AssetID {
+						return nil, fmt.Errorf("%w: run %s belongs to asset %s, not %s", domain.ErrTranslationOwnershipMismatch, in.RunID, job.SourceAssetID, in.AssetID)
+					}
+				} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+					return nil, fmt.Errorf("lookup job %s for run %s: %w", jobID, in.RunID, err)
+				}
+			}
+		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("lookup run %s: %w", in.RunID, err)
+		}
+	}
+	if s.db != nil && strings.TrimSpace(in.JobID) != "" {
+		job, err := s.db.GetJob(ctx, in.JobID)
+		if err == nil && job != nil {
+			if in.AssetID != "" && job.SourceAssetID != "" && job.SourceAssetID != in.AssetID {
+				return nil, fmt.Errorf("%w: job %s belongs to asset %s, not %s", domain.ErrTranslationOwnershipMismatch, in.JobID, job.SourceAssetID, in.AssetID)
+			}
+		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("lookup job %s: %w", in.JobID, err)
+		}
+	}
+
 	// resolveRunTranscriptCAS resolves the pinned transcript artifact for a run from its stage execution
 	// or run index, refusing any index entry that belongs to a different asset.
 	// A run-scoped direct translation request may already provide canonical segments,
 	// but the resulting artifact must still pin the source transcript it came from.
 	// Prefer run evidence only; never infer this lineage from an unrelated asset-latest run.
-	if strings.TrimSpace(in.TranscriptArtifactCAS) == "" && s.db != nil {
+	if !in.Ephemeral && s.db != nil && strings.TrimSpace(in.RunID) != "" {
 		transcriptCAS, err := resolveRunTranscriptCAS(ctx, s.db, in.RunID, in.AssetID, "translation")
 		if err != nil {
 			return nil, err
 		}
-		in.TranscriptArtifactCAS = transcriptCAS
+		if transcriptCAS == "" {
+			return nil, fmt.Errorf("missing pinned speech_understand transcript lineage for run %s", in.RunID)
+		}
+		if strings.TrimSpace(in.TranscriptArtifactCAS) == "" {
+			in.TranscriptArtifactCAS = transcriptCAS
+		} else if transcriptCAS != in.TranscriptArtifactCAS {
+			return nil, fmt.Errorf("run %s transcript lineage mismatch for translation: input=%s run=%s", in.RunID, in.TranscriptArtifactCAS, transcriptCAS)
+		}
 	}
 
 	// 1. Resolve segments: if none provided, load SpeechBlocks from TranscriptArtifact.
 	// Preserve the transcript CAS hash as a content input to deterministic cache identity.
 	if len(in.Segments) == 0 {
+		if strings.TrimSpace(in.RunID) != "" && strings.TrimSpace(in.TranscriptArtifactCAS) == "" {
+			return nil, fmt.Errorf("missing pinned speech_understand transcript lineage for run %s", in.RunID)
+		}
 		segments, transcriptCAS, err := s.loadSegmentsFromTranscript(ctx, in.AssetID, in.TranscriptArtifactCAS)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load source segments: %w", err)
@@ -149,7 +205,7 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 	}
 	// Explicit compatibility proof: when direct segments are provided without an explicit transcript CAS,
 	// allow fallback to the asset's latest transcript index only when candidate segments exactly match.
-	if strings.TrimSpace(in.TranscriptArtifactCAS) == "" && s.db != nil && s.cas != nil {
+	if strings.TrimSpace(in.TranscriptArtifactCAS) == "" && strings.TrimSpace(in.RunID) == "" && s.db != nil && s.cas != nil {
 		if idx, err := s.db.GetTranscriptArtifactIndex(ctx, in.AssetID); err == nil && idx != nil && idx.CASHash != "" {
 			candidateSegments, _, loadErr := s.loadSegmentsFromTranscript(ctx, in.AssetID, idx.CASHash)
 			if loadErr == nil && translationSegmentsExactlyMatch(in.Segments, candidateSegments) {
@@ -159,15 +215,27 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 			return nil, fmt.Errorf("resolve compatible transcript lineage for translation: %w", err)
 		}
 	}
-	if len(in.Glossary) == 0 && s.db != nil && strings.TrimSpace(in.RunID) != "" {
-		if run, err := s.db.GetRun(ctx, in.RunID); err == nil && run != nil && strings.TrimSpace(run.ConfigSnapshotJSON) != "" {
-			var cfg struct {
-				Glossary []domain.GlossaryEntry `json:"glossary"`
+	if s.db != nil && strings.TrimSpace(in.RunID) != "" {
+		if run, err := s.db.GetRun(ctx, in.RunID); err == nil && run != nil {
+			var frozenGlossary []domain.GlossaryEntry
+			if strings.TrimSpace(run.ConfigSnapshotJSON) != "" {
+				var cfg struct {
+					Glossary []domain.GlossaryEntry `json:"glossary"`
+				}
+				if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
+					return nil, fmt.Errorf("decode frozen run glossary: %w", err)
+				}
+				frozenGlossary = cfg.Glossary
 			}
-			if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
-				return nil, fmt.Errorf("decode frozen run glossary: %w", err)
+			if len(in.Glossary) == 0 {
+				in.Glossary = frozenGlossary
+			} else if !CanonicalGlossaryEqual(frozenGlossary, in.Glossary) {
+				return nil, fmt.Errorf("%w: request glossary conflicts with frozen run snapshot", domain.ErrGlossaryConflict)
+			} else {
+				in.Glossary = frozenGlossary
 			}
-			in.Glossary = cfg.Glossary
+		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("lookup run %s: %w", in.RunID, err)
 		}
 	}
 	effective, err := effectiveGlossary(in.Glossary, in.Segments)
@@ -401,18 +469,49 @@ func (s *TranslationService) CanReuseVariant(ctx context.Context, in domain.Tran
 	if in.SourceLanguage == "" {
 		in.SourceLanguage = "zh"
 	}
-	if len(in.Glossary) == 0 && s.db != nil && strings.TrimSpace(in.RunID) != "" {
+	if s.db != nil && strings.TrimSpace(in.RunID) != "" {
 		run, err := s.db.GetRun(ctx, in.RunID)
-		if err != nil || run == nil {
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
 			return false
 		}
-		var cfg struct {
-			Glossary []domain.GlossaryEntry `json:"glossary"`
+		if run != nil {
+			if strings.TrimSpace(in.JobID) != "" && run.JobID != "" && in.JobID != run.JobID {
+				return false
+			}
+			jobID := run.JobID
+			if jobID == "" {
+				jobID = in.JobID
+			}
+			if jobID != "" {
+				job, err := s.db.GetJob(ctx, jobID)
+				if err == nil && job != nil && in.AssetID != "" && job.SourceAssetID != "" && job.SourceAssetID != in.AssetID {
+					return false
+				}
+			}
+			var frozenGlossary []domain.GlossaryEntry
+			if strings.TrimSpace(run.ConfigSnapshotJSON) != "" {
+				var cfg struct {
+					Glossary []domain.GlossaryEntry `json:"glossary"`
+				}
+				if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
+					return false
+				}
+				frozenGlossary = cfg.Glossary
+			}
+			if len(in.Glossary) == 0 {
+				in.Glossary = frozenGlossary
+			} else if !CanonicalGlossaryEqual(frozenGlossary, in.Glossary) {
+				return false
+			} else {
+				in.Glossary = frozenGlossary
+			}
 		}
-		if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
+	}
+	if s.db != nil && strings.TrimSpace(in.JobID) != "" {
+		job, err := s.db.GetJob(ctx, in.JobID)
+		if err == nil && job != nil && in.AssetID != "" && job.SourceAssetID != "" && job.SourceAssetID != in.AssetID {
 			return false
 		}
-		in.Glossary = cfg.Glossary
 	}
 	effective, err := effectiveGlossary(in.Glossary, in.Segments)
 	if err != nil {
@@ -431,13 +530,31 @@ func (s *TranslationService) CanReuseVariant(ctx context.Context, in domain.Tran
 	if err != nil {
 		return false
 	}
+	provenanceMatches := variant.ProvenanceHash == expectedProvenance
+	if !provenanceMatches && s.db != nil && strings.TrimSpace(in.RunID) != "" {
+		if stageHash, err := s.db.GetStageArtifactHash(ctx, in.RunID, "translation"); err == nil && stageHash != "" && (stageHash == variant.CASHash || variant.CASHash == "") {
+			if idx, err := s.db.GetTranslationVariantIndexByRun(ctx, in.RunID); err == nil && idx != nil {
+				selModelName, selModelVer := routeRes.SelectedProvider.ModelInfo()
+				if idx.CASHash == stageHash && idx.ProvenanceHash == variant.ProvenanceHash &&
+					idx.AssetID == in.AssetID && idx.RunID == in.RunID &&
+					idx.ProviderID == routeRes.SelectedProvider.ID() &&
+					idx.ModelName == selModelName &&
+					idx.ModelVersion == selModelVer &&
+					variant.ProviderID == idx.ProviderID &&
+					variant.ModelName == idx.ModelName &&
+					variant.ModelVersion == idx.ModelVersion {
+					provenanceMatches = true
+				}
+			}
+		}
+	}
 	return variant.AssetID == in.AssetID &&
 		strings.EqualFold(variant.SourceLanguage, in.SourceLanguage) &&
 		strings.EqualFold(variant.TargetLanguage, in.TargetLanguage) &&
 		variant.TranscriptArtifactCAS == in.TranscriptArtifactCAS &&
 		variant.EffectiveGlossary.Hash == effective.Hash &&
 		variant.InputHash == inputHash &&
-		variant.ProvenanceHash == expectedProvenance
+		provenanceMatches
 }
 
 // loadSegmentsFromTranscript loads SpeechBlocks from TranscriptArtifact in CAS/DB.
@@ -473,23 +590,11 @@ func (s *TranslationService) loadSegmentsFromTranscript(ctx context.Context, ass
 		return nil, "", fmt.Errorf("transcript artifact %s belongs to asset %q, not %q", casHash, transcript.AssetID, assetID)
 	}
 
-	var segments []domain.TranslationInputSegment
-	for _, block := range transcript.SpeechBlocks {
-		if !domain.IsSpeechBlock(block) {
-			continue
-		}
-		text := strings.TrimSpace(block.SourceText)
-		if text == "" || domain.IsPathologicalRepetitionNoise(text) {
-			continue
-		}
-		segments = append(segments, domain.TranslationInputSegment{
-			Index:      block.Index,
-			SourceText: text,
-			SpeakerID:  block.SpeakerID,
-			StartMs:    block.StartMs,
-			EndMs:      block.EndMs,
-		})
+	var rolePlan *domain.AudioRolePlan
+	if s.db != nil && assetID != "" {
+		rolePlan, _ = s.db.GetAudioRolePlan(ctx, assetID)
 	}
+	segments := domain.CanonicalTranslationSegments(&transcript, rolePlan)
 	return segments, casHash, nil
 }
 

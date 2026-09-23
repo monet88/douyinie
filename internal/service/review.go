@@ -92,58 +92,85 @@ func (s *ReviewService) validateTranslationCompatibility(ctx context.Context, re
 
 	// 1. Check pinned transcript lineage
 	if s.db != nil && requestedRunID != "" {
+		if strings.TrimSpace(tVar.TranscriptArtifactCAS) == "" {
+			return fmt.Errorf("translation variant %s is missing transcript lineage", transIdx.CASHash)
+		}
 		runTranscriptCAS, err := resolveRunTranscriptCAS(ctx, s.db, requestedRunID, in.AssetID, "correction")
 		if err != nil {
 			return fmt.Errorf("resolve run transcript for correction: %w", err)
 		}
-		if runTranscriptCAS != "" && tVar.TranscriptArtifactCAS != "" && tVar.TranscriptArtifactCAS != runTranscriptCAS {
+		if runTranscriptCAS != "" && tVar.TranscriptArtifactCAS != runTranscriptCAS {
 			return fmt.Errorf("translation variant transcript lineage mismatch: variant=%s run=%s", tVar.TranscriptArtifactCAS, runTranscriptCAS)
 		}
 	}
-
 	// 2. Check frozen run glossary
 	if s.db != nil && requestedRunID != "" {
 		run, err := s.db.GetRun(ctx, requestedRunID)
-		if err == nil && run != nil && strings.TrimSpace(run.ConfigSnapshotJSON) != "" {
+		if err != nil {
+			return fmt.Errorf("load run %s for correction glossary check: %w", requestedRunID, err)
+		}
+		if run == nil {
+			return fmt.Errorf("run %s not found for correction glossary check", requestedRunID)
+		}
+		var frozenGlossary []domain.GlossaryEntry
+		if strings.TrimSpace(run.ConfigSnapshotJSON) != "" {
 			var cfg struct {
 				Glossary []domain.GlossaryEntry `json:"glossary"`
 			}
-			if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err == nil && len(cfg.Glossary) > 0 {
-				var segs []domain.TranslationInputSegment
-				for _, seg := range tVar.Segments {
-					segs = append(segs, domain.TranslationInputSegment{
-						Index:      seg.Index,
-						SourceText: seg.SourceText,
-						SpeakerID:  seg.SpeakerID,
-						StartMs:    seg.StartMs,
-						EndMs:      seg.EndMs,
-					})
-				}
-				effective, err := effectiveGlossary(cfg.Glossary, segs)
-				if err == nil && tVar.EffectiveGlossary.Hash != "" && tVar.EffectiveGlossary.Hash != effective.Hash {
-					return fmt.Errorf("translation variant effective glossary mismatch: variant=%s run=%s", tVar.EffectiveGlossary.Hash, effective.Hash)
-				}
+			if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
+				return fmt.Errorf("malformed run config snapshot JSON: %w", err)
 			}
+			frozenGlossary = cfg.Glossary
+		}
+		var segs []domain.TranslationInputSegment
+		for _, seg := range tVar.Segments {
+			segs = append(segs, domain.TranslationInputSegment{
+				Index:      seg.Index,
+				SourceText: seg.SourceText,
+				SpeakerID:  seg.SpeakerID,
+				StartMs:    seg.StartMs,
+				EndMs:      seg.EndMs,
+			})
+		}
+		effective, err := effectiveGlossary(frozenGlossary, segs)
+		if err != nil {
+			return fmt.Errorf("compute effective glossary for correction: %w", err)
+		}
+		if tVar.EffectiveGlossary.Hash == "" {
+			return fmt.Errorf("translation variant %s is missing effective glossary hash", transIdx.CASHash)
+		}
+		if tVar.EffectiveGlossary.Hash != effective.Hash {
+			return fmt.Errorf("translation variant effective glossary mismatch: variant=%s run=%s", tVar.EffectiveGlossary.Hash, effective.Hash)
 		}
 	}
 
 	// 3. Check InputHash against canonical segments from transcript
 	if s.translationSvc != nil && tVar.TranscriptArtifactCAS != "" && s.cas != nil {
+		if strings.TrimSpace(tVar.InputHash) == "" {
+			return fmt.Errorf("translation variant %s is missing input hash", transIdx.CASHash)
+		}
 		canonicalSegments, _, err := s.translationSvc.loadSegmentsFromTranscript(ctx, in.AssetID, tVar.TranscriptArtifactCAS)
-		if err == nil && len(canonicalSegments) > 0 {
-			jobIn := domain.TranslationJobInput{
-				AssetID:               in.AssetID,
-				RunID:                 requestedRunID,
-				SourceLanguage:        tVar.SourceLanguage,
-				TargetLanguage:        in.TargetLanguage,
-				Segments:              canonicalSegments,
-				EffectiveGlossary:     tVar.EffectiveGlossary,
-				TranscriptArtifactCAS: tVar.TranscriptArtifactCAS,
-			}
-			expectedInputHash, err := s.translationSvc.computeTranslationInputHash(jobIn)
-			if err == nil && tVar.InputHash != "" && tVar.InputHash != expectedInputHash {
-				return fmt.Errorf("translation variant input hash mismatch: variant=%s expected=%s", tVar.InputHash, expectedInputHash)
-			}
+		if err != nil {
+			return fmt.Errorf("load canonical segments for correction: %w", err)
+		}
+		if len(canonicalSegments) == 0 {
+			return fmt.Errorf("transcript %s contains no canonical translation segments", tVar.TranscriptArtifactCAS)
+		}
+		jobIn := domain.TranslationJobInput{
+			AssetID:               in.AssetID,
+			RunID:                 requestedRunID,
+			SourceLanguage:        tVar.SourceLanguage,
+			TargetLanguage:        in.TargetLanguage,
+			Segments:              canonicalSegments,
+			EffectiveGlossary:     tVar.EffectiveGlossary,
+			TranscriptArtifactCAS: tVar.TranscriptArtifactCAS,
+		}
+		expectedInputHash, err := s.translationSvc.computeTranslationInputHash(jobIn)
+		if err != nil {
+			return fmt.Errorf("compute expected input hash for correction: %w", err)
+		}
+		if tVar.InputHash != expectedInputHash {
+			return fmt.Errorf("translation variant input hash mismatch: variant=%s expected=%s", tVar.InputHash, expectedInputHash)
 		}
 	}
 
@@ -158,13 +185,19 @@ func (s *ReviewService) validateTranslationCompatibility(ctx context.Context, re
 			TranscriptArtifactCAS: tVar.TranscriptArtifactCAS,
 		}
 		routeRes, err := s.translationSvc.router.Route(ctx, translationRouteRequest(jobIn))
-		if err == nil && routeRes != nil && routeRes.SelectedProvider != nil {
-			if tVar.ProviderID != "" && tVar.ProviderID != routeRes.SelectedProvider.ID() {
-				return fmt.Errorf("translation variant provider mismatch: variant=%s active=%s", tVar.ProviderID, routeRes.SelectedProvider.ID())
-			}
+		if err != nil {
+			return fmt.Errorf("route provider for correction check: %w", err)
+		}
+		if routeRes == nil || routeRes.SelectedProvider == nil {
+			return errors.New("no eligible translation provider selected for correction check")
+		}
+		if strings.TrimSpace(tVar.ProviderID) == "" {
+			return fmt.Errorf("translation variant %s is missing provider lineage", transIdx.CASHash)
+		}
+		if tVar.ProviderID != routeRes.SelectedProvider.ID() {
+			return fmt.Errorf("translation variant provider mismatch: variant=%s active=%s", tVar.ProviderID, routeRes.SelectedProvider.ID())
 		}
 	}
-
 	return nil
 }
 

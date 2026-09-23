@@ -2030,13 +2030,23 @@ async function loadSelectedRun() {
       apply: (value) => {
         state.translation = value?.translation_variant || null;
         const omitted = Number(state.translation?.effective_glossary?.omitted_matches || 0);
-        const omissionKey = omitted > 0 ? `${runID}:${state.translation?.cas_hash || ""}:${omitted}` : "";
+        const conflicts = Number(state.translation?.effective_glossary?.omitted_conflicts || 0);
+        const omissionKey = `${runID}:${state.translation?.cas_hash || ""}:${omitted}:${conflicts}`;
         if (omissionKey && omissionKey !== lastGlossaryOmissionKey) {
-          toast(
-            "Glossary vượt giới hạn áp dụng",
-            `${omitted} thuật ngữ khớp đã bị bỏ qua sau 100 mục đầu tiên. Hãy đưa thuật ngữ quan trọng lên trước hoặc giảm glossary.`,
-            "warning"
-          );
+          if (omitted > 0) {
+            toast(
+              "Glossary vượt giới hạn áp dụng",
+              `${omitted} thuật ngữ khớp đã bị bỏ qua sau 100 mục đầu tiên. Hãy đưa thuật ngữ quan trọng lên trước hoặc giảm glossary.`,
+              "warning"
+            );
+          }
+          if (conflicts > 0) {
+            toast(
+              "Glossary có xung đột thuật ngữ trùng lặp",
+              `${conflicts} mục trùng lặp xung đột đã bị bỏ qua theo nguyên tắc ưu tiên mục đầu tiên.`,
+              "warning"
+            );
+          }
         }
         lastGlossaryOmissionKey = omissionKey;
       },

@@ -393,29 +393,69 @@ func IsDubEligible(plan *AudioRolePlan) bool {
 	return false
 }
 
-// IsInsideDialogueWindow checks whether the timing interval [startMs, endMs] falls within
-// accepted narration/dialogue segments and does not overlap any non-dialogue segments
-// (singing/music-vocal, BGM/instrumental, ambience/SFX, uncertain).
-func IsInsideDialogueWindow(startMs, endMs int64, plan *AudioRolePlan) bool {
+// IsDubEligibleTiming checks whether the timing interval [startMs, endMs] has dialogue overlap
+// in AudioRolePlan and is not constrained by protected vocal regions (singing/music-vocal, uncertain).
+// Ordinary BGM/instrumental and ambience/SFX do not disqualify actual dialogue speech (Issue #153).
+func IsDubEligibleTiming(startMs, endMs int64, plan *AudioRolePlan) bool {
 	if plan == nil || len(plan.Segments) == 0 || endMs <= startMs {
 		return false
 	}
 	hasDialogue := false
 	for _, seg := range plan.Segments {
-		overlapStart := startMs
-		if seg.StartMs > overlapStart {
-			overlapStart = seg.StartMs
+		if startMs >= seg.EndMs || endMs <= seg.StartMs {
+			continue
 		}
-		overlapEnd := endMs
-		if seg.EndMs < overlapEnd {
-			overlapEnd = seg.EndMs
-		}
-		if overlapStart < overlapEnd {
-			if seg.Role != AudioRoleNarrationDialogue {
-				return false
-			}
+		switch seg.Role {
+		case AudioRoleNarrationDialogue:
 			hasDialogue = true
+		case AudioRoleSingingMusicVocal, AudioRoleUncertain:
+			return false
 		}
 	}
 	return hasDialogue
+}
+
+// IsInsideDialogueWindow checks whether the timing interval [startMs, endMs] represents dub-eligible dialogue.
+// Matches IsDubEligibleTiming (Issue #153): singing/music-vocal and uncertain constrain; ordinary BGM/SFX/ambience do not.
+func IsInsideDialogueWindow(startMs, endMs int64, plan *AudioRolePlan) bool {
+	return IsDubEligibleTiming(startMs, endMs, plan)
+}
+
+// IsDubEligibleSpeechBlock checks whether a SpeechBlock represents canonical dialogue speech eligible for dubbing:
+// it must be a valid speech block, have dialogue overlap in AudioRolePlan, and not overlap protected vocal
+// or uncertain regions (singing/music-vocal, uncertain). Ordinary BGM/SFX/ambience do not disqualify (Issue #153).
+func IsDubEligibleSpeechBlock(b SpeechBlock, plan *AudioRolePlan) bool {
+	if !IsSpeechBlock(b) {
+		return false
+	}
+	if plan == nil || len(plan.Segments) == 0 {
+		return true
+	}
+	return IsDubEligibleTiming(b.StartMs, b.EndMs, plan)
+}
+
+// CanonicalTranslationSegments extracts canonical dub-eligible translation input segments from a TranscriptArtifact
+// using the unified dub-eligible SpeechBlock predicate (Issue #153).
+func CanonicalTranslationSegments(transcript *TranscriptArtifact, plan *AudioRolePlan) []TranslationInputSegment {
+	if transcript == nil {
+		return nil
+	}
+	var segments []TranslationInputSegment
+	for _, b := range transcript.SpeechBlocks {
+		if !IsDubEligibleSpeechBlock(b, plan) {
+			continue
+		}
+		text := strings.TrimSpace(b.SourceText)
+		if text == "" || IsPathologicalRepetitionNoise(text) {
+			continue
+		}
+		segments = append(segments, TranslationInputSegment{
+			Index:      b.Index,
+			SourceText: text,
+			SpeakerID:  b.SpeakerID,
+			StartMs:    b.StartMs,
+			EndMs:      b.EndMs,
+		})
+	}
+	return segments
 }

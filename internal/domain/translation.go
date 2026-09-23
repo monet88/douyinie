@@ -11,14 +11,16 @@ import (
 
 // Translation domain errors.
 var (
-	ErrMeaningPreservationFailed  = errors.New("meaning preservation validation failed")
-	ErrFactCorrupted              = errors.New("fact or entity corrupted in translation")
-	ErrNameCorrupted              = errors.New("named entity corrupted or dropped in translation")
-	ErrNumberCorrupted            = errors.New("numerical value or quantity corrupted in translation")
-	ErrNegationInverted           = errors.New("negation polarity inverted in translation")
-	ErrTranslationVariantNotFound = errors.New("translation variant not found")
-	ErrEmptyTranslationInput      = errors.New("empty translation input")
-	ErrDubScriptVariantNotFound   = errors.New("dub script variant not found")
+	ErrMeaningPreservationFailed    = errors.New("meaning preservation validation failed")
+	ErrFactCorrupted                = errors.New("fact or entity corrupted in translation")
+	ErrNameCorrupted                = errors.New("named entity corrupted or dropped in translation")
+	ErrNumberCorrupted              = errors.New("numerical value or quantity corrupted in translation")
+	ErrNegationInverted             = errors.New("negation polarity inverted in translation")
+	ErrTranslationVariantNotFound   = errors.New("translation variant not found")
+	ErrEmptyTranslationInput        = errors.New("empty translation input")
+	ErrDubScriptVariantNotFound     = errors.New("dub script variant not found")
+	ErrTranslationOwnershipMismatch = errors.New("translation ownership mismatch")
+	ErrGlossaryConflict             = errors.New("request glossary conflicts with frozen run snapshot")
 )
 
 const (
@@ -46,9 +48,10 @@ type GlossaryEntry struct {
 // EffectiveGlossary is the resolved subset that actually matches the current
 // translation input. Its order is semantic and therefore participates in cache identity.
 type EffectiveGlossary struct {
-	Entries        []GlossaryEntry `json:"entries,omitempty"`
-	OmittedMatches int             `json:"omitted_matches,omitempty"`
-	Hash           string          `json:"hash,omitempty"`
+	Entries          []GlossaryEntry `json:"entries,omitempty"`
+	OmittedMatches   int             `json:"omitted_matches,omitempty"`
+	OmittedConflicts int             `json:"omitted_conflicts,omitempty"`
+	Hash             string          `json:"hash,omitempty"`
 }
 
 // NormalizeGlossarySource canonicalizes a glossary source or target term for matching:

@@ -745,22 +745,7 @@ func (r *BenchmarkRunner) ExecuteQualityCase(ctx context.Context, input QualityC
 		if len(input.AudioRoleSegments) > 0 {
 			rolePlan = &domain.AudioRolePlan{AssetID: qc.SourceAssetID, Segments: input.AudioRoleSegments}
 		}
-		canonicalSegments = make([]domain.TranslationInputSegment, 0, len(qc.StageArtifacts.Transcript.SpeechBlocks))
-		for _, block := range qc.StageArtifacts.Transcript.SpeechBlocks {
-			if !domain.IsSpeechBlock(block) {
-				continue
-			}
-			if rolePlan != nil && !domain.IsInsideDialogueWindow(block.StartMs, block.EndMs, rolePlan) {
-				continue
-			}
-			if strings.TrimSpace(block.SourceText) == "" {
-				continue
-			}
-			canonicalSegments = append(canonicalSegments, domain.TranslationInputSegment{
-				Index: block.Index, SourceText: block.SourceText, SpeakerID: block.SpeakerID,
-				StartMs: block.StartMs, EndMs: block.EndMs,
-			})
-		}
+		canonicalSegments = domain.CanonicalTranslationSegments(qc.StageArtifacts.Transcript, rolePlan)
 		if len(canonicalSegments) == 0 {
 			return qc, fmt.Errorf("quality case %s transcript has no canonical speech segments", input.CaseID)
 		}
@@ -1022,7 +1007,7 @@ const (
 	BenchmarkQCProducerKey   = "producer"
 	BenchmarkQCProducerValue = "douyinie_benchmark_runner"
 	BenchmarkQCSchemaKey     = "benchmark_qc_schema"
-	BenchmarkQCSchemaVersion = 1
+	BenchmarkQCSchemaVersion = 2
 )
 
 // IsBenchmarkOwnedQualityResult checks if a QualityResult is owned by the benchmark runner
@@ -1047,14 +1032,14 @@ func IsBenchmarkOwnedQualityResult(qr domain.QualityResult, runID, jobID, assetI
 	}
 	switch v := schemaVal.(type) {
 	case int:
-		return v == BenchmarkQCSchemaVersion
+		return v == BenchmarkQCSchemaVersion || v == 1
 	case float64:
-		return int(v) == BenchmarkQCSchemaVersion
+		return int(v) == BenchmarkQCSchemaVersion || int(v) == 1
 	case json.Number:
 		n, err := v.Int64()
-		return err == nil && int(n) == BenchmarkQCSchemaVersion
+		return err == nil && (int(n) == BenchmarkQCSchemaVersion || int(n) == 1)
 	case string:
-		return v == "1"
+		return v == "1" || v == "2"
 	default:
 		return false
 	}

@@ -2,11 +2,14 @@ package seam1_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/provider"
 )
@@ -51,6 +54,15 @@ func TestSeam1_DubScript_UnseenTextUsesGenericAdaptationAndPreservesSourceGap(t 
 		fake.CustomTranslations[source1] = target1
 		fake.CustomTranslations[source2] = target2
 	}
+	tObj1, _ := h.casStore.Put(bytes.NewReader([]byte(`{"asset_id":"` + assetID + `"}`)))
+	_ = h.db.CreateStageExecution(context.Background(), domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObj1.SHA256,
+		CreatedAt:      time.Now().UTC(),
+	})
 
 	transReq := map[string]any{
 		"run_id":          runID,
@@ -135,6 +147,15 @@ func TestSeam1_DubScript_FittingTextStillRoutesExtremeCadenceDeviationToReview(t
 		}
 		fake.CustomTranslations[source] = target
 	}
+	tObj2, _ := h.casStore.Put(bytes.NewReader([]byte(`{"asset_id":"` + assetID + `"}`)))
+	_ = h.db.CreateStageExecution(context.Background(), domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObj2.SHA256,
+		CreatedAt:      time.Now().UTC(),
+	})
 
 	transReq := map[string]any{
 		"run_id":          runID,

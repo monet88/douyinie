@@ -77,3 +77,50 @@ func TestIsPathologicalRepetitionNoise_JapaneseKanaHallucination(t *testing.T) {
 		}
 	}
 }
+
+func TestSpeechBlock_DubEligibility_PermitsOrdinaryBGMAmbience_BlocksSingingUncertain(t *testing.T) {
+	plan := &domain.AudioRolePlan{
+		AssetID: "asset-straddling",
+		Segments: []domain.AudioSegment{
+			// Dialogue with overlapping BGM/ambience
+			{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 1000, EndMs: 3000, Role: domain.AudioRoleInstrumentalBgm},
+			{StartMs: 2000, EndMs: 4000, Role: domain.AudioRoleAmbienceSFX},
+
+			// Dialogue overlapping singing/music-vocal
+			{StartMs: 6000, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 7000, EndMs: 8000, Role: domain.AudioRoleSingingMusicVocal},
+
+			// Dialogue overlapping uncertain
+			{StartMs: 11000, EndMs: 15000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 12000, EndMs: 13000, Role: domain.AudioRoleUncertain},
+		},
+	}
+
+	// 1. Block straddling ordinary BGM/ambience must be dub-eligible
+	b1 := domain.SpeechBlock{Index: 0, StartMs: 500, EndMs: 3500, SourceText: "dialogue with bgm", SegmentType: domain.SpeechBlockTypeSpeech}
+	if !domain.IsDubEligibleSpeechBlock(b1, plan) {
+		t.Fatalf("expected dialogue overlapping ordinary BGM/SFX to be dub-eligible, got false")
+	}
+
+	// 2. Block overlapping singing/music-vocal must be rejected
+	b2 := domain.SpeechBlock{Index: 1, StartMs: 6500, EndMs: 8500, SourceText: "dialogue with singing", SegmentType: domain.SpeechBlockTypeSpeech}
+	if domain.IsDubEligibleSpeechBlock(b2, plan) {
+		t.Fatalf("expected dialogue overlapping singing/music-vocal to be rejected, got true")
+	}
+
+	// 3. Block overlapping uncertain vocal must be rejected
+	b3 := domain.SpeechBlock{Index: 2, StartMs: 11500, EndMs: 13500, SourceText: "dialogue with uncertain", SegmentType: domain.SpeechBlockTypeSpeech}
+	if domain.IsDubEligibleSpeechBlock(b3, plan) {
+		t.Fatalf("expected dialogue overlapping uncertain vocal to be rejected, got true")
+	}
+
+	// 4. CanonicalTranslationSegments includes only b1
+	transcript := &domain.TranscriptArtifact{
+		SpeechBlocks: []domain.SpeechBlock{b1, b2, b3},
+	}
+	canonical := domain.CanonicalTranslationSegments(transcript, plan)
+	if len(canonical) != 1 || canonical[0].Index != 0 {
+		t.Fatalf("expected exactly segment 0 to be extracted as canonical translation member, got %+v", canonical)
+	}
+}

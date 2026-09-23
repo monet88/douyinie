@@ -363,23 +363,7 @@ func eligibleSpeechBlocks(transcript *domain.TranscriptArtifact, rolePlan *domai
 		return out
 	}
 	for _, b := range transcript.SpeechBlocks {
-		if !domain.IsSpeechBlock(b) {
-			continue
-		}
-		hasDialogue := false
-		blockedByProtectedVocal := false
-		for _, seg := range rolePlan.Segments {
-			if b.StartMs >= seg.EndMs || b.EndMs <= seg.StartMs {
-				continue
-			}
-			switch seg.Role {
-			case domain.AudioRoleNarrationDialogue:
-				hasDialogue = true
-			case domain.AudioRoleSingingMusicVocal, domain.AudioRoleUncertain:
-				blockedByProtectedVocal = true
-			}
-		}
-		if hasDialogue && !blockedByProtectedVocal {
+		if domain.IsDubEligibleSpeechBlock(b, rolePlan) {
 			out[b.Index] = b
 		}
 	}
@@ -849,8 +833,12 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 			if len(seg.SpeechBlockIndices) == 0 {
 				return refuse(fmt.Sprintf("segment %d has no canonical source membership", seg.Index))
 			}
-			minStart, maxEnd := int64(0), int64(0)
-			var lastBlock domain.SpeechBlock
+			var (
+				minStart  int64
+				maxEnd    int64
+				hasMember bool
+				lastBlock domain.SpeechBlock
+			)
 			for _, member := range seg.SpeechBlockIndices {
 				block, ok := eligible[member]
 				if !ok {
@@ -860,13 +848,14 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 					return refuse(fmt.Sprintf("source member %d is covered more than once", member))
 				}
 				covered[member] = true
-				if minStart == 0 || block.StartMs < minStart {
+				if !hasMember || block.StartMs < minStart {
 					minStart = block.StartMs
 				}
-				if block.EndMs > maxEnd {
+				if !hasMember || block.EndMs > maxEnd {
 					maxEnd = block.EndMs
 					lastBlock = block
 				}
+				hasMember = true
 			}
 			if seg.StartMs != minStart || seg.EndMs != maxEnd {
 				return refuse(fmt.Sprintf("segment %d source envelope %d-%d does not match member envelope %d-%d", seg.Index, seg.StartMs, seg.EndMs, minStart, maxEnd))

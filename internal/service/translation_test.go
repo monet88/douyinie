@@ -124,6 +124,15 @@ func TestTranslationService_Translate_VI_and_EN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	tObj, _ := casStore.Put(bytes.NewReader([]byte(`{"asset_id":"` + assetID + `"}`)))
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObj.SHA256,
+		CreatedAt:      time.Now().UTC(),
+	})
 
 	input := domain.TranslationJobInput{
 		RunID:          runID,
@@ -211,6 +220,7 @@ func TestTranslationService_ProviderReportedNegativeCannotOverrideLexicalNegatio
 	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: jobID, Status: "running", CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	service.SeedRunTranscriptForTest(ctx, db, casStore, assetID, runID)
 
 	svc.TranslateInvoke = func(_ context.Context, _ provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
 		return &provider.TranslationResult{
@@ -271,6 +281,7 @@ func TestTranslationService_IdempotentCache(t *testing.T) {
 	_ = db.CreateJob(ctx, domain.LocalizationJob{ID: "j1", SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: time.Now().UTC()})
 	_ = db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: "j1", Status: "running", CreatedAt: time.Now().UTC()})
 
+	service.SeedRunTranscriptForTest(ctx, db, casStore, assetID, runID)
 	input := domain.TranslationJobInput{
 		RunID:          runID,
 		AssetID:        assetID,
@@ -315,6 +326,7 @@ func TestTranslationService_PolicyFallbackRouting(t *testing.T) {
 	_ = db.CreateJob(ctx, domain.LocalizationJob{ID: "j1", SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: time.Now().UTC()})
 	_ = db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: "j1", Status: "running", CreatedAt: time.Now().UTC()})
 
+	service.SeedRunTranscriptForTest(ctx, db, casStore, assetID, runID)
 	// Make primary provider fail with error
 	primaryProv, ok := reg.Get("fake_llm_translator")
 	if !ok {
@@ -373,6 +385,7 @@ func TestTranslationService_QAGate_FlagsInsteadOfRejecting(t *testing.T) {
 	_ = db.CreateJob(ctx, domain.LocalizationJob{ID: "j1", SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: time.Now().UTC()})
 	_ = db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: "j1", Status: "running", CreatedAt: time.Now().UTC()})
 
+	service.SeedRunTranscriptForTest(ctx, db, casStore, assetID, runID)
 	// Make fake provider corrupt numbers
 	prov, _ := reg.Get("fake_llm_translator")
 	fake := prov.(*provider.FakeTranslationProvider)
@@ -487,5 +500,446 @@ func TestTranslationService_PathologicalASRRepetition_SkippedFromTranslation(t *
 	}
 	if variant.Segments[0].Index != 0 || variant.Segments[1].Index != 2 {
 		t.Errorf("expected segments [0, 2], got indices [%d, %d]", variant.Segments[0].Index, variant.Segments[1].Index)
+	}
+}
+
+func TestTranslationService_ResolveRunTranscriptCAS_RefusesMismatchedAsset(t *testing.T) {
+	db, casStore, _, _ := setupTranslationTestEnv(t)
+	ctx := context.Background()
+
+	assetA := uuid.NewString()
+	assetB := uuid.NewString()
+	runB := uuid.NewString()
+	jobB := "job-b"
+
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION", TermsAccepted: true, ConfirmedAt: time.Now().UTC()})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{ID: assetA, RightsAttestationID: attID, SHA256: "sha-a", ByteSize: 100, CreatedAt: time.Now().UTC()})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{ID: assetB, RightsAttestationID: attID, SHA256: "sha-b", ByteSize: 100, CreatedAt: time.Now().UTC()})
+	_ = db.CreateJob(ctx, domain.LocalizationJob{ID: jobB, SourceAssetID: assetB, TargetLanguage: "vi", CreatedAt: time.Now().UTC()})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{ID: runB, JobID: jobB, Status: "running", CreatedAt: time.Now().UTC()})
+
+	// Put speech_understand stage execution for runB
+	dummyData := []byte(`{"dummy":"transcript"}`)
+	obj, _ := casStore.Put(bytes.NewReader(dummyData))
+	now := time.Now().UTC()
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runB,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: obj.SHA256,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+
+	// Resolving for assetB should succeed and return obj.SHA256
+	casHash, err := service.ResolveRunTranscriptCASForTest(ctx, db, runB, assetB, "translation")
+	if err != nil {
+		t.Fatalf("resolve for matching asset failed: %v", err)
+	}
+	if casHash != obj.SHA256 {
+		t.Fatalf("expected hash %s, got %s", obj.SHA256, casHash)
+	}
+
+	// Resolving for assetA must fail closed with lineage mismatch, NOT returning casHash
+	mismatchHash, err := service.ResolveRunTranscriptCASForTest(ctx, db, runB, assetA, "translation")
+	if err == nil {
+		t.Fatalf("expected lineage mismatch error when run belongs to assetB, got hash: %s", mismatchHash)
+	}
+	if !strings.Contains(err.Error(), "transcript lineage mismatch") && !strings.Contains(err.Error(), assetB) {
+		t.Fatalf("expected lineage mismatch error naming asset, got: %v", err)
+	}
+}
+
+func TestTranslationService_Translate_RefusesMismatchedAssetOrJob(t *testing.T) {
+	db, casStore, router, _ := setupTranslationTestEnv(t)
+	svc := service.NewTranslationService(db, casStore)
+	svc.ConfigureRouter(router)
+	ctx := context.Background()
+
+	assetA := uuid.NewString()
+	assetB := uuid.NewString()
+	runB := uuid.NewString()
+	jobB := "job-b"
+
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION", TermsAccepted: true, ConfirmedAt: time.Now().UTC()})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{ID: assetA, RightsAttestationID: attID, SHA256: "sha-a", ByteSize: 100, CreatedAt: time.Now().UTC()})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{ID: assetB, RightsAttestationID: attID, SHA256: "sha-b", ByteSize: 100, CreatedAt: time.Now().UTC()})
+	_ = db.CreateJob(ctx, domain.LocalizationJob{ID: jobB, SourceAssetID: assetB, TargetLanguage: "vi", CreatedAt: time.Now().UTC()})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{ID: runB, JobID: jobB, Status: "running", CreatedAt: time.Now().UTC()})
+
+	// 1. Run belongs to assetB, requested for assetA -> fail closed
+	_, err := svc.Translate(ctx, domain.TranslationJobInput{
+		RunID:          runB,
+		AssetID:        assetA,
+		JobID:          jobB,
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "你好世界"},
+		},
+	})
+	if err == nil || !errors.Is(err, domain.ErrTranslationOwnershipMismatch) {
+		t.Fatalf("expected ErrTranslationOwnershipMismatch for cross-asset run, got: %v", err)
+	}
+
+	// 2. JobID mismatch for run
+	_, err = svc.Translate(ctx, domain.TranslationJobInput{
+		RunID:          runB,
+		AssetID:        assetB,
+		JobID:          "unrelated-job",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "你好世界"},
+		},
+	})
+	if err == nil || !errors.Is(err, domain.ErrTranslationOwnershipMismatch) {
+		t.Fatalf("expected ErrTranslationOwnershipMismatch for mismatched JobID, got: %v", err)
+	}
+}
+
+func TestTranslationService_Translate_FrozenGlossaryAuthoritative(t *testing.T) {
+	db, casStore, router, _ := setupTranslationTestEnv(t)
+	svc := service.NewTranslationService(db, casStore)
+	svc.ConfigureRouter(router)
+	ctx := context.Background()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	jobID := "job-glossary"
+
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION", TermsAccepted: true, ConfirmedAt: time.Now().UTC()})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{ID: assetID, RightsAttestationID: attID, SHA256: "sha-g", ByteSize: 100, CreatedAt: time.Now().UTC()})
+	_ = db.CreateJob(ctx, domain.LocalizationJob{ID: jobID, SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: time.Now().UTC()})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{
+		ID:                 runID,
+		JobID:              jobID,
+		Status:             "running",
+		ConfigSnapshotJSON: `{"glossary":[{"source":"SUPOR","target":"Nồi Supor","note":"Brand"}]}`,
+		CreatedAt:          time.Now().UTC(),
+	})
+	tObj, _ := casStore.Put(bytes.NewReader([]byte(`{"asset_id":"` + assetID + `"}`)))
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObj.SHA256,
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	invocations := 0
+	svc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		invocations++
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "fake_model",
+			ModelVersion: "1",
+			Segments: []domain.TranslationSegment{
+				{Index: 0, SourceText: req.Segments[0].SourceText, TargetText: "Chào Nồi Supor"},
+			},
+		}, nil
+	}
+
+	// 1. Conflicting request glossary must fail closed before routing (zero provider calls, zero mutation)
+	_, err := svc.Translate(ctx, domain.TranslationJobInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		JobID:          jobID,
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "SUPOR 你好"},
+		},
+		Glossary: []domain.GlossaryEntry{
+			{Source: "SUPOR", Target: "Khác", Note: "Different"},
+		},
+	})
+	if err == nil || !errors.Is(err, domain.ErrGlossaryConflict) {
+		t.Fatalf("expected ErrGlossaryConflict for conflicting glossary, got: %v", err)
+	}
+	if invocations != 0 {
+		t.Fatalf("expected 0 provider invocations on glossary conflict, got %d", invocations)
+	}
+	if _, err := db.GetTranslationVariantIndexByRun(ctx, runID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected no variant index stored in DB on failure, got err=%v", err)
+	}
+
+	// 2. Empty request glossary inherits frozen snapshot
+	v1, err := svc.Translate(ctx, domain.TranslationJobInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		JobID:          jobID,
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "SUPOR 你好"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected success with inherited frozen glossary, got: %v", err)
+	}
+	if invocations != 1 {
+		t.Fatalf("expected 1 provider invocation, got %d", invocations)
+	}
+	if len(v1.EffectiveGlossary.Entries) != 1 || v1.EffectiveGlossary.Entries[0].Target != "Nồi Supor" {
+		t.Fatalf("expected effective glossary target 'Nồi Supor', got %+v", v1.EffectiveGlossary)
+	}
+
+	// 3. Canonically equivalent request glossary is accepted and preserves frozen snapshot semantics
+	runID2 := uuid.NewString()
+	_ = db.CreateRun(ctx, domain.LocalizationRun{
+		ID:                 runID2,
+		JobID:              jobID,
+		Status:             "running",
+		ConfigSnapshotJSON: `{"glossary":[{"source":"SUPOR","target":"Nồi Supor","note":"Brand"}]}`,
+		CreatedAt:          time.Now().UTC(),
+	})
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID2,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObj.SHA256,
+		CreatedAt:      time.Now().UTC(),
+	})
+	v2, err := svc.Translate(ctx, domain.TranslationJobInput{
+		RunID:          runID2,
+		AssetID:        assetID,
+		JobID:          jobID,
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "SUPOR 你好"},
+		},
+		Glossary: []domain.GlossaryEntry{
+			{Source: " ｓｕｐｏｒ ", Target: "Nồi Supor", Note: "Brand"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected success with canonically equivalent glossary, got: %v", err)
+	}
+	if invocations != 2 {
+		t.Fatalf("expected 2 provider invocations, got %d", invocations)
+	}
+	if v2.EffectiveGlossary.Hash != v1.EffectiveGlossary.Hash {
+		t.Fatalf("expected identical effective glossary hash, got %s vs %s", v2.EffectiveGlossary.Hash, v1.EffectiveGlossary.Hash)
+	}
+}
+
+func TestTranslationService_CanReuseVariant_PreservesCorrectedTargetTextOnResume(t *testing.T) {
+	db, casStore, router, reg := setupTranslationTestEnv(t)
+	svc := service.NewTranslationService(db, casStore)
+	svc.ConfigureRouter(router)
+	ctx := context.Background()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	jobID := "job-resume-test"
+
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION", TermsAccepted: true, ConfirmedAt: time.Now().UTC()})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{ID: assetID, RightsAttestationID: attID, SHA256: "sha-resume", ByteSize: 100, CreatedAt: time.Now().UTC()})
+	_ = db.CreateJob(ctx, domain.LocalizationJob{ID: jobID, SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: time.Now().UTC()})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: jobID, Status: "running", ConfigSnapshotJSON: "{}", CreatedAt: time.Now().UTC()})
+
+	// Put transcript in CAS
+	transcript := domain.TranscriptArtifact{
+		ID:           "transcript-" + assetID,
+		AssetID:      assetID,
+		SpeechBlocks: []domain.SpeechBlock{{Index: 0, StartMs: 0, EndMs: 1500, SourceText: "你好", SpeakerID: "S1", SegmentType: domain.SpeechBlockTypeSpeech}},
+	}
+	tBytes, _ := json.Marshal(transcript)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	_ = db.SaveTranscriptArtifactIndex(ctx, storage.TranscriptArtifactIndex{
+		ID: transcript.ID, AssetID: assetID, RunID: runID, CASHash: tObj.SHA256, CreatedAt: time.Now().UTC(),
+	})
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID: uuid.NewString(), RunID: runID, Stage: "speech_understand", Status: domain.StageStatusSucceeded, ArtifactSHA256: tObj.SHA256, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	})
+
+	canonicalSegs := []domain.TranslationInputSegment{
+		{Index: 0, SourceText: "你好", SpeakerID: "S1", StartMs: 0, EndMs: 1500},
+	}
+	eff, _ := service.EffectiveGlossaryForTest(nil, canonicalSegs)
+	jobIn := domain.TranslationJobInput{
+		AssetID:               assetID,
+		RunID:                 runID,
+		JobID:                 jobID,
+		SourceLanguage:        "zh",
+		TargetLanguage:        "vi",
+		Segments:              canonicalSegs,
+		EffectiveGlossary:     eff,
+		TranscriptArtifactCAS: tObj.SHA256,
+	}
+	inputHash, _ := svc.ComputeTranslationInputHashForTest(jobIn)
+
+	// Obtain active provider ID from router
+	p, _ := reg.Get("fake_llm_translator")
+	mName, mVer := p.ModelInfo()
+
+	// Corrected variant has chained ProvenanceHash and corrected TargetText
+	correctedVariant := domain.TranslationVariant{
+		ID:                    "trans-corrected-1",
+		SchemaVersion:         domain.TranslationSchemaVersion,
+		ContractID:            service.TranslationContractID,
+		AssetID:               assetID,
+		RunID:                 runID,
+		JobID:                 jobID,
+		SourceLanguage:        "zh",
+		TargetLanguage:        "vi",
+		TranscriptArtifactCAS: tObj.SHA256,
+		EffectiveGlossary:     eff,
+		InputHash:             inputHash,
+		ProvenanceHash:        "chained-provenance-hash-from-correction",
+		ProviderID:            p.ID(),
+		ModelName:             mName,
+		ModelVersion:          mVer,
+		OverallQAScore:        0.95,
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "你好", TargetText: "Xin chào (đã sửa)", StartMs: 0, EndMs: 1500, QAConfidence: 0.95, PassedQAGate: true},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	cvBytes, _ := json.Marshal(correctedVariant)
+	cvObj, _ := casStore.Put(bytes.NewReader(cvBytes))
+	correctedVariant.CASHash = cvObj.SHA256
+
+	// Record corrected variant in stage_executions and translation_variant_indices as review service does
+	_ = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             correctedVariant.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		JobID:          jobID,
+		TargetLanguage: "vi",
+		CASHash:        cvObj.SHA256,
+		ProvenanceHash: correctedVariant.ProvenanceHash,
+		ProviderID:     p.ID(),
+		ModelName:      mName,
+		ModelVersion:   mVer,
+		OverallQAScore: 0.95,
+		CreatedAt:      correctedVariant.CreatedAt,
+	})
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "translation",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: cvObj.SHA256,
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+	})
+
+	// CanReuseVariant must accept the corrected variant on resume!
+	canReuse := svc.CanReuseVariant(ctx, jobIn, &correctedVariant)
+	if !canReuse {
+		t.Fatalf("expected CanReuseVariant to return true for valid corrected translation on resume, got false")
+	}
+	if correctedVariant.Segments[0].TargetText != "Xin chào (đã sửa)" {
+		t.Fatalf("expected corrected target text to be preserved, got %q", correctedVariant.Segments[0].TargetText)
+	}
+}
+
+func TestTranslationService_Translate_RunScopedMissingSpeechTranscriptCAS_FailsClosed(t *testing.T) {
+	db, casStore, router, _ := setupTranslationTestEnv(t)
+	svc := service.NewTranslationService(db, casStore)
+	svc.ConfigureRouter(router)
+	ctx := context.Background()
+
+	assetID := uuid.NewString()
+	run1 := uuid.NewString()
+	run2 := uuid.NewString()
+
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION", TermsAccepted: true, ConfirmedAt: time.Now().UTC()})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{ID: assetID, RightsAttestationID: attID, SHA256: "sha-run-fallback", ByteSize: 100, CreatedAt: time.Now().UTC()})
+	_ = db.CreateJob(ctx, domain.LocalizationJob{ID: "job-1", SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: time.Now().UTC()})
+	_ = db.CreateJob(ctx, domain.LocalizationJob{ID: "job-2", SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: time.Now().UTC()})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{ID: run1, JobID: "job-1", Status: "completed", CreatedAt: time.Now().UTC()})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{ID: run2, JobID: "job-2", Status: "running", CreatedAt: time.Now().UTC().Add(time.Minute)})
+
+	// Run 1 had a transcript, which is the asset's latest transcript index
+	tObj1, _ := casStore.Put(bytes.NewReader([]byte(`{"asset_id":"` + assetID + `","speech_blocks":[{"index":0,"start_ms":0,"end_ms":1000,"source_text":"你好","speaker_id":"S1","segment_type":"speech"}]}`)))
+	_ = db.SaveTranscriptArtifactIndex(ctx, storage.TranscriptArtifactIndex{
+		ID:             "transcript-run1",
+		AssetID:        assetID,
+		RunID:          run1,
+		CASHash:        tObj1.SHA256,
+		ProvenanceHash: "prov-run1",
+		CreatedAt:      time.Now().UTC(),
+	})
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID: uuid.NewString(), RunID: run1, Stage: "speech_understand", Status: domain.StageStatusSucceeded, ArtifactSHA256: tObj1.SHA256, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	})
+
+	invocations := 0
+	svc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		invocations++
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "fake_model",
+			ModelVersion: "1",
+			Segments: []domain.TranslationSegment{
+				{Index: 0, SourceText: req.Segments[0].SourceText, TargetText: "Xin chào"},
+			},
+		}, nil
+	}
+
+	// 1. Run 2 has NO speech_understand transcript. Direct translation for Run 2 without segments must FAIL CLOSED.
+	// It must NOT fall back to Run 1's transcript!
+	_, err := svc.Translate(ctx, domain.TranslationJobInput{
+		RunID:          run2,
+		AssetID:        assetID,
+		JobID:          "job-2",
+		TargetLanguage: "vi",
+		SourceLanguage: "zh",
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing pinned speech_understand transcript lineage") {
+		t.Fatalf("expected missing pinned speech_understand transcript lineage error, got: %v", err)
+	}
+	if invocations != 0 {
+		t.Fatalf("expected 0 provider invocations on fail-closed run, got %d", invocations)
+	}
+
+	// 2. Direct translation with RunID + explicit Segments + no speech_understand stage MUST also FAIL CLOSED:
+	// 0 provider calls, 0 mutation, even when the same asset has a valid latest transcript from another run (Run 1).
+	_, errExplicit := svc.Translate(ctx, domain.TranslationJobInput{
+		RunID:          run2,
+		AssetID:        assetID,
+		JobID:          "job-2",
+		TargetLanguage: "vi",
+		SourceLanguage: "zh",
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "你好", SpeakerID: "S1", StartMs: 0, EndMs: 1000},
+		},
+	})
+	if errExplicit == nil || !strings.Contains(errExplicit.Error(), "missing pinned speech_understand transcript lineage") {
+		t.Fatalf("expected error for run with explicit segments but missing run transcript lineage, got: %v", errExplicit)
+	}
+	if invocations != 0 {
+		t.Fatalf("expected 0 provider invocations on fail-closed run with explicit segments, got %d", invocations)
+	}
+	if _, err := db.GetTranslationVariantIndexByRun(ctx, run2); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected zero mutation in storage for run2, got err=%v", err)
+	}
+
+	// 3. Standalone non-run request (RunID == "") with explicit matching segments preserves compatibility fallback.
+	standaloneVariant, errStandalone := svc.Translate(ctx, domain.TranslationJobInput{
+		RunID:          "",
+		AssetID:        assetID,
+		JobID:          "",
+		TargetLanguage: "vi",
+		SourceLanguage: "zh",
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "你好", SpeakerID: "S1", StartMs: 0, EndMs: 1000},
+		},
+	})
+	if errStandalone != nil {
+		t.Fatalf("expected standalone non-run explicit segment translation to succeed via asset-latest fallback, got: %v", errStandalone)
+	}
+	if standaloneVariant.TranscriptArtifactCAS != tObj1.SHA256 {
+		t.Fatalf("expected standalone request to bind asset-latest transcript CAS %s, got %s", tObj1.SHA256, standaloneVariant.TranscriptArtifactCAS)
+	}
+	if invocations != 1 {
+		t.Fatalf("expected 1 provider invocation for standalone request, got %d", invocations)
 	}
 }
