@@ -301,22 +301,47 @@ type VoiceProviderEscalation struct {
 	Resolved bool `json:"resolved"`
 }
 
+// FitControllerConfig holds parameters for the measured-duration fit controller.
+type FitControllerConfig struct {
+	MaxSpeedMultiplier   float64 `json:"max_speed_multiplier,omitempty"`
+	MinNaturalGapMs      int64   `json:"min_natural_gap_ms,omitempty"`
+	MaxNaturalGapMs      int64   `json:"max_natural_gap_ms,omitempty"`
+	DefaultNaturalGapMs  int64   `json:"default_natural_gap_ms,omitempty"`
+	AllowRegroupSameTurn bool    `json:"allow_regroup_same_turn,omitempty"`
+	ReserveRatio         float64 `json:"reserve_ratio,omitempty"`
+	PolicyVersion        string  `json:"policy_version,omitempty"`
+}
+
+// DefaultFitControllerConfig returns the standard fit controller configuration.
+func DefaultFitControllerConfig() FitControllerConfig {
+	return FitControllerConfig{
+		MaxSpeedMultiplier:   1.25,
+		MinNaturalGapMs:      50,
+		MaxNaturalGapMs:      400,
+		DefaultNaturalGapMs:  150,
+		AllowRegroupSameTurn: true,
+		ReserveRatio:         0.30,
+		PolicyVersion:        "playback-window-v1",
+	}
+}
+
 // DubSegmentsVariant is the immutable target-language dubbing artifact containing all selected DubSegments.
 type DubSegmentsVariant struct {
-	ID                    string             `json:"id"`
-	SchemaVersion         int                `json:"schema_version"`
-	AssetID               string             `json:"asset_id"`
-	RunID                 string             `json:"run_id"`
-	JobID                 string             `json:"job_id,omitempty"`
-	TargetLanguage        string             `json:"target_language"` // "vi" or "en"
-	DubScriptVariantCAS   string             `json:"dub_script_variant_cas,omitempty"`
-	VoiceAssignmentCAS    string             `json:"voice_assignment_cas,omitempty"`
-	TranscriptArtifactCAS string             `json:"transcript_artifact_cas,omitempty"`
-	AudioRolePlanCAS      string             `json:"audio_role_plan_cas,omitempty"`
-	FitPolicyID           string             `json:"fit_policy_id"`
-	Segments              []DubSegment       `json:"segments"`                  // Strictly ACCEPTED fit-gated segments (mixer inputs)
-	ReviewSegments        []DubSegmentReview `json:"review_segments,omitempty"` // Flagged unselected candidates requiring review
-	FitPlans              []DubbingFitPlan   `json:"fit_plans,omitempty"`
+	ID                    string               `json:"id"`
+	SchemaVersion         int                  `json:"schema_version"`
+	AssetID               string               `json:"asset_id"`
+	RunID                 string               `json:"run_id"`
+	JobID                 string               `json:"job_id,omitempty"`
+	TargetLanguage        string               `json:"target_language"` // "vi" or "en"
+	DubScriptVariantCAS   string               `json:"dub_script_variant_cas,omitempty"`
+	VoiceAssignmentCAS    string               `json:"voice_assignment_cas,omitempty"`
+	TranscriptArtifactCAS string               `json:"transcript_artifact_cas,omitempty"`
+	AudioRolePlanCAS      string               `json:"audio_role_plan_cas,omitempty"`
+	FitPolicyID           string               `json:"fit_policy_id"`
+	FitConfig             *FitControllerConfig `json:"fit_config,omitempty"`
+	Segments              []DubSegment         `json:"segments"`                  // Strictly ACCEPTED fit-gated segments (mixer inputs)
+	ReviewSegments        []DubSegmentReview   `json:"review_segments,omitempty"` // Flagged unselected candidates requiring review
+	FitPlans              []DubbingFitPlan     `json:"fit_plans,omitempty"`
 	// Escalations records whole-speaker provider escalations performed while
 	// generating this variant (Issue #94): empty for the single-pass case.
 	Escalations []VoiceProviderEscalation `json:"escalations,omitempty"`

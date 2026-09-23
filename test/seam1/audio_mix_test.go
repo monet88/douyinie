@@ -3,6 +3,7 @@ package seam1_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -906,6 +907,140 @@ func TestSeam1_AudioMix_SpeechClipSampleRateResampling(t *testing.T) {
 	}
 	if mix.DurationMs != 3000 {
 		t.Errorf("expected mixed duration 3000ms, got %dms", mix.DurationMs)
+	}
+}
+
+func makePCM16WAVWithFrames(sampleRate, channels, frames int) []byte {
+	dataSize := frames * channels * 2
+	var buf bytes.Buffer
+	buf.WriteString("RIFF")
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(36+dataSize))
+	buf.WriteString("WAVEfmt ")
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(16))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(channels))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(sampleRate))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(sampleRate*channels*2))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(channels*2))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(16))
+	buf.WriteString("data")
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(dataSize))
+	buf.Write(make([]byte, dataSize))
+	return buf.Bytes()
+}
+
+func TestSeam1_AudioMix_FractionalSampleRateRoundingOverrun_48kHzTo44kHz(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// Audio role plan with narration/dialogue for 5ms: [1000ms, 1005ms]
+	planPayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 1000, EndMs: 1005, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	planBody, _ := json.Marshal(planPayload)
+	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+	source := []domain.TranslationInputSegment{{
+		Index: 0, SourceText: "short", SpeakerID: "SPEAKER_00", StartMs: 1000, EndMs: 1005,
+	}}
+	lineage := pinSeam1DubLineage(t, h, runID, assetID, "vi", source)
+
+	// Output media format: Background stem at 44.1kHz (44100Hz)
+	bgWAV := media.GeneratePCM16WAV(44100, 1, 3000)
+	bgObj, _ := h.casStore.Put(bytes.NewReader(bgWAV))
+
+	stemsArtifact := domain.AudioStemArtifacts{
+		ID:            "stems_resample_44k",
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: bgObj.SHA256,
+				SampleRate:   44100,
+				Channels:     1,
+				DurationMs:   3000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	stemsBytes, _ := json.Marshal(stemsArtifact)
+	stemsObj, _ := h.casStore.Put(bytes.NewReader(stemsBytes))
+
+	// 1. Positive case: 239 frames at 48kHz (239 * 44100 / 48000 = 219.58 -> 220 frames at 44.1kHz).
+	// In 44.1kHz: startFrame = 44100, endFrame = 44320. Allowed end = (1005 * 44100) / 1000 = 44320.5.
+	// Exactly fits without exceeding playback window -> PASS.
+	passClipWAV := makePCM16WAVWithFrames(48000, 1, 239)
+	passClipObj, _ := h.casStore.Put(bytes.NewReader(passClipWAV))
+	passArtifact := domain.DubSegmentsVariant{
+		ID:                    "dub_resample_pass",
+		SchemaVersion:         domain.DubSegmentsSchemaVersion,
+		AssetID:               assetID,
+		RunID:                 runID,
+		TargetLanguage:        "vi",
+		DubScriptVariantCAS:   lineage.DubScriptCAS,
+		VoiceAssignmentCAS:    lineage.VoiceAssignmentCAS,
+		TranscriptArtifactCAS: lineage.TranscriptCAS,
+		AudioRolePlanCAS:      lineage.AudioRolePlanCAS,
+		FitPolicyID:           seam1CurrentFitPolicyID(t),
+		OverallStatus:         "PASS",
+		Segments: []domain.DubSegment{
+			{
+				Index:              0,
+				SpeechBlockIndices: []int{0},
+				SpeakerID:          "SPEAKER_00",
+				StartMs:            1000,
+				EndMs:              1005,
+				SlotDurationMs:     5,
+				MeasuredDurationMs: 5,
+				AudioSHA256:        passClipObj.SHA256,
+				Voice:              domain.VoiceProfile{ID: "v1", Language: "vi"},
+				FitDecision:        domain.FitActionAccept,
+				DubPlaybackEndMs:   1005,
+			},
+		},
+		FitPlans: []domain.DubbingFitPlan{{
+			SegmentIndex: 0, SpeakerID: "SPEAKER_00", SlotDurationMs: 5, UsableSlotMs: 5,
+			MeasuredDurationMs: 5, DubPlaybackEndMs: 1005, FitPolicyID: seam1CurrentFitPolicyID(t),
+			SpeechBlockIndices: []int{0}, Decision: domain.FitActionAccept,
+		}},
+		CreatedAt: time.Now().UTC(),
+	}
+	passBytes, _ := json.Marshal(passArtifact)
+	passObj, _ := h.casStore.Put(bytes.NewReader(passBytes))
+	respPass, mixPass := runAudioMix(t, h, assetID, map[string]any{
+		"run_id":           runID,
+		"target_language":  "vi",
+		"audio_stems_cas":  stemsObj.SHA256,
+		"dub_segments_cas": passObj.SHA256,
+	})
+	if respPass.StatusCode != http.StatusCreated || mixPass == nil || mixPass.OverallStatus != "PASS" {
+		t.Fatalf("expected 239 frames @ 48kHz to pass 44.1kHz mix, got status %d mix %+v", respPass.StatusCode, mixPass)
+	}
+
+	// 2. Negative counterexample: 240 frames at 48kHz (5.0ms exact @ 48kHz).
+	// Resampled to 44.1kHz: round(240 * 44100 / 48000) = 221 frames.
+	// In 44.1kHz: startFrame = 44100, endFrame = 44321.
+	// 44321 * 1000 = 44321000 > 1005 * 44100 = 44320500 -> 1 sample overrun!
+	// Must fail closed with refusal.
+	failClipWAV := makePCM16WAVWithFrames(48000, 1, 240)
+	failClipObj, _ := h.casStore.Put(bytes.NewReader(failClipWAV))
+	failArtifact := passArtifact
+	failArtifact.ID = "dub_resample_fail"
+	failArtifact.Segments[0].AudioSHA256 = failClipObj.SHA256
+	failBytes, _ := json.Marshal(failArtifact)
+	failObj, _ := h.casStore.Put(bytes.NewReader(failBytes))
+	respFail, mixFail := runAudioMix(t, h, assetID, map[string]any{
+		"run_id":           runID,
+		"target_language":  "vi",
+		"audio_stems_cas":  stemsObj.SHA256,
+		"dub_segments_cas": failObj.SHA256,
+	})
+	if respFail.StatusCode == http.StatusCreated && (mixFail != nil && mixFail.OverallStatus == "PASS") {
+		t.Fatalf("expected 240 frames @ 48kHz (resampled to 221 frames > 220 allowed) to be refused, got PASS")
 	}
 }
 

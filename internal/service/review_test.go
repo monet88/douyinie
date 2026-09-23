@@ -2713,6 +2713,82 @@ func TestReviewService_CorrectTargetText_RequiresRunID(t *testing.T) {
 		t.Fatalf("rejected correction mutated translation lineage: before=%v after=%v", before, after)
 	}
 }
+
+func TestReviewService_CorrectTargetText_RejectsIncompatibleLineage(t *testing.T) {
+	svc, db, casStore, assetID := setupFullReviewHarness(t)
+	ctx := context.Background()
+	runID := "run-correct-compat"
+	jobID := seedReviewRun(t, db, assetID, runID)
+
+	transVar := domain.TranslationVariant{
+		ID:             "trans-compat-1",
+		SchemaVersion:  domain.TranslationSchemaVersion,
+		ContractID:     service.TranslationContractID,
+		AssetID:        assetID,
+		RunID:          runID,
+		JobID:          jobID,
+		TargetLanguage: "vi",
+		SourceLanguage: "zh",
+		ProvenanceHash: "prov-trans-compat",
+		OverallQAScore: 0.5,
+		Segments: []domain.TranslationSegment{
+			{
+				Index:        0,
+				SourceText:   "点击右上角",
+				TargetText:   "Nhấn góc trên",
+				StartMs:      0,
+				EndMs:        1500,
+				QAConfidence: 0.9,
+				PassedQAGate: true,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	pinReviewTranslationTranscript(t, casStore, &transVar)
+	tBytes, _ := json.Marshal(transVar)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	_ = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID:             transVar.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		JobID:          jobID,
+		TargetLanguage: "vi",
+		CASHash:        tObj.SHA256,
+		ProvenanceHash: transVar.ProvenanceHash,
+		OverallQAScore: transVar.OverallQAScore,
+		CreatedAt:      transVar.CreatedAt,
+	})
+
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID: "se-foreign", RunID: runID, Stage: "speech_understand", Status: domain.StageStatusSucceeded,
+		ArtifactSHA256: "foreign-transcript-cas", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	})
+	_, err := svc.CorrectTargetText(ctx, service.TargetTextCorrectionInput{
+		RunID: runID, AssetID: assetID, TargetLanguage: "vi", SegmentIndex: 0,
+		NewTargetText: "Nhấn góc trên mới", Reason: "lineage check", Operator: "editor",
+	})
+	if err == nil || !strings.Contains(err.Error(), "transcript lineage mismatch") {
+		t.Fatalf("expected transcript lineage mismatch error, got %v", err)
+	}
+
+	// 2. Fix transcript execution back to matching
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID: "se-match", RunID: runID, Stage: "speech_understand", Status: domain.StageStatusSucceeded,
+		ArtifactSHA256: transVar.TranscriptArtifactCAS, CreatedAt: time.Now().UTC().Add(time.Second), UpdatedAt: time.Now().UTC().Add(time.Second),
+	})
+	_ = db.UpsertRun(ctx, domain.LocalizationRun{
+		ID: runID, JobID: jobID, Status: "running",
+		ConfigSnapshotJSON: `{"glossary":[{"source":"点击","target":"CLICK_REQUIRED"}]}`,
+		CreatedAt:          time.Now().UTC(),
+	})
+	_, err = svc.CorrectTargetText(ctx, service.TargetTextCorrectionInput{
+		RunID: runID, AssetID: assetID, TargetLanguage: "vi", SegmentIndex: 0,
+		NewTargetText: "Nhấn góc trên mới", Reason: "glossary check", Operator: "editor",
+	})
+	if err == nil || !strings.Contains(err.Error(), "effective glossary mismatch") {
+		t.Fatalf("expected effective glossary mismatch error, got %v", err)
+	}
+}
 func TestReviewService_CorrectRegionGeometry_RejectsGeometryOutsideCanonicalFrame(t *testing.T) {
 	svc, db, casStore, assetID := setupFullReviewHarness(t)
 	ctx := context.Background()

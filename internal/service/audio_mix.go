@@ -3,6 +3,8 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,9 +41,10 @@ type SeparatorInvokeFunc func(ctx context.Context, p provider.Provider, req prov
 //  5. Zero-speech / no-dub bypass: Audio with no dub-eligible speech passes through cleanly without TTS injection.
 //  6. Testable independently with fake accepted dub audio once SpeechBlocks are known.
 type AudioMixService struct {
-	db     *storage.DB
-	cas    *cas.Store
-	router *provider.Router
+	db            *storage.DB
+	cas           *cas.Store
+	router        *provider.Router
+	fitController *FitController
 
 	// SeparatorInvoke executes one audio separation attempt.
 	// When nil, router-backed invocation is used.
@@ -59,6 +62,11 @@ func NewAudioMixService(db *storage.DB, casStore *cas.Store) *AudioMixService {
 // ConfigureRouter injects the provider router.
 func (s *AudioMixService) ConfigureRouter(router *provider.Router) {
 	s.router = router
+}
+
+// ConfigureFitController injects a custom fit controller configuration.
+func (s *AudioMixService) ConfigureFitController(fc *FitController) {
+	s.fitController = fc
 }
 
 // AudioSeparationInput defines the input parameters for audio stem separation.
@@ -379,26 +387,24 @@ func eligibleSpeechBlocks(transcript *domain.TranscriptArtifact, rolePlan *domai
 }
 
 func (s *AudioMixService) loadDubSpeechClip(seg domain.DubSegment) (media.DubSpeechClip, error) {
-	if seg.AudioSHA256 == "" && seg.AudioCASPath == "" {
-		return media.DubSpeechClip{}, errors.New("neither audio_sha256 nor audio_cas_path provided")
+	if seg.AudioSHA256 == "" {
+		return media.DubSpeechClip{}, errors.New("audio_sha256 is required to load pinned dub audio")
 	}
 	var audioBytes []byte
 	var readErr error
-	if seg.AudioSHA256 != "" {
-		if s.cas != nil {
-			r, err := s.cas.Get(seg.AudioSHA256)
-			if err == nil {
-				audioBytes, readErr = io.ReadAll(r)
-				_ = r.Close()
-				if readErr != nil {
-					return media.DubSpeechClip{}, fmt.Errorf("read audio from CAS (%s): %w", seg.AudioSHA256, readErr)
-				}
-			} else {
-				readErr = err
+	if s.cas != nil {
+		r, err := s.cas.Get(seg.AudioSHA256)
+		if err == nil {
+			audioBytes, readErr = io.ReadAll(r)
+			_ = r.Close()
+			if readErr != nil {
+				return media.DubSpeechClip{}, fmt.Errorf("read audio from CAS (%s): %w", seg.AudioSHA256, readErr)
 			}
 		} else {
-			readErr = errors.New("CAS store is not configured")
+			readErr = err
 		}
+	} else {
+		readErr = errors.New("CAS store is not configured")
 	}
 	if audioBytes == nil && seg.AudioCASPath != "" {
 		f, err := os.Open(seg.AudioCASPath)
@@ -417,6 +423,12 @@ func (s *AudioMixService) loadDubSpeechClip(seg domain.DubSegment) (media.DubSpe
 	}
 	if audioBytes == nil {
 		return media.DubSpeechClip{}, fmt.Errorf("read audio from CAS (%s): %w", seg.AudioSHA256, readErr)
+	}
+
+	h := sha256.Sum256(audioBytes)
+	actualSHA := hex.EncodeToString(h[:])
+	if !strings.EqualFold(actualSHA, seg.AudioSHA256) {
+		return media.DubSpeechClip{}, fmt.Errorf("audio content hash mismatch for segment %d: expected %s, got %s", seg.Index, seg.AudioSHA256, actualSHA)
 	}
 
 	clipSamples, clipHeader, err := media.ExtractPCM16Samples(audioBytes)
@@ -702,6 +714,43 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 			return refuse(err.Error())
 		}
 	}
+	// Extract background stem first to determine output sample rate and channel geometry.
+	var bgStem, vocalsStem domain.AudioStem
+	for _, stem := range stemsArtifact.Stems {
+		if stem.Type == domain.StemTypeBackground {
+			bgStem = stem
+		} else if stem.Type == domain.StemTypeVocals {
+			vocalsStem = stem
+		}
+	}
+	if bgStem.AudioCASHash == "" {
+		return nil, fmt.Errorf("%w: missing required background stem in audio stems artifact", domain.ErrSoundtrackPreservationFailed)
+	}
+
+	bgReader, err := s.cas.Get(bgStem.AudioCASHash)
+	if err != nil {
+		return nil, fmt.Errorf("%w: read background stem from CAS (%s): %v", domain.ErrSoundtrackPreservationFailed, bgStem.AudioCASHash, err)
+	}
+	defer bgReader.Close()
+	bgData, err := io.ReadAll(bgReader)
+	if err != nil {
+		return nil, fmt.Errorf("%w: read background stem bytes: %v", domain.ErrSoundtrackPreservationFailed, err)
+	}
+
+	bgSamples, bgHeader, err := media.ExtractPCM16Samples(bgData)
+	if err != nil {
+		return nil, fmt.Errorf("%w: extract background PCM16 samples: %v", domain.ErrSoundtrackPreservationFailed, err)
+	}
+
+	sampleRate := int(bgHeader.SampleRate)
+	channels := int(bgHeader.NumChannels)
+	if sampleRate <= 0 || channels <= 0 {
+		return nil, fmt.Errorf("%w: invalid background stem format: sample rate %d, channels %d", domain.ErrSoundtrackPreservationFailed, sampleRate, channels)
+	}
+	if len(bgSamples)%channels != 0 {
+		return nil, fmt.Errorf("%w: background stem sample count is not channel aligned", domain.ErrSoundtrackPreservationFailed)
+	}
+	bgFrames := int64(len(bgSamples) / channels)
 
 	speechClips := make([]media.DubSpeechClip, 0)
 	speechClipSegments := make([]domain.DubSegment, 0)
@@ -776,7 +825,14 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 				})
 			}
 		}
-		currentFit := NewFitController()
+		var currentFit *FitController
+		if dubSegments.FitConfig != nil {
+			currentFit = NewFitController(*dubSegments.FitConfig)
+		} else if s.fitController != nil {
+			currentFit = s.fitController
+		} else {
+			currentFit = NewFitController()
+		}
 		currentPolicyID := currentFit.policyID()
 		if currentPolicyID == "" || dubSegments.FitPolicyID != currentPolicyID {
 			return refuse(fmt.Sprintf("dub artifact fit policy mismatch: dub=%q current=%q", dubSegments.FitPolicyID, currentPolicyID))
@@ -833,9 +889,17 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 			if clip.SampleRate <= 0 || clip.Channels <= 0 || len(clip.Samples)%clip.Channels != 0 {
 				return refuse(fmt.Sprintf("segment %d decoded waveform has invalid format", seg.Index))
 			}
-			frames := int64(len(clip.Samples) / clip.Channels)
-			allowedMs := seg.DubPlaybackEndMs - seg.StartMs
-			if frames*1000 > allowedMs*int64(clip.SampleRate) {
+			// Resample/normalize clip to output sample rate and channel count before validation,
+			// matching the exact sample extent and placement the mixer will execute.
+			if clip.SampleRate != sampleRate || clip.Channels != channels {
+				clip.Samples = media.ResamplePCM16(clip.Samples, clip.SampleRate, clip.Channels, sampleRate, channels)
+				clip.SampleRate = sampleRate
+				clip.Channels = channels
+			}
+
+			startFrame := (seg.StartMs * int64(sampleRate)) / 1000
+			clipFrames := int64(len(clip.Samples) / clip.Channels)
+			if (startFrame+clipFrames)*1000 > seg.DubPlaybackEndMs*int64(sampleRate) {
 				return refuse(fmt.Sprintf("segment %d decoded waveform exceeds playback window", seg.Index))
 			}
 			speechClips = append(speechClips, clip)
@@ -855,43 +919,6 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 		return refuse(unresolvedDubReason(dubSegments, dubArtifactErr))
 	}
 
-	// 6. Extract background and vocal stems audio
-	var bgStem, vocalsStem domain.AudioStem
-	for _, stem := range stemsArtifact.Stems {
-		if stem.Type == domain.StemTypeBackground {
-			bgStem = stem
-		} else if stem.Type == domain.StemTypeVocals {
-			vocalsStem = stem
-		}
-	}
-	if bgStem.AudioCASHash == "" {
-		return nil, fmt.Errorf("%w: missing required background stem in audio stems artifact", domain.ErrSoundtrackPreservationFailed)
-	}
-
-	bgReader, err := s.cas.Get(bgStem.AudioCASHash)
-	if err != nil {
-		return nil, fmt.Errorf("%w: read background stem from CAS (%s): %v", domain.ErrSoundtrackPreservationFailed, bgStem.AudioCASHash, err)
-	}
-	defer bgReader.Close()
-	bgData, err := io.ReadAll(bgReader)
-	if err != nil {
-		return nil, fmt.Errorf("%w: read background stem bytes: %v", domain.ErrSoundtrackPreservationFailed, err)
-	}
-
-	bgSamples, bgHeader, err := media.ExtractPCM16Samples(bgData)
-	if err != nil {
-		return nil, fmt.Errorf("%w: extract background PCM16 samples: %v", domain.ErrSoundtrackPreservationFailed, err)
-	}
-
-	sampleRate := int(bgHeader.SampleRate)
-	channels := int(bgHeader.NumChannels)
-	if sampleRate <= 0 || channels <= 0 {
-		return nil, fmt.Errorf("%w: invalid background stem format: sample rate %d, channels %d", domain.ErrSoundtrackPreservationFailed, sampleRate, channels)
-	}
-	if len(bgSamples)%channels != 0 {
-		return nil, fmt.Errorf("%w: background stem sample count is not channel aligned", domain.ErrSoundtrackPreservationFailed)
-	}
-	bgFrames := int64(len(bgSamples) / channels)
 	order := make([]int, len(speechClips))
 	for i := range order {
 		order[i] = i
@@ -902,16 +929,16 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 	for pos, idx := range order {
 		clip := speechClips[idx]
 		seg := speechClipSegments[idx]
+		startFrame := (seg.StartMs * int64(sampleRate)) / 1000
 		frames := int64(len(clip.Samples) / clip.Channels)
-		// Compare exact rational sample extents instead of millisecond-rounded metadata.
-		clipEndNumerator := (seg.StartMs*int64(clip.SampleRate) + frames*1000) * int64(sampleRate)
-		mediaEndNumerator := bgFrames * int64(clip.SampleRate) * 1000
-		if clipEndNumerator > mediaEndNumerator {
+		endFrame := startFrame + frames
+		if endFrame > bgFrames {
 			return refuse(fmt.Sprintf("segment %d decoded waveform extends past source media end", seg.Index))
 		}
 		if pos+1 < len(order) {
 			next := speechClipSegments[order[pos+1]]
-			if seg.StartMs*int64(clip.SampleRate)+frames*1000 > next.StartMs*int64(clip.SampleRate) {
+			nextStartFrame := (next.StartMs * int64(sampleRate)) / 1000
+			if endFrame > nextStartFrame {
 				return refuse(fmt.Sprintf("segment %d decoded waveform collides with localized segment %d", seg.Index, next.Index))
 			}
 		}

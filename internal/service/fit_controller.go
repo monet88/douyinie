@@ -12,27 +12,11 @@ import (
 )
 
 // FitControllerConfig holds parameters for the measured-duration fit controller.
-type FitControllerConfig struct {
-	MaxSpeedMultiplier   float64 // Maximum allowable speed factor for RESYNTH (default 1.25)
-	MinNaturalGapMs      int64   // Minimum natural pause margin to preserve (default 50ms)
-	MaxNaturalGapMs      int64   // Maximum natural pause margin (default 400ms)
-	DefaultNaturalGapMs  int64   // Default natural pause margin (default 150ms)
-	AllowRegroupSameTurn bool    // Whether to attempt same-speaker regrouping on overrun
-	ReserveRatio         float64 // Fraction of a genuine following vocal gap reserved as silence.
-	PolicyVersion        string  // Versioned identity for playback-window semantics.
-}
+type FitControllerConfig = domain.FitControllerConfig
 
 // DefaultFitControllerConfig returns the standard fit controller configuration.
 func DefaultFitControllerConfig() FitControllerConfig {
-	return FitControllerConfig{
-		MaxSpeedMultiplier:   1.25,
-		MinNaturalGapMs:      50,
-		MaxNaturalGapMs:      400,
-		DefaultNaturalGapMs:  150,
-		AllowRegroupSameTurn: true,
-		ReserveRatio:         0.30,
-		PolicyVersion:        "playback-window-v1",
-	}
+	return domain.DefaultFitControllerConfig()
 }
 
 // FitController evaluates synthesized audio candidates against immutable source timing windows.

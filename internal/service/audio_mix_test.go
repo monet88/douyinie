@@ -957,3 +957,328 @@ func TestAudioMixService_SeparateAudio_SchemaVersion2_BypassesLegacyV1Cache(t *t
 		t.Fatalf("expected contract 16000 Hz stems, got stale 44100 Hz from cache")
 	}
 }
+
+func TestAudioMixService_FrozenFitControllerPolicyRespected(t *testing.T) {
+	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+	assetID := "asset_custom_fit_" + uuid.NewString()[:8]
+	runID := "run-mix-custom-fit"
+
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION", TermsAccepted: true, ConfirmedAt: time.Now().UTC(),
+	})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID: assetID, RightsAttestationID: attID, SHA256: "mock-sha", ByteSize: 1024, CreatedAt: time.Now().UTC(),
+	})
+	// Setup custom FitControllerConfig
+	customCfg := service.DefaultFitControllerConfig()
+	customCfg.ReserveRatio = 0.20
+	customCfg.PolicyVersion = "playback-custom-v1"
+	customFit := service.NewFitController(customCfg)
+	_, _, customPolicyID := customFit.ResolvePlaybackWindow(1000, 2000)
+
+	// Stems artifact
+	bgWAV := media.GeneratePCM16WAV(16000, 1, 5000)
+	bgObj, _ := casStore.Put(bytes.NewReader(bgWAV))
+	stems := domain.AudioStemArtifacts{
+		ID:            "stems-" + runID,
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: bgObj.SHA256,
+				SampleRate:   16000,
+				Channels:     1,
+				DurationMs:   5000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	sBytes, _ := json.Marshal(stems)
+	sObj, _ := casStore.Put(bytes.NewReader(sBytes))
+
+	rolePlan := domain.AudioRolePlan{
+		ID:             "role-" + runID,
+		AssetID:        assetID,
+		Segments:       []domain.AudioSegment{{StartMs: 1000, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue}},
+		ProvenanceHash: "prov-role-" + runID,
+		CreatedAt:      time.Now().UTC(),
+	}
+	rpBytes, _ := json.Marshal(rolePlan)
+	rpObj, _ := casStore.Put(bytes.NewReader(rpBytes))
+	rolePlan.CASHash = rpObj.SHA256
+	_ = db.SaveAudioRolePlan(ctx, rolePlan)
+
+	// Transcript
+	transcript := domain.TranscriptArtifact{
+		AssetID: assetID,
+		SpeechBlocks: []domain.SpeechBlock{
+			{Index: 0, StartMs: 1000, EndMs: 3000, SourceText: "hello", SpeakerID: "SPEAKER_00", SegmentType: domain.SpeechBlockTypeSpeech},
+		},
+	}
+	tBytes, _ := json.Marshal(transcript)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+
+	// Dub script
+	dubScript := domain.DubScriptVariant{
+		ID: uuid.NewString(), SchemaVersion: domain.DubScriptSchemaVersion, AssetID: assetID, RunID: runID,
+		SourceLanguage: "zh", TargetLanguage: "vi", ProvenanceHash: "prov-ds-" + runID,
+		Segments:  []domain.DubScriptSegment{{Index: 0, SpeakerID: "SPEAKER_00", StartMs: 1000, EndMs: 3000, SlotDurationMs: 2000, SourceText: "hello", SpokenText: "xin chào"}},
+		CreatedAt: time.Now().UTC(),
+	}
+	dsBytes, _ := json.Marshal(dubScript)
+	dsObj, _ := casStore.Put(bytes.NewReader(dsBytes))
+	_ = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID: dubScript.ID, AssetID: assetID, RunID: runID, TargetLanguage: "vi", CASHash: dsObj.SHA256,
+		ProvenanceHash: dubScript.ProvenanceHash, CreatedAt: dubScript.CreatedAt,
+	})
+
+	// Voice assignment
+	va := domain.VoiceAssignment{
+		ID: uuid.NewString(), SchemaVersion: domain.VoiceAssignmentSchemaVersion, AssetID: assetID, RunID: runID, TargetLanguage: "vi",
+		Assignments:           map[string]domain.VoiceProfile{"SPEAKER_00": {ID: "v1", Language: "vi"}},
+		DubScriptVariantCAS:   dsObj.SHA256,
+		TranscriptArtifactCAS: tObj.SHA256,
+		ProvenanceHash:        "prov-va-" + runID,
+		CreatedAt:             time.Now().UTC(),
+	}
+	vaBytes, _ := json.Marshal(va)
+	vaObj, _ := casStore.Put(bytes.NewReader(vaBytes))
+	_ = db.SaveVoiceAssignmentIndex(ctx, storage.VoiceAssignmentIndex{
+		ID: va.ID, AssetID: assetID, RunID: runID, TargetLanguage: "vi", CASHash: vaObj.SHA256,
+		ProvenanceHash: va.ProvenanceHash, CreatedAt: va.CreatedAt,
+	})
+
+	clipWAV := media.GeneratePCM16WAV(16000, 1, 2000)
+	clipObj, _ := casStore.Put(bytes.NewReader(clipWAV))
+
+	// 1. DubSegmentsVariant carrying custom FitConfig and matching FitPolicyID
+	dubVariant := domain.DubSegmentsVariant{
+		ID:                    "dub-custom-fit",
+		SchemaVersion:         domain.DubSegmentsSchemaVersion,
+		AssetID:               assetID,
+		RunID:                 runID,
+		TargetLanguage:        "vi",
+		DubScriptVariantCAS:   dsObj.SHA256,
+		VoiceAssignmentCAS:    vaObj.SHA256,
+		TranscriptArtifactCAS: tObj.SHA256,
+		AudioRolePlanCAS:      rpObj.SHA256,
+		FitPolicyID:           customPolicyID,
+		FitConfig:             &customCfg,
+		OverallStatus:         "PASS",
+		Segments: []domain.DubSegment{
+			{
+				Index:              0,
+				SpeechBlockIndices: []int{0},
+				SpeakerID:          "SPEAKER_00",
+				StartMs:            1000,
+				EndMs:              3000,
+				SlotDurationMs:     2000,
+				MeasuredDurationMs: 2000,
+				AudioSHA256:        clipObj.SHA256,
+				FitDecision:        domain.FitActionAccept,
+				DubPlaybackEndMs:   3000,
+			},
+		},
+		FitPlans: []domain.DubbingFitPlan{
+			{
+				SegmentIndex: 0, SpeakerID: "SPEAKER_00", SlotDurationMs: 2000, UsableSlotMs: 2000,
+				MeasuredDurationMs: 2000, DubPlaybackEndMs: 3000, FitPolicyID: customPolicyID,
+				SpeechBlockIndices: []int{0}, Decision: domain.FitActionAccept,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dvBytes, _ := json.Marshal(dubVariant)
+	dvObj, _ := casStore.Put(bytes.NewReader(dvBytes))
+
+	// Mix with custom fit policy: must PASS
+	mixArtifact, err := mixSvc.MixAudio(ctx, service.AudioMixInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		AudioStemsCAS:  sObj.SHA256,
+		DubSegmentsCAS: dvObj.SHA256,
+	})
+	if err != nil || mixArtifact == nil || mixArtifact.OverallStatus != "PASS" {
+		t.Fatalf("expected custom fit policy to be accepted by mixer, got err=%v mix=%+v", err, mixArtifact)
+	}
+
+	// 2. Modified FitPolicyID mismatching the FitConfig: must REFUSE
+	dubVariantTampered := dubVariant
+	dubVariantTampered.ID = "dub-custom-fit-tampered"
+	dubVariantTampered.FitPolicyID = "tampered-policy-id"
+	dvtBytes, _ := json.Marshal(dubVariantTampered)
+	dvtObj, _ := casStore.Put(bytes.NewReader(dvtBytes))
+
+	mixTampered, err := mixSvc.MixAudio(ctx, service.AudioMixInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		AudioStemsCAS:  sObj.SHA256,
+		DubSegmentsCAS: dvtObj.SHA256,
+	})
+	if err == nil || mixTampered != nil && mixTampered.OverallStatus == "PASS" {
+		t.Fatal("expected tampered policy ID to be refused by mixer, got PASS")
+	}
+}
+
+func TestAudioMixService_CASAuthorityAndPathBypassForbidden(t *testing.T) {
+	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+	assetID := "asset_cas_auth_" + uuid.NewString()[:8]
+	runID := "run-cas-auth"
+
+	attID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID: attID, AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION", TermsAccepted: true, ConfirmedAt: time.Now().UTC(),
+	})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID: assetID, RightsAttestationID: attID, SHA256: "mock-sha", ByteSize: 1024, CreatedAt: time.Now().UTC(),
+	})
+
+	bgWAV := media.GeneratePCM16WAV(16000, 1, 5000)
+	bgObj, _ := casStore.Put(bytes.NewReader(bgWAV))
+	stems := domain.AudioStemArtifacts{
+		ID:            "stems-" + runID,
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: bgObj.SHA256,
+				SampleRate:   16000,
+				Channels:     1,
+				DurationMs:   5000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	sBytes, _ := json.Marshal(stems)
+	sObj, _ := casStore.Put(bytes.NewReader(sBytes))
+
+	rolePlan := domain.AudioRolePlan{
+		ID:             "role-" + runID,
+		AssetID:        assetID,
+		Segments:       []domain.AudioSegment{{StartMs: 1000, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue}},
+		ProvenanceHash: "prov-role-" + runID,
+		CreatedAt:      time.Now().UTC(),
+	}
+	rpBytes, _ := json.Marshal(rolePlan)
+	rpObj, _ := casStore.Put(bytes.NewReader(rpBytes))
+	rolePlan.CASHash = rpObj.SHA256
+	_ = db.SaveAudioRolePlan(ctx, rolePlan)
+
+	transcript := domain.TranscriptArtifact{
+		AssetID: assetID,
+		SpeechBlocks: []domain.SpeechBlock{
+			{Index: 0, StartMs: 1000, EndMs: 3000, SourceText: "hello", SpeakerID: "SPEAKER_00", SegmentType: domain.SpeechBlockTypeSpeech},
+		},
+	}
+	tBytes, _ := json.Marshal(transcript)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+
+	dubScript := domain.DubScriptVariant{
+		ID: uuid.NewString(), SchemaVersion: domain.DubScriptSchemaVersion, AssetID: assetID, RunID: runID,
+		SourceLanguage: "zh", TargetLanguage: "vi", ProvenanceHash: "prov-ds-" + runID,
+		Segments:  []domain.DubScriptSegment{{Index: 0, SpeakerID: "SPEAKER_00", StartMs: 1000, EndMs: 3000, SlotDurationMs: 2000, SourceText: "hello", SpokenText: "xin chào"}},
+		CreatedAt: time.Now().UTC(),
+	}
+	dsBytes, _ := json.Marshal(dubScript)
+	dsObj, _ := casStore.Put(bytes.NewReader(dsBytes))
+	_ = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID: dubScript.ID, AssetID: assetID, RunID: runID, TargetLanguage: "vi", CASHash: dsObj.SHA256,
+		ProvenanceHash: dubScript.ProvenanceHash, CreatedAt: dubScript.CreatedAt,
+	})
+
+	va := domain.VoiceAssignment{
+		ID: uuid.NewString(), SchemaVersion: domain.VoiceAssignmentSchemaVersion, AssetID: assetID, RunID: runID, TargetLanguage: "vi",
+		Assignments:           map[string]domain.VoiceProfile{"SPEAKER_00": {ID: "v1", Language: "vi"}},
+		DubScriptVariantCAS:   dsObj.SHA256,
+		TranscriptArtifactCAS: tObj.SHA256,
+		ProvenanceHash:        "prov-va-" + runID,
+		CreatedAt:             time.Now().UTC(),
+	}
+	vaBytes, _ := json.Marshal(va)
+	vaObj, _ := casStore.Put(bytes.NewReader(vaBytes))
+	_ = db.SaveVoiceAssignmentIndex(ctx, storage.VoiceAssignmentIndex{
+		ID: va.ID, AssetID: assetID, RunID: runID, TargetLanguage: "vi", CASHash: vaObj.SHA256,
+		ProvenanceHash: va.ProvenanceHash, CreatedAt: va.CreatedAt,
+	})
+
+	_, _, fitPolicyID := service.NewFitController().ResolvePlaybackWindow(1000, 2000)
+	clipWAV := media.GeneratePCM16WAV(16000, 1, 2000)
+	clipObj, _ := casStore.Put(bytes.NewReader(clipWAV))
+
+	// 1. Missing AudioSHA256 must be refused (cannot rely on AudioCASPath alone)
+	dubVariantNoSHA := domain.DubSegmentsVariant{
+		ID:                    "dub-no-sha",
+		SchemaVersion:         domain.DubSegmentsSchemaVersion,
+		AssetID:               assetID,
+		RunID:                 runID,
+		TargetLanguage:        "vi",
+		DubScriptVariantCAS:   dsObj.SHA256,
+		VoiceAssignmentCAS:    vaObj.SHA256,
+		TranscriptArtifactCAS: tObj.SHA256,
+		AudioRolePlanCAS:      rpObj.SHA256,
+		FitPolicyID:           fitPolicyID,
+		OverallStatus:         "PASS",
+		Segments: []domain.DubSegment{
+			{
+				Index:              0,
+				SpeechBlockIndices: []int{0},
+				SpeakerID:          "SPEAKER_00",
+				StartMs:            1000,
+				EndMs:              3000,
+				SlotDurationMs:     2000,
+				MeasuredDurationMs: 2000,
+				AudioSHA256:        "", // empty hash
+				AudioCASPath:       clipObj.Path,
+				FitDecision:        domain.FitActionAccept,
+				DubPlaybackEndMs:   3000,
+			},
+		},
+		FitPlans: []domain.DubbingFitPlan{
+			{
+				SegmentIndex: 0, SpeakerID: "SPEAKER_00", SlotDurationMs: 2000, UsableSlotMs: 2000,
+				MeasuredDurationMs: 2000, DubPlaybackEndMs: 3000, FitPolicyID: fitPolicyID,
+				SpeechBlockIndices: []int{0}, Decision: domain.FitActionAccept,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dnsBytes, _ := json.Marshal(dubVariantNoSHA)
+	dnsObj, _ := casStore.Put(bytes.NewReader(dnsBytes))
+
+	_, err := mixSvc.MixAudio(ctx, service.AudioMixInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		AudioStemsCAS:  sObj.SHA256,
+		DubSegmentsCAS: dnsObj.SHA256,
+	})
+	if err == nil {
+		t.Fatal("expected missing AudioSHA256 to be refused by mixer, got PASS")
+	}
+
+	// 2. Mismatched AudioSHA256 with readable path must fail closed on hash mismatch (cannot bypass pinned CAS)
+	dubVariantBypass := dubVariantNoSHA
+	dubVariantBypass.ID = "dub-bypass-attempt"
+	dubVariantBypass.Segments[0].AudioSHA256 = "corrupt_sha_256_attempting_to_bypass_with_valid_path"
+	dubVariantBypass.Segments[0].AudioCASPath = clipObj.Path
+	dbpBytes, _ := json.Marshal(dubVariantBypass)
+	dbpObj, _ := casStore.Put(bytes.NewReader(dbpBytes))
+
+	_, err = mixSvc.MixAudio(ctx, service.AudioMixInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		AudioStemsCAS:  sObj.SHA256,
+		DubSegmentsCAS: dbpObj.SHA256,
+	})
+	if err == nil || !strings.Contains(err.Error(), "mismatch") && !strings.Contains(err.Error(), "audio load or decode failure") {
+		t.Fatalf("expected hash mismatch failure when trying to bypass CAS with path, got %v", err)
+	}
+}

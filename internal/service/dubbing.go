@@ -2141,6 +2141,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 		TranscriptArtifactCAS: in.TranscriptArtifactCAS,
 		AudioRolePlanCAS:      in.AudioRolePlanCAS,
 		FitPolicyID:           fc.policyID(),
+		FitConfig:             &fc.config,
 		Segments:              selectedSegments,
 		ReviewSegments:        reviewSegments,
 		FitPlans:              fitPlans,

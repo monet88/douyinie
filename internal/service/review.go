@@ -81,6 +81,93 @@ type ManualOverrideInput struct {
 }
 
 // RecordManualOverride records an auditable operator acceptance of a flagged exception.
+
+func (s *ReviewService) validateTranslationCompatibility(ctx context.Context, requestedRunID string, in TargetTextCorrectionInput, tVar *domain.TranslationVariant, transIdx *storage.TranslationVariantIndex) error {
+	if tVar.AssetID != in.AssetID || !strings.EqualFold(tVar.TargetLanguage, in.TargetLanguage) {
+		return fmt.Errorf("translation variant artifact %s belongs to asset %s (%s), expected asset %s (%s)", transIdx.CASHash, tVar.AssetID, tVar.TargetLanguage, in.AssetID, in.TargetLanguage)
+	}
+	if tVar.SchemaVersion != domain.TranslationSchemaVersion || tVar.ContractID != TranslationContractID {
+		return fmt.Errorf("translation variant %s uses stale translation contract (schema=%d contract=%q)", transIdx.CASHash, tVar.SchemaVersion, tVar.ContractID)
+	}
+
+	// 1. Check pinned transcript lineage
+	if s.db != nil && requestedRunID != "" {
+		runTranscriptCAS, err := resolveRunTranscriptCAS(ctx, s.db, requestedRunID, in.AssetID, "correction")
+		if err != nil {
+			return fmt.Errorf("resolve run transcript for correction: %w", err)
+		}
+		if runTranscriptCAS != "" && tVar.TranscriptArtifactCAS != "" && tVar.TranscriptArtifactCAS != runTranscriptCAS {
+			return fmt.Errorf("translation variant transcript lineage mismatch: variant=%s run=%s", tVar.TranscriptArtifactCAS, runTranscriptCAS)
+		}
+	}
+
+	// 2. Check frozen run glossary
+	if s.db != nil && requestedRunID != "" {
+		run, err := s.db.GetRun(ctx, requestedRunID)
+		if err == nil && run != nil && strings.TrimSpace(run.ConfigSnapshotJSON) != "" {
+			var cfg struct {
+				Glossary []domain.GlossaryEntry `json:"glossary"`
+			}
+			if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err == nil && len(cfg.Glossary) > 0 {
+				var segs []domain.TranslationInputSegment
+				for _, seg := range tVar.Segments {
+					segs = append(segs, domain.TranslationInputSegment{
+						Index:      seg.Index,
+						SourceText: seg.SourceText,
+						SpeakerID:  seg.SpeakerID,
+						StartMs:    seg.StartMs,
+						EndMs:      seg.EndMs,
+					})
+				}
+				effective, err := effectiveGlossary(cfg.Glossary, segs)
+				if err == nil && tVar.EffectiveGlossary.Hash != "" && tVar.EffectiveGlossary.Hash != effective.Hash {
+					return fmt.Errorf("translation variant effective glossary mismatch: variant=%s run=%s", tVar.EffectiveGlossary.Hash, effective.Hash)
+				}
+			}
+		}
+	}
+
+	// 3. Check InputHash against canonical segments from transcript
+	if s.translationSvc != nil && tVar.TranscriptArtifactCAS != "" && s.cas != nil {
+		canonicalSegments, _, err := s.translationSvc.loadSegmentsFromTranscript(ctx, in.AssetID, tVar.TranscriptArtifactCAS)
+		if err == nil && len(canonicalSegments) > 0 {
+			jobIn := domain.TranslationJobInput{
+				AssetID:               in.AssetID,
+				RunID:                 requestedRunID,
+				SourceLanguage:        tVar.SourceLanguage,
+				TargetLanguage:        in.TargetLanguage,
+				Segments:              canonicalSegments,
+				EffectiveGlossary:     tVar.EffectiveGlossary,
+				TranscriptArtifactCAS: tVar.TranscriptArtifactCAS,
+			}
+			expectedInputHash, err := s.translationSvc.computeTranslationInputHash(jobIn)
+			if err == nil && tVar.InputHash != "" && tVar.InputHash != expectedInputHash {
+				return fmt.Errorf("translation variant input hash mismatch: variant=%s expected=%s", tVar.InputHash, expectedInputHash)
+			}
+		}
+	}
+
+	// 4. Check Provider/Model lineage if router is configured
+	if s.translationSvc != nil && s.translationSvc.router != nil {
+		jobIn := domain.TranslationJobInput{
+			AssetID:               in.AssetID,
+			RunID:                 requestedRunID,
+			SourceLanguage:        tVar.SourceLanguage,
+			TargetLanguage:        in.TargetLanguage,
+			EffectiveGlossary:     tVar.EffectiveGlossary,
+			TranscriptArtifactCAS: tVar.TranscriptArtifactCAS,
+		}
+		routeRes, err := s.translationSvc.router.Route(ctx, translationRouteRequest(jobIn))
+		if err == nil && routeRes != nil && routeRes.SelectedProvider != nil {
+			if tVar.ProviderID != "" && tVar.ProviderID != routeRes.SelectedProvider.ID() {
+				return fmt.Errorf("translation variant provider mismatch: variant=%s active=%s", tVar.ProviderID, routeRes.SelectedProvider.ID())
+			}
+		}
+	}
+
+	return nil
+}
+
 // Invariant: Overrides are append-only audit records; historical QA scores and failures are never mutated or rewritten to PASS.
 // Invariant: Manual override requires an exact, currently pending ReviewItemID for the same asset and language.
 // Stage-only or implicit index-0 requests, nonexistent IDs, stale IDs, or non-pending IDs must be rejected.
@@ -369,11 +456,8 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		return nil, fmt.Errorf("decode translation variant (%s): %w", transIdx.CASHash, err)
 	}
 	trc.Close()
-	if tVar.AssetID != in.AssetID || !strings.EqualFold(tVar.TargetLanguage, in.TargetLanguage) {
-		return nil, fmt.Errorf("translation variant artifact %s belongs to asset %s (%s), expected asset %s (%s)", transIdx.CASHash, tVar.AssetID, tVar.TargetLanguage, in.AssetID, in.TargetLanguage)
-	}
-	if tVar.SchemaVersion != domain.TranslationSchemaVersion || tVar.ContractID != TranslationContractID {
-		return nil, fmt.Errorf("translation variant %s uses stale translation contract (schema=%d contract=%q)", transIdx.CASHash, tVar.SchemaVersion, tVar.ContractID)
+	if err := s.validateTranslationCompatibility(ctx, requestedRunID, in, &tVar, transIdx); err != nil {
+		return nil, err
 	}
 	// A segment's own index is the source speech-block index, not its position in the slice: a clip
 	// with silent stretches indexes 0,2,4,6, so indexing the slice with it rejected every correction
@@ -412,9 +496,16 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		tVar.OverallQAScore = totalConf / float64(len(tVar.Segments))
 	}
 
-	// Compute updated provenance hash
+	// Compute updated provenance hash chaining from original provenance
+	baseProvenance := tVar.ProvenanceHash
+	if baseProvenance == "" && transIdx != nil {
+		baseProvenance = transIdx.ProvenanceHash
+	}
+	if baseProvenance == "" {
+		return nil, fmt.Errorf("translation variant %s is missing provenance hash", transIdx.CASHash)
+	}
 	hTrans := sha256.New()
-	_, _ = hTrans.Write([]byte(fmt.Sprintf("%s:%s:%d:%s", transIdx.ProvenanceHash, in.TargetLanguage, in.SegmentIndex, in.NewTargetText)))
+	_, _ = hTrans.Write([]byte(fmt.Sprintf("%s:%s:%d:%s", baseProvenance, in.TargetLanguage, in.SegmentIndex, in.NewTargetText)))
 	tVar.ProvenanceHash = hex.EncodeToString(hTrans.Sum(nil))
 
 	tBytes, err := json.MarshalIndent(tVar, "", "  ")
