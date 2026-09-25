@@ -81,6 +81,148 @@ type ManualOverrideInput struct {
 }
 
 // RecordManualOverride records an auditable operator acceptance of a flagged exception.
+
+func (s *ReviewService) validateTranslationCompatibility(ctx context.Context, requestedRunID string, in TargetTextCorrectionInput, tVar *domain.TranslationVariant, transIdx *storage.TranslationVariantIndex) error {
+	if tVar.AssetID != in.AssetID || !strings.EqualFold(tVar.TargetLanguage, in.TargetLanguage) {
+		return fmt.Errorf("translation variant artifact %s belongs to asset %s (%s), expected asset %s (%s)", transIdx.CASHash, tVar.AssetID, tVar.TargetLanguage, in.AssetID, in.TargetLanguage)
+	}
+	if tVar.SchemaVersion != domain.TranslationSchemaVersion || tVar.ContractID != TranslationContractID {
+		return fmt.Errorf("translation variant %s uses stale translation contract (schema=%d contract=%q)", transIdx.CASHash, tVar.SchemaVersion, tVar.ContractID)
+	}
+
+	// 1. Check pinned transcript lineage
+	if s.db != nil && requestedRunID != "" {
+		if strings.TrimSpace(tVar.TranscriptArtifactCAS) == "" {
+			return fmt.Errorf("translation variant %s is missing transcript lineage", transIdx.CASHash)
+		}
+		runTranscriptCAS, err := resolveRunTranscriptCAS(ctx, s.db, requestedRunID, in.AssetID, "correction")
+		if err != nil {
+			return fmt.Errorf("resolve run transcript for correction: %w", err)
+		}
+		if runTranscriptCAS != "" && tVar.TranscriptArtifactCAS != runTranscriptCAS {
+			return fmt.Errorf("translation variant transcript lineage mismatch: variant=%s run=%s", tVar.TranscriptArtifactCAS, runTranscriptCAS)
+		}
+	}
+	// 2. Check frozen run glossary
+	if s.db != nil && requestedRunID != "" {
+		run, err := s.db.GetRun(ctx, requestedRunID)
+		if err != nil {
+			return fmt.Errorf("load run %s for correction glossary check: %w", requestedRunID, err)
+		}
+		if run == nil {
+			return fmt.Errorf("run %s not found for correction glossary check", requestedRunID)
+		}
+		if tVar.EffectiveGlossary.Hash == "" {
+			return fmt.Errorf("translation variant %s is missing effective glossary hash", transIdx.CASHash)
+		}
+		frozenGlossary, hasFrozen, err := decodeFrozenRunGlossary(run.ConfigSnapshotJSON)
+		if err != nil {
+			return fmt.Errorf("malformed run config snapshot JSON: %w", err)
+		}
+		if hasFrozen {
+			var segs []domain.TranslationInputSegment
+			for _, seg := range tVar.Segments {
+				segs = append(segs, domain.TranslationInputSegment{
+					Index:      seg.Index,
+					SourceText: seg.SourceText,
+					SpeakerID:  seg.SpeakerID,
+					StartMs:    seg.StartMs,
+					EndMs:      seg.EndMs,
+				})
+			}
+			effective, err := effectiveGlossary(frozenGlossary, segs)
+			if err != nil {
+				return fmt.Errorf("compute effective glossary for correction: %w", err)
+			}
+			if tVar.EffectiveGlossary.Hash != effective.Hash {
+				return fmt.Errorf("translation variant effective glossary mismatch: variant=%s run=%s", tVar.EffectiveGlossary.Hash, effective.Hash)
+			}
+		}
+	}
+
+	// 3. Check InputHash against canonical segments from transcript
+	if s.translationSvc != nil && tVar.TranscriptArtifactCAS != "" && s.cas != nil {
+		if strings.TrimSpace(tVar.InputHash) == "" {
+			return fmt.Errorf("translation variant %s is missing input hash", transIdx.CASHash)
+		}
+		// Canonical segmentation is re-derived from the run's own pinned role-plan lineage: the
+		// operator's current plan for the asset may have been edited since the run froze this
+		// variant, which must not re-segment (and so invalidate) an otherwise valid correction.
+		canonicalSegments, _, err := s.translationSvc.loadSegmentsFromTranscript(ctx, in.AssetID, requestedRunID, tVar.TranscriptArtifactCAS)
+		if err != nil {
+			return fmt.Errorf("load canonical segments for correction: %w", err)
+		}
+		if len(canonicalSegments) == 0 {
+			return fmt.Errorf("transcript %s contains no canonical translation segments", tVar.TranscriptArtifactCAS)
+		}
+		jobIn := domain.TranslationJobInput{
+			AssetID:               in.AssetID,
+			RunID:                 requestedRunID,
+			SourceLanguage:        tVar.SourceLanguage,
+			TargetLanguage:        in.TargetLanguage,
+			Segments:              canonicalSegments,
+			EffectiveGlossary:     tVar.EffectiveGlossary,
+			TranscriptArtifactCAS: tVar.TranscriptArtifactCAS,
+		}
+		expectedInputHash, err := s.translationSvc.computeTranslationInputHash(jobIn)
+		if err != nil {
+			return fmt.Errorf("compute expected input hash for correction: %w", err)
+		}
+		if tVar.InputHash != expectedInputHash {
+			return fmt.Errorf("translation variant input hash mismatch: variant=%s expected=%s", tVar.InputHash, expectedInputHash)
+		}
+	}
+
+	// 4. Check Provider/Model lineage if router is configured
+	if s.translationSvc != nil && s.translationSvc.router != nil {
+		jobIn := domain.TranslationJobInput{
+			AssetID:               in.AssetID,
+			RunID:                 requestedRunID,
+			SourceLanguage:        tVar.SourceLanguage,
+			TargetLanguage:        in.TargetLanguage,
+			EffectiveGlossary:     tVar.EffectiveGlossary,
+			TranscriptArtifactCAS: tVar.TranscriptArtifactCAS,
+		}
+		routeRes, err := s.translationSvc.router.Route(ctx, translationRouteRequest(jobIn))
+		if err != nil {
+			return fmt.Errorf("route provider for correction check: %w", err)
+		}
+		if routeRes == nil || routeRes.SelectedProvider == nil {
+			return errors.New("no eligible translation provider selected for correction check")
+		}
+		if strings.TrimSpace(tVar.ProviderID) == "" {
+			return fmt.Errorf("translation variant %s is missing provider lineage", transIdx.CASHash)
+		}
+		// The variant froze the provider that produced it. Translation's production ladder scores by exact
+		// provider ID and Router deliberately ignores PreferredProviderID for this stage, so the frozen
+		// provider is proven still eligible through the route result instead: selected, or standing among
+		// the eligible fallback candidates. Health, policy, license or credential loss removes it from both
+		// and the correction fails closed.
+		if !frozenProviderEligible(routeRes, tVar.ProviderID) {
+			return fmt.Errorf("translation variant provider mismatch: variant=%s not eligible in the current provider route (active=%s)", tVar.ProviderID, routeRes.SelectedProvider.ID())
+		}
+	}
+	return nil
+}
+
+// frozenProviderEligible reports whether the router still proves a frozen provider eligible for the stage:
+// it is the selected candidate or stands among the eligible fallback candidates. A provider the router
+// dropped (unhealthy, policy-blocked, unlicensed, unauthorized) is absent from both.
+func frozenProviderEligible(res *provider.RouteResult, providerID string) bool {
+	if res == nil || res.SelectedProvider == nil {
+		return false
+	}
+	if isProviderEquivalent(res.SelectedProvider.ID(), providerID) {
+		return true
+	}
+	for _, candidate := range res.FallbackOrdered {
+		if candidate != nil && isProviderEquivalent(candidate.ID(), providerID) {
+			return true
+		}
+	}
+	return false
+}
+
 // Invariant: Overrides are append-only audit records; historical QA scores and failures are never mutated or rewritten to PASS.
 // Invariant: Manual override requires an exact, currently pending ReviewItemID for the same asset and language.
 // Stage-only or implicit index-0 requests, nonexistent IDs, stale IDs, or non-pending IDs must be rejected.
@@ -124,6 +266,9 @@ func (s *ReviewService) RecordManualOverride(ctx context.Context, in ManualOverr
 	}
 	if targetItem == nil {
 		return nil, fmt.Errorf("review item %q not found in pending review queue for asset %s (%s)", in.ReviewItemID, in.AssetID, in.TargetLanguage)
+	}
+	if targetItem.Type == domain.ReviewItemTypeTTSOverrun && targetItem.Stage == "dub_synthesize" {
+		return nil, fmt.Errorf("review item %q is a hard timing blocker and cannot be manually overridden; correct or re-synthesize the segment", targetItem.ID)
 	}
 
 	runID := in.RunID
@@ -305,7 +450,7 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 	}
 	requestedRunID := strings.TrimSpace(in.RunID)
 	if requestedRunID == "" {
-		in.RunID = fmt.Sprintf("corr-run-%d", time.Now().UnixNano())
+		return nil, errors.New("run_id is required for target text correction")
 	}
 
 	result := &TargetTextCorrectionResult{
@@ -335,27 +480,23 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 	// 1. Update TranslationVariant with honest QA validation (never hardcoding 1.0/PASS)
 	var transIdx *storage.TranslationVariantIndex
 	var err error
-	if requestedRunID != "" {
-		transIdx, err = s.db.GetTranslationVariantIndexByRun(ctx, requestedRunID)
-		if errors.Is(err, storage.ErrNotFound) {
-			// A run that replayed cached stages owns no variant row of its own; its stage
-			// execution records the artifact it consumed (see runBoundArtifactCAS).
-			casHash, boundErr := s.runBoundArtifactCAS(ctx, requestedRunID, "translation")
-			if boundErr != nil {
-				return nil, boundErr
-			}
-			if casHash != "" {
-				transIdx = &storage.TranslationVariantIndex{
-					AssetID: in.AssetID, RunID: requestedRunID, TargetLanguage: in.TargetLanguage, CASHash: casHash,
-				}
-				err = nil
-			}
+	transIdx, err = s.db.GetTranslationVariantIndexByRun(ctx, requestedRunID)
+	if errors.Is(err, storage.ErrNotFound) {
+		// A run that replayed cached stages owns no variant row of its own; its stage
+		// execution records the artifact it consumed (see runBoundArtifactCAS).
+		casHash, boundErr := s.runBoundArtifactCAS(ctx, requestedRunID, "translation")
+		if boundErr != nil {
+			return nil, boundErr
 		}
-		if err == nil && transIdx != nil && (transIdx.AssetID != in.AssetID || !strings.EqualFold(transIdx.TargetLanguage, in.TargetLanguage)) {
-			return nil, fmt.Errorf("translation variant run binding mismatch for run %s", requestedRunID)
+		if casHash != "" {
+			transIdx = &storage.TranslationVariantIndex{
+				AssetID: in.AssetID, RunID: requestedRunID, TargetLanguage: in.TargetLanguage, CASHash: casHash,
+			}
+			err = nil
 		}
-	} else {
-		transIdx, err = s.db.GetTranslationVariantIndex(ctx, in.AssetID, in.TargetLanguage)
+	}
+	if err == nil && transIdx != nil && (transIdx.AssetID != in.AssetID || !strings.EqualFold(transIdx.TargetLanguage, in.TargetLanguage)) {
+		return nil, fmt.Errorf("translation variant run binding mismatch for run %s", requestedRunID)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("load translation variant index: %w", err)
@@ -370,8 +511,8 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		return nil, fmt.Errorf("decode translation variant (%s): %w", transIdx.CASHash, err)
 	}
 	trc.Close()
-	if tVar.AssetID != in.AssetID || !strings.EqualFold(tVar.TargetLanguage, in.TargetLanguage) {
-		return nil, fmt.Errorf("translation variant artifact %s belongs to asset %s (%s), expected asset %s (%s)", transIdx.CASHash, tVar.AssetID, tVar.TargetLanguage, in.AssetID, in.TargetLanguage)
+	if err := s.validateTranslationCompatibility(ctx, requestedRunID, in, &tVar, transIdx); err != nil {
+		return nil, err
 	}
 	// A segment's own index is the source speech-block index, not its position in the slice: a clip
 	// with silent stretches indexes 0,2,4,6, so indexing the slice with it rejected every correction
@@ -386,7 +527,8 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		qaGate = NewMeaningFirstQAGate()
 	}
 
-	qaRes := qaGate.ValidateSegment(tVar.Segments[transPos].SourceText, in.NewTargetText, tVar.SourceLanguage, in.TargetLanguage)
+	applicableGlossary := glossaryForSource(tVar.EffectiveGlossary, tVar.Segments[transPos].SourceText)
+	qaRes := qaGate.ValidateSegment(tVar.Segments[transPos].SourceText, in.NewTargetText, tVar.SourceLanguage, in.TargetLanguage, applicableGlossary)
 
 	tVar.ID = uuid.NewString()
 	tVar.RunID = in.RunID
@@ -409,9 +551,16 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		tVar.OverallQAScore = totalConf / float64(len(tVar.Segments))
 	}
 
-	// Compute updated provenance hash
+	// Compute updated provenance hash chaining from original provenance
+	baseProvenance := tVar.ProvenanceHash
+	if baseProvenance == "" && transIdx != nil {
+		baseProvenance = transIdx.ProvenanceHash
+	}
+	if baseProvenance == "" {
+		return nil, fmt.Errorf("translation variant %s is missing provenance hash", transIdx.CASHash)
+	}
 	hTrans := sha256.New()
-	_, _ = hTrans.Write([]byte(fmt.Sprintf("%s:%s:%d:%s", transIdx.ProvenanceHash, in.TargetLanguage, in.SegmentIndex, in.NewTargetText)))
+	_, _ = hTrans.Write([]byte(fmt.Sprintf("%s:%s:%d:%s", baseProvenance, in.TargetLanguage, in.SegmentIndex, in.NewTargetText)))
 	tVar.ProvenanceHash = hex.EncodeToString(hTrans.Sum(nil))
 
 	tBytes, err := json.MarshalIndent(tVar, "", "  ")
@@ -465,7 +614,7 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		if pos := slices.IndexFunc(dsVar.Segments, func(s domain.DubScriptSegment) bool { return s.Index == in.SegmentIndex }); pos >= 0 {
 			seg := &dsVar.Segments[pos]
 			seg.SpokenText = in.SpokenTextOverride
-			spQa := qaGate.ValidateSegment(seg.SourceText, in.SpokenTextOverride, tVar.SourceLanguage, in.TargetLanguage)
+			spQa := qaGate.ValidateSegment(seg.SourceText, in.SpokenTextOverride, tVar.SourceLanguage, in.TargetLanguage, glossaryForSource(tVar.EffectiveGlossary, seg.SourceText))
 			seg.PassedQAGate = spQa.Passed
 			seg.QAConfidence = spQa.Confidence
 			seg.KeyFacts = spQa.ExtractedFacts
@@ -516,19 +665,63 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		return nil, err
 	}
 
-	// 3. Rerun TTS & DubSegments synthesis
+	// 3. Re-freeze the chosen voices against the corrected DubScript/Transcript lineage,
+	// then rerun TTS & DubSegments synthesis. A corrected script must not keep pointing
+	// at a VoiceAssignment frozen for the pre-correction script: the mixer validates the
+	// exact pinned lineage and will (correctly) refuse that stale combination.
 	voiceAssignCAS := ""
 	var vaIdx *storage.VoiceAssignmentIndex
-	if requestedRunID != "" {
-		vaIdx, err = s.db.GetVoiceAssignmentIndexByRun(ctx, in.AssetID, requestedRunID, in.TargetLanguage)
-	} else {
-		vaIdx, err = s.db.GetVoiceAssignmentIndex(ctx, in.AssetID, in.TargetLanguage)
-	}
-	if err == nil && vaIdx != nil {
-		voiceAssignCAS = vaIdx.CASHash
-	} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+	vaIdx, err = s.db.GetVoiceAssignmentIndexByRun(ctx, in.AssetID, requestedRunID, in.TargetLanguage)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return nil, fmt.Errorf("load voice assignment index: %w", err)
 	}
+
+	voiceInput := domain.VoiceAssignmentInput{
+		RunID:                 in.RunID,
+		AssetID:               in.AssetID,
+		JobID:                 in.JobID,
+		TargetLanguage:        in.TargetLanguage,
+		DubScriptVariantCAS:   result.DubScriptVariantCAS,
+		TranscriptArtifactCAS: tVar.TranscriptArtifactCAS,
+		ExecutionProfile:      in.ExecutionProfile,
+	}
+	var priorAssignment *domain.VoiceAssignment
+	if vaIdx != nil && strings.TrimSpace(vaIdx.CASHash) != "" {
+		vaRC, loadErr := s.cas.Get(vaIdx.CASHash)
+		if loadErr != nil {
+			return nil, fmt.Errorf("load frozen voice assignment from CAS (%s): %w", vaIdx.CASHash, loadErr)
+		}
+		var loaded domain.VoiceAssignment
+		decodeErr := json.NewDecoder(vaRC).Decode(&loaded)
+		vaRC.Close()
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode frozen voice assignment (%s): %w", vaIdx.CASHash, decodeErr)
+		}
+		if loaded.AssetID != "" && loaded.AssetID != in.AssetID {
+			return nil, fmt.Errorf("voice assignment artifact %s belongs to asset %s, expected %s", vaIdx.CASHash, loaded.AssetID, in.AssetID)
+		}
+		if loaded.TargetLanguage != "" && !strings.EqualFold(loaded.TargetLanguage, in.TargetLanguage) {
+			return nil, fmt.Errorf("voice assignment artifact %s uses language %s, expected %s", vaIdx.CASHash, loaded.TargetLanguage, in.TargetLanguage)
+		}
+		loaded.CASHash = vaIdx.CASHash
+		priorAssignment = &loaded
+		voiceInput.CustomAssignments = loaded.Assignments
+		voiceInput.UseSameVoiceForAll = loaded.UseSameVoiceForAll
+	}
+
+	var frozenAssignment *domain.VoiceAssignment
+	if priorAssignment != nil && priorAssignment.RunID == in.RunID {
+		frozenAssignment, err = s.dubbingSvc.ReassignVoice(ctx, voiceInput)
+	} else {
+		frozenAssignment, err = s.dubbingSvc.AssignVoices(ctx, voiceInput)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("freeze corrected voice assignment lineage: %w", err)
+	}
+	if frozenAssignment == nil || strings.TrimSpace(frozenAssignment.CASHash) == "" {
+		return nil, errors.New("freeze corrected voice assignment lineage produced no CAS artifact")
+	}
+	voiceAssignCAS = frozenAssignment.CASHash
 
 	dubbingJobIn := domain.DubbingJobInput{
 		RunID:                 in.RunID,
@@ -537,6 +730,7 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		TargetLanguage:        in.TargetLanguage,
 		DubScriptVariantCAS:   result.DubScriptVariantCAS,
 		VoiceAssignmentCAS:    voiceAssignCAS,
+		TranscriptArtifactCAS: tVar.TranscriptArtifactCAS,
 		ExecutionProfile:      in.ExecutionProfile,
 		AuthorizedCredentials: in.AuthorizedCredentials,
 	}
@@ -651,9 +845,11 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 		}
 	}
 
-	// DubSegments candidate must fit without overrun
+	// DubSegments candidate must satisfy the accepted playback-window contract.
 	if pos := slices.IndexFunc(dubSegsVar.Segments, func(s domain.DubSegment) bool { return s.Index == in.SegmentIndex }); pos >= 0 {
-		if seg := dubSegsVar.Segments[pos]; seg.RequiresReview || seg.FitDecision == domain.FitActionReview || (seg.SlotDurationMs > 0 && seg.MeasuredDurationMs > seg.SlotDurationMs) {
+		seg := dubSegsVar.Segments[pos]
+		playbackDurationMs := seg.DubPlaybackEndMs - seg.StartMs
+		if seg.RequiresReview || seg.FitDecision != domain.FitActionAccept || playbackDurationMs <= 0 || seg.MeasuredDurationMs > playbackDurationMs {
 			isResolved = false
 		}
 	}
@@ -682,13 +878,16 @@ func (s *ReviewService) CorrectTargetText(ctx context.Context, in TargetTextCorr
 // ReassignVoice explicitly changes one or more speakers' frozen voices for a run,
 // regenerating exactly that speaker's affected downstream scope (TTS -> DubSegment -> DubMix -> RenderPlan)
 // while strictly preserving source-derived extractions (source media, audio stems, transcript alignment, text regions).
-// Run-pinned callers stay strictly run-bound; legacy asset-scoped callers that send no
-// run_id resolve the run from the asset's latest dub script variant for the target language.
+// Voice reassignment is strictly run-bound so a correction can never adopt another
+// run's latest script, transcript, or downstream lineage.
 func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorrectionInput) (*VoiceReassignCorrectionResult, error) {
 	if strings.TrimSpace(in.AssetID) == "" {
 		return nil, errors.New("asset_id is required")
 	}
 	pinnedRunID := strings.TrimSpace(in.RunID)
+	if pinnedRunID == "" {
+		return nil, errors.New("run_id is required for voice reassignment")
+	}
 	targetLang := strings.ToLower(strings.TrimSpace(in.TargetLanguage))
 	if targetLang == "" {
 		targetLang = "vi"
@@ -708,41 +907,52 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 		return nil, errors.New("render service is required for voice reassign rerun")
 	}
 
-	// 1. Resolve the dub script variant the reassignment regenerates against. A
-	// run-pinned caller stays strictly run-bound. The legacy asset-scoped route
-	// (POST /api/v1/assets/{id}/inspector/reassign-voice) sends no run_id and keeps
-	// the latest-variant-for-asset/language resolution, adopting the run that variant
-	// was produced for so the regeneration below still writes run-bound artifacts.
+	// 1. Resolve the exact run-bound dub script variant the reassignment regenerates
+	// against. Asset-latest fallback is deliberately prohibited: a voice correction
+	// must never adopt another run's script merely because the caller omitted run_id.
 	var dubScriptIdx *storage.DubScriptVariantIndex
 	var err error
-	if pinnedRunID != "" {
-		dubScriptIdx, err = s.db.GetDubScriptVariantIndexByRun(ctx, pinnedRunID)
-		if err != nil {
-			return nil, fmt.Errorf("load run dub script variant: %w", err)
-		}
-		if dubScriptIdx == nil || dubScriptIdx.AssetID != in.AssetID || !strings.EqualFold(dubScriptIdx.TargetLanguage, in.TargetLanguage) {
-			return nil, fmt.Errorf("dub script variant run binding mismatch for run %s", pinnedRunID)
-		}
-	} else {
-		dubScriptIdx, err = s.db.GetDubScriptVariantIndex(ctx, in.AssetID, in.TargetLanguage)
-		if err != nil {
-			return nil, fmt.Errorf("load latest dub script variant: %w", err)
-		}
-		if dubScriptIdx == nil || strings.TrimSpace(dubScriptIdx.RunID) == "" {
-			return nil, fmt.Errorf("run_id is required: no run-bound dub script variant for asset %s (%s)", in.AssetID, in.TargetLanguage)
-		}
-		in.RunID = dubScriptIdx.RunID
+	dubScriptIdx, err = s.db.GetDubScriptVariantIndexByRun(ctx, pinnedRunID)
+	if err != nil {
+		return nil, fmt.Errorf("load run dub script variant: %w", err)
+	}
+	if dubScriptIdx == nil || dubScriptIdx.AssetID != in.AssetID || !strings.EqualFold(dubScriptIdx.TargetLanguage, in.TargetLanguage) {
+		return nil, fmt.Errorf("dub script variant run binding mismatch for run %s", pinnedRunID)
 	}
 
-	// 2. Reassign voice profile(s) for the run
+	// 2. Reassign voice profile(s) for the run against the exact current script/transcript lineage.
+	// Historical assignments may predate these pins; a successor used by the current mixer must not.
+	// The asset-latest fallback below applies only when the run genuinely pins no transcript: a run whose
+	// pinned-transcript proof failed must not silently adopt another run's transcript.
+	transcriptCAS, err := resolveRunTranscriptCAS(ctx, s.db, in.RunID, in.AssetID, "voice reassignment")
+	if err != nil {
+		return nil, fmt.Errorf("resolve run transcript lineage for voice reassignment: %w", err)
+	}
+	if strings.TrimSpace(transcriptCAS) == "" {
+		dubScript, _, loadErr := s.dubbingSvc.loadDubScriptVariant(ctx, in.AssetID, targetLang, dubScriptIdx.CASHash)
+		if loadErr != nil {
+			return nil, fmt.Errorf("load exact dub script lineage for voice reassignment: %w", loadErr)
+		}
+		if strings.TrimSpace(dubScript.TranslationVariantCAS) != "" {
+			transcriptCAS, err = s.dubbingSvc.transcriptCASFromTranslationVariant(in.AssetID, targetLang, dubScript.TranslationVariantCAS)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if strings.TrimSpace(transcriptCAS) == "" {
+		return nil, fmt.Errorf("pinned transcript artifact is required for voice reassignment")
+	}
 	assignIn := domain.VoiceAssignmentInput{
-		RunID:              in.RunID,
-		AssetID:            in.AssetID,
-		JobID:              in.JobID,
-		TargetLanguage:     in.TargetLanguage,
-		CustomAssignments:  in.CustomAssignments,
-		UseSameVoiceForAll: in.UseSameVoiceForAll,
-		ExecutionProfile:   in.ExecutionProfile,
+		RunID:                 in.RunID,
+		AssetID:               in.AssetID,
+		JobID:                 in.JobID,
+		TargetLanguage:        in.TargetLanguage,
+		CustomAssignments:     in.CustomAssignments,
+		UseSameVoiceForAll:    in.UseSameVoiceForAll,
+		ExecutionProfile:      in.ExecutionProfile,
+		DubScriptVariantCAS:   dubScriptIdx.CASHash,
+		TranscriptArtifactCAS: transcriptCAS,
 	}
 	newAssign, err := s.dubbingSvc.ReassignVoice(ctx, assignIn)
 	if err != nil {
@@ -762,6 +972,7 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 		TargetLanguage:        in.TargetLanguage,
 		VoiceAssignmentCAS:    newAssign.CASHash,
 		DubScriptVariantCAS:   dubScriptIdx.CASHash,
+		TranscriptArtifactCAS: transcriptCAS,
 		ExecutionProfile:      in.ExecutionProfile,
 		AuthorizedCredentials: in.AuthorizedCredentials,
 	}
@@ -1355,7 +1566,16 @@ func (s *ReviewService) EvaluateFinalRenderHandoff(ctx context.Context, in domai
 		}, nil
 	}
 
-	// 2. Queue is zero
+	// 2. The run's own delivery lineage must still be current. A correction supersedes the dub mix or
+	// render plan for one run; until that run re-freezes them, a handoff would publish the artifacts the
+	// correction replaced, so the refusal here names them and keeps the run resumable.
+	if reason, err := s.staleDeliveryLineage(ctx, in.AssetID, in.TargetLanguage, in.RunID); err != nil {
+		return nil, err
+	} else if reason != "" {
+		return nil, errors.New(reason)
+	}
+
+	// 3. Queue is zero and the lineage is current.
 	result := &domain.FinalRenderHandoffResult{
 		AssetID:             in.AssetID,
 		RunID:               in.RunID,
@@ -1395,6 +1615,86 @@ func (s *ReviewService) EvaluateFinalRenderHandoff(ctx context.Context, in domai
 	}
 
 	return result, nil
+}
+
+// finalRenderDeliveryStages name the run stages whose artifacts a final render consumes, in pipeline order.
+// A correction that invalidates one of them leaves the run mid-delivery: the resumed pipeline rebuilds the
+// stage before the handoff stage runs again.
+var finalRenderDeliveryStages = []string{"audio_mix", "render_plan", "render_preview"}
+
+// staleDeliveryLineage reports why a run may not hand off for final render, or "" when its delivery lineage
+// is current. The explicit final render resolves the asset-latest render plan and executes the dub mix that
+// plan pins, so a correction that superseded this run's mix or render plan leaves the run holding artifacts
+// the correction replaced; handing off would publish them. Read failures are returned: a lineage this
+// cannot describe must never be reported as fresh.
+func (s *ReviewService) staleDeliveryLineage(ctx context.Context, assetID, targetLang, runID string) (string, error) {
+	if s.db == nil || strings.TrimSpace(runID) == "" {
+		return "", nil
+	}
+	stages, err := s.db.ListStageExecutions(ctx, runID)
+	if err != nil {
+		return "", fmt.Errorf("read run %s delivery lineage: %w", runID, err)
+	}
+	// ListStageExecutions is ordered by creation, so the last row per stage is its newest attempt.
+	newest := make(map[string]domain.StageExecution, len(finalRenderDeliveryStages))
+	for _, se := range stages {
+		for _, stage := range finalRenderDeliveryStages {
+			if se.Stage == stage {
+				newest[stage] = se
+			}
+		}
+	}
+	for _, stage := range finalRenderDeliveryStages {
+		if se, ok := newest[stage]; ok && se.Status == domain.StageStatusQueued {
+			return fmt.Sprintf("final render handoff refused: a correction invalidated the run's %s artifact and the run has not rebuilt it yet; resume the run to re-freeze the corrected lineage before final render", stage), nil
+		}
+	}
+
+	mixCAS := ""
+	if se, ok := newest["audio_mix"]; ok && se.Status == domain.StageStatusSucceeded {
+		mixCAS = strings.TrimSpace(se.ArtifactSHA256)
+	}
+	if mixCAS == "" {
+		idx, err := s.db.GetDubMixArtifactIndexByRun(ctx, runID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return "", fmt.Errorf("read run %s dub mix lineage: %w", runID, err)
+		}
+		if idx != nil {
+			mixCAS = strings.TrimSpace(idx.CASHash)
+		}
+	}
+
+	planCAS := ""
+	if se, ok := newest["render_plan"]; ok && se.Status == domain.StageStatusSucceeded {
+		planCAS = strings.TrimSpace(se.ArtifactSHA256)
+	}
+	if planCAS == "" {
+		// With no plan pinned to the run, the handoff renders the asset's latest plan.
+		idx, err := s.db.GetRenderPlanIndex(ctx, assetID, targetLang)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return "", fmt.Errorf("read asset %s render plan lineage: %w", assetID, err)
+		}
+		if idx != nil {
+			planCAS = strings.TrimSpace(idx.CASHash)
+		}
+	}
+	if mixCAS == "" || planCAS == "" {
+		return "", nil
+	}
+
+	rc, err := s.cas.Get(planCAS)
+	if err != nil {
+		return "", fmt.Errorf("read render plan %s for handoff lineage: %w", planCAS, err)
+	}
+	defer rc.Close()
+	var plan domain.RenderPlan
+	if err := json.NewDecoder(rc).Decode(&plan); err != nil {
+		return "", fmt.Errorf("decode render plan %s for handoff lineage: %w", planCAS, err)
+	}
+	if plan.DubMixCASHash != "" && plan.DubMixCASHash != mixCAS {
+		return fmt.Sprintf("final render handoff refused: render plan %s still pins dub mix %s but the run's current dub mix is %s; re-freeze the render plan from the corrected mix before final render", planCAS, plan.DubMixCASHash, mixCAS), nil
+	}
+	return "", nil
 }
 
 // ProjectReviewItems collects and projects all actionable review exceptions for a given asset and target language.

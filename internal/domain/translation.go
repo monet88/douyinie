@@ -2,19 +2,34 @@ package domain
 
 import (
 	"errors"
+	"strings"
 	"time"
+	"unicode"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // Translation domain errors.
 var (
-	ErrMeaningPreservationFailed  = errors.New("meaning preservation validation failed")
-	ErrFactCorrupted              = errors.New("fact or entity corrupted in translation")
-	ErrNameCorrupted              = errors.New("named entity corrupted or dropped in translation")
-	ErrNumberCorrupted            = errors.New("numerical value or quantity corrupted in translation")
-	ErrNegationInverted           = errors.New("negation polarity inverted in translation")
-	ErrTranslationVariantNotFound = errors.New("translation variant not found")
-	ErrEmptyTranslationInput      = errors.New("empty translation input")
-	ErrDubScriptVariantNotFound   = errors.New("dub script variant not found")
+	ErrMeaningPreservationFailed    = errors.New("meaning preservation validation failed")
+	ErrFactCorrupted                = errors.New("fact or entity corrupted in translation")
+	ErrNameCorrupted                = errors.New("named entity corrupted or dropped in translation")
+	ErrNumberCorrupted              = errors.New("numerical value or quantity corrupted in translation")
+	ErrNegationInverted             = errors.New("negation polarity inverted in translation")
+	ErrTranslationVariantNotFound   = errors.New("translation variant not found")
+	ErrEmptyTranslationInput        = errors.New("empty translation input")
+	ErrDubScriptVariantNotFound     = errors.New("dub script variant not found")
+	ErrTranslationOwnershipMismatch = errors.New("translation ownership mismatch")
+	ErrGlossaryConflict             = errors.New("request glossary conflicts with frozen run snapshot")
+	// ErrTranscriptLineageMissing is returned when a run has no pinned speech_understand transcript
+	// lineage and the caller cannot supply one. Transport layers classify it as a bad request.
+	ErrTranscriptLineageMissing = errors.New("missing pinned speech_understand transcript lineage")
+	// ErrTranscriptLineageMismatch is returned when a supplied or pinned transcript lineage does not
+	// match the run, job, or asset it is being used for.
+	ErrTranscriptLineageMismatch = errors.New("transcript lineage mismatch")
+	// ErrTranscriptLineageProofFailed is returned when the pinned-lineage proof itself could not be
+	// completed (storage/DB failure). It must not be treated as "no pinned transcript exists".
+	ErrTranscriptLineageProofFailed = errors.New("transcript lineage proof failed")
 )
 
 const (
@@ -23,13 +38,89 @@ const (
 	// ReviewReason and the rule that a segment failing the meaning gate is persisted
 	// with passed_qa_gate=false for operator review instead of rejecting the candidate:
 	// a variant cached under version 1 predates both.
-	TranslationSchemaVersion = 2
+	TranslationSchemaVersion = 3
 	DubScriptSchemaVersion   = 2
 
 	// ReviewReasonMeaningCorrupted marks a dub script segment whose spoken text failed
 	// the meaning-first gate. The operator corrects it or records a manual override.
 	ReviewReasonMeaningCorrupted = "meaning_corrupted"
 )
+
+// GlossaryEntry is one ordered request-local terminology rule. It is frozen with
+// the run config and never becomes a shared mutable catalog.
+type GlossaryEntry struct {
+	Source string `json:"source"`
+	Target string `json:"target"`
+	Note   string `json:"note,omitempty"`
+}
+
+// EffectiveGlossary is the resolved subset that actually matches the current
+// translation input. Its order is semantic and therefore participates in cache identity.
+type EffectiveGlossary struct {
+	Entries          []GlossaryEntry `json:"entries,omitempty"`
+	OmittedMatches   int             `json:"omitted_matches,omitempty"`
+	OmittedConflicts int             `json:"omitted_conflicts,omitempty"`
+	Hash             string          `json:"hash,omitempty"`
+}
+
+// NormalizeGlossarySource canonicalizes a glossary source or target term for matching:
+// NFKC, trimmed, and lowercased.
+func NormalizeGlossarySource(s string) string {
+	return strings.ToLower(norm.NFKC.String(strings.TrimSpace(s)))
+}
+
+// HasCJK reports whether the string contains any CJK ideographs or kana/hangul runes.
+func HasCJK(s string) bool {
+	for _, r := range s {
+		if unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul) {
+			return true
+		}
+	}
+	return false
+}
+
+// GlossaryWordRune reports whether r is a Latin word rune, digit, or underscore.
+// Non-Latin scripts (such as CJK) return false so Latin boundaries do not block
+// matching adjacent to CJK or non-Latin characters (e.g. "AI" in "AI模型").
+func GlossaryWordRune(r rune) bool {
+	if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+		return true
+	}
+	return unicode.In(r, unicode.Latin)
+}
+
+// GlossaryTermMatches reports whether term appears in text according to the
+// request-local glossary matching contract: NFKC/lowercase normalization,
+// Latin/digit/underscore boundaries, and CJK substring matching.
+func GlossaryTermMatches(text, term string) bool {
+	normText := []rune(NormalizeGlossarySource(text))
+	needle := []rune(NormalizeGlossarySource(term))
+	if len(needle) == 0 || len(normText) < len(needle) {
+		return false
+	}
+	for i := 0; i+len(needle) <= len(normText); i++ {
+		match := true
+		for j := range needle {
+			if normText[i+j] != needle[j] {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		if HasCJK(string(needle)) {
+			return true
+		}
+		leftOK := i == 0 || !GlossaryWordRune(normText[i-1])
+		right := i + len(needle)
+		rightOK := right == len(normText) || !GlossaryWordRune(normText[right])
+		if leftOK && rightOK {
+			return true
+		}
+	}
+	return false
+}
 
 // TranslationSegment represents a single translated unit (typically mapped 1:1 to a SpeechBlock or visual text region).
 type TranslationSegment struct {
@@ -52,24 +143,28 @@ type TranslationSegment struct {
 // TranslationVariant is the immutable target-language meaning-preserving artifact.
 // Consumed explicitly by downstream stages: T10 (visual text localization) and T13 (dubbing translation).
 type TranslationVariant struct {
-	ID                string               `json:"id"`
-	SchemaVersion     int                  `json:"schema_version"`
-	AssetID           string               `json:"asset_id"`
-	RunID             string               `json:"run_id"`
-	JobID             string               `json:"job_id,omitempty"`
-	SourceLanguage    string               `json:"source_language"` // e.g. "zh"
-	TargetLanguage    string               `json:"target_language"` // "vi" or "en"
-	Segments          []TranslationSegment `json:"segments"`
-	ProviderID        string               `json:"provider_id"`
-	ModelName         string               `json:"model_name"`
-	ModelVersion      string               `json:"model_version"`
-	ServiceBaselineID string               `json:"service_baseline_id,omitempty"`
-	ObservedModel     string               `json:"observed_model,omitempty"`
-	SystemFingerprint string               `json:"system_fingerprint,omitempty"`
-	CASHash           string               `json:"cas_hash,omitempty"`
-	ProvenanceHash    string               `json:"provenance_hash,omitempty"`
-	OverallQAScore    float64              `json:"overall_qa_score"`
-	CreatedAt         time.Time            `json:"created_at"`
+	ID                    string               `json:"id"`
+	SchemaVersion         int                  `json:"schema_version"`
+	AssetID               string               `json:"asset_id"`
+	RunID                 string               `json:"run_id"`
+	JobID                 string               `json:"job_id,omitempty"`
+	SourceLanguage        string               `json:"source_language"` // e.g. "zh"
+	TargetLanguage        string               `json:"target_language"` // "vi" or "en"
+	ContractID            string               `json:"contract_id"`
+	EffectiveGlossary     EffectiveGlossary    `json:"effective_glossary,omitempty"`
+	TranscriptArtifactCAS string               `json:"transcript_artifact_cas,omitempty"`
+	InputHash             string               `json:"input_hash"`
+	Segments              []TranslationSegment `json:"segments"`
+	ProviderID            string               `json:"provider_id"`
+	ModelName             string               `json:"model_name"`
+	ModelVersion          string               `json:"model_version"`
+	ServiceBaselineID     string               `json:"service_baseline_id,omitempty"`
+	ObservedModel         string               `json:"observed_model,omitempty"`
+	SystemFingerprint     string               `json:"system_fingerprint,omitempty"`
+	CASHash               string               `json:"cas_hash,omitempty"`
+	ProvenanceHash        string               `json:"provenance_hash,omitempty"`
+	OverallQAScore        float64              `json:"overall_qa_score"`
+	CreatedAt             time.Time            `json:"created_at"`
 }
 
 // TranslationInputSegment is a text input segment for translation.
@@ -88,6 +183,8 @@ type TranslationJobInput struct {
 	JobID                 string                    `json:"job_id,omitempty"`
 	SourceLanguage        string                    `json:"source_language"`
 	TargetLanguage        string                    `json:"target_language"`
+	Glossary              []GlossaryEntry           `json:"glossary,omitempty"`
+	EffectiveGlossary     EffectiveGlossary         `json:"effective_glossary,omitempty"`
 	Segments              []TranslationInputSegment `json:"segments"`
 	TranscriptArtifactCAS string                    `json:"transcript_artifact_cas,omitempty"`
 	ExecutionProfile      ExecutionProfile          `json:"execution_profile,omitempty"`

@@ -43,7 +43,7 @@
     { "id": "separation_worker", "type": "backend", "label": "Audio Separation", "sublabel": "Demucs / UVR", "pos": [660, 50], "size": [130, 56], "tag": "16kHz Mono" },
     { "id": "asr_worker", "type": "backend", "label": "ASR & Aligner", "sublabel": "Qwen3 + 3D-Speaker", "pos": [860, 50], "size": [130, 56], "tag": "Speech Blocks" },
     { "id": "ocr_worker", "type": "backend", "label": "OCR & Ink Refine", "sublabel": "PaddleOCR + Refine", "pos": [660, 295], "size": [130, 56], "tag": "Ink Refine" },
-    { "id": "tts_worker", "type": "backend", "label": "TTS Worker", "sublabel": "ZeroTTS / CosyVoice3", "pos": [860, 215], "size": [130, 56], "tag": "Zero Overrun" },
+    { "id": "tts_worker", "type": "backend", "label": "TTS Worker", "sublabel": "ZeroTTS / CosyVoice3", "pos": [860, 215], "size": [130, 56], "tag": "Playback Window" },
     { "id": "render_worker", "type": "backend", "label": "Render Worker", "sublabel": "FFmpeg Mix & Draw", "pos": [860, 375], "size": [130, 56], "tag": "Final Media" }
   ],
   "boundaries": [
@@ -87,7 +87,7 @@
       "title": "Quality & Domain Invariants",
       "items": [
         "SourceTimeline bất biến; thời lượng video và âm thanh bảo toàn tuyệt đối không co giãn",
-        "Zero Overrun: tts_finish <= source_end; tự động escalate speaker sang CosyVoice3 nếu ZeroTTS quá thời lượng",
+        "Playback Window: source anchors bất biến; waveform dub phải kết thúc <= DubPlaybackEndMs được suy ra từ source silence thật với reserve và không va chạm clip kế tiếp",
         "Fail-Closed: từ chối hòa âm (ErrMixerOverrunRefused) nếu có lời thoại nhưng không có clip lồng tiếng đặt được"
       ]
     }

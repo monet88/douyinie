@@ -9,7 +9,10 @@ package seam1_test
 //
 //  1. measured media truth                      — candidates are fit-gated on PROBED waveform
 //     duration, never on predicted/WPM planning evidence.
-//  2. tts_finish <= immutable_source_window_end — zero overrun inside the immutable slot.
+//  2. accepted playback window                  — a dub finish may borrow proven source silence
+//     past the immutable source window end, but it must stay inside the persisted
+//     DubPlaybackEndMs for its segment and never breach it (the retired "zero overrun" rule
+//     required finish <= source end and no longer holds).
 //  3. no adjacent collision / run-on            — dub spans never collide on the timeline.
 //  4. perceptible turn gaps                     — the inter-turn breathing room equals the
 //     source-derived relation next_turn_start − dub_finish (clamped ≥ 0), never a hard-coded
@@ -329,7 +332,9 @@ func TestSeam1_AcceptanceGate_NormativeInvariants(t *testing.T) {
 			h := setupHarness(t)
 			configureFixtureProviders(t, h, fg)
 
-			jobID, runID := createJobAndRun(t, h)
+			// The canonical fixtures exercise source windows out to ~30s; give the
+			// synthetic media enough real sample extent for the waveform-safe mixer gate.
+			jobID, runID := createJobAndRunWithDuration(t, h, 35.0)
 			job := getJobViaAPI(t, h, jobID)
 			assetID := job.SourceAssetID
 			targetLang := domain.TargetLanguageVI
@@ -396,7 +401,8 @@ func TestSeam1_AcceptanceGate_NormativeInvariants(t *testing.T) {
 			}
 			respMix, mix := runAudioMix(t, h, assetID, mixPayload)
 			if respMix.StatusCode != http.StatusCreated {
-				t.Fatalf("audio-mix failed: status=%d", respMix.StatusCode)
+				body, _ := io.ReadAll(respMix.Body)
+				t.Fatalf("audio-mix failed: status=%d body=%s", respMix.StatusCode, string(body))
 			}
 			if fg.expectDub && dubSegments != nil && mix.DubSegmentsCAS != dubSegments.CASHash {
 				t.Errorf("audio mix DubSegmentsCAS %q != synthesized dub segments CAS %q (lineage breach)",
@@ -459,6 +465,7 @@ func configureFixtureProviders(t *testing.T, h *testHarness, fg fixtureGate) {
 // segments (the fixture's immutable source speech windows).
 func runFixtureTranslation(t *testing.T, h *testHarness, assetID, runID string, segments []domain.TranslationInputSegment, evidence string) *domain.TranslationVariant {
 	t.Helper()
+	pinSeam1TranscriptForSegments(t, h, runID, assetID, segments)
 	resp, v := runTranslation(t, h, assetID, map[string]any{
 		"run_id":          runID,
 		"target_language": domain.TargetLanguageVI,
@@ -597,13 +604,22 @@ func assertDubInvariants(t *testing.T, h *testHarness, fg fixtureGate, assetID s
 		if seg.Index != i {
 			t.Errorf("segment %d: unexpected segment index %d", i, seg.Index)
 		}
-		// Invariant 2: tts_finish <= immutable source window end (zero overrun).
+		// Invariant 2 (#153 retired "zero overrun"): the accepted playback window for a segment is
+		// [StartMs, DubPlaybackEndMs]. The source end stays immutable, but a candidate may borrow
+		// proven source silence, so the finish only has to stay inside the persisted playback end —
+		// never breach it — and must not collide with the next localized speech (asserted below).
 		finish := seg.StartMs + seg.MeasuredDurationMs
-		if finish > seg.EndMs {
-			t.Errorf("segment %d zero-overrun breach: finish %dms > immutable end %dms", i, finish, seg.EndMs)
+		if seg.DubPlaybackEndMs < seg.EndMs || seg.DubPlaybackEndMs <= seg.StartMs {
+			t.Errorf("segment %d has an unusable dub playback end %d for source window %d-%d",
+				i, seg.DubPlaybackEndMs, seg.StartMs, seg.EndMs)
 		}
-		if seg.MeasuredDurationMs > seg.SlotDurationMs {
-			t.Errorf("segment %d measured %dms > slot %dms", i, seg.MeasuredDurationMs, seg.SlotDurationMs)
+		if finish > seg.DubPlaybackEndMs {
+			t.Errorf("segment %d playback-window breach: finish %dms > dub playback end %dms",
+				i, finish, seg.DubPlaybackEndMs)
+		}
+		if seg.MeasuredDurationMs > seg.DubPlaybackEndMs-seg.StartMs {
+			t.Errorf("segment %d measured %dms > accepted playback window %dms",
+				i, seg.MeasuredDurationMs, seg.DubPlaybackEndMs-seg.StartMs)
 		}
 		// Invariant 1: measured media truth — MeasuredDurationMs equals the probed waveform duration.
 		probed := probeSegmentDuration(t, h, seg.AudioSHA256)

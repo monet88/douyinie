@@ -631,7 +631,9 @@ func TestSeam1_QualityCorpus_SyntheticRegression_BoundProfile48Executions(t *tes
 		}
 	}
 	// Seed all 24 primary assets in SQLite DB and CAS
-	normAudioBytes := media.GeneratePCM16WAV(16000, 1, 3000)
+	// The canonical fake transcript contains speech through 7000ms. Keep the
+	// normalized source waveform long enough for #153's real media-end gate.
+	normAudioBytes := media.GeneratePCM16WAV(16000, 1, 8000)
 	normAudioObj, err := h.casStore.Put(bytes.NewReader(normAudioBytes))
 	if err != nil {
 		t.Fatalf("put normalized audio in CAS: %v", err)
@@ -673,6 +675,7 @@ func TestSeam1_QualityCorpus_SyntheticRegression_BoundProfile48Executions(t *tes
 		} else {
 			assetAudioRoles[p.AssetID] = []domain.AudioSegment{
 				{StartMs: 0, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
+				{StartMs: 3500, EndMs: 7000, Role: domain.AudioRoleNarrationDialogue},
 			}
 		}
 	}

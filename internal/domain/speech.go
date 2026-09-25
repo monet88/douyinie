@@ -90,6 +90,12 @@ const (
 	SpeechBlockTypeNoise   = "noise"
 )
 
+// IsSpeechBlock reports whether b is a dialogue speech block. Unset SegmentType
+// defaults to speech for backward compatibility with legacy artifacts.
+func IsSpeechBlock(b SpeechBlock) bool {
+	return b.SegmentType == "" || b.SegmentType == SpeechBlockTypeSpeech
+}
+
 // IsPathologicalRepetitionNoise detects non-semantic repetitive ASR noise loops
 // (such as Whisper looping on BGM/ambient sound with 4+ identical n-grams or
 // single-character runaway loops). It protects production translation/dubbing
@@ -387,29 +393,68 @@ func IsDubEligible(plan *AudioRolePlan) bool {
 	return false
 }
 
-// IsInsideDialogueWindow checks whether the timing interval [startMs, endMs] falls within
-// accepted narration/dialogue segments and does not overlap any non-dialogue segments
-// (singing/music-vocal, BGM/instrumental, ambience/SFX, uncertain).
-func IsInsideDialogueWindow(startMs, endMs int64, plan *AudioRolePlan) bool {
+// IsDubEligibleTiming checks whether the timing interval [startMs, endMs] has dialogue overlap
+// in AudioRolePlan and is not constrained by protected vocal regions (singing/music-vocal, uncertain).
+// Ordinary BGM/instrumental and ambience/SFX do not disqualify actual dialogue speech (Issue #153).
+func IsDubEligibleTiming(startMs, endMs int64, plan *AudioRolePlan) bool {
 	if plan == nil || len(plan.Segments) == 0 || endMs <= startMs {
 		return false
 	}
 	hasDialogue := false
 	for _, seg := range plan.Segments {
-		overlapStart := startMs
-		if seg.StartMs > overlapStart {
-			overlapStart = seg.StartMs
+		if startMs >= seg.EndMs || endMs <= seg.StartMs {
+			continue
 		}
-		overlapEnd := endMs
-		if seg.EndMs < overlapEnd {
-			overlapEnd = seg.EndMs
-		}
-		if overlapStart < overlapEnd {
-			if seg.Role != AudioRoleNarrationDialogue {
-				return false
-			}
+		switch seg.Role {
+		case AudioRoleNarrationDialogue:
 			hasDialogue = true
+		case AudioRoleSingingMusicVocal, AudioRoleUncertain:
+			return false
 		}
 	}
 	return hasDialogue
+}
+
+// IsDubEligibleSpeechBlock checks whether a SpeechBlock represents canonical dialogue speech eligible for dubbing:
+// it must be a valid speech block, carry real source text (not empty, not pathological repetition noise),
+// have dialogue overlap in AudioRolePlan, and not overlap protected vocal or uncertain regions
+// (singing/music-vocal, uncertain). Ordinary BGM/SFX/ambience do not disqualify (Issue #153).
+//
+// This is the single canonical eligibility predicate. Translation input, dub coverage, and mix coverage
+// must all agree on it: a block that translation drops as empty/noise must not still count as a required
+// dub member, otherwise the mix reports an impossible MISSING_REPLACEMENT blocker.
+func IsDubEligibleSpeechBlock(b SpeechBlock, plan *AudioRolePlan) bool {
+	if !IsSpeechBlock(b) {
+		return false
+	}
+	text := strings.TrimSpace(b.SourceText)
+	if text == "" || IsPathologicalRepetitionNoise(text) {
+		return false
+	}
+	if plan == nil || len(plan.Segments) == 0 {
+		return true
+	}
+	return IsDubEligibleTiming(b.StartMs, b.EndMs, plan)
+}
+
+// CanonicalTranslationSegments extracts canonical dub-eligible translation input segments from a TranscriptArtifact
+// using the unified dub-eligible SpeechBlock predicate (Issue #153).
+func CanonicalTranslationSegments(transcript *TranscriptArtifact, plan *AudioRolePlan) []TranslationInputSegment {
+	if transcript == nil {
+		return nil
+	}
+	var segments []TranslationInputSegment
+	for _, b := range transcript.SpeechBlocks {
+		if !IsDubEligibleSpeechBlock(b, plan) {
+			continue
+		}
+		segments = append(segments, TranslationInputSegment{
+			Index:      b.Index,
+			SourceText: strings.TrimSpace(b.SourceText),
+			SpeakerID:  b.SpeakerID,
+			StartMs:    b.StartMs,
+			EndMs:      b.EndMs,
+		})
+	}
+	return segments
 }

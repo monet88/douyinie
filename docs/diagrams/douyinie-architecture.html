@@ -5300,8 +5300,8 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
         <text data-detail="fine" x="725" y="343" class="t-backend" font-size="7" text-anchor="middle">Ink Refine</text>
         </g>
 
-        <g id="node-tts_worker" data-node-id="tts_worker" data-node-label="TTS Worker" tabindex="0" role="button" aria-label="Focus TTS Worker, ZeroTTS / CosyVoice3, Execution Plane (Seam 2 StageWorkers)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="ZeroTTS / CosyVoice3" data-node-tag="Zero Overrun" data-node-context="Execution Plane (Seam 2 StageWorkers)">
-          <title>TTS Worker · ZeroTTS / CosyVoice3 · Execution Plane (Seam 2 StageWorkers) · Zero Overrun</title>
+        <g id="node-tts_worker" data-node-id="tts_worker" data-node-label="TTS Worker" tabindex="0" role="button" aria-label="Focus TTS Worker, ZeroTTS / CosyVoice3, Execution Plane (Seam 2 StageWorkers)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="ZeroTTS / CosyVoice3" data-node-tag="Playback Window" data-node-context="Execution Plane (Seam 2 StageWorkers)">
+          <title>TTS Worker · ZeroTTS / CosyVoice3 · Execution Plane (Seam 2 StageWorkers) · Playback Window</title>
           <rect x="860" y="215" width="130" height="56" rx="6" class="c-mask"/>
           <rect x="860" y="215" width="130" height="56" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(866 221) scale(0.6875)">
@@ -5309,7 +5309,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
           </g>
           <text data-node-label="" data-detail-anchor="" x="925" y="241" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">TTS Worker</text>
         <text data-detail="context" x="925" y="257" class="t-muted" font-size="9" text-anchor="middle">ZeroTTS / CosyVoice3</text>
-        <text data-detail="fine" x="925" y="263" class="t-backend" font-size="7" text-anchor="middle">Zero Overrun</text>
+        <text data-detail="fine" x="925" y="263" class="t-backend" font-size="7" text-anchor="middle">Playback Window</text>
         </g>
 
         <g id="node-render_worker" data-node-id="render_worker" data-node-label="Render Worker" tabindex="0" role="button" aria-label="Focus Render Worker, FFmpeg Mix &amp; Draw, Execution Plane (Seam 2 StageWorkers)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="FFmpeg Mix &amp; Draw" data-node-tag="Final Media" data-node-context="Execution Plane (Seam 2 StageWorkers)">
@@ -5610,7 +5610,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
         </div>
         <ul>
           <li>&bull; SourceTimeline bất biến; thời lượng video và âm thanh bảo toàn tuyệt đối không co giãn</li>
-          <li>&bull; Zero Overrun: tts_finish &lt;= source_end; tự động escalate speaker sang CosyVoice3 nếu ZeroTTS quá thời lượng</li>
+          <li>&bull; Playback Window: source anchors bất biến; waveform dub phải kết thúc &lt;= DubPlaybackEndMs được suy ra từ source silence thật với reserve và không va chạm clip kế tiếp</li>
           <li>&bull; Fail-Closed: từ chối hòa âm (ErrMixerOverrunRefused) nếu có lời thoại nhưng không có clip lồng tiếng đặt được</li>
         </ul>
       </div>

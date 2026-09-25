@@ -3,6 +3,8 @@ package service_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -959,5 +961,71 @@ func TestAudioRoleService_ConcurrentGeneration_SerializedPerAsset(t *testing.T) 
 	// Ensure Asset A and Asset B are distinct
 	if plansA[0].ID == plansB[0].ID {
 		t.Fatalf("asset A and asset B produced identical plan ID %s", plansA[0].ID)
+	}
+}
+
+func TestAudioRoleService_SaveOperatorAudioRolePlan_HashParityAndIndex(t *testing.T) {
+	h := setupAudioRoleTestHarness(t)
+	ctx := context.Background()
+
+	durationMs := int64(3000)
+	sampleRate := 16000
+	totalSamples := (sampleRate * int(durationMs)) / 1000
+	vocal := make([]int16, totalSamples)
+	bg := make([]int16, totalSamples)
+	assetID, assetSHA := createControlledAsset(t, h, durationMs, vocal, bg)
+
+	segments := []domain.AudioSegment{
+		{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleNarrationDialogue},
+		{StartMs: 2000, EndMs: 3000, Role: domain.AudioRoleInstrumentalBgm},
+	}
+
+	plan, err := h.audioRole.SaveOperatorAudioRolePlan(ctx, assetID, segments)
+	if err != nil {
+		t.Fatalf("SaveOperatorAudioRolePlan failed: %v", err)
+	}
+
+	if plan.ProviderID != "operator" || plan.ModelName != "manual-role-plan" || plan.ModelVersion != "1" {
+		t.Fatalf("unexpected provider/model identity: %+v", plan)
+	}
+
+	// Verify provenance hash matches exact formula
+	segJSON, err := json.Marshal(segments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgDigest := sha256.Sum256(segJSON)
+	expectedProvenance := domain.ComputeAudioRolePlanProvenanceHash(assetSHA, "", "operator", "manual-role-plan", "1", hex.EncodeToString(cfgDigest[:]))
+	if plan.ProvenanceHash != expectedProvenance {
+		t.Fatalf("provenance mismatch: got %q, want %q", plan.ProvenanceHash, expectedProvenance)
+	}
+
+	// Verify CAS artifact content matches
+	rc, err := h.casStore.Get(plan.CASHash)
+	if err != nil {
+		t.Fatalf("get artifact from CAS: %v", err)
+	}
+	defer rc.Close()
+	var loadedPlan domain.AudioRolePlan
+	if err := json.NewDecoder(rc).Decode(&loadedPlan); err != nil {
+		t.Fatalf("decode CAS artifact: %v", err)
+	}
+	if loadedPlan.ProvenanceHash != expectedProvenance || plan.CASHash == "" {
+		t.Fatalf("loaded CAS plan mismatch: %+v, CASHash=%q", loadedPlan, plan.CASHash)
+	}
+
+	// Verify SQLite index
+	savedPlan, err := h.db.GetAudioRolePlan(ctx, assetID)
+	if err != nil {
+		t.Fatalf("get plan from db: %v", err)
+	}
+	if savedPlan.CASHash != plan.CASHash {
+		t.Fatalf("db saved plan CAS mismatch: %s != %s", savedPlan.CASHash, plan.CASHash)
+	}
+
+	// Verify fail-closed on unknown asset
+	_, err = h.audioRole.SaveOperatorAudioRolePlan(ctx, "non-existent-asset", segments)
+	if err == nil || !errors.Is(err, domain.ErrAssetNotFound) {
+		t.Fatalf("expected ErrAssetNotFound for unknown asset, got: %v", err)
 	}
 }

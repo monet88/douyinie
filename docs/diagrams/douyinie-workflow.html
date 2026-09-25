@@ -5298,8 +5298,8 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
         <text data-detail="fine" x="580.6" y="394" class="t-backend" font-size="7" text-anchor="middle">Speech Blocks</text>
         </g>
 
-        <g id="node-dubbing" data-node-id="dubbing" data-node-label="TTS Dubbing" tabindex="0" role="button" aria-label="Focus TTS Dubbing, ZeroTTS &amp; CosyVoice3, Audio StageWorkers › 3. Dub, Mix &amp; Deliver" aria-pressed="false" data-node-kind="backend" data-node-sublabel="ZeroTTS &amp; CosyVoice3" data-node-tag="Zero Overrun" data-node-context="Audio StageWorkers › 3. Dub, Mix &amp; Deliver">
-          <title>TTS Dubbing · ZeroTTS &amp; CosyVoice3 · Audio StageWorkers › 3. Dub, Mix &amp; Deliver · Zero Overrun</title>
+        <g id="node-dubbing" data-node-id="dubbing" data-node-label="TTS Dubbing" tabindex="0" role="button" aria-label="Focus TTS Dubbing, ZeroTTS &amp; CosyVoice3, Audio StageWorkers › 3. Dub, Mix &amp; Deliver" aria-pressed="false" data-node-kind="backend" data-node-sublabel="ZeroTTS &amp; CosyVoice3" data-node-tag="Playback Window" data-node-context="Audio StageWorkers › 3. Dub, Mix &amp; Deliver">
+          <title>TTS Dubbing · ZeroTTS &amp; CosyVoice3 · Audio StageWorkers › 3. Dub, Mix &amp; Deliver · Playback Window</title>
           <rect x="647.6" y="338" width="118" height="68" rx="6" class="c-mask"/>
           <rect x="647.6" y="338" width="118" height="68" rx="6" class="c-backend" data-animate="node" style="--step:5" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(653.6 344) scale(0.6875)">
@@ -5307,7 +5307,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
           </g>
           <text data-node-label="" data-detail-anchor="" x="706.6" y="359" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">TTS Dubbing</text>
           <text data-detail="context" x="706.6" y="376" class="t-muted" font-size="8" text-anchor="middle">ZeroTTS &amp; CosyVoice3</text>
-        <text data-detail="fine" x="706.6" y="394" class="t-backend" font-size="7" text-anchor="middle">Zero Overrun</text>
+        <text data-detail="fine" x="706.6" y="394" class="t-backend" font-size="7" text-anchor="middle">Playback Window</text>
         </g>
 
         <g id="node-review_gate" data-node-id="review_gate" data-node-label="Review Queue" tabindex="0" role="button" aria-label="Focus Review Queue, Confidence / Timing, Exception &amp; Review Gate › 2. Align &amp; Translate" aria-pressed="false" data-node-kind="security" data-node-sublabel="Confidence / Timing" data-node-tag="ReviewItem" data-node-context="Exception &amp; Review Gate › 2. Align &amp; Translate">
@@ -5600,7 +5600,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
         <ul>
           <li>&bull; Trích xuất media, bóc tách vocals 16kHz mono và nhận dạng giọng nói bằng Qwen3 + 3D-Speaker</li>
           <li>&bull; Dịch thuật ngữ nghĩa song song (speech + visual text) qua Remote LLM Gateway (Gemini 3.8 Flash -&gt; DeepSeek v4.1 Flash)</li>
-          <li>&bull; Lồng tiếng ZeroTTS quay vòng giọng quangminh-&gt;maichi, kiểm soát thời lượng nghiêm ngặt (tts_finish &lt;= source_end)</li>
+          <li>&bull; Lồng tiếng ZeroTTS quay vòng giọng quangminh-&gt;maichi, kiểm soát thời lượng nghiêm ngặt (tts_finish &lt;= dub playback end)</li>
         </ul>
       </div>
 

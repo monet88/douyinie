@@ -186,7 +186,7 @@
       "from": "worker",
       "to": "cas",
       "y": 399,
-      "label": "CAS Put: WAV (zero overrun)",
+      "label": "CAS Put: WAV (playback window)",
       "variant": "dashed"
     },
     {
@@ -267,7 +267,7 @@
       "title": "Invariants & Remote Gateway",
       "items": [
         "Dịch thuật sản xuất bắt buộc qua Remote LLM Gateway (Gemini 3.8 Flash -> DeepSeek v4.1 Flash), fail-closed",
-        "Quy chuẩn Zero Overrun nghiêm ngặt: tts_finish <= source_end; tự động escalate CosyVoice3 nếu quá thời lượng",
+        "Quy chuẩn playback window: tts_finish nằm trong cửa sổ phát đã chấp nhận (được mượn silence nguồn đã chứng minh, không vượt DubPlaybackEndMs và không đè speech kế cận); tự động escalate CosyVoice3 nếu quá thời lượng",
         "Ở Review Posture, run hoàn tất nhưng job ở lại review_required chờ operator duyệt explicit render"
       ]
     }

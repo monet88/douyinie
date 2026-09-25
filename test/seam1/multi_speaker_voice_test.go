@@ -543,6 +543,13 @@ func TestSeam1_VoiceChange_DubScriptChangeForcesSynthesisEvenWithSupersession(t 
 	if dubVariant2.CASHash == dubVariant1.CASHash {
 		t.Fatalf("expected different CASHash for modified dub script")
 	}
+	respRefresh, assign3 := runAssignVoices(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	})
+	if (respRefresh.StatusCode != http.StatusCreated && respRefresh.StatusCode != http.StatusOK) || assign3 == nil {
+		t.Fatalf("refresh assignment lineage for modified dub script failed: %d", respRefresh.StatusCode)
+	}
 
 	// Instrument provider invocations
 	zeroTTSProv := defaultVITTSFake(t, h)
@@ -554,7 +561,7 @@ func TestSeam1_VoiceChange_DubScriptChangeForcesSynthesisEvenWithSupersession(t 
 		"run_id":                 runID,
 		"target_language":        "vi",
 		"dub_script_variant_cas": dubVariant2.CASHash,
-		"voice_assignment_cas":   assign2.CASHash,
+		"voice_assignment_cas":   assign3.CASHash,
 	})
 	if respSynth2.StatusCode != http.StatusCreated || variant2 == nil {
 		t.Fatalf("synthesis failed: %d", respSynth2.StatusCode)

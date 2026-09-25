@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -85,7 +86,9 @@ func TestSeam1_ExceptionOnlyReviewQueue_And_InspectorTargetTextCorrection(t *tes
 	}
 	assignResp, _ := runAssignVoices(t, h, assetID, assignBody)
 	if assignResp.StatusCode != http.StatusOK && assignResp.StatusCode != http.StatusCreated {
-		t.Fatalf("POST voice-assignment failed: status=%d", assignResp.StatusCode)
+		body, _ := io.ReadAll(assignResp.Body)
+		_ = assignResp.Body.Close()
+		t.Fatalf("POST voice-assignment failed: status=%d body=%s", assignResp.StatusCode, string(body))
 	}
 
 	// Save DubSegmentsVariant with an overrun exception (2400ms > 1500ms slot)
@@ -571,6 +574,7 @@ func TestSeam1_MultimodalQualityResults_AutomatedRunDerivationAndCapture(t *test
 // 4. All QC results (both unowned and benchmark-owned) are captured into RelationalQC.
 func TestSeam1_MultimodalQualityResults_ResumeSafeAndFailClosedCapture(t *testing.T) {
 	h := setupHarness(t)
+	defaultVITTSFake(t, h).DurationMs = 200
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -796,11 +800,18 @@ func TestSeam1_TargetedInvalidation_StrictReuseOfSourceArtifacts(t *testing.T) {
 	}
 	roleBody, _ := json.Marshal(rolePayload)
 	_, _ = http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
+	transcriptIdx, err := h.db.GetTranscriptArtifactIndexByRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get initial transcript index failed: %v", err)
+	}
+	initialTranscriptCAS := transcriptIdx.CASHash
 
 	assignBody := map[string]any{
-		"run_id":          runID,
-		"job_id":          jobID,
-		"target_language": "vi",
+		"run_id":                  runID,
+		"job_id":                  jobID,
+		"target_language":         "vi",
+		"dub_script_variant_cas":  dubScriptVariant.CASHash,
+		"transcript_artifact_cas": initialTranscriptCAS,
 	}
 	_, voiceAssign := runAssignVoices(t, h, assetID, assignBody)
 
@@ -860,9 +871,35 @@ func TestSeam1_TargetedInvalidation_StrictReuseOfSourceArtifacts(t *testing.T) {
 	if len(rolePlanAfter.Segments) != len(rolePlan.Segments) {
 		t.Errorf("AudioRolePlan was modified")
 	}
-	vaAfter, _ := h.db.GetVoiceAssignmentIndex(ctx, assetID, "vi")
-	if vaAfter.CASHash != initialVoiceAssignCAS {
-		t.Errorf("VoiceAssignment was modified: %s != %s", vaAfter.CASHash, initialVoiceAssignCAS)
+	transcriptAfter, _ := h.db.GetTranscriptArtifactIndexByRun(ctx, runID)
+	if transcriptAfter.CASHash != initialTranscriptCAS {
+		t.Errorf("TranscriptArtifact was modified: %s != %s", transcriptAfter.CASHash, initialTranscriptCAS)
+	}
+	vaAfter, err := h.db.GetVoiceAssignmentIndexByRunID(ctx, runID)
+	if err != nil {
+		t.Fatalf("get corrected voice assignment index failed: %v", err)
+	}
+	if vaAfter.CASHash == initialVoiceAssignCAS {
+		t.Errorf("VoiceAssignment was not superseded after DubScript correction: %s", vaAfter.CASHash)
+	}
+	vaReader, err := h.casStore.Get(vaAfter.CASHash)
+	if err != nil {
+		t.Fatalf("load corrected VoiceAssignment: %v", err)
+	}
+	var correctedVA domain.VoiceAssignment
+	if err := json.NewDecoder(vaReader).Decode(&correctedVA); err != nil {
+		vaReader.Close()
+		t.Fatalf("decode corrected VoiceAssignment: %v", err)
+	}
+	vaReader.Close()
+	if correctedVA.DubScriptVariantCAS != corrBody.Result.DubScriptVariantCAS {
+		t.Errorf("corrected VoiceAssignment pins dub script %s, want %s", correctedVA.DubScriptVariantCAS, corrBody.Result.DubScriptVariantCAS)
+	}
+	if correctedVA.TranscriptArtifactCAS != initialTranscriptCAS {
+		t.Errorf("corrected VoiceAssignment pins transcript %s, want preserved %s", correctedVA.TranscriptArtifactCAS, initialTranscriptCAS)
+	}
+	if !reflect.DeepEqual(correctedVA.Assignments, voiceAssign.Assignments) || correctedVA.UseSameVoiceForAll != voiceAssign.UseSameVoiceForAll {
+		t.Errorf("VoiceAssignment selection changed across target-text correction: before=%+v after=%+v", voiceAssign.Assignments, correctedVA.Assignments)
 	}
 }
 
@@ -1041,7 +1078,7 @@ func TestSeam1_VoiceReassign_TargetedInvalidation_And_DownstreamRerun(t *testing
 	h := setupHarness(t)
 	ctx := context.Background()
 
-	jobID, runID := createJobAndRun(t, h)
+	jobID, runID := createJobAndRunWithDuration(t, h, 10.0)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -1106,8 +1143,9 @@ func TestSeam1_VoiceReassign_TargetedInvalidation_And_DownstreamRerun(t *testing
 	}
 
 	_, mix1 := runAudioMix(t, h, assetID, map[string]any{
-		"run_id":          runID,
-		"target_language": "vi",
+		"run_id":           runID,
+		"target_language":  "vi",
+		"dub_segments_cas": variant1.CASHash,
 	})
 	if mix1 == nil {
 		t.Fatalf("initial audio mix failed")
@@ -1116,13 +1154,16 @@ func TestSeam1_VoiceReassign_TargetedInvalidation_And_DownstreamRerun(t *testing
 	// Generate visual track
 	_, _ = http.Post(fmt.Sprintf("%s/api/v1/assets/%s/visual-track", h.server.URL, assetID), "application/json", bytes.NewReader([]byte(`{"run_id":"`+runID+`","target_language":"vi"}`)))
 
-	_, rPlan1 := runFreezeRenderPlan(t, h, assetID, map[string]any{
+	rPlanResp, rPlan1 := runFreezeRenderPlan(t, h, assetID, map[string]any{
 		"run_id":          runID,
 		"job_id":          jobID,
 		"target_language": "vi",
+		"dub_mix_cas":     mix1.CASHash,
 	})
 	if rPlan1 == nil {
-		t.Fatalf("initial render plan freeze failed")
+		body, _ := io.ReadAll(rPlanResp.Body)
+		_ = rPlanResp.Body.Close()
+		t.Fatalf("initial render plan freeze failed: status=%d body=%s", rPlanResp.StatusCode, string(body))
 	}
 
 	// Record initial artifacts
@@ -1368,58 +1409,11 @@ func TestSeam1_VoiceReassign_AssetScopedWithoutRunID(t *testing.T) {
 	buf := new(bytes.Buffer)
 	_, _ = buf.ReadFrom(legacyResp.Body)
 	_ = legacyResp.Body.Close()
-	if legacyResp.StatusCode != http.StatusOK {
-		t.Fatalf("legacy asset-scoped reassign without run_id: status=%d body=%s", legacyResp.StatusCode, buf.String())
+	if legacyResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("asset-scoped reassign without run_id must fail closed: status=%d body=%s", legacyResp.StatusCode, buf.String())
 	}
-
-	var decoded struct {
-		Result service.VoiceReassignCorrectionResult `json:"result"`
-	}
-	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
-		t.Fatalf("decode reassign result: %v", err)
-	}
-	res := decoded.Result
-	if res.VoiceAssignmentCAS == "" || res.VoiceAssignmentCAS == assign1.CASHash {
-		t.Errorf("expected new VoiceAssignment CAS, got %s", res.VoiceAssignmentCAS)
-	}
-	if len(res.InvalidatedSpeakers) != 1 || res.InvalidatedSpeakers[0] != "SPEAKER_00" {
-		t.Errorf("expected InvalidatedSpeakers=[SPEAKER_00], got %v", res.InvalidatedSpeakers)
-	}
-	if res.DubSegmentsVariantCAS == "" || res.DubSegmentsVariantCAS == variant1.CASHash {
-		t.Errorf("expected new DubSegmentsVariant CAS, got %s", res.DubSegmentsVariantCAS)
-	}
-	if res.DubMixCAS == "" || res.DubMixCAS == mix1.CASHash {
-		t.Errorf("expected new DubMix CAS, got %s", res.DubMixCAS)
-	}
-	if res.RenderPlanCAS == "" {
-		t.Errorf("expected new RenderPlan CAS, got empty")
-	}
-
-	// The legacy call must still land on the run the resolved variant belongs to:
-	// the regenerated dub mix has to be run-bound so run-scoped reads still see it.
-	runMixIdx, err := h.db.GetDubMixArtifactIndexByRun(ctx, runID)
-	if err != nil {
-		t.Fatalf("run-scoped dub mix index missing after legacy reassign: %v", err)
-	}
-	if runMixIdx.CASHash != res.DubMixCAS {
-		t.Errorf("legacy reassign dub mix bound to CAS %s, want run %s mix %s", runMixIdx.CASHash, runID, res.DubMixCAS)
-	}
-
-	// The regenerated render plan must freeze the adopted run's subtitle cues.
-	// A newer same-asset/same-language visual track from a different run must
-	// never bleed its cues in.
-	rcPlan, err := h.casStore.Get(res.RenderPlanCAS)
-	if err != nil {
-		t.Fatalf("load regenerated render plan from CAS: %v", err)
-	}
-	var newPlan domain.RenderPlan
-	decErr := json.NewDecoder(rcPlan).Decode(&newPlan)
-	rcPlan.Close()
-	if decErr != nil {
-		t.Fatalf("decode regenerated render plan: %v", decErr)
-	}
-	if len(newPlan.SubtitleCues) != 1 || newPlan.SubtitleCues[0].Text != "run A subtitle" {
-		t.Errorf("legacy reassign froze subtitle cues from another run: got %+v, want run A subtitle", newPlan.SubtitleCues)
+	if !strings.Contains(buf.String(), "run_id is required") {
+		t.Fatalf("expected actionable run_id error, got %s", buf.String())
 	}
 }
 
@@ -1509,7 +1503,7 @@ func TestSeam1_RegionOverride_Reclassify_Drag_Resize_Relabel_TargetedInvalidatio
 	// which no longer satisfies selected-run correction semantics.
 	rolePayload := map[string]any{
 		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleInstrumentalBgm},
 		},
 	}
 	roleBody, _ := json.Marshal(rolePayload)
@@ -1548,7 +1542,7 @@ func TestSeam1_RegionOverride_Reclassify_Drag_Resize_Relabel_TargetedInvalidatio
 	}
 
 	// 2. Query review items -> 1 pending low confidence / uncertain role item
-	getQueueURL := fmt.Sprintf("%s/api/v1/assets/%s/review-items?target_language=vi", h.server.URL, assetID)
+	getQueueURL := fmt.Sprintf("%s/api/v1/runs/%s/review-items", h.server.URL, runID)
 	qResp, _ := http.Get(getQueueURL)
 	var qBody struct {
 		ReviewItems []domain.ReviewItem `json:"review_items"`
@@ -1763,8 +1757,9 @@ func TestSeam1_FinalRenderHandoff_QueueZero_AutoVsReview(t *testing.T) {
 		t.Fatalf("setup render plan failed")
 	}
 
-	// 2. Query pending queue -> 1 item
-	getQueueURL := fmt.Sprintf("%s/api/v1/assets/%s/review-items?target_language=vi", h.server.URL, assetID)
+	// 2. Query this run's pending queue -> 1 item. Asset-scoped review can also
+	// contain exceptions from another run of the same deduped source asset.
+	getQueueURL := fmt.Sprintf("%s/api/v1/runs/%s/review-items", h.server.URL, runID)
 	qResp, _ := http.Get(getQueueURL)
 	var qBody struct {
 		ReviewItems []domain.ReviewItem `json:"review_items"`
@@ -2052,7 +2047,7 @@ func TestSeam1_RegionOverride_OutOfFrameFailsClosedWithoutMutatingState(t *testi
 
 	rolePayload := map[string]any{
 		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleInstrumentalBgm},
 		},
 	}
 	roleBody, _ := json.Marshal(rolePayload)

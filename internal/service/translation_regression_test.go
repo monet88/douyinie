@@ -153,6 +153,7 @@ func TestTranslationService_FallbackAppendsSelectionDecision(t *testing.T) {
 	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: "translation-fallback-job", Status: "running", CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	service.SeedRunTranscriptForTest(ctx, db, casStore, assetID, runID)
 
 	primaryProv, ok := reg.Get("fake_llm_translator")
 	if !ok {
@@ -208,6 +209,7 @@ func TestTranslationService_CacheIdentityChangesWithProviderModelVersion(t *test
 	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: "translation-cache-job", Status: "running", CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	service.SeedRunTranscriptForTest(ctx, db, casStore, assetID, runID)
 
 	input := domain.TranslationJobInput{
 		RunID:          runID,
@@ -285,6 +287,7 @@ func TestTranslationService_QAInvalidPrimary_ValidFallback_AdvancesAndRecordsPro
 	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: "qa-fallback-job", Status: "running", CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	service.SeedRunTranscriptForTest(ctx, db, casStore, assetID, runID)
 
 	// Primary provider produces corrupted numbers -> triggers Meaning-First QA rejection
 	primaryProv, ok := reg.Get("fake_llm_translator")
@@ -379,6 +382,7 @@ func TestTranslationService_AllCandidatesQAFlagged_PersistsBestEffortForReview(t
 	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: "all-invalid-job", Status: "running", CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	service.SeedRunTranscriptForTest(ctx, db, casStore, assetID, runID)
 
 	// Both primary and fallback invert negation
 	primaryProv, _ := reg.Get("fake_llm_translator")
@@ -511,6 +515,7 @@ func TestTranslationService_HybridLadder_Gemini_DeepSeek_FlagsForReviewWithoutLo
 	_ = db.CreateSourceAsset(initCtx, domain.SourceAsset{ID: assetID, RightsAttestationID: attID, SHA256: "ladder-source", ByteSize: 100, CreatedAt: time.Now().UTC()})
 	_ = db.CreateJob(initCtx, domain.LocalizationJob{ID: "ladder-job", SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: time.Now().UTC()})
 	_ = db.CreateRun(initCtx, domain.LocalizationRun{ID: runID, JobID: "ladder-job", Status: "running", CreatedAt: time.Now().UTC()})
+	service.SeedRunTranscriptForTest(initCtx, db, casStore, assetID, runID)
 
 	input := domain.TranslationJobInput{
 		RunID:            runID,

@@ -102,10 +102,19 @@ func setupAssetWithDubMix(t *testing.T, h *testHarness) (assetID, runID, jobID s
 	}
 	_ = sepResp.Body.Close()
 
-	// 3. Audio mix (passthrough/preservation)
+	// 3. Pin the current dubbing lineage and create a small accepted dub artifact.
+	source := []domain.TranslationInputSegment{{
+		Index: 0, SourceText: "test", SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 1500,
+	}}
+	lineage := pinSeam1DubLineage(t, h, runID, assetID, domain.TargetLanguageVI, source)
+	dubSegmentsCAS := putAcceptedSeam1DubSegments(t, h, assetID, runID, domain.TargetLanguageVI, lineage, source)
+
+	// 4. Audio mix
 	mixResp, mix := runAudioMix(t, h, assetID, map[string]any{
-		"run_id":          runID,
-		"target_language": domain.TargetLanguageVI,
+		"run_id":           runID,
+		"target_language":  domain.TargetLanguageVI,
+		"dub_segments_cas": dubSegmentsCAS,
+		"audio_stems_cas":  stems.CASHash,
 	})
 	if mixResp.StatusCode != http.StatusCreated || mix == nil {
 		t.Fatalf("setup audio mix failed, status: %d", mixResp.StatusCode)

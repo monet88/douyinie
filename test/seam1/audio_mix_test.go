@@ -3,6 +3,7 @@ package seam1_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,7 +16,17 @@ import (
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/provider"
+	"github.com/monet88/douyinie/internal/service"
 )
+
+func seam1CurrentFitPolicyID(t *testing.T) string {
+	t.Helper()
+	_, _, id := service.NewFitController().ResolvePlaybackWindow(1, 0)
+	if id == "" {
+		t.Fatal("expected current fit policy identity")
+	}
+	return id
+}
 
 // Helper to run audio separation
 func runSeparateStems(t *testing.T, h *testHarness, assetID string, payload map[string]any) (*http.Response, *domain.AudioStemArtifacts) {
@@ -210,16 +221,6 @@ func TestSeam1_AudioMix_MixerRefusesOverlongCandidate(t *testing.T) {
 		},
 	}
 
-	segBytes, _ := json.Marshal(overlongSegments)
-	segObj, err := h.casStore.Put(bytes.NewReader(segBytes))
-	if err != nil {
-		t.Fatalf("put overlong segments in cas: %v", err)
-	}
-	overlongSegments.CASHash = segObj.SHA256
-	segBytes, _ = json.Marshal(overlongSegments)
-	segObj, _ = h.casStore.Put(bytes.NewReader(segBytes))
-	segCASHash := segObj.SHA256
-
 	// Audio role plan with [0, 2000ms]
 	planPayload := map[string]any{
 		"segments": []domain.AudioSegment{
@@ -228,6 +229,29 @@ func TestSeam1_AudioMix_MixerRefusesOverlongCandidate(t *testing.T) {
 	}
 	planBody, _ := json.Marshal(planPayload)
 	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+	source := []domain.TranslationInputSegment{{
+		Index: 0, SourceText: "dialogue", SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 2000,
+	}}
+	lineage := pinSeam1DubLineage(t, h, runID, assetID, "vi", source)
+	overlongSegments.DubScriptVariantCAS = lineage.DubScriptCAS
+	overlongSegments.VoiceAssignmentCAS = lineage.VoiceAssignmentCAS
+	overlongSegments.TranscriptArtifactCAS = lineage.TranscriptCAS
+	overlongSegments.AudioRolePlanCAS = lineage.AudioRolePlanCAS
+	overlongSegments.FitPolicyID = "seam1-overlong-fit-v1"
+	overlongSegments.OverallStatus = "PASS"
+	overlongSegments.Segments[0].FitDecision = domain.FitActionAccept
+	overlongSegments.Segments[0].DubPlaybackEndMs = 2000
+	overlongSegments.FitPlans = []domain.DubbingFitPlan{{
+		SegmentIndex: 0, SpeakerID: "SPEAKER_00", SlotDurationMs: 2000, UsableSlotMs: 2000,
+		MeasuredDurationMs: 3500, DubPlaybackEndMs: 2000, FitPolicyID: seam1CurrentFitPolicyID(t),
+		SpeechBlockIndices: []int{0}, Decision: domain.FitActionAccept,
+	}}
+	segBytes, _ := json.Marshal(overlongSegments)
+	segObj, err := h.casStore.Put(bytes.NewReader(segBytes))
+	if err != nil {
+		t.Fatalf("put overlong segments in cas: %v", err)
+	}
+	segCASHash := segObj.SHA256
 
 	// Run audio mix with overlong dub segments
 	respMix, mix := runAudioMix(t, h, assetID, map[string]any{
@@ -255,9 +279,30 @@ func TestSeam1_AudioMix_MixerRefusesOverlongCandidate(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestSeam1_AudioMix_IndependentTestingWithFakeDubAudio(t *testing.T) {
 	h := setupHarness(t)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, runID := createJobAndRunWithDuration(t, h, 4.0)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
+	segments := []domain.TranslationInputSegment{{
+		Index: 0, SourceText: "fake source", SpeakerID: "SPEAKER_00", StartMs: 1000, EndMs: 3000,
+	}}
+
+	// Audio role plan with [1000, 3000ms]
+	planPayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 1000, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	planBody, _ := json.Marshal(planPayload)
+	planResp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+	if err != nil {
+		t.Fatalf("save audio role plan: %v", err)
+	}
+	planResp.Body.Close()
+	rolePlan, err := h.db.GetAudioRolePlan(context.Background(), assetID)
+	if err != nil {
+		t.Fatalf("get audio role plan: %v", err)
+	}
+	lineage := pinSeam1DubLineage(t, h, runID, assetID, "en", segments)
 
 	// Directly construct an accepted DubSegmentsVariant with fake 16kHz audio clips
 	clipWAV := media.GeneratePCM16WAV(16000, 1, 1500)
@@ -267,11 +312,17 @@ func TestSeam1_AudioMix_IndependentTestingWithFakeDubAudio(t *testing.T) {
 	}
 
 	fakeDubVariant := domain.DubSegmentsVariant{
-		ID:             "fake_accepted_dub_variant",
-		SchemaVersion:  domain.DubSegmentsSchemaVersion,
-		AssetID:        assetID,
-		RunID:          runID,
-		TargetLanguage: "en",
+		ID:                    "fake_accepted_dub_variant",
+		SchemaVersion:         domain.DubSegmentsSchemaVersion,
+		AssetID:               assetID,
+		RunID:                 runID,
+		TargetLanguage:        "en",
+		DubScriptVariantCAS:   lineage.DubScriptCAS,
+		VoiceAssignmentCAS:    lineage.VoiceAssignmentCAS,
+		TranscriptArtifactCAS: lineage.TranscriptCAS,
+		AudioRolePlanCAS:      rolePlan.CASHash,
+		FitPolicyID:           seam1CurrentFitPolicyID(t),
+		OverallStatus:         "PASS",
 		Segments: []domain.DubSegment{
 			{
 				Index:              0,
@@ -285,8 +336,14 @@ func TestSeam1_AudioMix_IndependentTestingWithFakeDubAudio(t *testing.T) {
 				AudioCASPath:       clipHash.Path,
 				Voice:              domain.VoiceProfile{ID: "kokoro_voice", Language: "en"},
 				FitDecision:        domain.FitActionAccept,
+				DubPlaybackEndMs:   3000,
 			},
 		},
+		FitPlans: []domain.DubbingFitPlan{{
+			SegmentIndex: 0, SpeakerID: "SPEAKER_00", SlotDurationMs: 2000, UsableSlotMs: 2000,
+			MeasuredDurationMs: 1500, DubPlaybackEndMs: 3000, FitPolicyID: seam1CurrentFitPolicyID(t),
+			SpeechBlockIndices: []int{0}, Decision: domain.FitActionAccept,
+		}},
 	}
 	fakeDubVariant.CreatedAt = time.Now().UTC()
 	b, _ := json.Marshal(fakeDubVariant)
@@ -296,14 +353,6 @@ func TestSeam1_AudioMix_IndependentTestingWithFakeDubAudio(t *testing.T) {
 	dubObj, _ = h.casStore.Put(bytes.NewReader(b))
 	dubCAS := dubObj.SHA256
 
-	// Audio role plan with [1000, 3000ms]
-	planPayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 1000, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
-		},
-	}
-	planBody, _ := json.Marshal(planPayload)
-	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
 	respMix, mix := runAudioMix(t, h, assetID, map[string]any{
 		"run_id":           runID,
 		"target_language":  "en",
@@ -311,7 +360,8 @@ func TestSeam1_AudioMix_IndependentTestingWithFakeDubAudio(t *testing.T) {
 	})
 
 	if respMix.StatusCode != http.StatusCreated || mix == nil {
-		t.Fatalf("expected 201 Created for audio mix with fake dub audio, got %d", respMix.StatusCode)
+		body, _ := readAll(respMix)
+		t.Fatalf("expected 201 Created for audio mix with fake dub audio, got %d: %s", respMix.StatusCode, string(body))
 	}
 	if mix.OverallStatus != "PASS" {
 		t.Errorf("expected PASS, got %s", mix.OverallStatus)
@@ -326,7 +376,7 @@ func TestSeam1_AudioMix_IndependentTestingWithFakeDubAudio(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestSeam1_AudioMix_SingingVocalsPreservedInSoundtrack(t *testing.T) {
 	h := setupHarness(t)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, runID := createJobAndRunWithDuration(t, h, 7.0)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -350,6 +400,7 @@ func TestSeam1_AudioMix_SingingVocalsPreservedInSoundtrack(t *testing.T) {
 			EndMs:      2000,
 		},
 	}
+	pinSeam1TranscriptForSegments(t, h, runID, assetID, segments)
 
 	// 1. Audio role plan with both narration and singing segments
 	singingPlanPayload := map[string]any{
@@ -509,6 +560,10 @@ func TestSeam1_AudioMix_SingingPreservation_SignalAcousticVerification(t *testin
 	}
 	planBody, _ := json.Marshal(planPayload)
 	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+	source := []domain.TranslationInputSegment{{
+		Index: 0, SourceText: "dialogue", SpeakerID: "SPEAKER_00", StartMs: 2000, EndMs: 4000,
+	}}
+	lineage := pinSeam1DubLineage(t, h, runID, assetID, "vi", source)
 
 	// Create custom AudioStemArtifacts in CAS with known non-zero signals
 	sampleRate := 16000
@@ -572,21 +627,36 @@ func TestSeam1_AudioMix_SingingPreservation_SignalAcousticVerification(t *testin
 	clipObj, _ := h.casStore.Put(bytes.NewReader(clipWAV))
 
 	dubArtifact := domain.DubSegmentsVariant{
-		ID:             "dub_test_signal",
-		SchemaVersion:  domain.DubSegmentsSchemaVersion,
-		AssetID:        assetID,
-		TargetLanguage: "vi",
+		ID:                    "dub_test_signal",
+		SchemaVersion:         domain.DubSegmentsSchemaVersion,
+		AssetID:               assetID,
+		RunID:                 runID,
+		TargetLanguage:        "vi",
+		DubScriptVariantCAS:   lineage.DubScriptCAS,
+		VoiceAssignmentCAS:    lineage.VoiceAssignmentCAS,
+		TranscriptArtifactCAS: lineage.TranscriptCAS,
+		AudioRolePlanCAS:      lineage.AudioRolePlanCAS,
+		FitPolicyID:           seam1CurrentFitPolicyID(t),
+		OverallStatus:         "PASS",
 		Segments: []domain.DubSegment{
 			{
 				Index:              0,
+				SpeechBlockIndices: []int{0},
+				SpeakerID:          "SPEAKER_00",
 				StartMs:            2000,
 				EndMs:              4000,
 				SlotDurationMs:     2000,
 				MeasuredDurationMs: 2000,
 				AudioSHA256:        clipObj.SHA256,
 				FitDecision:        domain.FitActionAccept,
+				DubPlaybackEndMs:   4000,
 			},
 		},
+		FitPlans: []domain.DubbingFitPlan{{
+			SegmentIndex: 0, SpeakerID: "SPEAKER_00", SlotDurationMs: 2000, UsableSlotMs: 2000,
+			MeasuredDurationMs: 2000, DubPlaybackEndMs: 4000, FitPolicyID: seam1CurrentFitPolicyID(t),
+			SpeechBlockIndices: []int{0}, Decision: domain.FitActionAccept,
+		}},
 		CreatedAt: time.Now().UTC(),
 	}
 	dubBytes, _ := json.Marshal(dubArtifact)
@@ -645,7 +715,7 @@ func TestSeam1_AudioMix_FailClosed_CorruptOrMissingBackgroundStem(t *testing.T) 
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
-	// Audio role plan with narration/dialogue
+	// Narration requires an accepted dub artifact before the mixer can inspect soundtrack evidence.
 	planPayload := map[string]any{
 		"segments": []domain.AudioSegment{
 			{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleNarrationDialogue},
@@ -653,6 +723,11 @@ func TestSeam1_AudioMix_FailClosed_CorruptOrMissingBackgroundStem(t *testing.T) 
 	}
 	planBody, _ := json.Marshal(planPayload)
 	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+	source := []domain.TranslationInputSegment{{
+		Index: 0, SourceText: "soundtrack", SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 2000,
+	}}
+	lineage := pinSeam1DubLineage(t, h, runID, assetID, "vi", source)
+	dubSegmentsCAS := putAcceptedSeam1DubSegments(t, h, assetID, runID, "vi", lineage, source)
 
 	// Stems artifact with missing background stem (only vocals)
 	badStems := domain.AudioStemArtifacts{
@@ -674,9 +749,10 @@ func TestSeam1_AudioMix_FailClosed_CorruptOrMissingBackgroundStem(t *testing.T) 
 	badObj, _ := h.casStore.Put(bytes.NewReader(badBytes))
 
 	respMix, _ := runAudioMix(t, h, assetID, map[string]any{
-		"run_id":          runID,
-		"target_language": "vi",
-		"audio_stems_cas": badObj.SHA256,
+		"run_id":           runID,
+		"target_language":  "vi",
+		"audio_stems_cas":  badObj.SHA256,
+		"dub_segments_cas": dubSegmentsCAS,
 	})
 
 	// Must fail closed with 422 or 500, never claim success or fabricate silence
@@ -717,9 +793,10 @@ func TestSeam1_AudioMix_FailClosed_CorruptOrMissingBackgroundStem(t *testing.T) 
 	}
 
 	respTrunc, _ := runAudioMix(t, h, assetID, map[string]any{
-		"run_id":          runID,
-		"target_language": "vi",
-		"audio_stems_cas": truncStemsObj.SHA256,
+		"run_id":           runID,
+		"target_language":  "vi",
+		"audio_stems_cas":  truncStemsObj.SHA256,
+		"dub_segments_cas": dubSegmentsCAS,
 	})
 	if respTrunc.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("expected truncated background stem to fail closed, got status %d", respTrunc.StatusCode)
@@ -747,6 +824,10 @@ func TestSeam1_AudioMix_SpeechClipSampleRateResampling(t *testing.T) {
 	}
 	planBody, _ := json.Marshal(planPayload)
 	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+	source := []domain.TranslationInputSegment{{
+		Index: 0, SourceText: "resample", SpeakerID: "SPEAKER_00", StartMs: 500, EndMs: 1500,
+	}}
+	lineage := pinSeam1DubLineage(t, h, runID, assetID, "vi", source)
 
 	// Background stem at 16kHz
 	bgWAV := media.GeneratePCM16WAV(16000, 1, 3000)
@@ -775,21 +856,36 @@ func TestSeam1_AudioMix_SpeechClipSampleRateResampling(t *testing.T) {
 	clipObj, _ := h.casStore.Put(bytes.NewReader(clipWAV))
 
 	dubArtifact := domain.DubSegmentsVariant{
-		ID:             "dub_resample_test",
-		SchemaVersion:  domain.DubSegmentsSchemaVersion,
-		AssetID:        assetID,
-		TargetLanguage: "vi",
+		ID:                    "dub_resample_test",
+		SchemaVersion:         domain.DubSegmentsSchemaVersion,
+		AssetID:               assetID,
+		RunID:                 runID,
+		TargetLanguage:        "vi",
+		DubScriptVariantCAS:   lineage.DubScriptCAS,
+		VoiceAssignmentCAS:    lineage.VoiceAssignmentCAS,
+		TranscriptArtifactCAS: lineage.TranscriptCAS,
+		AudioRolePlanCAS:      lineage.AudioRolePlanCAS,
+		FitPolicyID:           seam1CurrentFitPolicyID(t),
+		OverallStatus:         "PASS",
 		Segments: []domain.DubSegment{
 			{
 				Index:              0,
+				SpeechBlockIndices: []int{0},
+				SpeakerID:          "SPEAKER_00",
 				StartMs:            500,
 				EndMs:              1500,
 				SlotDurationMs:     1000,
 				MeasuredDurationMs: 1000,
 				AudioSHA256:        clipObj.SHA256,
 				FitDecision:        domain.FitActionAccept,
+				DubPlaybackEndMs:   1500,
 			},
 		},
+		FitPlans: []domain.DubbingFitPlan{{
+			SegmentIndex: 0, SpeakerID: "SPEAKER_00", SlotDurationMs: 1000, UsableSlotMs: 1000,
+			MeasuredDurationMs: 1000, DubPlaybackEndMs: 1500, FitPolicyID: seam1CurrentFitPolicyID(t),
+			SpeechBlockIndices: []int{0}, Decision: domain.FitActionAccept,
+		}},
 		CreatedAt: time.Now().UTC(),
 	}
 	dubBytes, _ := json.Marshal(dubArtifact)
@@ -811,6 +907,140 @@ func TestSeam1_AudioMix_SpeechClipSampleRateResampling(t *testing.T) {
 	}
 	if mix.DurationMs != 3000 {
 		t.Errorf("expected mixed duration 3000ms, got %dms", mix.DurationMs)
+	}
+}
+
+func makePCM16WAVWithFrames(sampleRate, channels, frames int) []byte {
+	dataSize := frames * channels * 2
+	var buf bytes.Buffer
+	buf.WriteString("RIFF")
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(36+dataSize))
+	buf.WriteString("WAVEfmt ")
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(16))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(channels))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(sampleRate))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(sampleRate*channels*2))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(channels*2))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(16))
+	buf.WriteString("data")
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(dataSize))
+	buf.Write(make([]byte, dataSize))
+	return buf.Bytes()
+}
+
+func TestSeam1_AudioMix_FractionalSampleRateRoundingOverrun_48kHzTo44kHz(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// Audio role plan with narration/dialogue for 500ms: [1000ms, 1500ms]
+	planPayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 1000, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	planBody, _ := json.Marshal(planPayload)
+	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+	source := []domain.TranslationInputSegment{{
+		Index: 0, SourceText: "exact end", SpeakerID: "SPEAKER_00", StartMs: 1000, EndMs: 1500,
+	}}
+	lineage := pinSeam1DubLineage(t, h, runID, assetID, "vi", source)
+
+	// Output media format: Background stem at 44.1kHz (44100Hz)
+	bgWAV := media.GeneratePCM16WAV(44100, 1, 3000)
+	bgObj, _ := h.casStore.Put(bytes.NewReader(bgWAV))
+
+	stemsArtifact := domain.AudioStemArtifacts{
+		ID:            "stems_resample_44k",
+		SchemaVersion: domain.AudioStemsSchemaVersion,
+		AssetID:       assetID,
+		Stems: []domain.AudioStem{
+			{
+				Type:         domain.StemTypeBackground,
+				AudioCASHash: bgObj.SHA256,
+				SampleRate:   44100,
+				Channels:     1,
+				DurationMs:   3000,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	stemsBytes, _ := json.Marshal(stemsArtifact)
+	stemsObj, _ := h.casStore.Put(bytes.NewReader(stemsBytes))
+
+	// 1. Positive case: 24000 frames @ 48kHz -> round(24000 * 44100 / 48000) = 22050 frames @ 44.1kHz.
+	// In 44.1kHz: startFrame = 44100, endFrame = 66150. Allowed end = (1500 * 44100) / 1000 = 66150.
+	// Exactly fits without exceeding playback window -> PASS.
+	passClipWAV := makePCM16WAVWithFrames(48000, 1, 24000)
+	passClipObj, _ := h.casStore.Put(bytes.NewReader(passClipWAV))
+	passArtifact := domain.DubSegmentsVariant{
+		ID:                    "dub_resample_pass",
+		SchemaVersion:         domain.DubSegmentsSchemaVersion,
+		AssetID:               assetID,
+		RunID:                 runID,
+		TargetLanguage:        "vi",
+		DubScriptVariantCAS:   lineage.DubScriptCAS,
+		VoiceAssignmentCAS:    lineage.VoiceAssignmentCAS,
+		TranscriptArtifactCAS: lineage.TranscriptCAS,
+		AudioRolePlanCAS:      lineage.AudioRolePlanCAS,
+		FitPolicyID:           seam1CurrentFitPolicyID(t),
+		OverallStatus:         "PASS",
+		Segments: []domain.DubSegment{
+			{
+				Index:              0,
+				SpeechBlockIndices: []int{0},
+				SpeakerID:          "SPEAKER_00",
+				StartMs:            1000,
+				EndMs:              1500,
+				SlotDurationMs:     500,
+				MeasuredDurationMs: 500,
+				AudioSHA256:        passClipObj.SHA256,
+				Voice:              domain.VoiceProfile{ID: "v1", Language: "vi"},
+				FitDecision:        domain.FitActionAccept,
+				DubPlaybackEndMs:   1500,
+			},
+		},
+		FitPlans: []domain.DubbingFitPlan{{
+			SegmentIndex: 0, SpeakerID: "SPEAKER_00", SlotDurationMs: 500, UsableSlotMs: 500,
+			MeasuredDurationMs: 500, DubPlaybackEndMs: 1500, FitPolicyID: seam1CurrentFitPolicyID(t),
+			SpeechBlockIndices: []int{0}, Decision: domain.FitActionAccept,
+		}},
+		CreatedAt: time.Now().UTC(),
+	}
+	passBytes, _ := json.Marshal(passArtifact)
+	passObj, _ := h.casStore.Put(bytes.NewReader(passBytes))
+	respPass, mixPass := runAudioMix(t, h, assetID, map[string]any{
+		"run_id":           runID,
+		"target_language":  "vi",
+		"audio_stems_cas":  stemsObj.SHA256,
+		"dub_segments_cas": passObj.SHA256,
+	})
+	if respPass.StatusCode != http.StatusCreated || mixPass == nil || mixPass.OverallStatus != "PASS" {
+		t.Fatalf("expected 24000 frames @ 48kHz to pass 44.1kHz mix, got status %d mix %+v", respPass.StatusCode, mixPass)
+	}
+
+	// 2. Negative counterexample: 24001 frames @ 48kHz (500.02ms @ 48kHz).
+	// Resampled to 44.1kHz: round(24001 * 44100 / 48000) = round(22050.91875) = 22051 frames.
+	// In 44.1kHz: startFrame = 44100, endFrame = 66151.
+	// 66151 * 1000 = 66151000 > 1500 * 44100 = 66150000 -> 1 output sample overrun!
+	// Must fail closed with refusal.
+	failClipWAV := makePCM16WAVWithFrames(48000, 1, 24001)
+	failClipObj, _ := h.casStore.Put(bytes.NewReader(failClipWAV))
+	failArtifact := passArtifact
+	failArtifact.ID = "dub_resample_fail"
+	failArtifact.Segments[0].AudioSHA256 = failClipObj.SHA256
+	failBytes, _ := json.Marshal(failArtifact)
+	failObj, _ := h.casStore.Put(bytes.NewReader(failBytes))
+	respFail, mixFail := runAudioMix(t, h, assetID, map[string]any{
+		"run_id":           runID,
+		"target_language":  "vi",
+		"audio_stems_cas":  stemsObj.SHA256,
+		"dub_segments_cas": failObj.SHA256,
+	})
+	if respFail.StatusCode == http.StatusCreated && (mixFail != nil && mixFail.OverallStatus == "PASS") {
+		t.Fatalf("expected 24001 frames @ 48kHz (resampled to 22051 frames > 22050 allowed) to be refused, got PASS")
 	}
 }
 

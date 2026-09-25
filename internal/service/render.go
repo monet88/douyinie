@@ -184,6 +184,11 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 	if dubMix.OverallStatus != "PASS" {
 		return nil, fmt.Errorf("%w: status is %s (reason: %s)", domain.ErrDubMixNotRenderable, dubMix.OverallStatus, dubMix.RefusalReason)
 	}
+	// Invariant: A legacy DubMix predates the current playback/coverage acceptance contract, so its
+	// PASS cannot be re-used as render evidence; it must be re-derived before it can be rendered.
+	if err := dubMix.ValidateCurrentSchema(); err != nil {
+		return nil, fmt.Errorf("%w: %w", domain.ErrDubMixNotRenderable, err)
+	}
 	if !s.casStore.Exists(dubMix.AudioCASHash) {
 		return nil, fmt.Errorf("%w: dub mix audio file missing in CAS (%s)", domain.ErrRenderSourceNotFound, dubMix.AudioCASHash)
 	}

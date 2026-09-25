@@ -35,6 +35,7 @@ const state = {
 };
 
 let pollTimer = null;
+let lastGlossaryOmissionKey = "";
 
 const titles = {
   new: "Tạo localization job",
@@ -2028,6 +2029,26 @@ async function loadSelectedRun() {
       url: assetID ? `/api/v1/assets/${encodeURIComponent(assetID)}/translation-variant?target_language=${target}&run_id=${encodeURIComponent(runID)}` : "",
       apply: (value) => {
         state.translation = value?.translation_variant || null;
+        const omitted = Number(state.translation?.effective_glossary?.omitted_matches || 0);
+        const conflicts = Number(state.translation?.effective_glossary?.omitted_conflicts || 0);
+        const omissionKey = `${runID}:${state.translation?.cas_hash || ""}:${omitted}:${conflicts}`;
+        if (omissionKey && omissionKey !== lastGlossaryOmissionKey) {
+          if (omitted > 0) {
+            toast(
+              "Glossary vượt giới hạn áp dụng",
+              `${omitted} thuật ngữ khớp đã bị bỏ qua sau 100 mục đầu tiên. Hãy đưa thuật ngữ quan trọng lên trước hoặc giảm glossary.`,
+              "warning"
+            );
+          }
+          if (conflicts > 0) {
+            toast(
+              "Glossary có xung đột thuật ngữ trùng lặp",
+              `${conflicts} mục trùng lặp xung đột đã bị bỏ qua theo nguyên tắc ưu tiên mục đầu tiên.`,
+              "warning"
+            );
+          }
+        }
+        lastGlossaryOmissionKey = omissionKey;
       },
     },
     {
@@ -2181,6 +2202,18 @@ async function handleNewJob(event) {
   const operator = operatorName();
   if (!source) return;
 
+  let glossary = [];
+  const glossaryRaw = $("#glossary-input")?.value?.trim() || "";
+  if (glossaryRaw) {
+    try {
+      glossary = JSON.parse(glossaryRaw);
+      if (!Array.isArray(glossary)) throw new Error("Glossary phải là một JSON array.");
+    } catch (error) {
+      showError(new Error(`Glossary không hợp lệ: ${error.message}`));
+      return;
+    }
+  }
+
   setBusy(button, true, "Đang tạo job…");
   try {
     const sourceResult = await createSource(source, operator);
@@ -2201,6 +2234,7 @@ async function handleNewJob(event) {
           source: "operator-ui",
           posture,
           cover_color: $("#cover-color-input")?.value?.trim() || "#000000",
+          glossary,
         }),
       }),
     });

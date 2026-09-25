@@ -50,7 +50,7 @@
     { "id": "translation", "lane": "control", "col": 3, "type": "cloud", "label": "Remote Translation", "sublabel": "Gemini -> DeepSeek", "tag": "Strictly Remote", "width": 118 },
     { "id": "operator_edit", "lane": "review", "col": 3, "type": "frontend", "label": "Operator Override", "sublabel": "Strict Overlap Check", "tag": "Fail-Closed", "width": 118 },
     { "id": "visual_track", "lane": "visual", "col": 4, "type": "backend", "label": "Visual Overlay", "sublabel": "Tight Hug Cover", "tag": "In-Place Plan", "width": 118 },
-    { "id": "dubbing", "lane": "audio", "col": 4, "type": "backend", "label": "TTS Dubbing", "sublabel": "ZeroTTS & CosyVoice3", "tag": "Zero Overrun", "width": 118 },
+    { "id": "dubbing", "lane": "audio", "col": 4, "type": "backend", "label": "TTS Dubbing", "sublabel": "ZeroTTS & CosyVoice3", "tag": "Playback Window", "width": 118 },
     { "id": "final_render", "lane": "control", "col": 5, "type": "backend", "label": "Final Render", "sublabel": "FFmpeg Mix & Draw", "tag": "PASS Deliverable", "width": 118 }
   ],
   "edges": [
@@ -75,7 +75,7 @@
       "items": [
         "Trích xuất media, bóc tách vocals 16kHz mono và nhận dạng giọng nói bằng Qwen3 + 3D-Speaker",
         "Dịch thuật ngữ nghĩa song song (speech + visual text) qua Remote LLM Gateway (Gemini 3.8 Flash -> DeepSeek v4.1 Flash)",
-        "Lồng tiếng ZeroTTS quay vòng giọng quangminh->maichi, kiểm soát thời lượng nghiêm ngặt (tts_finish <= source_end)"
+        "Lồng tiếng ZeroTTS quay vòng giọng quangminh->maichi, kiểm soát thời lượng nghiêm ngặt (tts_finish <= dub playback end)"
       ]
     },
     {

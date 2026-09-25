@@ -109,7 +109,7 @@ func TestSeam1_OperatorUIRegionCorrectionBrowserSmoke(t *testing.T) {
 
 	roleBody, _ := json.Marshal(map[string]any{
 		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleInstrumentalBgm},
 		},
 	})
 	roleResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))

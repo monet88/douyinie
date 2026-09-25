@@ -89,6 +89,7 @@ Do not rerun source acquisition, ASR, forced alignment, diarization, separation,
 - Cache identity must **not** depend on paths, mtimes, JobID, or RunID.
 - A retry or rerun creates new immutable evidence; it does not rewrite historical evidence in place.
 - Changing what a stage emits or persists requires bumping that stage's schema version (or its semantic-config token) in the same change; otherwise already-cached rows replay the old behavior and the new behavior is silently disabled.
+- Intentional cross-run or cross-asset cache reuse requires explicit compatibility proof: the candidate artifact must match current `SchemaVersion`, `ContractID`, `EffectiveGlossary.Hash`, canonical `InputHash`, and pinned `TranscriptArtifactCAS`. Fallback to an asset's latest transcript is permitted only when candidate segments exactly match the input segments.
 
 ## 5. Append-only evidence and review semantics
 
@@ -123,7 +124,9 @@ The operator queue is exception-only. Passing, auto-resolved, and manually overr
 
 - Predicted/WPM duration is planning evidence only.
 - A selectable TTS candidate must be checked against **actual synthesized audio duration**.
-- Enforce `tts_finish <= immutable_source_window_end`.
+- Keep immutable source start/end anchors separate from playback acceptance. A selected dub may extend only to its persisted `DubPlaybackEndMs`, derived from proven source silence before the next canonical speech/vocal boundary with a frozen reserve.
+- Validate the decoded waveform/sample extent against that playback end and against neighboring localized clip placement; metadata duration alone is not acceptance proof.
+- Contract enforcement across audition/benchmark/review: In accordance with #153, contextual audition, benchmark evaluation, review inspection, and production synthesis share the exact same playback contract and require run-scoped lineage proof (`RunID`).
 - An overlong candidate must not reach the final mixer.
 - Resolve overrun through the approved adaptation loop: rewrite/resynthesize/rate/mild stretch/local regroup within the same speaker turn.
 - Never fix one overrun by shifting later source speech.

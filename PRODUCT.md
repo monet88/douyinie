@@ -35,7 +35,7 @@ Unlike generic auto-subtitlers or blunt voice-over tools that wipe background au
   - Audio role separation (`narration/dialogue`, `singing/music-vocal`, `instrumental/background`, `ambience/SFX`).
   - Speech understanding: ASR, forced word-level alignment, speaker diarization.
   - Remote-only production translation (Gemini 3.8 Flash primary, DeepSeek V4.1 Flash secondary) with strict negation/numeric/entity QA.
-  - Speech fit adaptation: shorten-first text adaptation with zero adjacent overrun (`tts_finish <= source_end`) and natural breathing pauses.
+  - Speech fit adaptation: shorten-first text adaptation with measured playback-window fitting, preserving immutable source anchors, genuine silence reserve, and zero collision with adjacent localized speech.
   - Voice assignment with AI recommendation and standalone (~5s) or contextual (~10s) voice audition.
   - OCR text region detection, classification (`speech_subtitle`, `semantic_text`, `instructional_ui_text`, `brand_keep`, `ignore/noise`), tracking, and translation.
   - Direct operator overrides in Review Workspace: drag/resize/reclassify text regions, edit translation text, swap voices.
@@ -76,7 +76,7 @@ Unlike generic auto-subtitlers or blunt voice-over tools that wipe background au
 2. **Immutable Source-Timing Anchors**:
    - Source video timeline and visual cuts remain immutable; do not stretch, shrink, or retime the video.
    - Spoken adaptation must **shorten/rewrite concise target text first** when source speech cadence is brisk.
-   - Probe actual synthesized audio duration; enforce zero adjacent speech overrun (`tts_finish <= immutable source window end`).
+   - Probe actual synthesized waveform duration; allow bounded borrowing only from proven source silence before the next canonical speech/vocal boundary, and require the decoded dub waveform to end at or before the persisted `DubPlaybackEndMs` without colliding with adjacent localized speech.
    - Maintain perceptible natural breathing pauses between speech turns to prevent run-on or glued delivery.
    - Source-relative cadence and pause spacing are evaluated via perceptual audiovisual quality gates, not arithmetic duration alone.
 

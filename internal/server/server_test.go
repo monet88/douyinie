@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
@@ -239,6 +240,26 @@ func TestVoiceAuditionReturnsBrowserPlayableAudioWithoutLocalPath(t *testing.T) 
 	}
 	if strings.Contains(rec.Body.String(), root) || strings.Contains(rec.Body.String(), "secret-source.mp4") {
 		t.Fatalf("response leaked a machine-local filesystem path: %s", rec.Body.String())
+	}
+}
+
+func TestVoiceAuditionContextualRequiresRunID(t *testing.T) {
+	t.Parallel()
+	wav := media.GeneratePCM16WAV(16000, 1, 500)
+	s, assetID, _ := newAuditionTestServer(t, wav)
+	body, err := json.Marshal(map[string]any{
+		"target_language": "vi", "is_contextual": true, "segment_index": 0,
+		"voice": domain.VoiceProfile{ID: "voice-audition", ProviderID: "fake-tts", VoiceID: "voice-1", Name: "Voice 1", Language: "vi"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/assets/"+assetID+"/voice-audition", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "run_id is required") {
+		t.Fatalf("contextual audition without run_id status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -868,6 +889,166 @@ func TestExecuteRun_StageFailureRecordsEvidenceAndInterrupts(t *testing.T) {
 	}
 	if stages[0].Stage != "audio_mix" || stages[0].Status != domain.StageStatusFailed {
 		t.Fatalf("expected failed audio_mix stage, got %+v", stages[0])
+	}
+}
+
+func TestExecuteRun_RunScopedAudioRolePlan_NeverAdoptsNewerNoDubPlan(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	db, err := storage.Open(filepath.Join(tmpDir, "execute_run_rolediv.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	casStore, err := cas.NewStore(filepath.Join(tmpDir, "cas"))
+	if err != nil {
+		t.Fatalf("new cas: %v", err)
+	}
+
+	qSvc := queue.NewService(db)
+	now := time.Now().UTC()
+
+	att := domain.RightsAttestation{
+		ID:              "att-1",
+		AttestationType: "USER_VERIFIED",
+		DeclaredBy:      "tester",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	}
+	if err := db.CreateRightsAttestation(ctx, att); err != nil {
+		t.Fatalf("create attestation: %v", err)
+	}
+
+	rawBytes := []byte("fake audio content for normalization")
+	cObj, err := casStore.Put(bytes.NewReader(rawBytes))
+	if err != nil {
+		t.Fatalf("put raw bytes: %v", err)
+	}
+
+	asset := domain.SourceAsset{
+		ID:                  "asset-rolediv",
+		SHA256:              cObj.SHA256,
+		CASPath:             cObj.Path,
+		RightsAttestationID: att.ID,
+		CreatedAt:           now,
+	}
+	if err := db.CreateSourceAsset(ctx, asset); err != nil {
+		t.Fatalf("create source asset: %v", err)
+	}
+
+	job := domain.LocalizationJob{
+		ID:             "job-rolediv",
+		SourceAssetID:  asset.ID,
+		TargetLanguage: "vi",
+		Status:         "queued",
+		CreatedAt:      now,
+	}
+	if err := db.CreateJob(ctx, job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	run := domain.LocalizationRun{
+		ID:                 "run-rolediv",
+		JobID:              job.ID,
+		Status:             domain.RunStatusQueued,
+		ConfigSnapshotJSON: "{}",
+		CreatedAt:          now,
+	}
+	if err := db.CreateRun(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	if _, err := qSvc.Enqueue(ctx, run.ID, job.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := qSvc.MarkRunning(ctx, run.ID); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+
+	// 1. Pinned AudioRolePlan A with dub-eligible dialogue
+	planA := domain.AudioRolePlan{
+		ID:      "planA",
+		AssetID: asset.ID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleNarrationDialogue},
+		},
+		CreatedAt: now,
+	}
+	planABytes, _ := json.Marshal(planA)
+	planAObj, err := casStore.Put(bytes.NewReader(planABytes))
+	if err != nil {
+		t.Fatalf("put planA: %v", err)
+	}
+	planA.CASHash = planAObj.SHA256
+	if err := db.SaveAudioRolePlan(ctx, planA); err != nil {
+		t.Fatalf("save planA: %v", err)
+	}
+	// Pin Plan A to Run A via stage_executions
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             "se-audio-role-pin",
+		RunID:          run.ID,
+		Stage:          "audio_role_plan",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: planAObj.SHA256,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("record audio_role_plan stage: %v", err)
+	}
+
+	// 2. Save newer AudioRolePlan B for asset with NO dialogue
+	planB := domain.AudioRolePlan{
+		ID:      "planB",
+		AssetID: asset.ID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 35000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+		CreatedAt: now.Add(time.Minute),
+	}
+	planBBytes, _ := json.Marshal(planB)
+	planBObj, err := casStore.Put(bytes.NewReader(planBBytes))
+	if err != nil {
+		t.Fatalf("put planB: %v", err)
+	}
+	planB.CASHash = planBObj.SHA256
+	if err := db.SaveAudioRolePlan(ctx, planB); err != nil {
+		t.Fatalf("save planB: %v", err)
+	}
+
+	// 3. executeRun for Run A
+	// Without SpeechSvc configured:
+	// - If Run A uses Plan A (dub-eligible), it attempts speech_understand and fails with "SpeechService is not configured"
+	// - If Run A adopted Plan B (no dialogue), it would bypass speech_understand, translation, and dub_synthesize, jumping to audio_mix
+	s := New(Config{
+		Addr:     "127.0.0.1:0",
+		DB:       db,
+		CASStore: casStore,
+		QueueSvc: qSvc,
+	})
+
+	_ = s.executeRun(ctx, run.ID, job.ID)
+
+	stages, err := db.ListStageExecutions(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+
+	foundSpeechStage := false
+	for _, st := range stages {
+		if st.Stage == "speech_understand" {
+			foundSpeechStage = true
+			if st.Status != domain.StageStatusFailed {
+				t.Errorf("expected speech_understand stage to fail closed, got status: %s", st.Status)
+			}
+		}
+		if st.Stage == "audio_mix" {
+			t.Fatalf("executeRun incorrectly skipped speech understanding and jumped to audio_mix (it adopted no-dub Plan B!)")
+		}
+	}
+	if !foundSpeechStage {
+		t.Fatalf("expected speech_understand stage to be attempted under Plan A, but it was not found in stages: %+v", stages)
 	}
 }
 
@@ -1868,5 +2049,498 @@ func TestTranslationAndVoiceAssignmentRunIsolation(t *testing.T) {
 	}
 	if !strings.Contains(recReview2.Body.String(), "Xin chào từ Run 2") || strings.Contains(recReview2.Body.String(), "Xin chào từ Run 1") {
 		t.Fatalf("run 2 review projection crossed run boundary: %s", recReview2.Body.String())
+	}
+}
+
+func TestHandleRunTranslation_AssetRunBindingAndFrozenGlossary(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	db, err := storage.Open(filepath.Join(root, "douyinie.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	casStore, err := cas.NewStore(filepath.Join(root, "cas"))
+	if err != nil {
+		t.Fatalf("open cas: %v", err)
+	}
+
+	transSvc := service.NewTranslationService(db, casStore)
+	invocations := 0
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		invocations++
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "fake_model",
+			ModelVersion: "1",
+			Segments: []domain.TranslationSegment{
+				{Index: 0, SourceText: req.Segments[0].SourceText, TargetText: "Chào Nồi Supor"},
+			},
+		}, nil
+	}
+
+	s := New(Config{Addr: "127.0.0.1:0", DB: db, CASStore: casStore, TranslationSvc: transSvc})
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	attestation := domain.RightsAttestation{
+		ID:              "attestation-bind-1",
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		DeclaredBy:      "tester",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	}
+	_ = db.CreateRightsAttestation(ctx, attestation)
+
+	assetA := domain.SourceAsset{
+		ID:                  "asset-A",
+		SHA256:              "sha-A",
+		ByteSize:            100,
+		RightsAttestationID: attestation.ID,
+		CreatedAt:           now,
+	}
+	_ = db.CreateSourceAsset(ctx, assetA)
+
+	assetB := domain.SourceAsset{
+		ID:                  "asset-B",
+		SHA256:              "sha-B",
+		ByteSize:            100,
+		RightsAttestationID: attestation.ID,
+		CreatedAt:           now,
+	}
+	_ = db.CreateSourceAsset(ctx, assetB)
+
+	jobA := domain.LocalizationJob{
+		ID:             "job-A",
+		SourceAssetID:  assetA.ID,
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      now,
+	}
+	_ = db.CreateJob(ctx, jobA)
+
+	jobB := domain.LocalizationJob{
+		ID:             "job-B",
+		SourceAssetID:  assetB.ID,
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      now,
+	}
+	_ = db.CreateJob(ctx, jobB)
+
+	runA := domain.LocalizationRun{
+		ID:                 "run-A",
+		JobID:              jobA.ID,
+		Status:             "running",
+		ConfigSnapshotJSON: `{"glossary":[{"source":"SUPOR","target":"Nồi Supor","note":"Brand"}]}`,
+		CreatedAt:          now,
+	}
+	_ = db.CreateRun(ctx, runA)
+	tObjA, _ := casStore.Put(bytes.NewReader([]byte(`{"asset_id":"asset-A"}`)))
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             "se-stage-runA",
+		RunID:          runA.ID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObjA.SHA256,
+		CreatedAt:      now,
+	})
+
+	runB := domain.LocalizationRun{
+		ID:                 "run-B",
+		JobID:              jobB.ID,
+		Status:             "running",
+		ConfigSnapshotJSON: `{"glossary":[{"source":"SUPOR","target":"Nồi Supor","note":"Brand"}]}`,
+		CreatedAt:          now,
+	}
+	_ = db.CreateRun(ctx, runB)
+
+	// 1. Cross-asset run_id must fail closed with 400 (runB passed to assetA URL)
+	reqCrossRun := httptest.NewRequest(http.MethodPost, "/api/v1/assets/asset-A/translate", strings.NewReader(`{
+		"run_id": "run-B",
+		"target_language": "vi",
+		"segments": [{"index": 0, "source_text": "SUPOR 你好"}]
+	}`))
+	recCrossRun := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recCrossRun, reqCrossRun)
+	if recCrossRun.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for cross-asset run_id, got %d: %s", recCrossRun.Code, recCrossRun.Body.String())
+	}
+	if !strings.Contains(recCrossRun.Body.String(), "belongs to asset asset-B, not asset-A") {
+		t.Fatalf("expected error message to name asset mismatch, got: %s", recCrossRun.Body.String())
+	}
+	if invocations != 0 {
+		t.Fatalf("expected 0 provider invocations on cross-asset run, got %d", invocations)
+	}
+
+	// 2. Mismatched job_id must fail closed with 400
+	reqMismatchedJob := httptest.NewRequest(http.MethodPost, "/api/v1/assets/asset-A/translate", strings.NewReader(`{
+		"run_id": "run-A",
+		"job_id": "job-B",
+		"target_language": "vi",
+		"segments": [{"index": 0, "source_text": "SUPOR 你好"}]
+	}`))
+	recMismatchedJob := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recMismatchedJob, reqMismatchedJob)
+	if recMismatchedJob.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for mismatched job_id, got %d: %s", recMismatchedJob.Code, recMismatchedJob.Body.String())
+	}
+	if invocations != 0 {
+		t.Fatalf("expected 0 provider invocations on mismatched job_id, got %d", invocations)
+	}
+
+	// 3. Conflicting glossary must fail closed with 400 before provider routing or mutation
+	reqConflictGlossary := httptest.NewRequest(http.MethodPost, "/api/v1/assets/asset-A/translate", strings.NewReader(`{
+		"run_id": "run-A",
+		"job_id": "job-A",
+		"target_language": "vi",
+		"segments": [{"index": 0, "source_text": "SUPOR 你好"}],
+		"glossary": [{"source": "SUPOR", "target": "Khác", "note": "Override attempt"}]
+	}`))
+	recConflictGlossary := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recConflictGlossary, reqConflictGlossary)
+	if recConflictGlossary.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for conflicting glossary, got %d: %s", recConflictGlossary.Code, recConflictGlossary.Body.String())
+	}
+	if !strings.Contains(recConflictGlossary.Body.String(), "request glossary conflicts with frozen run snapshot") {
+		t.Fatalf("expected error message to explain glossary conflict, got: %s", recConflictGlossary.Body.String())
+	}
+	if invocations != 0 {
+		t.Fatalf("expected 0 provider invocations on conflicting glossary, got %d", invocations)
+	}
+	if _, err := db.GetTranslationVariantIndexByRun(ctx, runA.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected zero mutation in storage on failure, got err=%v", err)
+	}
+
+	// 4. Inheriting frozen glossary with empty request glossary succeeds (201 Created)
+	reqInherit := httptest.NewRequest(http.MethodPost, "/api/v1/assets/asset-A/translate", strings.NewReader(`{
+		"run_id": "run-A",
+		"job_id": "job-A",
+		"target_language": "vi",
+		"segments": [{"index": 0, "source_text": "SUPOR 你好"}]
+	}`))
+	recInherit := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recInherit, reqInherit)
+	if recInherit.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for inheriting frozen glossary, got %d: %s", recInherit.Code, recInherit.Body.String())
+	}
+	if invocations != 1 {
+		t.Fatalf("expected 1 provider invocation, got %d", invocations)
+	}
+	var res1 struct {
+		Variant domain.TranslationVariant `json:"translation_variant"`
+	}
+	if err := json.Unmarshal(recInherit.Body.Bytes(), &res1); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(res1.Variant.EffectiveGlossary.Entries) != 1 || res1.Variant.EffectiveGlossary.Entries[0].Target != "Nồi Supor" {
+		t.Fatalf("expected effective glossary target 'Nồi Supor', got %+v", res1.Variant.EffectiveGlossary)
+	}
+
+	// 5. Canonically equivalent glossary succeeds (201 Created)
+	runA2 := domain.LocalizationRun{
+		ID:                 "run-A2",
+		JobID:              jobA.ID,
+		Status:             "running",
+		ConfigSnapshotJSON: `{"glossary":[{"source":"SUPOR","target":"Nồi Supor","note":"Brand"}]}`,
+		CreatedAt:          now.Add(time.Second),
+	}
+	_ = db.CreateRun(ctx, runA2)
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             "se-stage-runA2",
+		RunID:          runA2.ID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObjA.SHA256,
+		CreatedAt:      now,
+	})
+
+	reqCanon := httptest.NewRequest(http.MethodPost, "/api/v1/assets/asset-A/translate", strings.NewReader(`{
+		"run_id": "run-A2",
+		"job_id": "job-A",
+		"target_language": "vi",
+		"segments": [{"index": 0, "source_text": "SUPOR 你好"}],
+		"glossary": [{"source": " ｓｕｐｏｒ ", "target": "Nồi Supor", "note": "Brand"}]
+	}`))
+	recCanon := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recCanon, reqCanon)
+	if recCanon.Code != http.StatusCreated {
+		t.Fatalf("expected 201 for canonically equivalent glossary, got %d: %s", recCanon.Code, recCanon.Body.String())
+	}
+	if invocations != 2 {
+		t.Fatalf("expected 2 provider invocations, got %d", invocations)
+	}
+}
+
+// TestReviewItemOverrideRequiresRunID pins finding 3: a review item id alone cannot prove which
+// run's pending queue it belongs to, so the direct override endpoint must reject a missing run_id
+// instead of silently falling back to the asset-latest queue (which could accept a stale item from
+// a superseded run). The guard must also reject a whitespace-only run_id.
+func TestReviewItemOverrideRequiresRunID(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	db, err := storage.Open(filepath.Join(root, "douyinie.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	casStore, err := cas.NewStore(filepath.Join(root, "cas"))
+	if err != nil {
+		t.Fatalf("open cas: %v", err)
+	}
+
+	// ReviewSvc is auto-constructed from DB + CASStore, mirroring production wiring.
+	s := New(Config{Addr: "127.0.0.1:0", DB: db, CASStore: casStore})
+
+	for name, body := range map[string]string{
+		"missing run_id": `{}`,
+		"blank run_id":   `{"run_id":"   "}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/review-items/item-1/override", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: expected 400, got %d: %s", name, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "run_id is required") {
+			t.Fatalf("%s: expected the run_id requirement, got %s", name, rec.Body.String())
+		}
+	}
+}
+
+// TestSpeechUnderstandRejectsUnprovenRunLineage pins finding 4: the speech_understand stage
+// execution and the transcript artifact index are both pinned to the client-supplied run_id, so a
+// run that does not exist, or that belongs to a different asset, must be rejected before any
+// lineage is written - otherwise the run's transcript lineage could be poisoned with another
+// asset's media.
+func TestSpeechUnderstandRejectsUnprovenRunLineage(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	db, err := storage.Open(filepath.Join(root, "douyinie.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	casStore, err := cas.NewStore(filepath.Join(root, "cas"))
+	if err != nil {
+		t.Fatalf("open cas: %v", err)
+	}
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	attestation := domain.RightsAttestation{
+		ID:              "attestation-speech-own-1",
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		DeclaredBy:      "tester",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	}
+	_ = db.CreateRightsAttestation(ctx, attestation)
+
+	for _, id := range []string{"asset-owned", "asset-other"} {
+		_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+			ID:                  id,
+			SHA256:              "sha-" + id,
+			ByteSize:            100,
+			RightsAttestationID: attestation.ID,
+			CreatedAt:           now,
+		})
+	}
+	_ = db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             "job-other",
+		SourceAssetID:  "asset-other",
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      now,
+	})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        "run-other",
+		JobID:     "job-other",
+		Status:    "running",
+		CreatedAt: now,
+	})
+
+	speechSvc := service.NewSpeechService(db, casStore)
+	s := New(Config{Addr: "127.0.0.1:0", DB: db, CASStore: casStore, SpeechSvc: speechSvc})
+
+	cases := []struct {
+		name         string
+		body         string
+		wantContains string
+	}{
+		{"missing run_id", `{}`, "run_id is required"},
+		{"unknown run", `{"run_id":"run-absent"}`, "not found"},
+		{"run owned by another asset", `{"run_id":"run-other"}`, "belongs to asset asset-other"},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/assets/asset-owned/speech-understand", strings.NewReader(tc.body))
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: expected 400, got %d: %s", tc.name, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), tc.wantContains) {
+			t.Fatalf("%s: expected response to mention %q, got %s", tc.name, tc.wantContains, rec.Body.String())
+		}
+	}
+
+	// No lineage may be written by a rejected request: not for the foreign run, not for the asset.
+	stages, err := db.ListStageExecutions(ctx, "run-other")
+	if err != nil {
+		t.Fatalf("list stage executions: %v", err)
+	}
+	if len(stages) != 0 {
+		t.Fatalf("rejected speech-understand wrote lineage for run-other: %+v", stages)
+	}
+	if idx, err := db.GetTranscriptArtifactIndex(ctx, "asset-owned"); err == nil && idx != nil {
+		t.Fatalf("rejected speech-understand persisted a transcript index for asset-owned: %+v", idx)
+	}
+}
+
+// TestRunGlossaryConflictCountSurvivesIngress pins finding 11 end to end: a run glossary frozen at
+// create-run keeps conflicting duplicates, so the variant produced for that run reports the
+// omitted-conflict count the operator UI turns into feedback. Persisting only the deduped list would
+// make EffectiveGlossary report zero conflicts for the frozen run and the feedback would never fire.
+// The same ingress must reject an invisible format rune before any mutation.
+func TestRunGlossaryConflictCountSurvivesIngress(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	db, err := storage.Open(filepath.Join(root, "douyinie.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	casStore, err := cas.NewStore(filepath.Join(root, "cas"))
+	if err != nil {
+		t.Fatalf("open cas: %v", err)
+	}
+
+	transSvc := service.NewTranslationService(db, casStore)
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		target := req.Segments[0].SourceText
+		if len(req.Glossary) > 0 {
+			target = req.Glossary[0].Target
+		}
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "fake_model",
+			ModelVersion: "1",
+			Segments: []domain.TranslationSegment{
+				{Index: 0, SourceText: req.Segments[0].SourceText, TargetText: target},
+			},
+		}, nil
+	}
+	s := New(Config{Addr: "127.0.0.1:0", DB: db, CASStore: casStore, TranslationSvc: transSvc})
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              "attestation-glossary-conflict",
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		DeclaredBy:      "tester",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  "asset-glossary",
+		SHA256:              "sha-glossary",
+		ByteSize:            100,
+		RightsAttestationID: "attestation-glossary-conflict",
+		CreatedAt:           now,
+	})
+	_ = db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             "job-glossary",
+		SourceAssetID:  "asset-glossary",
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      now,
+	})
+
+	// Invisible format rune: the request must be rejected before any run is created.
+	badBody, _ := json.Marshal(map[string]any{
+		"config_snapshot_json": `{"glossary":[{"source":"ke\u200byword","target":"x"}]}`,
+	})
+	recBad := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recBad, httptest.NewRequest(http.MethodPost, "/api/v1/jobs/job-glossary/runs", bytes.NewReader(badBody)))
+	if recBad.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a glossary source with an invisible format rune, got %d: %s", recBad.Code, recBad.Body.String())
+	}
+	if !strings.Contains(recBad.Body.String(), "format character") {
+		t.Fatalf("expected the format-character rejection to be reported, got %s", recBad.Body.String())
+	}
+
+	// Conflicting duplicates: same source, different targets. First entry wins.
+	runBody, _ := json.Marshal(map[string]any{
+		"config_snapshot_json": `{"glossary":[{"source":"SUPOR","target":"Nồi Supor"},{"source":"ｓｕｐｏｒ","target":"Supor"}]}`,
+	})
+	recRun := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recRun, httptest.NewRequest(http.MethodPost, "/api/v1/jobs/job-glossary/runs", bytes.NewReader(runBody)))
+	if recRun.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating the run, got %d: %s", recRun.Code, recRun.Body.String())
+	}
+	var created struct {
+		Run domain.LocalizationRun `json:"run"`
+	}
+	if err := json.NewDecoder(recRun.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created run: %v", err)
+	}
+	if created.Run.ID == "" {
+		t.Fatalf("expected a run id in the create response: %s", recRun.Body.String())
+	}
+
+	// The frozen snapshot must still carry both conflicting entries, otherwise the count is unrecoverable.
+	if !strings.Contains(created.Run.ConfigSnapshotJSON, "Supor") {
+		t.Fatalf("frozen run snapshot dropped the conflicting duplicate: %s", created.Run.ConfigSnapshotJSON)
+	}
+
+	// Translation requires pinned speech_understand transcript lineage for the run.
+	tObj, err := casStore.Put(bytes.NewReader([]byte(`{"asset_id":"asset-glossary"}`)))
+	if err != nil {
+		t.Fatalf("put transcript artifact: %v", err)
+	}
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             "se-glossary-transcript",
+		RunID:          created.Run.ID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObj.SHA256,
+		CreatedAt:      now,
+	}); err != nil {
+		t.Fatalf("pin transcript lineage: %v", err)
+	}
+
+	translateBody, _ := json.Marshal(map[string]any{
+		"run_id":          created.Run.ID,
+		"job_id":          "job-glossary",
+		"target_language": "vi",
+		"segments":        []map[string]any{{"index": 0, "source_text": "SUPOR 你好"}},
+	})
+	recTrans := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recTrans, httptest.NewRequest(http.MethodPost, "/api/v1/assets/asset-glossary/translate", bytes.NewReader(translateBody)))
+	if recTrans.Code != http.StatusCreated {
+		t.Fatalf("expected 201 translating with the frozen run glossary, got %d: %s", recTrans.Code, recTrans.Body.String())
+	}
+	var translated struct {
+		Variant domain.TranslationVariant `json:"translation_variant"`
+	}
+	if err := json.NewDecoder(recTrans.Body).Decode(&translated); err != nil {
+		t.Fatalf("decode translation variant: %v", err)
+	}
+	if got := translated.Variant.EffectiveGlossary.OmittedConflicts; got != 1 {
+		t.Fatalf("expected the operator-visible conflict count 1 from the frozen run glossary, got %d (effective glossary %+v)",
+			got, translated.Variant.EffectiveGlossary)
+	}
+	entries := translated.Variant.EffectiveGlossary.Entries
+	if len(entries) != 1 || entries[0].Target != "Nồi Supor" {
+		t.Fatalf("expected first-wins to keep the first conflicting entry, got %+v", entries)
 	}
 }

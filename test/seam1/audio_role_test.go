@@ -1043,7 +1043,28 @@ func TestSeam1_SpeechUnderstand_AudioRoleErrorClassification(t *testing.T) {
 	if err := h.db.CreateSourceAsset(context.Background(), unseededAsset); err != nil {
 		t.Fatalf("create unseeded source asset: %v", err)
 	}
-	speechBody2, err := json.Marshal(map[string]any{"run_id": uuid.NewString()})
+	// The speech_understand handler proves the client run_id belongs to the asset before it can
+	// persist any lineage, so the classification under test needs a real run bound to this asset.
+	unseededJob := domain.LocalizationJob{
+		ID:             "job-unseeded-" + uuid.NewString()[:8],
+		SourceAssetID:  unseededAsset.ID,
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      time.Now().UTC(),
+	}
+	if err := h.db.CreateJob(context.Background(), unseededJob); err != nil {
+		t.Fatalf("create unseeded job: %v", err)
+	}
+	unseededRun := domain.LocalizationRun{
+		ID:        "run-unseeded-" + uuid.NewString()[:8],
+		JobID:     unseededJob.ID,
+		Status:    "running",
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := h.db.CreateRun(context.Background(), unseededRun); err != nil {
+		t.Fatalf("create unseeded run: %v", err)
+	}
+	speechBody2, err := json.Marshal(map[string]any{"run_id": unseededRun.ID})
 	if err != nil {
 		t.Fatalf("marshal speech body 2: %v", err)
 	}

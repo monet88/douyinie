@@ -975,6 +975,14 @@ func seedTranslationTestRun(t *testing.T, db *storage.DB, ctx context.Context, a
 		Status:    "running",
 		CreatedAt: time.Now().UTC(),
 	})
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: "fake-transcript-sha256",
+		CreatedAt:      time.Now().UTC(),
+	})
 }
 
 func TestTranslationService_FlaggedFallback_PublishesWhenAllLanesTripQA(t *testing.T) {

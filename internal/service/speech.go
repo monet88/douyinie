@@ -367,10 +367,21 @@ func (s *SpeechService) persistTranscript(ctx context.Context, in domain.SpeechP
 		if err == nil {
 			loaded.ProvenanceHash = existing.ProvenanceHash
 			*artifact = *loaded
+			if strings.TrimSpace(in.RunID) != "" {
+				if err := s.db.CreateStageExecution(ctx, domain.StageExecution{
+					ID:             uuid.NewString(),
+					RunID:          in.RunID,
+					Stage:          "speech_understand",
+					Status:         domain.StageStatusSucceeded,
+					ArtifactSHA256: existing.CASHash,
+					CreatedAt:      time.Now().UTC(),
+				}); err != nil {
+					return fmt.Errorf("record speech_understand stage for run %s: %w", in.RunID, err)
+				}
+			}
 			return nil
 		}
 	}
-
 	// Marshal the artifact (excluding its own CAS/provenance hashes) into CAS.
 	blob, err := json.Marshal(artifact)
 	if err != nil {
@@ -400,6 +411,18 @@ func (s *SpeechService) persistTranscript(ctx context.Context, in domain.SpeechP
 	}
 	if err := s.db.SaveTranscriptArtifactIndex(ctx, idx); err != nil {
 		return fmt.Errorf("persist transcript artifact index: %w", err)
+	}
+	if strings.TrimSpace(in.RunID) != "" {
+		if err := s.db.CreateStageExecution(ctx, domain.StageExecution{
+			ID:             uuid.NewString(),
+			RunID:          in.RunID,
+			Stage:          "speech_understand",
+			Status:         domain.StageStatusSucceeded,
+			ArtifactSHA256: obj.SHA256,
+			CreatedAt:      artifact.CreatedAt,
+		}); err != nil {
+			return fmt.Errorf("record speech_understand stage for run %s: %w", in.RunID, err)
+		}
 	}
 	return nil
 }
