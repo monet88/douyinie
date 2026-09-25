@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/provider"
@@ -38,6 +39,38 @@ func seam1QueueLen(t *testing.T, h *testHarness) int {
 		t.Fatalf("decode queue: %v", err)
 	}
 	return len(out.Queue)
+}
+
+// assertSeam1MixedAudioSamples decodes the actual PCM16 audio samples from CAS
+// to enforce Issue 153 acceptance requirement ("verify actual output samples, not only status JSON").
+func assertSeam1MixedAudioSamples(t *testing.T, casStore *cas.Store, audioCASHash string, minDurationMs int64) []int16 {
+	t.Helper()
+	r, err := casStore.Get(audioCASHash)
+	if err != nil {
+		t.Fatalf("failed to read mixed audio from CAS (%s): %v", audioCASHash, err)
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read mixed audio bytes: %v", err)
+	}
+	samples, hdr, err := media.ExtractPCM16Samples(data)
+	if err != nil {
+		t.Fatalf("extract mixed samples failed: %v", err)
+	}
+	if len(samples) == 0 {
+		t.Fatalf("mixed audio contains zero samples")
+	}
+	if hdr.SampleRate <= 0 || hdr.NumChannels <= 0 {
+		t.Fatalf("invalid mixed audio header: rate=%d channels=%d", hdr.SampleRate, hdr.NumChannels)
+	}
+	if minDurationMs > 0 {
+		durMs := int64(len(samples)) * 1000 / (int64(hdr.SampleRate) * int64(hdr.NumChannels))
+		if durMs < minDurationMs {
+			t.Errorf("mixed audio duration %dms < expected %dms", durMs, minDurationMs)
+		}
+	}
+	return samples
 }
 
 func TestSeam1_Issue151_GlossaryIngressAndCanonicalSpeechVariant(t *testing.T) {
@@ -299,6 +332,7 @@ func TestSeam1_Issue153_AudioMixAcceptsBorrowedPlaybackWindowAndPinsCAS(t *testi
 	if resp.StatusCode != http.StatusCreated || mix == nil || mix.OverallStatus != "PASS" {
 		t.Fatalf("borrowed playback window should mix successfully: status=%d mix=%+v", resp.StatusCode, mix)
 	}
+	assertSeam1MixedAudioSamples(t, h.casStore, mix.AudioCASHash, 3000)
 
 	mixReq["dub_segments_cas"] = strings.Repeat("f", 64)
 	resp, _ = runAudioMix(t, h, assetID, mixReq)
@@ -401,6 +435,7 @@ func TestSeam1_Issue153_PlaybackWindowBoundaryMatrix(t *testing.T) {
 		if respMix.StatusCode != http.StatusCreated || mix == nil || mix.OverallStatus != "PASS" {
 			t.Fatalf("exact end (3400ms) should mix successfully: status=%d mix=%+v", respMix.StatusCode, mix)
 		}
+		assertSeam1MixedAudioSamples(t, h.casStore, mix.AudioCASHash, 3400)
 
 		// Each fallible sub-case below mutates the fixture it derives from. Segments, FitPlans and
 		// their membership slices are slices, so a plain struct copy aliases every other sub-case's
@@ -726,6 +761,7 @@ func TestSeam1_Issue153_ProtectedRegionBlocksBorrowedPlaybackWindow(t *testing.T
 			if resp.StatusCode != http.StatusCreated || mixArtifact == nil || mixArtifact.OverallStatus != "PASS" {
 				t.Fatalf("a candidate ending at the protected boundary must mix: status=%d mix=%+v", resp.StatusCode, mixArtifact)
 			}
+			assertSeam1MixedAudioSamples(t, h.casStore, mixArtifact.AudioCASHash, 2140)
 
 			// A 2200ms candidate does not fit the 2000ms source slot: it would need playback through
 			// 3200ms, exactly where the protected region begins. The mixer recomputes the boundary
@@ -793,6 +829,7 @@ func TestSeam1_Issue153_AdjacentSpeechTurnBlocksBorrowing(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated || mixArtifact == nil || mixArtifact.OverallStatus != "PASS" {
 		t.Fatalf("a variant that honors the adjacent turn must mix: status=%d mix=%+v", resp.StatusCode, mixArtifact)
 	}
+	assertSeam1MixedAudioSamples(t, h.casStore, mixArtifact.AudioCASHash, 4500)
 
 	// A variant computed against a timeline that does not carry the adjacent turn claims the
 	// standard gap borrowing to 4600ms (reserve 400ms) — a window this timeline never granted.
@@ -847,6 +884,7 @@ func TestSeam1_Issue153_DuplicateSourceMemberCoverageRefused(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated || mixArtifact == nil || mixArtifact.OverallStatus != "PASS" {
 		t.Fatalf("an honest single-member variant must mix: status=%d mix=%+v", resp.StatusCode, mixArtifact)
 	}
+	assertSeam1MixedAudioSamples(t, h.casStore, mixArtifact.AudioCASHash, 3000)
 
 	// One segment claiming member 0 twice: the member is covered more than once.
 	doubled := seam1BuildVariant(t, h, assetID, runID, "vi", "member-twice-in-one-segment", lineage, []seam1SegmentSpec{
@@ -941,4 +979,321 @@ func TestSeam1_Issue153_DubReviewRequiredParksRunAndMarksJobReviewRequired(t *te
 		t.Fatalf("expected an unplaceable REVIEW_REQUIRED variant, got status=%s accepted=%d review=%d",
 			variant.OverallStatus, len(variant.Segments), len(variant.ReviewSegments))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Issue #153 / F2: A gap between adjacent same-speaker speech blocks that contains preserved
+// soundtrack (singing/music-vocal or uncertain) must NEVER be regrouped across, even when the gap
+// duration is < 600ms. Regrouping would swallow the soundtrack interval into dialogue and clash
+// spoken audio with playing vocals.
+// ---------------------------------------------------------------------------
+func TestSeam1_Issue153_RegroupNeverCrossesPreservedInternalSoundtrack(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	// 1. Separate audio into stems
+	respSep, _ := runSeparateStems(t, h, assetID, map[string]any{"run_id": runID})
+	if respSep.StatusCode != http.StatusCreated && respSep.StatusCode != http.StatusOK {
+		t.Fatalf("separate-stems status=%d", respSep.StatusCode)
+	}
+
+	// 2. AudioRolePlan with dialogue [0, 1000], singing gap [1000, 1300] (300ms < 600ms), dialogue [1300, 3000]
+	rolePayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 1000, EndMs: 1300, Role: domain.AudioRoleSingingMusicVocal},
+			{StartMs: 1300, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	roleBody, _ := json.Marshal(rolePayload)
+	respRole, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(roleBody))
+	if err != nil {
+		t.Fatalf("audio-role-plan request failed: %v", err)
+	}
+	if respRole.StatusCode != http.StatusCreated && respRole.StatusCode != http.StatusOK {
+		t.Fatalf("audio-role-plan status=%d", respRole.StatusCode)
+	}
+
+	// 3. Transcript with 2 speech blocks separated by the 300ms singing gap
+	transcript := domain.TranscriptArtifact{
+		ID:             "transcript-regroup-gap-" + assetID,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		SpeechBlocks: []domain.SpeechBlock{
+			{Index: 0, SegmentType: domain.SpeechBlockTypeSpeech, SourceText: "前半句", SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 1000},
+			{Index: 1, SegmentType: domain.SpeechBlockTypeSpeech, SourceText: "后半句", SpeakerID: "SPEAKER_00", StartMs: 1300, EndMs: 3000},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tBytes, _ := json.Marshal(transcript)
+	tObj, err := h.casStore.Put(bytes.NewReader(tBytes))
+	if err != nil {
+		t.Fatalf("put transcript: %v", err)
+	}
+	_ = h.db.SaveTranscriptArtifactIndex(context.Background(), storage.TranscriptArtifactIndex{
+		ID: transcript.ID, AssetID: assetID, RunID: runID, CASHash: tObj.SHA256,
+		ProvenanceHash: "prov-transcript-regroup-" + assetID, CreatedAt: transcript.CreatedAt,
+	})
+	_ = h.db.CreateStageExecution(context.Background(), domain.StageExecution{
+		ID:             "se-speech-regroup-" + runID,
+		RunID:          runID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObj.SHA256,
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+	})
+
+	// 4. DubScript with segment 0 having SourceGapAfterMs = 300ms
+	dubScript := domain.DubScriptVariant{
+		ID:             "dubscript-regroup-" + assetID,
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:               0,
+				SpeakerID:           "SPEAKER_00",
+				StartMs:             0,
+				EndMs:               1000,
+				SlotDurationMs:      1000,
+				SourceText:          "前半句",
+				MeaningText:         "Vế thứ nhất",
+				SpokenText:          "Vế thứ nhất",
+				SourceGapAfterMs:    300,
+				EstimatedDurationMs: 1500, // overruns 1000ms slot
+				PassedQAGate:        true,
+			},
+			{
+				Index:               1,
+				SpeakerID:           "SPEAKER_00",
+				StartMs:             1300,
+				EndMs:               3000,
+				SlotDurationMs:      1700,
+				SourceText:          "后半句",
+				MeaningText:         "vế thứ hai.",
+				SpokenText:          "vế thứ hai.",
+				SourceGapAfterMs:    100,
+				EstimatedDurationMs: 1200,
+				PassedQAGate:        true,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	// Pin translation variant for DubScript
+	tv := domain.TranslationVariant{
+		ID:                    "tv-regroup-" + assetID,
+		SchemaVersion:         domain.TranslationSchemaVersion,
+		ContractID:            service.TranslationContractID,
+		AssetID:               assetID,
+		RunID:                 runID,
+		JobID:                 jobID,
+		SourceLanguage:        "zh",
+		TargetLanguage:        "vi",
+		TranscriptArtifactCAS: tObj.SHA256,
+		InputHash:             "h-regroup",
+		ProvenanceHash:        "p-regroup",
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "前半句", TargetText: "Vế thứ nhất", SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 1000, PassedQAGate: true},
+			{Index: 1, SourceText: "后半句", TargetText: "vế thứ hai.", SpeakerID: "SPEAKER_00", StartMs: 1300, EndMs: 3000, PassedQAGate: true},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	tvBytes, _ := json.Marshal(tv)
+	tvObj, _ := h.casStore.Put(bytes.NewReader(tvBytes))
+	dubScript.TranslationVariantCAS = tvObj.SHA256
+
+	dsBytes, _ := json.Marshal(dubScript)
+	dsObj, _ := h.casStore.Put(bytes.NewReader(dsBytes))
+	_ = h.db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+		ID: dubScript.ID, AssetID: assetID, RunID: runID, TargetLanguage: "vi",
+		CASHash: dsObj.SHA256, ProvenanceHash: "prov-ds-regroup", CreatedAt: dubScript.CreatedAt,
+	})
+
+	// 5. Assign voices
+	respVA, va := runAssignVoices(t, h, assetID, map[string]any{"run_id": runID, "target_language": "vi"})
+	if respVA.StatusCode != http.StatusCreated && respVA.StatusCode != http.StatusOK {
+		t.Fatalf("voice-assignment status=%d", respVA.StatusCode)
+	}
+
+	// 6. Dub synthesize via API
+	respDub, dubVariant := runDubSynthesize(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": dsObj.SHA256,
+		"voice_assignment_cas":   va.CASHash,
+	})
+	if respDub.StatusCode != http.StatusCreated && respDub.StatusCode != http.StatusOK {
+		t.Fatalf("dub-synthesize status=%d", respDub.StatusCode)
+	}
+
+	// Invariant: Seg 0 must NOT be merged with Seg 1 across the singing gap [1000, 1300]!
+	for _, seg := range dubVariant.Segments {
+		if len(seg.SpeechBlockIndices) > 1 {
+			t.Fatalf("regroup incorrectly swallowed singing soundtrack gap! SpeechBlockIndices: %v", seg.SpeechBlockIndices)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Issue #151/153: Direct translation, correction, and restart against a run with a frozen glossary
+// ---------------------------------------------------------------------------
+func TestSeam1_Issue151_FrozenGlossary_CorrectionAndDirectAPI(t *testing.T) {
+	h := setupHarness(t)
+	ctx := context.Background()
+
+	jobID, _ := createJobAndRun(t, h)
+	job := getJobViaAPI(t, h, jobID)
+	assetID := job.SourceAssetID
+
+	frozenCfg := `{"glossary":[{"source":"OpenAI","target":"OPENAI_FROZEN","note":"brand"}]}`
+	postRun := func(cfg string) *http.Response {
+		resp, err := http.Post(
+			fmt.Sprintf("%s/api/v1/jobs/%s/runs", h.server.URL, jobID),
+			"application/json",
+			bytes.NewReader([]byte(fmt.Sprintf(`{"config_snapshot_json":%q}`, cfg))),
+		)
+		if err != nil {
+			t.Fatalf("post run: %v", err)
+		}
+		return resp
+	}
+
+	respRun := postRun(frozenCfg)
+	var runOut struct {
+		Run domain.LocalizationRun `json:"run"`
+	}
+	_ = json.NewDecoder(respRun.Body).Decode(&runOut)
+	respRun.Body.Close()
+	runID := runOut.Run.ID
+
+	// Seed AudioRolePlan and pinned transcript lineage for the run
+	rolePayload := map[string]any{
+		"segments": []domain.AudioSegment{
+			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	roleBody, _ := json.Marshal(rolePayload)
+	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(roleBody))
+
+	transcriptJSON := fmt.Sprintf(`{"asset_id":%q,"speech_blocks":[{"index":0,"start_ms":0,"end_ms":1500,"source_text":"OpenAI 是一个机构","speaker_id":"SPEAKER_00","segment_type":"speech"}]}`, assetID)
+	tObj, _ := h.casStore.Put(bytes.NewReader([]byte(transcriptJSON)))
+	_ = h.db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             "se-speech-frozen-" + runID,
+		RunID:          runID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObj.SHA256,
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+	})
+
+	// 2. Direct API translation without glossary inherits the frozen glossary
+	p, ok := h.registry.Get("fake_llm_translator")
+	if !ok {
+		t.Fatal("fake_llm_translator missing")
+	}
+	fakeTrans := p.(*provider.FakeTranslationProvider)
+	fakeTrans.CustomTranslations["vi:OpenAI 是一个机构"] = "OPENAI_FROZEN là một tổ chức"
+
+	translateBody, _ := json.Marshal(map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": "vi",
+	})
+	respTrans, err := http.Post(
+		fmt.Sprintf("%s/api/v1/assets/%s/translate", h.server.URL, assetID),
+		"application/json",
+		bytes.NewReader(translateBody),
+	)
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	if respTrans.StatusCode != http.StatusCreated {
+		buf := new(bytes.Buffer)
+		_, _ = buf.ReadFrom(respTrans.Body)
+		respTrans.Body.Close()
+		t.Fatalf("expected 201 inheriting frozen glossary, got %d: %s", respTrans.StatusCode, buf.String())
+	}
+	var transOut struct {
+		Variant domain.TranslationVariant `json:"translation_variant"`
+	}
+	_ = json.NewDecoder(respTrans.Body).Decode(&transOut)
+	respTrans.Body.Close()
+
+	if len(transOut.Variant.EffectiveGlossary.Entries) != 1 || transOut.Variant.EffectiveGlossary.Entries[0].Target != "OPENAI_FROZEN" {
+		t.Fatalf("expected effective glossary target 'OPENAI_FROZEN', got %+v", transOut.Variant.EffectiveGlossary)
+	}
+
+	// 3. Direct API translation with conflicting glossary must fail closed with 400
+	conflictBody, _ := json.Marshal(map[string]any{
+		"run_id":          runID,
+		"job_id":          jobID,
+		"target_language": "vi",
+		"segments":        []domain.TranslationInputSegment{{Index: 0, SourceText: "OpenAI 是一个机构"}},
+		"glossary":        []map[string]string{{"source": "OpenAI", "target": "CONFLICTING_TARGET"}},
+	})
+	respConflict, err := http.Post(
+		fmt.Sprintf("%s/api/v1/assets/%s/translate", h.server.URL, assetID),
+		"application/json",
+		bytes.NewReader(conflictBody),
+	)
+	if err != nil {
+		t.Fatalf("translate conflict: %v", err)
+	}
+	if respConflict.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for conflicting glossary, got %d", respConflict.StatusCode)
+	}
+	respConflict.Body.Close()
+
+	// 4. Target text correction on this run preserves the frozen glossary
+	dubScript := domain.DubScriptVariant{
+		ID:                    "dubscript-frozen-" + assetID,
+		SchemaVersion:         domain.DubScriptSchemaVersion,
+		AssetID:               assetID,
+		RunID:                 runID,
+		SourceLanguage:        "zh",
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: transOut.Variant.CASHash,
+		Segments: []domain.DubScriptSegment{
+			{Index: 0, SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 1500, SlotDurationMs: 1500, SourceText: "OpenAI 是一个机构", MeaningText: "OPENAI_FROZEN là một tổ chức", SpokenText: "OPENAI_FROZEN là một tổ chức", PassedQAGate: true},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	dsBytes, _ := json.Marshal(dubScript)
+	dsObj, _ := h.casStore.Put(bytes.NewReader(dsBytes))
+	_ = h.db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID: dubScript.ID, AssetID: assetID, RunID: runID, TargetLanguage: "vi",
+		CASHash: dsObj.SHA256, ProvenanceHash: "prov-ds-frozen", CreatedAt: dubScript.CreatedAt,
+	})
+
+	corrPayload := map[string]any{
+		"run_id":               runID,
+		"job_id":               jobID,
+		"target_language":      "vi",
+		"segment_index":        0,
+		"new_target_text":      "OPENAI_FROZEN là tổ chức nghiên cứu.",
+		"spoken_text_override": "OPENAI_FROZEN là tổ chức nghiên cứu.",
+		"operator":             "editor_monet",
+	}
+	corrBytes, _ := json.Marshal(corrPayload)
+	corrResp, err := http.Post(
+		fmt.Sprintf("%s/api/v1/assets/%s/inspector/correct-text", h.server.URL, assetID),
+		"application/json",
+		bytes.NewReader(corrBytes),
+	)
+	if err != nil || corrResp.StatusCode != http.StatusOK {
+		buf := new(bytes.Buffer)
+		if corrResp != nil {
+			_, _ = buf.ReadFrom(corrResp.Body)
+			corrResp.Body.Close()
+		}
+		t.Fatalf("POST inspector/correct-text failed: status=%d err=%v body=%s", corrResp.StatusCode, err, buf.String())
+	}
+	corrResp.Body.Close()
 }

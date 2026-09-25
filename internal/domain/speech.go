@@ -415,12 +415,6 @@ func IsDubEligibleTiming(startMs, endMs int64, plan *AudioRolePlan) bool {
 	return hasDialogue
 }
 
-// IsInsideDialogueWindow checks whether the timing interval [startMs, endMs] represents dub-eligible dialogue.
-// Matches IsDubEligibleTiming (Issue #153): singing/music-vocal and uncertain constrain; ordinary BGM/SFX/ambience do not.
-func IsInsideDialogueWindow(startMs, endMs int64, plan *AudioRolePlan) bool {
-	return IsDubEligibleTiming(startMs, endMs, plan)
-}
-
 // IsDubEligibleSpeechBlock checks whether a SpeechBlock represents canonical dialogue speech eligible for dubbing:
 // it must be a valid speech block, carry real source text (not empty, not pathological repetition noise),
 // have dialogue overlap in AudioRolePlan, and not overlap protected vocal or uncertain regions

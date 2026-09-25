@@ -706,10 +706,18 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 	}
 
 	// 1. AudioRolePlan
-	rolePlan, err := s.db.GetAudioRolePlan(ctx, assetID)
-	if reusable, _ := isStageReusable("audio_role_plan"); reusable && rolePlan != nil {
-		// Reused audio role plan
-	} else if rolePlan == nil {
+	var rolePlan *domain.AudioRolePlan
+	if reusable, casHash := isStageReusable("audio_role_plan"); reusable && casHash != "" {
+		if plan, err := service.LoadPinnedAudioRolePlanFromCAS(s.casStore, casHash); err == nil {
+			rolePlan = plan
+		}
+	}
+	if rolePlan == nil {
+		if plan, err := service.ResolveRunScopedAudioRolePlan(ctx, s.db, s.casStore, assetID, runID); err == nil {
+			rolePlan = plan
+		}
+	}
+	if rolePlan == nil {
 		canReuse = false
 		if s.audioRoleSvc != nil {
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
@@ -2193,7 +2201,7 @@ func (s *Server) handleRunSpeechUnderstand(w http.ResponseWriter, r *http.Reques
 	// Load the audio role plan from the asset's CAS metadata. The pipeline
 	// fails closed when the plan is missing (ErrAudioRolePlanRequired).
 	var rolePlan *domain.AudioRolePlan
-	plan, err := s.db.GetAudioRolePlan(r.Context(), assetID)
+	plan, err := service.ResolveRunScopedAudioRolePlan(r.Context(), s.db, s.casStore, assetID, body.RunID)
 	if err == nil {
 		rolePlan = plan
 	} else if !errors.Is(err, storage.ErrNotFound) {
@@ -2353,59 +2361,6 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "target_language is required")
 		return
 	}
-	var frozenGlossary []domain.GlossaryEntry
-	hasExistingRun := false
-
-	run, err := s.db.GetRun(r.Context(), body.RunID)
-	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if run != nil {
-		hasExistingRun = true
-		if run.JobID != "" {
-			job, err := s.db.GetJob(r.Context(), run.JobID)
-			if err != nil {
-				if errors.Is(err, storage.ErrNotFound) {
-					writeError(w, http.StatusBadRequest, fmt.Sprintf("job %s for run %s not found", run.JobID, body.RunID))
-					return
-				}
-				writeError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			if job.SourceAssetID != asset.ID {
-				writeError(w, http.StatusBadRequest, fmt.Sprintf("run %s belongs to asset %s, not %s", body.RunID, job.SourceAssetID, asset.ID))
-				return
-			}
-			if strings.TrimSpace(body.JobID) != "" && body.JobID != job.ID {
-				writeError(w, http.StatusBadRequest, fmt.Sprintf("job_id %s does not match run %s job_id %s", body.JobID, body.RunID, job.ID))
-				return
-			}
-		}
-		if strings.TrimSpace(run.ConfigSnapshotJSON) != "" {
-			var cfg struct {
-				Glossary []domain.GlossaryEntry `json:"glossary"`
-			}
-			if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
-				writeError(w, http.StatusInternalServerError, "decode frozen run glossary: "+err.Error())
-				return
-			}
-			frozenGlossary = cfg.Glossary
-		}
-	}
-	if strings.TrimSpace(body.JobID) != "" {
-		job, err := s.db.GetJob(r.Context(), body.JobID)
-		if err == nil && job != nil {
-			if job.SourceAssetID != asset.ID {
-				writeError(w, http.StatusBadRequest, fmt.Sprintf("job %s belongs to asset %s, not %s", body.JobID, job.SourceAssetID, asset.ID))
-				return
-			}
-		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-	}
-
 	var glossary []domain.GlossaryEntry
 	if len(body.Glossary) > 0 && string(body.Glossary) != "null" {
 		if len(body.Glossary) > 256<<10 {
@@ -2423,16 +2378,8 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid glossary: "+err.Error())
 			return
 		}
-		if hasExistingRun && !service.CanonicalGlossaryEqual(frozenGlossary, normalized) {
-			writeError(w, http.StatusBadRequest, "request glossary conflicts with frozen run snapshot")
-			return
-		}
 		glossary = normalized
 	}
-	if hasExistingRun {
-		glossary = frozenGlossary
-	}
-
 	in := domain.TranslationJobInput{
 		RunID:                 body.RunID,
 		AssetID:               asset.ID,

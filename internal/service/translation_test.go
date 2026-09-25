@@ -1211,3 +1211,240 @@ func TestTranslationService_CanReuseVariant_RefusesChangedRolePlanAndUnprovenLin
 		t.Fatalf("a variant must not be reused when its lineage cannot be verified")
 	}
 }
+
+func TestTranslationService_RunScopedAudioRolePlan_NeverAdoptsNewerNoDubPlan(t *testing.T) {
+	db, casStore, router, _ := setupTranslationTestEnv(t)
+	svc := service.NewTranslationService(db, casStore)
+	svc.ConfigureRouter(router)
+	ctx := context.Background()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	jobID := "job-trans-rolediv"
+	now := time.Now().UTC()
+
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID: "att-" + assetID, AttestationType: "user_owned", DeclaredBy: "tester", TermsAccepted: true, ConfirmedAt: now,
+	})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID: assetID, SHA256: "sha-" + assetID, ByteSize: 1024, MimeType: "video/mp4",
+		OriginalFilename: "video.mp4", RightsAttestationID: "att-" + assetID, CreatedAt: now,
+	})
+	_ = db.CreateJob(ctx, domain.LocalizationJob{
+		ID: jobID, SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: now,
+	})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{
+		ID: runID, JobID: jobID, Status: "running", ConfigSnapshotJSON: "{}", CreatedAt: now,
+	})
+
+	// Pinned AudioRolePlan A with dialogue
+	planAJSON, _ := json.Marshal(domain.AudioRolePlan{
+		ID: "planA-" + assetID, AssetID: assetID, ProvenanceHash: "prov-planA-" + assetID, CreatedAt: now,
+		Segments: []domain.AudioSegment{{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleNarrationDialogue}},
+	})
+	planAObj, err := casStore.Put(bytes.NewReader(planAJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{
+		ID: "planA-" + assetID, AssetID: assetID, CASHash: planAObj.SHA256, ProvenanceHash: "prov-planA-" + assetID, CreatedAt: now,
+		Segments: []domain.AudioSegment{{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleNarrationDialogue}},
+	})
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "audio_role_plan",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: planAObj.SHA256,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+
+	transcript := domain.TranscriptArtifact{
+		ID: "transcript-" + assetID, AssetID: assetID, RunID: runID,
+		SpeechBlocks: []domain.SpeechBlock{
+			{Index: 0, StartMs: 1000, EndMs: 3000, SourceText: "测试", SpeakerID: "S1", SegmentType: domain.SpeechBlockTypeSpeech},
+		},
+		CreatedAt: now,
+	}
+	tBytes, _ := json.Marshal(transcript)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	_ = db.SaveTranscriptArtifactIndex(ctx, storage.TranscriptArtifactIndex{
+		ID: transcript.ID, AssetID: assetID, RunID: runID, CASHash: tObj.SHA256,
+		ProvenanceHash: "prov-transcript-" + assetID, CreatedAt: now,
+	})
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: tObj.SHA256,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+
+	// TranslationVariant for AdaptDubScript
+	tv := domain.TranslationVariant{
+		ID: uuid.NewString(), SchemaVersion: domain.TranslationSchemaVersion, ContractID: service.TranslationContractID,
+		AssetID: assetID, RunID: runID, JobID: jobID, SourceLanguage: "zh", TargetLanguage: "vi",
+		TranscriptArtifactCAS: tObj.SHA256, InputHash: "input-hash-test", ProvenanceHash: "prov-hash-test",
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "测试", TargetText: "thử nghiệm", SpeakerID: "S1", StartMs: 1000, EndMs: 3000, PassedQAGate: true},
+		},
+		CreatedAt: now,
+	}
+	tvBytes, _ := json.Marshal(tv)
+	tvObj, _ := casStore.Put(bytes.NewReader(tvBytes))
+	_ = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
+		ID: tv.ID, AssetID: assetID, RunID: runID, TargetLanguage: "vi", CASHash: tvObj.SHA256,
+		CreatedAt: now,
+	})
+
+	// Now save newer AudioRolePlan B for asset with NO dialogue
+	planBJSON, _ := json.Marshal(domain.AudioRolePlan{
+		ID: "planB-" + assetID, AssetID: assetID, ProvenanceHash: "prov-planB-" + assetID, CreatedAt: now.Add(time.Minute),
+		Segments: []domain.AudioSegment{{StartMs: 0, EndMs: 35000, Role: domain.AudioRoleInstrumentalBgm}},
+	})
+	planBObj, _ := casStore.Put(bytes.NewReader(planBJSON))
+	_ = db.SaveAudioRolePlan(ctx, domain.AudioRolePlan{
+		ID: "planB-" + assetID, AssetID: assetID, CASHash: planBObj.SHA256, ProvenanceHash: "prov-planB-" + assetID, CreatedAt: now.Add(time.Minute),
+		Segments: []domain.AudioSegment{{StartMs: 0, EndMs: 35000, Role: domain.AudioRoleInstrumentalBgm}},
+	})
+
+	// 1. ResolveCanonicalRolePlanForTest for Run A must return Plan A
+	pinned, err := svc.ResolveCanonicalRolePlanForTest(ctx, assetID, runID)
+	if err != nil {
+		t.Fatalf("resolve pinned role plan: %v", err)
+	}
+	if pinned == nil || pinned.CASHash != planAObj.SHA256 {
+		t.Fatalf("expected pinned plan A (%s), got %+v", planAObj.SHA256, pinned)
+	}
+
+	// 2. LoadSegmentsFromTranscriptForTest for Run A must use Plan A (returns 1 segment, not 0)
+	segs, casHash, err := svc.LoadSegmentsFromTranscriptForTest(ctx, assetID, runID, "")
+	if err != nil {
+		t.Fatalf("load segments from transcript: %v", err)
+	}
+	if len(segs) != 1 {
+		t.Fatalf("expected 1 segment from Plan A dialogue filter, got %d (Plan B would produce 0)", len(segs))
+	}
+	if casHash != tObj.SHA256 {
+		t.Errorf("expected transcript CAS %s, got %s", tObj.SHA256, casHash)
+	}
+
+	// 3. AdaptDubScript for Run A must succeed using Plan A, NOT fail with ErrNoDubbingRequired from Plan B
+	dubScript, err := svc.AdaptDubScript(ctx, domain.DubScriptJobInput{
+		RunID: runID, AssetID: assetID, JobID: jobID, TargetLanguage: "vi",
+		TranslationVariantCAS: tvObj.SHA256,
+	})
+	if err != nil {
+		t.Fatalf("expected AdaptDubScript to succeed using Run A's pinned Plan A, got: %v", err)
+	}
+	if dubScript == nil || len(dubScript.Segments) != 1 {
+		t.Fatalf("expected 1 dub script segment, got %+v", dubScript)
+	}
+}
+
+func TestTranslationVariant_SchemaGate_RefusesStaleSchemaOrWrongContract(t *testing.T) {
+	db, casStore, router, _ := setupTranslationTestEnv(t)
+	svc := service.NewTranslationService(db, casStore)
+	svc.ConfigureRouter(router)
+	ctx := context.Background()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	jobID := "job-schema-gate"
+	now := time.Now().UTC()
+
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID: "att-" + assetID, AttestationType: "user_owned", DeclaredBy: "tester", TermsAccepted: true, ConfirmedAt: now,
+	})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID: assetID, SHA256: "sha-" + assetID, ByteSize: 1024, MimeType: "video/mp4",
+		OriginalFilename: "video.mp4", RightsAttestationID: "att-" + assetID, CreatedAt: now,
+	})
+	_ = db.CreateJob(ctx, domain.LocalizationJob{
+		ID: jobID, SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: now,
+	})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{
+		ID: runID, JobID: jobID, Status: "running", ConfigSnapshotJSON: "{}", CreatedAt: now,
+	})
+
+	// Setup role plan and transcript
+	rolePlan := domain.AudioRolePlan{
+		ID: "role-" + assetID, AssetID: assetID, ProvenanceHash: "prov-role-" + assetID, CreatedAt: now,
+		Segments: []domain.AudioSegment{{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleNarrationDialogue}},
+	}
+	rpBytes, _ := json.Marshal(rolePlan)
+	rpObj, _ := casStore.Put(bytes.NewReader(rpBytes))
+	rolePlan.CASHash = rpObj.SHA256
+	_ = db.SaveAudioRolePlan(ctx, rolePlan)
+
+	transcript := domain.TranscriptArtifact{
+		ID: "transcript-" + assetID, AssetID: assetID, RunID: runID,
+		SpeechBlocks: []domain.SpeechBlock{
+			{Index: 0, StartMs: 1000, EndMs: 3000, SourceText: "测试", SpeakerID: "S1", SegmentType: domain.SpeechBlockTypeSpeech},
+		},
+		CreatedAt: now,
+	}
+	tBytes, _ := json.Marshal(transcript)
+	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	_ = db.SaveTranscriptArtifactIndex(ctx, storage.TranscriptArtifactIndex{
+		ID: transcript.ID, AssetID: assetID, RunID: runID, CASHash: tObj.SHA256,
+		ProvenanceHash: "prov-transcript-" + assetID, CreatedAt: now,
+	})
+
+	jobIn := domain.TranslationJobInput{
+		RunID: runID, AssetID: assetID, JobID: jobID, TargetLanguage: "vi",
+		TranscriptArtifactCAS: tObj.SHA256,
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: "测试", SpeakerID: "S1", StartMs: 1000, EndMs: 3000},
+		},
+	}
+
+	// 1. CanReuseVariant with stale SchemaVersion (e.g. version 2 when current is 3) must be refused
+	staleSchemaVariant := domain.TranslationVariant{
+		ID: uuid.NewString(), SchemaVersion: domain.TranslationSchemaVersion - 1, ContractID: service.TranslationContractID,
+		AssetID: assetID, RunID: runID, JobID: jobID, SourceLanguage: "zh", TargetLanguage: "vi",
+		TranscriptArtifactCAS: tObj.SHA256, InputHash: "h1", ProvenanceHash: "p1",
+		Segments:  []domain.TranslationSegment{{Index: 0, SourceText: "测试", TargetText: "thử", SpeakerID: "S1", StartMs: 1000, EndMs: 3000}},
+		CreatedAt: now,
+	}
+	if svc.CanReuseVariant(ctx, jobIn, &staleSchemaVariant) {
+		t.Fatal("CanReuseVariant must refuse variant with stale SchemaVersion")
+	}
+
+	// 2. CanReuseVariant with mismatched ContractID must be refused
+	wrongContractVariant := domain.TranslationVariant{
+		ID: uuid.NewString(), SchemaVersion: domain.TranslationSchemaVersion, ContractID: "legacy-unverified-contract-v0",
+		AssetID: assetID, RunID: runID, JobID: jobID, SourceLanguage: "zh", TargetLanguage: "vi",
+		TranscriptArtifactCAS: tObj.SHA256, InputHash: "h1", ProvenanceHash: "p1",
+		Segments:  []domain.TranslationSegment{{Index: 0, SourceText: "测试", TargetText: "thử", SpeakerID: "S1", StartMs: 1000, EndMs: 3000}},
+		CreatedAt: now,
+	}
+	if svc.CanReuseVariant(ctx, jobIn, &wrongContractVariant) {
+		t.Fatal("CanReuseVariant must refuse variant with mismatched ContractID")
+	}
+
+	// 3. AdaptDubScript with stale SchemaVersion artifact must fail closed
+	staleSchemaBytes, _ := json.Marshal(staleSchemaVariant)
+	staleSchemaObj, _ := casStore.Put(bytes.NewReader(staleSchemaBytes))
+	_, err := svc.AdaptDubScript(ctx, domain.DubScriptJobInput{
+		RunID: runID, AssetID: assetID, JobID: jobID, TargetLanguage: "vi",
+		TranslationVariantCAS: staleSchemaObj.SHA256,
+	})
+	if err == nil || !strings.Contains(err.Error(), "translation variant does not satisfy current translation contract") {
+		t.Fatalf("expected AdaptDubScript to fail closed on stale SchemaVersion, got: %v", err)
+	}
+
+	// 4. AdaptDubScript with mismatched ContractID must fail closed
+	wrongContractBytes, _ := json.Marshal(wrongContractVariant)
+	wrongContractObj, _ := casStore.Put(bytes.NewReader(wrongContractBytes))
+	_, err = svc.AdaptDubScript(ctx, domain.DubScriptJobInput{
+		RunID: runID, AssetID: assetID, JobID: jobID, TargetLanguage: "vi",
+		TranslationVariantCAS: wrongContractObj.SHA256,
+	})
+	if err == nil || !strings.Contains(err.Error(), "translation variant does not satisfy current translation contract") {
+		t.Fatalf("expected AdaptDubScript to fail closed on mismatched ContractID, got: %v", err)
+	}
+}

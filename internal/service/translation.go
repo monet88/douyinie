@@ -136,12 +136,14 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 			}
 			if jobID != "" {
 				job, err := s.db.GetJob(ctx, jobID)
-				if err == nil && job != nil {
-					if in.AssetID != "" && job.SourceAssetID != "" && job.SourceAssetID != in.AssetID {
-						return nil, fmt.Errorf("%w: run %s belongs to asset %s, not %s", domain.ErrTranslationOwnershipMismatch, in.RunID, job.SourceAssetID, in.AssetID)
+				if err != nil {
+					if errors.Is(err, storage.ErrNotFound) {
+						return nil, fmt.Errorf("%w: job %s for run %s not found", domain.ErrTranslationOwnershipMismatch, jobID, in.RunID)
 					}
-				} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
 					return nil, fmt.Errorf("lookup job %s for run %s: %w", jobID, in.RunID, err)
+				}
+				if in.AssetID != "" && job.SourceAssetID != "" && job.SourceAssetID != in.AssetID {
+					return nil, fmt.Errorf("%w: run %s belongs to asset %s, not %s", domain.ErrTranslationOwnershipMismatch, in.RunID, job.SourceAssetID, in.AssetID)
 				}
 			}
 		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
@@ -150,15 +152,16 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 	}
 	if s.db != nil && strings.TrimSpace(in.JobID) != "" {
 		job, err := s.db.GetJob(ctx, in.JobID)
-		if err == nil && job != nil {
-			if in.AssetID != "" && job.SourceAssetID != "" && job.SourceAssetID != in.AssetID {
-				return nil, fmt.Errorf("%w: job %s belongs to asset %s, not %s", domain.ErrTranslationOwnershipMismatch, in.JobID, job.SourceAssetID, in.AssetID)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil, fmt.Errorf("%w: job %s not found", domain.ErrTranslationOwnershipMismatch, in.JobID)
 			}
-		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
 			return nil, fmt.Errorf("lookup job %s: %w", in.JobID, err)
 		}
+		if in.AssetID != "" && job.SourceAssetID != "" && job.SourceAssetID != in.AssetID {
+			return nil, fmt.Errorf("%w: job %s belongs to asset %s, not %s", domain.ErrTranslationOwnershipMismatch, in.JobID, job.SourceAssetID, in.AssetID)
+		}
 	}
-
 	// resolveRunTranscriptCAS resolves the pinned transcript artifact for a run from its stage execution
 	// or run index, refusing any index entry that belongs to a different asset.
 	// A run-scoped direct translation request may already provide canonical segments,
@@ -222,22 +225,18 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 	}
 	if s.db != nil && strings.TrimSpace(in.RunID) != "" {
 		if run, err := s.db.GetRun(ctx, in.RunID); err == nil && run != nil {
-			var frozenGlossary []domain.GlossaryEntry
-			if strings.TrimSpace(run.ConfigSnapshotJSON) != "" {
-				var cfg struct {
-					Glossary []domain.GlossaryEntry `json:"glossary"`
-				}
-				if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
-					return nil, fmt.Errorf("decode frozen run glossary: %w", err)
-				}
-				frozenGlossary = cfg.Glossary
+			frozenGlossary, hasFrozen, err := decodeFrozenRunGlossary(run.ConfigSnapshotJSON)
+			if err != nil {
+				return nil, err
 			}
-			if len(in.Glossary) == 0 {
-				in.Glossary = frozenGlossary
-			} else if !CanonicalGlossaryEqual(frozenGlossary, in.Glossary) {
-				return nil, fmt.Errorf("%w: request glossary conflicts with frozen run snapshot", domain.ErrGlossaryConflict)
-			} else {
-				in.Glossary = frozenGlossary
+			if hasFrozen {
+				if len(in.Glossary) == 0 {
+					in.Glossary = frozenGlossary
+				} else if !CanonicalGlossaryEqual(frozenGlossary, in.Glossary) {
+					return nil, fmt.Errorf("%w: request glossary conflicts with frozen run snapshot", domain.ErrGlossaryConflict)
+				} else {
+					in.Glossary = frozenGlossary
+				}
 			}
 		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
 			return nil, fmt.Errorf("lookup run %s: %w", in.RunID, err)
@@ -496,22 +495,18 @@ func (s *TranslationService) CanReuseVariant(ctx context.Context, in domain.Tran
 					return false
 				}
 			}
-			var frozenGlossary []domain.GlossaryEntry
-			if strings.TrimSpace(run.ConfigSnapshotJSON) != "" {
-				var cfg struct {
-					Glossary []domain.GlossaryEntry `json:"glossary"`
-				}
-				if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
-					return false
-				}
-				frozenGlossary = cfg.Glossary
-			}
-			if len(in.Glossary) == 0 {
-				in.Glossary = frozenGlossary
-			} else if !CanonicalGlossaryEqual(frozenGlossary, in.Glossary) {
+			frozenGlossary, hasFrozen, err := decodeFrozenRunGlossary(run.ConfigSnapshotJSON)
+			if err != nil {
 				return false
-			} else {
-				in.Glossary = frozenGlossary
+			}
+			if hasFrozen {
+				if len(in.Glossary) == 0 {
+					in.Glossary = frozenGlossary
+				} else if !CanonicalGlossaryEqual(frozenGlossary, in.Glossary) {
+					return false
+				} else {
+					in.Glossary = frozenGlossary
+				}
 			}
 		}
 	}
@@ -614,10 +609,8 @@ func (s *TranslationService) loadSegmentsFromTranscript(ctx context.Context, ass
 	return segments, casHash, nil
 }
 
-// resolveCanonicalRolePlan resolves the AudioRolePlan governing canonical segmentation of a transcript.
-// A run pins the plan its stages consumed (the audio_role_plan stage execution), which is what its artifacts
-// were segmented from, so a correction re-derives the exact canonical input afterwards. Without a pinned run
-// plan the asset's newest plan applies, exactly as the run itself resolved it.
+// resolveCanonicalRolePlan resolves the AudioRolePlan governing canonical segmentation of a transcript,
+// so a correction re-derives the exact canonical input the run froze.
 //
 // A storage failure is returned rather than swallowed: silently degrading to a nil plan drops the dialogue
 // filter and changes the verdict the caller derives from these segments.
@@ -625,32 +618,44 @@ func (s *TranslationService) resolveCanonicalRolePlan(ctx context.Context, asset
 	if s.db == nil || strings.TrimSpace(assetID) == "" {
 		return nil, nil
 	}
+	return ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, assetID, runID)
+}
+
+// ResolveRunScopedAudioRolePlan resolves the AudioRolePlan that governs every run-scoped decision derived
+// from source audio: canonical segmentation, playback boundary, the no-dub decision, synthesis, audition,
+// and mix. A run pins the plan its audio_role_plan stage consumed, so a newer plan saved for the same asset
+// must never change what an older run already froze. Without a run pin - a fresh run, or a caller that is
+// not run-scoped - the asset's current plan applies, exactly as it did at run time.
+func ResolveRunScopedAudioRolePlan(ctx context.Context, db *storage.DB, store *cas.Store, assetID, runID string) (*domain.AudioRolePlan, error) {
+	if db == nil || strings.TrimSpace(assetID) == "" {
+		return nil, nil
+	}
 	if strings.TrimSpace(runID) != "" {
-		pinnedCAS, err := s.db.GetStageArtifactHash(ctx, runID, "audio_role_plan")
+		pinnedCAS, err := db.GetStageArtifactHash(ctx, runID, "audio_role_plan")
 		if err != nil {
 			return nil, fmt.Errorf("resolve run %s audio role plan lineage: %w", runID, err)
 		}
 		if pinnedCAS != "" {
-			return s.loadPinnedAudioRolePlan(pinnedCAS)
+			return LoadPinnedAudioRolePlanFromCAS(store, pinnedCAS)
 		}
 	}
-	plan, err := s.db.GetAudioRolePlan(ctx, assetID)
+	plan, err := db.GetAudioRolePlan(ctx, assetID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil, nil // no plan for this asset: segmentation is unfiltered, as it was for the run
 		}
-		return nil, fmt.Errorf("load audio role plan for canonical segmentation: %w", err)
+		return nil, fmt.Errorf("load audio role plan for %s: %w", assetID, err)
 	}
 	return plan, nil
 }
 
-// loadPinnedAudioRolePlan reads the role plan artifact a run recorded. It reads CAS only: the asset's plan
-// row is the operator's current plan and must never stand in for the frozen one.
-func (s *TranslationService) loadPinnedAudioRolePlan(casHash string) (*domain.AudioRolePlan, error) {
-	if s.cas == nil {
+// LoadPinnedAudioRolePlanFromCAS reads the role plan artifact a run recorded. It reads CAS only: the
+// asset's plan row is the operator's current plan and must never stand in for the frozen one.
+func LoadPinnedAudioRolePlanFromCAS(store *cas.Store, casHash string) (*domain.AudioRolePlan, error) {
+	if store == nil {
 		return nil, fmt.Errorf("CAS store required to load pinned audio role plan %s", casHash)
 	}
-	rc, err := s.cas.Get(casHash)
+	rc, err := store.Get(casHash)
 	if err != nil {
 		return nil, fmt.Errorf("read pinned audio role plan from CAS (%s): %w", casHash, err)
 	}
@@ -659,7 +664,31 @@ func (s *TranslationService) loadPinnedAudioRolePlan(casHash string) (*domain.Au
 	if err := json.NewDecoder(rc).Decode(&plan); err != nil {
 		return nil, fmt.Errorf("decode pinned audio role plan (%s): %w", casHash, err)
 	}
+	// The artifact is committed before its own CAS location is known, so cas_hash is empty on disk.
+	plan.CASHash = casHash
 	return &plan, nil
+}
+
+// decodeFrozenRunGlossary parses the frozen glossary from a run's configuration snapshot.
+// It returns (entries, hasFrozenGlossary, err).
+// hasFrozenGlossary is true only if the snapshot JSON explicitly contained a non-null "glossary" field (Issue #158 F6).
+func decodeFrozenRunGlossary(configSnapshotJSON string) ([]domain.GlossaryEntry, bool, error) {
+	if strings.TrimSpace(configSnapshotJSON) == "" {
+		return nil, false, nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(configSnapshotJSON), &raw); err != nil {
+		return nil, false, fmt.Errorf("decode frozen run config: %w", err)
+	}
+	glossaryRaw, ok := raw["glossary"]
+	if !ok || string(glossaryRaw) == "null" {
+		return nil, false, nil
+	}
+	var entries []domain.GlossaryEntry
+	if err := json.Unmarshal(glossaryRaw, &entries); err != nil {
+		return nil, false, fmt.Errorf("decode frozen run glossary: %w", err)
+	}
+	return entries, true, nil
 }
 
 // computeProvenanceHash computes deterministic cache identity for translation.
@@ -1000,11 +1029,8 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 	if s.db == nil || strings.TrimSpace(in.AssetID) == "" {
 		return nil, domain.ErrAudioRolePlanRequired
 	}
-	rolePlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID)
+	rolePlan, err := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, in.AssetID, in.RunID)
 	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			return nil, domain.ErrAudioRolePlanRequired
-		}
 		return nil, fmt.Errorf("get audio role plan: %w", err)
 	}
 	if rolePlan == nil {

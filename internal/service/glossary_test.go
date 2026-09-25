@@ -362,3 +362,86 @@ func TestGlossaryMatchesLatinNextToCJK(t *testing.T) {
 		t.Fatalf("expected 'AI' NOT to match in 'AIR', got %+v", effNeg.Entries)
 	}
 }
+
+func TestMeaningGateGlossaryDoesNotWaiveNumbersOrNegation(t *testing.T) {
+	gate := NewMeaningFirstQAGate()
+	glossary := []domain.GlossaryEntry{{Source: "SUPOR", Target: "Nồi Supor"}}
+
+	// 1. Valid: glossary mapped, number preserved (3), negation preserved (không)
+	resValid := gate.ValidateSegment("SUPOR 3 不卖", "Nồi Supor 3 không bán", "zh", "vi", glossary)
+	if !resValid.Passed {
+		t.Fatalf("expected valid translation with glossary, number and negation to pass: %+v", resValid.Violations)
+	}
+
+	// 2. Counterexample (AC5): glossary is satisfied, but number is corrupted (3 -> 5)
+	// The glossary match must NEVER waive the number integrity gate!
+	resCorruptedNumber := gate.ValidateSegment("SUPOR 3 不卖", "Nồi Supor 5 không bán", "zh", "vi", glossary)
+	if resCorruptedNumber.Passed {
+		t.Fatal("glossary match must not waive corrupted number check (3 -> 5)")
+	}
+	foundNumberViolation := false
+	for _, v := range resCorruptedNumber.Violations {
+		if strings.Contains(v, "number") || strings.Contains(v, "NUMBER") || strings.Contains(v, "digit") {
+			foundNumberViolation = true
+			break
+		}
+	}
+	if !foundNumberViolation {
+		t.Errorf("expected number violation, got: %+v", resCorruptedNumber.Violations)
+	}
+
+	// 3. Counterexample (AC5): glossary is satisfied, but negation is inverted (不 omitted or turned positive)
+	// The glossary match must NEVER waive the negation polarity gate!
+	resInvertedNegation := gate.ValidateSegment("SUPOR 3 不卖", "Nồi Supor 3 có bán", "zh", "vi", glossary)
+	if resInvertedNegation.Passed {
+		t.Fatal("glossary match must not waive inverted negation polarity check")
+	}
+	foundNegationViolation := false
+	for _, v := range resInvertedNegation.Violations {
+		if strings.Contains(v, "negation") || strings.Contains(v, "NEGATION") {
+			foundNegationViolation = true
+			break
+		}
+	}
+	if !foundNegationViolation {
+		t.Errorf("expected negation violation, got: %+v", resInvertedNegation.Violations)
+	}
+}
+
+func TestGlossaryMaxEntriesLimitAndOmittedMatches(t *testing.T) {
+	// 1. Verify maxGlossaryEntries (1000) ceiling
+	oversized := make([]domain.GlossaryEntry, maxGlossaryEntries+1)
+	for i := range oversized {
+		oversized[i] = domain.GlossaryEntry{
+			Source: fmt.Sprintf("src_%04d", i),
+			Target: fmt.Sprintf("tgt_%04d", i),
+		}
+	}
+	_, err := normalizeGlossaryEntries(oversized)
+	if err == nil {
+		t.Fatalf("expected error when glossary exceeds maxGlossaryEntries (%d), got nil", maxGlossaryEntries)
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("maximum is %d", maxGlossaryEntries)) {
+		t.Errorf("expected error to cite maximum %d, got: %v", maxGlossaryEntries, err)
+	}
+
+	// 2. Verify OmittedMatches accounting when matching terms exceed maxEffectiveGlossaryTerms (100)
+	matchCount := maxEffectiveGlossaryTerms + 7 // 107 matches -> 100 entries, 7 omitted
+	entries := make([]domain.GlossaryEntry, matchCount)
+	segments := make([]domain.TranslationInputSegment, matchCount)
+	for i := range matchCount {
+		term := fmt.Sprintf("term_%03d", i)
+		entries[i] = domain.GlossaryEntry{Source: term, Target: fmt.Sprintf("dich_%03d", i)}
+		segments[i] = domain.TranslationInputSegment{Index: i, SourceText: fmt.Sprintf("câu có %s ở đây", term)}
+	}
+	eff, err := effectiveGlossary(entries, segments)
+	if err != nil {
+		t.Fatalf("effectiveGlossary failed: %v", err)
+	}
+	if len(eff.Entries) != maxEffectiveGlossaryTerms {
+		t.Errorf("expected %d effective entries, got %d", maxEffectiveGlossaryTerms, len(eff.Entries))
+	}
+	if eff.OmittedMatches != 7 {
+		t.Errorf("expected OmittedMatches=7, got %d", eff.OmittedMatches)
+	}
+}

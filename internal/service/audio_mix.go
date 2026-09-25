@@ -127,7 +127,7 @@ func (s *AudioMixService) SeparateAudio(ctx context.Context, input AudioSeparati
 	}
 	_ = f.Close()
 
-	rolePlan, _ := s.db.GetAudioRolePlan(ctx, input.AssetID)
+	rolePlan, _ := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, input.AssetID, input.RunID)
 
 	// If router is available, pre-route to check for cached artifact by provenance across eligible order
 	sourceAudioRef := worker.ArtifactRef{
@@ -443,8 +443,32 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 		return nil, fmt.Errorf("load source asset: %w", err)
 	}
 
-	// 1. Load AudioRolePlan (required to determine dialogue/narration vs zero-speech bypass)
-	rolePlan, err := s.db.GetAudioRolePlan(ctx, input.AssetID)
+	// 1. Load AudioRolePlan (required to determine dialogue/narration vs zero-speech bypass).
+	// A run-scoped mix must resolve the plan pinned by that run's audio_role_plan stage CAS;
+	// a newer asset-latest plan must never change an older run's dub-eligibility or mix decisions.
+	rolePlan, err := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, input.AssetID, input.RunID)
+	if s.cas != nil {
+		dubCAS := input.DubSegmentsCAS
+		if dubCAS == "" && input.RunID != "" && s.db != nil {
+			if idx, err := s.db.GetDubSegmentsVariantIndexByRun(ctx, input.RunID); err == nil && idx != nil {
+				dubCAS = idx.CASHash
+			}
+		}
+		if dubCAS != "" {
+			if rc, err := s.cas.Get(dubCAS); err == nil {
+				var ds domain.DubSegmentsVariant
+				if err := json.NewDecoder(rc).Decode(&ds); err == nil && ds.AudioRolePlanCAS != "" {
+					if p, err := LoadPinnedAudioRolePlanFromCAS(s.cas, ds.AudioRolePlanCAS); err == nil {
+						rolePlan = p
+					}
+				}
+				rc.Close()
+			}
+		}
+	}
+	if rolePlan == nil {
+		rolePlan, err = s.db.GetAudioRolePlan(ctx, input.AssetID)
+	}
 	if err != nil || rolePlan == nil {
 		return nil, domain.ErrAudioRolePlanRequired
 	}

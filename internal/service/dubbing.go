@@ -89,12 +89,12 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 
 	// Check if video has audio role plan with no dub-eligible dialogue (no-speech bypass)
 	if s.db != nil && in.AssetID != "" {
-		rolePlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID)
+		rolePlan, err := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, in.AssetID, in.RunID)
 		if err == nil && rolePlan != nil {
 			if !domain.IsDubEligible(rolePlan) {
 				return nil, domain.ErrNoDubbingRequired
 			}
-		} else if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		} else if err != nil {
 			return nil, fmt.Errorf("get audio role plan: %w", err)
 		}
 	}
@@ -665,15 +665,12 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 				return nil, fmt.Errorf("%w: missing database for contextual audition", domain.ErrAudioRolePlanRequired)
 			}
 		} else {
-			rp, err := s.db.GetAudioRolePlan(ctx, in.AssetID)
+			rp, err := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, in.AssetID, in.RunID)
 			if err != nil {
-				if errors.Is(err, storage.ErrNotFound) {
-					return nil, fmt.Errorf("%w: audio role plan not found for asset %s", domain.ErrAudioRolePlanRequired, in.AssetID)
-				}
 				return nil, fmt.Errorf("%w: failed to get audio role plan for asset %s: %v", domain.ErrAudioRolePlanRequired, in.AssetID, err)
 			}
 			if rp == nil {
-				return nil, fmt.Errorf("%w: audio role plan is nil for asset %s", domain.ErrAudioRolePlanRequired, in.AssetID)
+				return nil, fmt.Errorf("%w: audio role plan not found for asset %s", domain.ErrAudioRolePlanRequired, in.AssetID)
 			}
 			if !domain.IsDubEligible(rp) {
 				return nil, domain.ErrNoDubbingRequired
@@ -725,18 +722,24 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 		if dubScript.SchemaVersion != domain.DubScriptSchemaVersion || dubScript.AssetID != in.AssetID || !strings.EqualFold(dubScript.TargetLanguage, targetLang) {
 			return nil, fmt.Errorf("%w: dub script does not satisfy current audition contract", domain.ErrDubScriptVariantNotFound)
 		}
-		segIdx := in.SegmentIndex
-		if segIdx < 0 || segIdx >= len(dubScript.Segments) {
-			return nil, fmt.Errorf("%w: segment index %d out of bounds (total segments: %d)", domain.ErrDubScriptVariantNotFound, segIdx, len(dubScript.Segments))
+		var matchedSeg *domain.DubScriptSegment
+		for i := range dubScript.Segments {
+			if dubScript.Segments[i].Index == in.SegmentIndex {
+				matchedSeg = &dubScript.Segments[i]
+				break
+			}
 		}
-		seg := dubScript.Segments[segIdx]
+		if matchedSeg == nil {
+			return nil, fmt.Errorf("%w: segment index %d not found in dub script (total segments: %d)", domain.ErrDubScriptVariantNotFound, in.SegmentIndex, len(dubScript.Segments))
+		}
+		seg := *matchedSeg
 		if seg.SpokenText != "" {
 			sampleText = seg.SpokenText
 		} else if seg.MeaningText != "" {
 			sampleText = seg.MeaningText
 		}
 		if strings.TrimSpace(sampleText) == "" {
-			return nil, fmt.Errorf("%w: segment %d has empty translation text", domain.ErrDubScriptVariantNotFound, segIdx)
+			return nil, fmt.Errorf("%w: segment %d has empty translation text", domain.ErrDubScriptVariantNotFound, in.SegmentIndex)
 		}
 		if seg.StartMs < 0 || seg.EndMs <= seg.StartMs || seg.SlotDurationMs < 0 {
 			return nil, fmt.Errorf("%w: invalid segment slot bounds (start=%d, end=%d, slot_duration=%d)", domain.ErrSoundtrackPreservationFailed, seg.StartMs, seg.EndMs, seg.SlotDurationMs)
@@ -1152,11 +1155,8 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 	if s.db == nil || strings.TrimSpace(in.AssetID) == "" {
 		return nil, domain.ErrAudioRolePlanRequired
 	}
-	rolePlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID)
+	rolePlan, err := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, in.AssetID, in.RunID)
 	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			return nil, domain.ErrAudioRolePlanRequired
-		}
 		return nil, fmt.Errorf("get audio role plan: %w", err)
 	}
 	if rolePlan == nil {
@@ -1244,11 +1244,13 @@ func (s *DubbingService) CanReuseVariant(ctx context.Context, in domain.DubbingJ
 		return false
 	}
 	in.TargetLanguage = strings.ToLower(strings.TrimSpace(in.TargetLanguage))
-	rolePlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID)
+	rolePlan, err := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, in.AssetID, in.RunID)
 	if err != nil || rolePlan == nil || rolePlan.CASHash == "" {
 		return false
 	}
-	in.AudioRolePlanCAS = rolePlan.CASHash
+	if in.AudioRolePlanCAS == "" {
+		in.AudioRolePlanCAS = rolePlan.CASHash
+	}
 	if in.TranscriptArtifactCAS == "" {
 		if idx, err := s.db.GetTranscriptArtifactIndexByRun(ctx, in.RunID); err == nil && idx != nil {
 			in.TranscriptArtifactCAS = idx.CASHash
@@ -1295,7 +1297,7 @@ func (s *DubbingService) loadPlaybackTimeline(ctx context.Context, in domain.Dub
 	if transcript.AssetID != "" && transcript.AssetID != in.AssetID {
 		return nil, nil, fmt.Errorf("pinned transcript asset mismatch: %s != %s", transcript.AssetID, in.AssetID)
 	}
-	rolePlan, err := s.db.GetAudioRolePlan(ctx, in.AssetID)
+	rolePlan, err := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, in.AssetID, in.RunID)
 	if err != nil || rolePlan == nil {
 		return nil, nil, domain.ErrAudioRolePlanRequired
 	}
@@ -1408,6 +1410,24 @@ func playbackBoundaryForBlock(blockIndex int, sourceStartMs, sourceEndMs int64, 
 		}
 	}
 	return next, nil
+}
+
+// hasProtectedSoundtrackInGap reports whether any singing/music-vocal or uncertain audio segment
+// exists within the gap interval (startMs, endMs). Regrouping across such a gap would merge dialogue
+// across preserved soundtrack and overlay spoken audio on singing or unclassified audio (Issue #153).
+func hasProtectedSoundtrackInGap(startMs, endMs int64, rolePlan *domain.AudioRolePlan) bool {
+	if rolePlan == nil || endMs <= startMs {
+		return false
+	}
+	for _, a := range rolePlan.Segments {
+		if a.Role != domain.AudioRoleSingingMusicVocal && a.Role != domain.AudioRoleUncertain {
+			continue
+		}
+		if a.StartMs < endMs && a.EndMs > startMs {
+			return true
+		}
+	}
+	return false
 }
 
 // speakerEscalationPlan carries a whole-speaker escalation to the duration-controlled
@@ -1861,6 +1881,9 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				// Verify adjacent same-speaker eligibility and gap constraint
 				prevSeg := dubScript.Segments[currIdx]
 				if nextSpk != spkID || nextSeg.StartMs < prevSeg.EndMs || prevSeg.SourceGapAfterMs <= 0 || prevSeg.SourceGapAfterMs >= 600 {
+					break
+				}
+				if hasProtectedSoundtrackInGap(prevSeg.EndMs, nextSeg.StartMs, rolePlan) {
 					break
 				}
 

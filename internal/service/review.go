@@ -112,35 +112,31 @@ func (s *ReviewService) validateTranslationCompatibility(ctx context.Context, re
 		if run == nil {
 			return fmt.Errorf("run %s not found for correction glossary check", requestedRunID)
 		}
-		var frozenGlossary []domain.GlossaryEntry
-		if strings.TrimSpace(run.ConfigSnapshotJSON) != "" {
-			var cfg struct {
-				Glossary []domain.GlossaryEntry `json:"glossary"`
-			}
-			if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
-				return fmt.Errorf("malformed run config snapshot JSON: %w", err)
-			}
-			frozenGlossary = cfg.Glossary
-		}
-		var segs []domain.TranslationInputSegment
-		for _, seg := range tVar.Segments {
-			segs = append(segs, domain.TranslationInputSegment{
-				Index:      seg.Index,
-				SourceText: seg.SourceText,
-				SpeakerID:  seg.SpeakerID,
-				StartMs:    seg.StartMs,
-				EndMs:      seg.EndMs,
-			})
-		}
-		effective, err := effectiveGlossary(frozenGlossary, segs)
-		if err != nil {
-			return fmt.Errorf("compute effective glossary for correction: %w", err)
-		}
 		if tVar.EffectiveGlossary.Hash == "" {
 			return fmt.Errorf("translation variant %s is missing effective glossary hash", transIdx.CASHash)
 		}
-		if tVar.EffectiveGlossary.Hash != effective.Hash {
-			return fmt.Errorf("translation variant effective glossary mismatch: variant=%s run=%s", tVar.EffectiveGlossary.Hash, effective.Hash)
+		frozenGlossary, hasFrozen, err := decodeFrozenRunGlossary(run.ConfigSnapshotJSON)
+		if err != nil {
+			return fmt.Errorf("malformed run config snapshot JSON: %w", err)
+		}
+		if hasFrozen {
+			var segs []domain.TranslationInputSegment
+			for _, seg := range tVar.Segments {
+				segs = append(segs, domain.TranslationInputSegment{
+					Index:      seg.Index,
+					SourceText: seg.SourceText,
+					SpeakerID:  seg.SpeakerID,
+					StartMs:    seg.StartMs,
+					EndMs:      seg.EndMs,
+				})
+			}
+			effective, err := effectiveGlossary(frozenGlossary, segs)
+			if err != nil {
+				return fmt.Errorf("compute effective glossary for correction: %w", err)
+			}
+			if tVar.EffectiveGlossary.Hash != effective.Hash {
+				return fmt.Errorf("translation variant effective glossary mismatch: variant=%s run=%s", tVar.EffectiveGlossary.Hash, effective.Hash)
+			}
 		}
 	}
 

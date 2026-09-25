@@ -2581,6 +2581,121 @@ func TestDubbingService_SynthesizeAndFit_Regroup_DifferentSpeakerOrNonEligibleGa
 		t.Errorf("Case B: expected review segment at index 0, got %+v", variantB.ReviewSegments[0])
 	}
 }
+
+// Issue #153 / F2: A gap between adjacent same-speaker speech blocks that contains preserved
+// soundtrack (singing/music-vocal or uncertain) must NEVER be regrouped across, even when the gap
+// duration is < 600ms. Regrouping would swallow the soundtrack interval into dialogue and clash
+// spoken audio with playing vocals.
+func TestDubbingService_SynthesizeAndFit_Regroup_BlocksInternalSingingOrUncertainSoundtrack(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, casStore, assetID, runID, "vi")
+
+	// Pinned AudioRolePlan with singing in the gap [2000, 2300]
+	rolePlan := domain.AudioRolePlan{
+		ID:             "role-" + assetID,
+		AssetID:        assetID,
+		ProviderID:     "test-role-provider",
+		ModelName:      "test-role-model",
+		ModelVersion:   "1",
+		ProvenanceHash: "prov-role-" + assetID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 500, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 500, EndMs: 600, Role: domain.AudioRoleSingingMusicVocal},
+			{StartMs: 600, EndMs: 2500, Role: domain.AudioRoleNarrationDialogue},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	roleBytes, _ := json.Marshal(rolePlan)
+	roleObj, err := casStore.Put(bytes.NewReader(roleBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rolePlan.CASHash = roleObj.SHA256
+	if err := db.SaveAudioRolePlan(ctx, rolePlan); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "audio_role_plan",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: roleObj.SHA256,
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+	})
+
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:               0,
+				SpeakerID:           "SPEAKER_00",
+				StartMs:             0,
+				EndMs:               500,
+				SlotDurationMs:      500,
+				SpokenText:          "Vế thứ nhất",
+				SourceText:          "前半句",
+				SourceGapAfterMs:    100, // 100ms gap, normally eligible because < 600ms, but contains singing!
+				EstimatedDurationMs: 800,
+			},
+			{
+				Index:               1,
+				SpeakerID:           "SPEAKER_00",
+				StartMs:             600,
+				EndMs:               2500,
+				SlotDurationMs:      1900,
+				SpokenText:          "vế thứ hai.",
+				SourceText:          "后半句。",
+				SourceGapAfterMs:    100,
+				EstimatedDurationMs: 800,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	pinDubbingScriptLineage(t, db, casStore, &dubScript, runID)
+	scriptBytes, _ := json.Marshal(dubScript)
+	scriptCAS, _ := casStore.Put(bytes.NewReader(scriptBytes))
+	_ = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
+		ID: dubScript.ID, AssetID: assetID, RunID: runID, TargetLanguage: "vi",
+		CASHash: scriptCAS.SHA256, ProvenanceHash: "prov-" + dubScript.ID, CreatedAt: dubScript.CreatedAt,
+	})
+
+	assign, err := dubSvc.AssignVoices(ctx, domain.VoiceAssignmentInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err != nil {
+		t.Fatalf("AssignVoices failed: %v", err)
+	}
+
+	variant, err := dubSvc.SynthesizeAndFit(ctx, domain.DubbingJobInput{
+		AssetID:             assetID,
+		RunID:               runID,
+		TargetLanguage:      "vi",
+		DubScriptVariantCAS: scriptCAS.SHA256,
+		VoiceAssignmentCAS:  assign.CASHash,
+	})
+	if err != nil {
+		t.Fatalf("SynthesizeAndFit failed: %v", err)
+	}
+
+	// In TestDubbingService_SynthesizeAndFit_Regroup_SameSpeakerSuccess, these exact two segments
+	// regrouped into 1 DubSegment covering [0, 1]. Here, because the gap [500, 600] contains singing,
+	// regrouping across the gap is BLOCKED. They must remain separate and NOT be merged into a single segment!
+	for _, seg := range variant.Segments {
+		if len(seg.SpeechBlockIndices) > 1 {
+			t.Fatalf("regroup incorrectly swallowed adjacent block across singing gap! SpeechBlockIndices: %v", seg.SpeechBlockIndices)
+		}
+	}
+}
 func TestDubbingService_NoSentenceBySentenceEngineHopping(t *testing.T) {
 	dubSvc, db, casStore, reg, _ := setupDubbingTestHarness(t)
 	defer db.Close()
@@ -3580,5 +3695,227 @@ func TestDubbingService_AuditionVoice_ContextualRequiresRunAndUsesPlaybackAllowa
 	}
 	if !res.ContextualMixed {
 		t.Fatal("expected contextual audition mix")
+	}
+}
+
+func TestDubbingService_AuditionVoice_ContextualSparseSegmentIndices(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, casStore, assetID, runID, "vi")
+	seedAuditionStems(t, db, casStore, assetID, 15000)
+
+	// Sparse canonical indices: 0, 2, 4, 6
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		CreatedAt:      time.Now().UTC(),
+		Segments: []domain.DubScriptSegment{
+			{Index: 0, SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 1500, SlotDurationMs: 1500, SpokenText: "Segment 0 text"},
+			{Index: 2, SpeakerID: "SPEAKER_00", StartMs: 2000, EndMs: 3500, SlotDurationMs: 1500, SpokenText: "Segment 2 text"},
+			{Index: 4, SpeakerID: "SPEAKER_00", StartMs: 4000, EndMs: 5500, SlotDurationMs: 1500, SpokenText: "Segment 4 text"},
+			{Index: 6, SpeakerID: "SPEAKER_00", StartMs: 6000, EndMs: 7500, SlotDurationMs: 1500, SpokenText: "Segment 6 text"},
+		},
+	}
+	dubBytes, _ := json.Marshal(dubScript)
+	dubObj, err := casStore.Put(bytes.NewReader(dubBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+		ID: dubScript.ID, AssetID: assetID, RunID: runID, TargetLanguage: "vi", CASHash: dubObj.SHA256,
+		ProvenanceHash: "prov-" + dubScript.ID, CreatedAt: dubScript.CreatedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var synthesizedText string
+	dubSvc.TTSInvoke = func(ctx context.Context, p provider.Provider, req provider.TTSSynthesisRequest) (*provider.TTSSynthesisResult, error) {
+		synthesizedText = req.Text
+		pcm := media.GeneratePCM16WAV(16000, 1, 1500)
+		return &provider.TTSSynthesisResult{AudioData: pcm, Format: "wav", SampleRate: 16000, Channels: 1, MeasuredDurationMs: 1500, ProviderID: p.ID(), ModelName: "fake", ModelVersion: "1"}, nil
+	}
+
+	voice := domain.VoiceProfile{ID: "vieneu_vi_female_1", ProviderID: "fake_vieneu_tts_vi", VoiceID: "vi_f1", Name: "VieNeu Nữ", Language: "vi"}
+
+	// 1. Audition with Index 6 (sparse index past length 4)
+	res6, err := dubSvc.AuditionVoice(context.Background(), domain.VoiceAuditionInput{
+		RunID: runID, AssetID: assetID, TargetLanguage: "vi", Voice: voice, IsContextual: true, SegmentIndex: 6,
+	})
+	if err != nil {
+		t.Fatalf("expected successful contextual audition for sparse canonical index 6, got: %v", err)
+	}
+	if !res6.ContextualMixed {
+		t.Errorf("expected ContextualMixed=true for index 6")
+	}
+	if synthesizedText != "Segment 6 text" {
+		t.Errorf("expected synthesized text 'Segment 6 text', got %q", synthesizedText)
+	}
+
+	// 2. Audition with non-existent index (e.g. 3) must fail closed with ErrDubScriptVariantNotFound
+	_, errMissing := dubSvc.AuditionVoice(context.Background(), domain.VoiceAuditionInput{
+		RunID: runID, AssetID: assetID, TargetLanguage: "vi", Voice: voice, IsContextual: true, SegmentIndex: 3,
+	})
+	if errMissing == nil || !errors.Is(errMissing, domain.ErrDubScriptVariantNotFound) {
+		t.Fatalf("expected ErrDubScriptVariantNotFound for missing segment index 3, got: %v", errMissing)
+	}
+
+	// 3. Audition with Index 2 must select segment with Index == 2, NOT dubScript.Segments[2] (which has Index 4)
+	res2, err := dubSvc.AuditionVoice(context.Background(), domain.VoiceAuditionInput{
+		RunID: runID, AssetID: assetID, TargetLanguage: "vi", Voice: voice, IsContextual: true, SegmentIndex: 2,
+	})
+	if err != nil {
+		t.Fatalf("expected successful contextual audition for sparse canonical index 2, got: %v", err)
+	}
+	if !res2.ContextualMixed {
+		t.Errorf("expected ContextualMixed=true for index 2")
+	}
+	if synthesizedText != "Segment 2 text" {
+		t.Errorf("expected synthesized text 'Segment 2 text' (Index 2), got %q", synthesizedText)
+	}
+}
+
+func TestDubbingService_RunScopedAudioRolePlan_NeverAdoptsNewerNoDubPlan(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, casStore, assetID, runID, "vi")
+	seedAuditionStems(t, db, casStore, assetID, 10000)
+
+	// Pinned AudioRolePlan A with dub-eligible dialogue
+	planA := domain.AudioRolePlan{
+		ID: "planA-" + assetID, AssetID: assetID, ProviderID: "test-role-provider",
+		ModelName: "test-role-model", ModelVersion: "1", ProvenanceHash: "prov-planA-" + assetID,
+		CreatedAt: time.Now().UTC(), Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	planABytes, _ := json.Marshal(planA)
+	planAObj, err := casStore.Put(bytes.NewReader(planABytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	planA.CASHash = planAObj.SHA256
+	if err := db.SaveAudioRolePlan(ctx, planA); err != nil {
+		t.Fatal(err)
+	}
+	// Pin Plan A to Run A via stage_executions
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "audio_role_plan",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: planAObj.SHA256,
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	dubScript := domain.DubScriptVariant{
+		ID: uuid.NewString(), SchemaVersion: domain.DubScriptSchemaVersion, AssetID: assetID, RunID: runID,
+		SourceLanguage: "zh", TargetLanguage: "vi", CreatedAt: time.Now().UTC(),
+		Segments: []domain.DubScriptSegment{{
+			Index: 0, SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 3000, SlotDurationMs: 3000,
+			SourceText: "测试", MeaningText: "thử nghiệm", SpokenText: "thử nghiệm", PassedQAGate: true,
+		}},
+	}
+	pinDubbingScriptLineage(t, db, casStore, &dubScript, runID)
+	scriptData, _ := json.Marshal(dubScript)
+	scriptObj, _ := casStore.Put(bytes.NewReader(scriptData))
+	dubScript.CASHash = scriptObj.SHA256
+	_ = db.SaveDubScriptVariantIndex(context.Background(), storage.DubScriptVariantIndex{
+		ID:             dubScript.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: "vi",
+		CASHash:        scriptObj.SHA256,
+		ProvenanceHash: "prov-" + dubScript.ID,
+		CreatedAt:      dubScript.CreatedAt,
+	})
+	// Now save a NEW AudioRolePlan B for the same asset with NO dub-eligible dialogue!
+	planB := domain.AudioRolePlan{
+		ID: "planB-" + assetID, AssetID: assetID, ProviderID: "test-role-provider",
+		ModelName: "test-role-model", ModelVersion: "1", ProvenanceHash: "prov-planB-" + assetID,
+		CreatedAt: time.Now().UTC().Add(time.Minute), Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+	}
+	planBBytes, _ := json.Marshal(planB)
+	planBObj, _ := casStore.Put(bytes.NewReader(planBBytes))
+	planB.CASHash = planBObj.SHA256
+	if err := db.SaveAudioRolePlan(ctx, planB); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify DB now returns Plan B for the asset
+	latestPlan, _ := db.GetAudioRolePlan(ctx, assetID)
+	if domain.IsDubEligible(latestPlan) {
+		t.Fatal("expected latestPlan to have no dub-eligible dialogue")
+	}
+
+	voice := domain.VoiceProfile{ID: "vieneu_vi_female_1", ProviderID: "fake_vieneu_tts_vi", VoiceID: "vi_f1", Name: "VieNeu Nữ", Language: "vi"}
+
+	// 1. AssignVoices for Run A must succeed and NOT adopt Plan B (which would return ErrNoDubbingRequired)
+	va, err := dubSvc.AssignVoices(ctx, domain.VoiceAssignmentInput{
+		RunID: runID, AssetID: assetID, TargetLanguage: "vi",
+		CustomAssignments: map[string]domain.VoiceProfile{"SPEAKER_00": voice},
+	})
+	if err != nil {
+		t.Fatalf("expected AssignVoices to succeed using Run A's pinned Plan A, got: %v", err)
+	}
+	if va == nil {
+		t.Fatal("expected non-nil VoiceAssignment")
+	}
+
+	// 2. AuditionVoice for Run A must succeed and NOT return ErrNoDubbingRequired
+	dubSvc.TTSInvoke = func(ctx context.Context, p provider.Provider, req provider.TTSSynthesisRequest) (*provider.TTSSynthesisResult, error) {
+		pcm := media.GeneratePCM16WAV(16000, 1, 3000)
+		return &provider.TTSSynthesisResult{AudioData: pcm, Format: "wav", SampleRate: 16000, Channels: 1, MeasuredDurationMs: 3000, ProviderID: p.ID(), ModelName: "fake", ModelVersion: "1"}, nil
+	}
+	res, err := dubSvc.AuditionVoice(ctx, domain.VoiceAuditionInput{
+		RunID: runID, AssetID: assetID, TargetLanguage: "vi", Voice: voice, IsContextual: true, SegmentIndex: 0,
+	})
+	if err != nil {
+		t.Fatalf("expected AuditionVoice to succeed using Run A's pinned Plan A, got: %v", err)
+	}
+	if !res.ContextualMixed {
+		t.Fatal("expected ContextualMixed=true")
+	}
+
+	// 3. SynthesizeAndFit for Run A must succeed and NOT return ErrNoDubbingRequired
+	dubSegs, err := dubSvc.SynthesizeAndFit(ctx, domain.DubbingJobInput{
+		RunID: runID, AssetID: assetID, TargetLanguage: "vi",
+		DubScriptVariantCAS:   dubScript.CASHash,
+		VoiceAssignmentCAS:    va.CASHash,
+		TranscriptArtifactCAS: va.TranscriptArtifactCAS,
+	})
+	if err != nil {
+		t.Fatalf("expected SynthesizeAndFit to succeed using Run A's pinned Plan A, got: %v", err)
+	}
+	if dubSegs.AudioRolePlanCAS != planAObj.SHA256 {
+		t.Errorf("expected DubSegmentsVariant.AudioRolePlanCAS to be %s (Plan A), got %s", planAObj.SHA256, dubSegs.AudioRolePlanCAS)
+	}
+
+	// 4. CanReuseVariant for Run A must return true despite newer Plan B on the asset
+	inputReuse := domain.DubbingJobInput{
+		RunID: runID, AssetID: assetID, TargetLanguage: "vi",
+		DubScriptVariantCAS:   dubScript.CASHash,
+		VoiceAssignmentCAS:    va.CASHash,
+		TranscriptArtifactCAS: va.TranscriptArtifactCAS,
+		AudioRolePlanCAS:      planAObj.SHA256,
+	}
+	reusable := dubSvc.CanReuseVariant(ctx, inputReuse, dubSegs)
+	if !reusable {
+		t.Errorf("expected CanReuseVariant to return true for Run A despite newer Plan B on asset")
 	}
 }

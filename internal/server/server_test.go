@@ -892,6 +892,166 @@ func TestExecuteRun_StageFailureRecordsEvidenceAndInterrupts(t *testing.T) {
 	}
 }
 
+func TestExecuteRun_RunScopedAudioRolePlan_NeverAdoptsNewerNoDubPlan(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	db, err := storage.Open(filepath.Join(tmpDir, "execute_run_rolediv.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	casStore, err := cas.NewStore(filepath.Join(tmpDir, "cas"))
+	if err != nil {
+		t.Fatalf("new cas: %v", err)
+	}
+
+	qSvc := queue.NewService(db)
+	now := time.Now().UTC()
+
+	att := domain.RightsAttestation{
+		ID:              "att-1",
+		AttestationType: "USER_VERIFIED",
+		DeclaredBy:      "tester",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	}
+	if err := db.CreateRightsAttestation(ctx, att); err != nil {
+		t.Fatalf("create attestation: %v", err)
+	}
+
+	rawBytes := []byte("fake audio content for normalization")
+	cObj, err := casStore.Put(bytes.NewReader(rawBytes))
+	if err != nil {
+		t.Fatalf("put raw bytes: %v", err)
+	}
+
+	asset := domain.SourceAsset{
+		ID:                  "asset-rolediv",
+		SHA256:              cObj.SHA256,
+		CASPath:             cObj.Path,
+		RightsAttestationID: att.ID,
+		CreatedAt:           now,
+	}
+	if err := db.CreateSourceAsset(ctx, asset); err != nil {
+		t.Fatalf("create source asset: %v", err)
+	}
+
+	job := domain.LocalizationJob{
+		ID:             "job-rolediv",
+		SourceAssetID:  asset.ID,
+		TargetLanguage: "vi",
+		Status:         "queued",
+		CreatedAt:      now,
+	}
+	if err := db.CreateJob(ctx, job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	run := domain.LocalizationRun{
+		ID:                 "run-rolediv",
+		JobID:              job.ID,
+		Status:             domain.RunStatusQueued,
+		ConfigSnapshotJSON: "{}",
+		CreatedAt:          now,
+	}
+	if err := db.CreateRun(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	if _, err := qSvc.Enqueue(ctx, run.ID, job.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := qSvc.MarkRunning(ctx, run.ID); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+
+	// 1. Pinned AudioRolePlan A with dub-eligible dialogue
+	planA := domain.AudioRolePlan{
+		ID:      "planA",
+		AssetID: asset.ID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleNarrationDialogue},
+		},
+		CreatedAt: now,
+	}
+	planABytes, _ := json.Marshal(planA)
+	planAObj, err := casStore.Put(bytes.NewReader(planABytes))
+	if err != nil {
+		t.Fatalf("put planA: %v", err)
+	}
+	planA.CASHash = planAObj.SHA256
+	if err := db.SaveAudioRolePlan(ctx, planA); err != nil {
+		t.Fatalf("save planA: %v", err)
+	}
+	// Pin Plan A to Run A via stage_executions
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             "se-audio-role-pin",
+		RunID:          run.ID,
+		Stage:          "audio_role_plan",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: planAObj.SHA256,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("record audio_role_plan stage: %v", err)
+	}
+
+	// 2. Save newer AudioRolePlan B for asset with NO dialogue
+	planB := domain.AudioRolePlan{
+		ID:      "planB",
+		AssetID: asset.ID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 35000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+		CreatedAt: now.Add(time.Minute),
+	}
+	planBBytes, _ := json.Marshal(planB)
+	planBObj, err := casStore.Put(bytes.NewReader(planBBytes))
+	if err != nil {
+		t.Fatalf("put planB: %v", err)
+	}
+	planB.CASHash = planBObj.SHA256
+	if err := db.SaveAudioRolePlan(ctx, planB); err != nil {
+		t.Fatalf("save planB: %v", err)
+	}
+
+	// 3. executeRun for Run A
+	// Without SpeechSvc configured:
+	// - If Run A uses Plan A (dub-eligible), it attempts speech_understand and fails with "SpeechService is not configured"
+	// - If Run A adopted Plan B (no dialogue), it would bypass speech_understand, translation, and dub_synthesize, jumping to audio_mix
+	s := New(Config{
+		Addr:     "127.0.0.1:0",
+		DB:       db,
+		CASStore: casStore,
+		QueueSvc: qSvc,
+	})
+
+	_ = s.executeRun(ctx, run.ID, job.ID)
+
+	stages, err := db.ListStageExecutions(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+
+	foundSpeechStage := false
+	for _, st := range stages {
+		if st.Stage == "speech_understand" {
+			foundSpeechStage = true
+			if st.Status != domain.StageStatusFailed {
+				t.Errorf("expected speech_understand stage to fail closed, got status: %s", st.Status)
+			}
+		}
+		if st.Stage == "audio_mix" {
+			t.Fatalf("executeRun incorrectly skipped speech understanding and jumped to audio_mix (it adopted no-dub Plan B!)")
+		}
+	}
+	if !foundSpeechStage {
+		t.Fatalf("expected speech_understand stage to be attempted under Plan A, but it was not found in stages: %+v", stages)
+	}
+}
+
 // A run leaves `review_required` behind when a blocked final render handoff interrupts it.
 // Once the operator clears the queue and the handoff passes, the job must follow its run.
 func TestCompleteRunSafely_CompletesTheJobItFinished(t *testing.T) {

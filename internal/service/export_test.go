@@ -20,6 +20,9 @@ func ResolveRunTranscriptCASForTest(ctx context.Context, db *storage.DB, runID, 
 func (s *TranslationService) ResolveCanonicalRolePlanForTest(ctx context.Context, assetID, runID string) (*domain.AudioRolePlan, error) {
 	return s.resolveCanonicalRolePlan(ctx, assetID, runID)
 }
+func (s *TranslationService) LoadSegmentsFromTranscriptForTest(ctx context.Context, assetID, runID, explicitCAS string) ([]domain.TranslationInputSegment, string, error) {
+	return s.loadSegmentsFromTranscript(ctx, assetID, runID, explicitCAS)
+}
 
 // ComputeTranslationInputHashForTest exposes computeTranslationInputHash for whitebox testing in service_test.
 
