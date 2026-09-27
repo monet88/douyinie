@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/media"
@@ -36,22 +37,26 @@ func NewFitController(cfg ...FitControllerConfig) *FitController {
 
 // FitEvaluationInput defines the inputs for evaluating a candidate's fit.
 type FitEvaluationInput struct {
-	SegmentIndex       int     `json:"segment_index"`
-	SpeakerID          string  `json:"speaker_id"`
-	StartMs            int64   `json:"start_ms"`
-	EndMs              int64   `json:"end_ms"`
-	NextTurnStartMs    int64   `json:"next_turn_start_ms"`   // Start of next speech turn (0 if none)
-	NextTurnSpeakerID  string  `json:"next_turn_speaker_id"` // Speaker of next speech turn
-	SourceGapAfterMs   int64   `json:"source_gap_after_ms"`  // Immutable source silence until next turn
-	MeasuredDurationMs int64   `json:"measured_duration_ms"` // Probed waveform duration
-	AttemptNumber      int     `json:"attempt_number"`       // Current synthesis attempt (1, 2, ...)
-	CurrentSpeed       float64 `json:"current_speed"`        // Current speed multiplier
-	CanShortenText     bool    `json:"can_shorten_text"`     // Whether text can be further condensed
-	SupportsSpeedFit   bool    `json:"supports_speed_fit"`   // Whether provider supports native speed adjustment
-	FixedRateVoice     bool    `json:"fixed_rate_voice"`     // Whether a non-1.0 speed request fails closed (preset-voice lanes)
-	DubPlaybackEndMs   int64   `json:"dub_playback_end_ms"`  // Accepted playback ceiling; source EndMs when borrowing is unavailable.
-	EffectiveReserveMs int64   `json:"effective_reserve_ms"`
-	// OutputSampleRate is the sample rate of the mix this candidate lands in (the background stem
+	SegmentIndex              int     `json:"segment_index"`
+	SpeakerID                 string  `json:"speaker_id"`
+	StartMs                   int64   `json:"start_ms"`
+	EndMs                     int64   `json:"end_ms"`
+	NextTurnStartMs           int64   `json:"next_turn_start_ms"`   // Start of next speech turn (0 if none)
+	NextTurnSpeakerID         string  `json:"next_turn_speaker_id"` // Speaker of next speech turn
+	SourceGapAfterMs          int64   `json:"source_gap_after_ms"`  // Immutable source silence until next turn
+	MeasuredDurationMs        int64   `json:"measured_duration_ms"` // Probed waveform duration
+	AttemptNumber             int     `json:"attempt_number"`       // Current synthesis attempt (1, 2, ...)
+	CurrentSpeed              float64 `json:"current_speed"`        // Current speed multiplier
+	CanShortenText            bool    `json:"can_shorten_text"`     // Whether text can be further condensed
+	FixedRateVoice            bool    `json:"fixed_rate_voice"`     // Whether a non-1.0 speed request fails closed (preset-voice lanes)
+	DubPlaybackEndMs          int64   `json:"dub_playback_end_ms"`  // Accepted playback ceiling; source EndMs when borrowing is unavailable.
+	EffectiveReserveMs        int64   `json:"effective_reserve_ms"`
+	ProviderID                string  `json:"provider_id,omitempty"`
+	ModelID                   string  `json:"model_id,omitempty"`
+	ModelVersion              string  `json:"model_version,omitempty"`
+	VoiceProfileID            string  `json:"voice_profile_id,omitempty"`
+	NativeAttemptsForLineage  int     `json:"native_attempts_for_lineage,omitempty"`
+	RewriteAttemptsForLineage int     `json:"rewrite_attempts_for_lineage,omitempty"`
 	// rate the mixer resamples to); 0 = unknown, and the fit then falls back to the millisecond
 	// window instead of the frame-exact one.
 	OutputSampleRate int `json:"output_sample_rate,omitempty"`
@@ -77,6 +82,7 @@ type FitEvaluationResult struct {
 	DubPlaybackEndMs   int64            `json:"dub_playback_end_ms"`
 	EffectiveReserveMs int64            `json:"effective_reserve_ms"`
 	FitPolicyID        string           `json:"fit_policy_id"`
+	CalibrationID      string           `json:"calibration_id,omitempty"`
 }
 
 func (fc *FitController) policyID() string {
@@ -84,15 +90,58 @@ func (fc *FitController) policyID() string {
 	if cfg.PolicyVersion == "" || !isFinitePositive(cfg.ReserveRatio) || cfg.ReserveRatio > 1 || cfg.MinNaturalGapMs < 0 || cfg.MaxNaturalGapMs < cfg.MinNaturalGapMs {
 		return ""
 	}
-	// Identity covers the whole effective config: freezing and hashing "the effective
-	// reserve configuration" (#153) must not let a changed field (speed ceiling,
-	// regroup allowance, default gap) keep the previous identity.
-	b, err := json.Marshal(cfg)
+	b, err := json.Marshal(fc.effectiveConfig())
 	if err != nil {
 		return ""
 	}
 	h := sha256.Sum256(b)
 	return cfg.PolicyVersion + ":" + hex.EncodeToString(h[:])
+}
+
+// effectiveConfig returns the controller config with every non-finite or inverted native-speed
+// envelope stripped. It is the single sanitization path behind both the policy identity hash and
+// the DubSegments FitConfig that the mixer replays, so the two can never drift apart.
+func (fc *FitController) effectiveConfig() FitControllerConfig {
+	cfg := fc.config
+	var clean []domain.NativeSpeedEnvelope
+	for _, env := range cfg.NativeSpeedEnvelopes {
+		if isFinitePositive(env.MinSpeed) && isFinitePositive(env.MaxSpeed) && env.MinSpeed <= env.MaxSpeed {
+			clean = append(clean, env)
+		}
+	}
+	cfg.NativeSpeedEnvelopes = clean
+	return cfg
+}
+
+func (fc *FitController) findVerifiedEnvelope(providerID, modelID, modelVersion, voiceProfileID string) *domain.NativeSpeedEnvelope {
+	if strings.TrimSpace(providerID) == "" {
+		return nil
+	}
+	for _, env := range fc.config.NativeSpeedEnvelopes {
+		if !env.Verified || strings.TrimSpace(env.CalibrationID) == "" {
+			continue
+		}
+		if strings.TrimSpace(env.ProviderID) == "" {
+			continue
+		}
+		if !isFinitePositive(env.MinSpeed) || !isFinitePositive(env.MaxSpeed) || env.MinSpeed > env.MaxSpeed {
+			continue
+		}
+		if !isProviderEquivalent(env.ProviderID, providerID) {
+			continue
+		}
+		if env.ModelID != "" && modelID != "" && !strings.EqualFold(strings.TrimSpace(env.ModelID), strings.TrimSpace(modelID)) && !isProviderEquivalent(env.ModelID, modelID) {
+			continue
+		}
+		if env.ModelVersion != "" && modelVersion != "" && !strings.EqualFold(strings.TrimSpace(env.ModelVersion), strings.TrimSpace(modelVersion)) {
+			continue
+		}
+		if env.VoiceProfileID != "" && voiceProfileID != "" && env.VoiceProfileID != voiceProfileID {
+			continue
+		}
+		return &env
+	}
+	return nil
 }
 
 func isFinitePositive(v float64) bool { return v > 0 && !math.IsNaN(v) && !math.IsInf(v, 0) }
@@ -233,7 +282,11 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 	// A fixed-rate preset-voice lane rejects any non-1.0 speed request, so a
 	// speed resynthesis is not a remedy for it: overrun must go through
 	// rewrite/regroup/review instead of a request the provider cannot honor.
-	if !in.FixedRateVoice && in.AttemptNumber < 2 && speedFactor <= fc.config.MaxSpeedMultiplier && (in.SupportsSpeedFit || speedFactor <= 1.15) {
+	env := fc.findVerifiedEnvelope(in.ProviderID, in.ModelID, in.ModelVersion, in.VoiceProfileID)
+	canResynth := !in.FixedRateVoice && in.AttemptNumber < 2 && in.NativeAttemptsForLineage < 1 &&
+		env != nil && isFinitePositive(speedFactor) && speedFactor >= env.MinSpeed && speedFactor <= env.MaxSpeed
+
+	if canResynth {
 		return FitEvaluationResult{
 			Decision:           domain.FitActionResynth,
 			UsableSlotMs:       usableSlotMs,
@@ -242,14 +295,18 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 			DurationDeltaMs:    deltaMs,
 			RecommendedSpeed:   speedFactor,
 			NaturalGapMs:       naturalGapMs,
-			Reason:             fmt.Sprintf("%s: requesting resynth with calibrated speed %.2fx", overrunLabel, speedFactor),
+			Reason:             fmt.Sprintf("%s: requesting resynth with calibrated speed %.2fx (calibration: %s)", overrunLabel, speedFactor, env.CalibrationID),
 			RequiresReview:     false,
-			DubPlaybackEndMs:   playbackEndMs, EffectiveReserveMs: naturalGapMs, FitPolicyID: fc.policyID(),
+			DubPlaybackEndMs:   playbackEndMs,
+			EffectiveReserveMs: naturalGapMs,
+			FitPolicyID:        fc.policyID(),
+			CalibrationID:      env.CalibrationID,
 		}
 	}
 
 	// Strategy B: REWRITE (shorten-first text adaptation)
-	if in.CanShortenText && in.AttemptNumber < 3 {
+	canRewrite := in.CanShortenText && in.AttemptNumber < 3 && in.RewriteAttemptsForLineage < 1
+	if canRewrite {
 		return FitEvaluationResult{
 			Decision:           domain.FitActionRewrite,
 			UsableSlotMs:       usableSlotMs,
@@ -260,7 +317,9 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 			NaturalGapMs:       naturalGapMs,
 			Reason:             fmt.Sprintf("%s: speed-fit limit reached, requesting shorten-first rewrite", overrunLabel),
 			RequiresReview:     false,
-			DubPlaybackEndMs:   playbackEndMs, EffectiveReserveMs: naturalGapMs, FitPolicyID: fc.policyID(),
+			DubPlaybackEndMs:   playbackEndMs,
+			EffectiveReserveMs: naturalGapMs,
+			FitPolicyID:        fc.policyID(),
 		}
 	}
 

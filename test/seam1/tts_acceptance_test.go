@@ -561,6 +561,34 @@ func TestSeam1_TTS_MeasuredDurationSpeedFitLane(t *testing.T) {
 			"SPEAKER_00": cosyVoice,
 		},
 	})
+	// 1. Without an explicit verified NativeSpeedEnvelope calibration, feature string alone stays natural-only (#154)
+	respUncal, uncalSegments := runDubSynthesize(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": dubVariant.CASHash,
+		"voice_assignment_cas":   voiceAssign.CASHash,
+	})
+	if respUncal.StatusCode != http.StatusCreated || uncalSegments == nil {
+		t.Fatalf("uncalibrated dub-synthesize failed: %d", respUncal.StatusCode)
+	}
+	if uncalSegments.OverallStatus != "REVIEW_REQUIRED" || fakeCosy.Invocations != 1 {
+		t.Fatalf("expected uncalibrated speed-fit lane to stay natural-only (REVIEW_REQUIRED, 1 call), got status=%s calls=%d", uncalSegments.OverallStatus, fakeCosy.Invocations)
+	}
+
+	// 2. Configure explicit verified NativeSpeedEnvelope calibration and re-run (#154)
+	cfg := service.DefaultFitControllerConfig()
+	cfg.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
+		{
+			ProviderID:     "fake_cosyvoice3_tts",
+			VoiceProfileID: "cosyvoice3_vi_female_1",
+			MinSpeed:       0.8,
+			MaxSpeed:       1.25,
+			Verified:       true,
+			CalibrationID:  "cal-cosyvoice3-vi-f1",
+		},
+	}
+	h.dubbingSvc.ConfigureFitController(service.NewFitController(cfg))
+
 	respSynth, dubSegments := runDubSynthesize(t, h, assetID, map[string]any{
 		"run_id":                 runID,
 		"target_language":        "vi",
@@ -572,12 +600,15 @@ func TestSeam1_TTS_MeasuredDurationSpeedFitLane(t *testing.T) {
 	}
 
 	if dubSegments.OverallStatus != "PASS" {
-		t.Fatalf("expected OverallStatus PASS after speed-fit, got %s", dubSegments.OverallStatus)
+		t.Fatalf("expected OverallStatus PASS after calibrated speed-fit, got %s", dubSegments.OverallStatus)
 	}
 
 	seg := dubSegments.Segments[0]
 	if seg.MeasuredDurationMs > seg.SlotDurationMs {
 		t.Fatalf("expected fitted duration <= %dms, got %dms", seg.SlotDurationMs, seg.MeasuredDurationMs)
+	}
+	if seg.CalibrationID != "cal-cosyvoice3-vi-f1" || dubSegments.FitPlans[0].CalibrationID != "cal-cosyvoice3-vi-f1" {
+		t.Fatalf("expected CalibrationID cal-cosyvoice3-vi-f1 on segment and fit plan, got seg=%q plan=%q", seg.CalibrationID, dubSegments.FitPlans[0].CalibrationID)
 	}
 }
 

@@ -28,15 +28,16 @@ import (
 )
 
 type testHarness struct {
-	server    *httptest.Server
-	srv       *server.Server
-	db        *storage.DB
-	casStore  *cas.Store
-	registry  *provider.Registry
-	router    *provider.Router
-	queueSvc  *queue.Service
-	scheduler *scheduler.Scheduler
-	dir       string
+	server     *httptest.Server
+	srv        *server.Server
+	db         *storage.DB
+	casStore   *cas.Store
+	registry   *provider.Registry
+	router     *provider.Router
+	queueSvc   *queue.Service
+	scheduler  *scheduler.Scheduler
+	dubbingSvc *service.DubbingService
+	dir        string
 }
 
 func (h *testHarness) SetExecutor(exec server.Executor) {
@@ -77,6 +78,7 @@ func saveAndPinAudioRolePlan(t *testing.T, h *testHarness, assetID, runID string
 type harnessOptions struct {
 	autoRunExecutor   bool
 	audioRoleAnalyzer domain.AudioRoleAnalyzer
+	dubbingSvc        *service.DubbingService
 }
 
 func setupHarnessWithOptions(t *testing.T, opts harnessOptions) *testHarness {
@@ -96,6 +98,9 @@ func setupHarnessWithOptions(t *testing.T, opts harnessOptions) *testHarness {
 
 	queueSvc := queue.NewService(db)
 	resScheduler := scheduler.New()
+	if opts.dubbingSvc == nil {
+		opts.dubbingSvc = service.NewDubbingService(db, casStore)
+	}
 	srv, registry, router := newRuntimeHostWithOptions(t, db, casStore, queueSvc, resScheduler, opts)
 
 	ts := httptest.NewServer(srv.Handler())
@@ -106,15 +111,16 @@ func setupHarnessWithOptions(t *testing.T, opts harnessOptions) *testHarness {
 	})
 
 	return &testHarness{
-		server:    ts,
-		srv:       srv,
-		db:        db,
-		casStore:  casStore,
-		registry:  registry,
-		router:    router,
-		queueSvc:  queueSvc,
-		scheduler: resScheduler,
-		dir:       tmpDir,
+		server:     ts,
+		srv:        srv,
+		db:         db,
+		casStore:   casStore,
+		registry:   registry,
+		router:     router,
+		queueSvc:   queueSvc,
+		scheduler:  resScheduler,
+		dubbingSvc: opts.dubbingSvc,
+		dir:        tmpDir,
 	}
 }
 
@@ -198,6 +204,10 @@ func newRuntimeHostWithOptions(t *testing.T, db *storage.DB, casStore *cas.Store
 		analyzer = service.NewDeterministicTestAudioRoleAnalyzer()
 	}
 	audioRoleSvc := service.NewAudioRoleServiceWithAnalyzer(db, casStore, audioMixSvc, analyzer)
+	dubbingSvc := opts.dubbingSvc
+	if dubbingSvc == nil {
+		dubbingSvc = service.NewDubbingService(db, casStore)
+	}
 	return server.New(server.Config{
 		Addr:            "127.0.0.1:0",
 		DB:              db,
@@ -213,7 +223,7 @@ func newRuntimeHostWithOptions(t *testing.T, db *storage.DB, casStore *cas.Store
 		AutoRunExecutor: opts.autoRunExecutor,
 		SpeechSvc:       service.NewSpeechService(db, casStore),
 		TranslationSvc:  service.NewTranslationService(db, casStore),
-		DubbingSvc:      service.NewDubbingService(db, casStore),
+		DubbingSvc:      dubbingSvc,
 		AudioMixSvc:     audioMixSvc,
 		AudioRoleSvc:    audioRoleSvc,
 		VisualTextSvc:   service.NewVisualTextService(db, casStore),

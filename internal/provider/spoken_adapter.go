@@ -27,6 +27,9 @@ type SpokenScriptAdaptationRequest struct {
 	SourceGapAfterMs      int64   // immutable source silence from this turn EndMs to the next turn StartMs
 	HasNextTurn           bool
 	ProtectedTerms        []domain.GlossaryEntry
+	MeasuredDurationMs    int64 // actual probed audio duration when invoked after synthesis overrun
+	OverrunMs             int64 // actual measured overrun above PlaybackAllowanceMs (0 when none is proved)
+	PlaybackAllowanceMs   int64 // accepted playback window budget (DubPlaybackEndMs - StartMs)
 }
 
 // SpokenScriptAdaptationResult represents the outcome of spoken dialogue adaptation.
@@ -256,10 +259,12 @@ func (a *DefaultSpokenScriptAdapter) AdaptSpokenScript(_ context.Context, req Sp
 	targetLang := strings.ToLower(strings.TrimSpace(req.TargetLanguage))
 	sourceLang := strings.ToLower(strings.TrimSpace(req.SourceLanguage))
 	slotMs := req.SlotDurationMs
+	if req.PlaybackAllowanceMs > 0 {
+		slotMs = req.PlaybackAllowanceMs
+	}
 	if slotMs <= 0 {
 		slotMs = 1000
 	}
-
 	sourceRate := req.SourceSpeakingRateCPS
 	if sourceRate <= 0 {
 		sourceRate = EstimateSourceSpeakingRate(req.SourceText, sourceLang, slotMs)
@@ -271,15 +276,18 @@ func (a *DefaultSpokenScriptAdapter) AdaptSpokenScript(_ context.Context, req Sp
 	targetWords := len(strings.Fields(meaningText))
 	wordBudget := targetWordBudget(slotMs, targetLang, sourceRate, meaningText)
 
-	shouldShorten := estimatedMs > slotMs || targetWords > wordBudget
+	measuredOverrun := req.MeasuredDurationMs > slotMs || req.OverrunMs > 0
+	shouldShorten := estimatedMs > slotMs || targetWords > wordBudget || measuredOverrun
 	if cadenceRatio > 0 && (cadenceRatio < cadenceTriggerMinRatio || cadenceRatio > cadenceTriggerMaxRatio) {
 		shouldShorten = true
 	}
-
 	spokenText := meaningText
 	isShortened := false
 	if shouldShorten {
 		candidate := RewriteConciseSpokenText(meaningText, targetLang)
+		if measuredOverrun {
+			candidate = RewriteMeasuredOverrunSpokenText(candidate, targetLang)
+		}
 		for _, term := range req.ProtectedTerms {
 			if domain.GlossaryTermMatches(meaningText, term.Target) && !domain.GlossaryTermMatches(candidate, term.Target) {
 				candidate = meaningText
@@ -361,6 +369,13 @@ var (
 	spaceBeforePunctRegex = regexp.MustCompile(`\s+([,.\?!])`)
 )
 
+// normalizeSpokenSpacing is the shared final pass of every spoken-text rewrite:
+// collapse whitespace runs and drop the space before sentence punctuation.
+func normalizeSpokenSpacing(text string) string {
+	text = multiSpaceRegex.ReplaceAllString(strings.TrimSpace(text), " ")
+	return spaceBeforePunctRegex.ReplaceAllString(text, "$1")
+}
+
 // RewriteConciseSpokenText applies only generic politeness, pronoun, verb-form,
 // and contraction reductions. It deliberately avoids corpus-specific sentence
 // rewrites so unseen text follows the same production path as test fixtures.
@@ -376,8 +391,80 @@ func RewriteConciseSpokenText(text, tgtLang string) string {
 			result = rule.Pattern.ReplaceAllString(result, rule.Replace)
 		}
 	}
-	result = strings.TrimSpace(result)
-	result = multiSpaceRegex.ReplaceAllString(result, " ")
-	result = spaceBeforePunctRegex.ReplaceAllString(result, "$1")
-	return result
+	return normalizeSpokenSpacing(result)
+}
+
+// The measured-overrun tier may only drop qualifiers that cannot change negation scope.
+// Vietnamese "rất"/"rất là"/"vô cùng" are intensifiers that carry no negation of their own, so on
+// clearly safe text removing them leaves the claim intact. Qualifiers such as
+// "hoàn toàn"/"thực sự"/"thật sự" instead scope the negation ("không hoàn toàn đồng ý" = does
+// not entirely agree), so removing them silently strengthens the claim to "không đồng ý";
+// MeaningFirstQAGate preserves polarity presence, not polarity scope, and cannot catch that.
+// English has no scope-safe intensifier in this tier — "not very"/"not really"/"not actually"/
+// "not truly"/"not extremely" all hedge the negation — so this tier defines no English rules and
+// a negated English qualifier survives untouched instead of being shortened.
+var viMeasuredOverrunRules = []struct {
+	Pattern *regexp.Regexp
+	Replace string
+}{
+	{regexp.MustCompile(`(?i)(?:^|\s+)(vô cùng|rất là)\s+`), " "},
+	{regexp.MustCompile(`(?i)(?:^|\s+)rất\s+`), " "},
+}
+
+// viNegationMarkerRegexp matches a Vietnamese negation marker as a whole word. Whether an
+// intensifier can lose its own text depends on the clause it sits in, not on the intensifier:
+// the same "rất" is removable in "Đây là điều rất quan trọng" and load-bearing in
+// "Tôi nói không rất rõ ràng" ("I said 'no', very clearly"), where deleting it moves the
+// standalone "không" into scope of "rõ ràng" and turns the claim into "không rõ ràng"
+// (I do not speak clearly). MeaningFirstQAGate preserves polarity presence, not polarity scope,
+// so only the clause context can refuse that deletion.
+var viNegationMarkerRegexp = regexp.MustCompile(`(?i)(^|[^\p{L}\p{N}])(không|chẳng|chả|chưa|đừng|chớ|đâu)([^\p{L}\p{N}]|$)`)
+
+// negationMarkerPrecedes reports whether a Vietnamese negation marker occurs in the clause that
+// reaches up to prefix. Any marker in that clause may scope the intensifier that follows, or be
+// re-read as a standalone particle beside it, so the tier refuses the deletion. Sentence and
+// clause punctuation open a fresh clause, which keeps clearly safe text shortenable even when an
+// earlier clause is negated.
+func negationMarkerPrecedes(prefix string) bool {
+	if cut := strings.LastIndexAny(prefix, ".!?;:,()\n"); cut >= 0 {
+		prefix = prefix[cut+1:]
+	}
+	return viNegationMarkerRegexp.MatchString(prefix)
+}
+
+// replaceUnscopedIntensifier applies one measured-overrun rule, skipping every occurrence whose
+// preceding clause carries a negation marker. Scope is decided per occurrence, so a negated
+// clause keeps its intensifier while an unnegated one in the same text still shortens.
+func replaceUnscopedIntensifier(text string, pattern *regexp.Regexp, replace string) string {
+	locs := pattern.FindAllStringIndex(text, -1)
+	if len(locs) == 0 {
+		return text
+	}
+	var b strings.Builder
+	b.Grow(len(text))
+	last := 0
+	for _, loc := range locs {
+		if negationMarkerPrecedes(text[:loc[0]]) {
+			continue
+		}
+		b.WriteString(text[last:loc[0]])
+		b.WriteString(replace)
+		last = loc[1]
+	}
+	b.WriteString(text[last:])
+	return b.String()
+}
+
+// RewriteMeasuredOverrunSpokenText applies a second-tier concision pass when a synthesized
+// waveform overruns its accepted playback budget. It removes only intensifiers that no
+// Vietnamese negation can scope, so facts, names, numbers, glossary terms, and negation scope
+// all survive the rewrite.
+func RewriteMeasuredOverrunSpokenText(text, tgtLang string) string {
+	result := text
+	if strings.ToLower(tgtLang) == "vi" {
+		for _, rule := range viMeasuredOverrunRules {
+			result = replaceUnscopedIntensifier(result, rule.Pattern, rule.Replace)
+		}
+	}
+	return normalizeSpokenSpacing(result)
 }

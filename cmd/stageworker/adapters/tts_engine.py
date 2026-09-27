@@ -603,18 +603,16 @@ def run_cosyvoice_tts(
     language: str,
     voice_id: str,
     speed: float,
-    slot_duration_ms: int = 0,
     model_name: str = "cosyvoice3",
     model_version: str = "3.0.0",
 ) -> Dict[str, Any]:
     """
-    CosyVoice3 (Measured-duration speed-fit lane) inference adapter.
+    CosyVoice3 inference adapter.
     Uses official FunAudioLLM/CosyVoice API:
     - from cosyvoice.cli.cosyvoice import AutoModel
     - cosyvoice = AutoModel(model_dir=...)
     - for j in cosyvoice.inference_sft(text, spk_id, stream=False, speed=curr_speed): ...
-    Implements benchmark #21 multi-pass lane:
-    Natural Pass -> Measure Duration -> Speed-Fit Recalibration -> Re-Measure.
+    One adapter invocation performs exactly one engine synthesis at the requested speed.
     """
     factory = _COSYVOICE_MODEL_FACTORY
     if factory is None:
@@ -721,26 +719,14 @@ def run_cosyvoice_tts(
             audio = gen
         return encode_audio_to_wav(audio, sample_rate=sample_rate)
 
-    # 1. Natural Pass
-    wav_bytes, natural_dur_ms = synthesize_pass(speed)
-    final_dur_ms = natural_dur_ms
-
-    # 2. Measured-duration speed-fit lane (Benchmark #21)
-    # If slot_duration_ms is constrained and natural duration exceeds slot, re-synthesize with speed-fit
-    if slot_duration_ms > 0 and natural_dur_ms > slot_duration_ms:
-        # Calculate calibrated speed adjustment factor
-        speed_adjustment = natural_dur_ms / float(slot_duration_ms)
-        fitted_speed = min(2.0, max(0.5, speed * speed_adjustment))
-        fit_wav_bytes, fit_dur_ms = synthesize_pass(fitted_speed)
-        wav_bytes = fit_wav_bytes
-        final_dur_ms = fit_dur_ms
+    wav_bytes, dur_ms = synthesize_pass(speed)
 
     return build_tts_response(
         wav_bytes=wav_bytes,
-        measured_duration_ms=final_dur_ms,
+        measured_duration_ms=dur_ms,
         model_name=model_name,
         model_version=model_version,
-        predicted_duration_ms=natural_dur_ms,
+        predicted_duration_ms=dur_ms,
     )
 
 
@@ -1003,7 +989,6 @@ def run_tts(req: Dict[str, Any]) -> Dict[str, Any]:
             language=language,
             voice_id=voice_id,
             speed=speed,
-            slot_duration_ms=slot_duration_ms,
             model_name=model_name,
             model_version=model_version,
         )
@@ -1038,7 +1023,7 @@ def run_tts(req: Dict[str, Any]) -> Dict[str, Any]:
                 text, language, voice_id, speed, model_name, model_version, model_path=model_path, entrypoint_file=entrypoint_file
             )
         elif language == "zh":
-            return run_cosyvoice_tts(text, language, voice_id, speed, slot_duration_ms, model_name, model_version)
+            return run_cosyvoice_tts(text, language, voice_id, speed, model_name, model_version)
         else:
             return run_vieneu_tts(
                 text, language, voice_id, speed, model_name, model_version, model_path=model_path, entrypoint_file=entrypoint_file

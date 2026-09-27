@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -1502,5 +1503,305 @@ func TestSeam1_Issue151_MalformedRunCreationReturns400(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400 for malformed json body, got %d", resp.StatusCode)
+	}
+}
+
+type seam1SpokenAdapterFunc func(ctx context.Context, req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error)
+
+func (f seam1SpokenAdapterFunc) AdaptSpokenScript(ctx context.Context, req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+	return f(ctx, req)
+}
+
+func TestSeam1_Issue154_NativeEnvelopesAndCalibrationCacheInvalidation(t *testing.T) {
+	h := setupHarness(t)
+	jobID, runID := createJobAndRunWithDuration(t, h, 4.0)
+	assetID := getJobViaAPI(t, h, jobID).SourceAssetID
+
+	segments := []domain.TranslationInputSegment{
+		{
+			Index:      0,
+			SpeakerID:  "SPEAKER_00",
+			StartMs:    0,
+			EndMs:      1500,
+			SourceText: "测试语音合成速度与校准缓存失效。",
+		},
+	}
+	dubVariant := setupDubScriptForSeam1Lang(t, h, runID, assetID, "vi", segments)
+
+	fakeCosy := registerCosyVoiceFallback(t, h, 1650, true)
+	cosyVoice := domain.VoiceProfile{
+		ID:         "cosyvoice3_vi_female_1",
+		ProviderID: "fake_cosyvoice3_tts",
+		VoiceID:    "cosy_vi_f1",
+		Name:       "CosyVoice3 VI",
+		Language:   "vi",
+	}
+	_, voiceAssign := runAssignVoices(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+		"custom_assignments": map[string]domain.VoiceProfile{
+			"SPEAKER_00": cosyVoice,
+		},
+	})
+
+	// Keep rewrite unchanged so native-speed behavior is isolated and deterministic.
+	h.dubbingSvc.ConfigureSpokenAdapter(seam1SpokenAdapterFunc(func(_ context.Context, req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+		return &provider.SpokenScriptAdaptationResult{SpokenText: req.MeaningText}, nil
+	}))
+
+	// 1. Non-finite/invalid envelopes (NaN, Inf, zero, inverted) and unverified envelopes must be rejected -> 1 natural synthesis only.
+	invalidCfg := service.DefaultFitControllerConfig()
+	invalidCfg.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
+		{ProviderID: "fake_cosyvoice3_tts", VoiceProfileID: "cosyvoice3_vi_female_1", MinSpeed: math.NaN(), MaxSpeed: 1.25, Verified: true, CalibrationID: "cal-nan"},
+		{ProviderID: "fake_cosyvoice3_tts", VoiceProfileID: "cosyvoice3_vi_female_1", MinSpeed: 0.85, MaxSpeed: math.Inf(1), Verified: true, CalibrationID: "cal-inf"},
+		{ProviderID: "fake_cosyvoice3_tts", VoiceProfileID: "cosyvoice3_vi_female_1", MinSpeed: 0, MaxSpeed: 1.25, Verified: true, CalibrationID: "cal-zero"},
+		{ProviderID: "fake_cosyvoice3_tts", VoiceProfileID: "cosyvoice3_vi_female_1", MinSpeed: 1.3, MaxSpeed: 1.1, Verified: true, CalibrationID: "cal-inv"},
+		{ProviderID: "fake_cosyvoice3_tts", VoiceProfileID: "cosyvoice3_vi_female_1", MinSpeed: 0.85, MaxSpeed: 1.25, Verified: false, CalibrationID: "cal-unverified"},
+	}
+	h.dubbingSvc.ConfigureFitController(service.NewFitController(invalidCfg))
+
+	respUncal, uncalSegs := runDubSynthesize(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": dubVariant.CASHash,
+		"voice_assignment_cas":   voiceAssign.CASHash,
+	})
+	if respUncal.StatusCode != http.StatusCreated || uncalSegs == nil {
+		t.Fatalf("dub-synthesize with invalid envelopes failed: %d", respUncal.StatusCode)
+	}
+	if uncalSegs.OverallStatus != "REVIEW_REQUIRED" || fakeCosy.Invocations != 1 || uncalSegs.FitPlans[0].AttemptCount != 1 {
+		t.Fatalf("expected natural-only 1 invocation under invalid/unverified envelopes, got status=%s calls=%d attempts=%d",
+			uncalSegs.OverallStatus, fakeCosy.Invocations, uncalSegs.FitPlans[0].AttemptCount)
+	}
+	attempts1, err := h.db.ListProviderAttempts(context.Background(), runID, "tts")
+	if err != nil || len(attempts1) != 1 {
+		t.Fatalf("expected exactly 1 ProviderAttempt row, got %d (err=%v)", len(attempts1), err)
+	}
+
+	// 2. Configure a valid verified envelope -> invalidates cache, runs 1 natural + 1 native speed retry (2 new calls).
+	validCfg1 := service.DefaultFitControllerConfig()
+	validCfg1.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
+		{
+			ProviderID:     "fake_cosyvoice3_tts",
+			VoiceProfileID: "cosyvoice3_vi_female_1",
+			MinSpeed:       0.85,
+			MaxSpeed:       1.25,
+			Verified:       true,
+			CalibrationID:  "cal-seam1-v1",
+		},
+	}
+	h.dubbingSvc.ConfigureFitController(service.NewFitController(validCfg1))
+
+	respCal1, calSegs1 := runDubSynthesize(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": dubVariant.CASHash,
+		"voice_assignment_cas":   voiceAssign.CASHash,
+	})
+	if respCal1.StatusCode != http.StatusCreated || calSegs1 == nil {
+		t.Fatalf("calibrated dub-synthesize failed: %d", respCal1.StatusCode)
+	}
+	if calSegs1.OverallStatus != "PASS" || fakeCosy.Invocations != 3 {
+		t.Fatalf("expected PASS with +2 invocations (total 3), got status=%s calls=%d", calSegs1.OverallStatus, fakeCosy.Invocations)
+	}
+	if calSegs1.FitPlans[0].AttemptCount != 2 || calSegs1.FitPlans[0].SpeedFactor <= 1.0 || calSegs1.FitPlans[0].CalibrationID != "cal-seam1-v1" {
+		t.Fatalf("FitPlan must match 2 synthesis calls, applied speed >1.0, and cal-seam1-v1: %+v", calSegs1.FitPlans[0])
+	}
+	if calSegs1.Segments[0].CalibrationID != "cal-seam1-v1" {
+		t.Fatalf("selected segment CalibrationID mismatch: got %q", calSegs1.Segments[0].CalibrationID)
+	}
+	attempts2, err := h.db.ListProviderAttempts(context.Background(), runID, "tts")
+	if err != nil || len(attempts2) != 3 {
+		t.Fatalf("expected 3 total ProviderAttempt rows (1 + 2), got %d (err=%v)", len(attempts2), err)
+	}
+
+	// 3. Changing policy/profile calibration identity invalidates cache and re-synthesizes.
+	validCfg2 := validCfg1
+	validCfg2.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
+		{
+			ProviderID:     "fake_cosyvoice3_tts",
+			VoiceProfileID: "cosyvoice3_vi_female_1",
+			MinSpeed:       0.85,
+			MaxSpeed:       1.25,
+			Verified:       true,
+			CalibrationID:  "cal-seam1-v2",
+		},
+	}
+	h.dubbingSvc.ConfigureFitController(service.NewFitController(validCfg2))
+
+	respCal2, calSegs2 := runDubSynthesize(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": dubVariant.CASHash,
+		"voice_assignment_cas":   voiceAssign.CASHash,
+	})
+	if respCal2.StatusCode != http.StatusCreated || calSegs2 == nil {
+		t.Fatalf("re-calibrated dub-synthesize failed: %d", respCal2.StatusCode)
+	}
+	if calSegs2.CASHash == calSegs1.CASHash || fakeCosy.Invocations != 5 {
+		t.Fatalf("policy/calibration change must invalidate cache and re-synthesize (+2 calls -> 5), got sameCAS=%v calls=%d",
+			calSegs2.CASHash == calSegs1.CASHash, fakeCosy.Invocations)
+	}
+	if calSegs2.FitPlans[0].CalibrationID != "cal-seam1-v2" || calSegs2.Segments[0].CalibrationID != "cal-seam1-v2" {
+		t.Fatalf("expected updated CalibrationID cal-seam1-v2, got plan=%q seg=%q",
+			calSegs2.FitPlans[0].CalibrationID, calSegs2.Segments[0].CalibrationID)
+	}
+}
+
+func TestSeam1_Issue154_MeasuredRewriteQAGateAndGlossaryLocalization(t *testing.T) {
+	cases := []struct {
+		name       string
+		sourceText string
+		glossary   []domain.GlossaryEntry
+		rewriteFn  func(req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error)
+		wantStatus string
+		wantCalls  int
+		wantText   string
+	}{
+		{
+			name:       "unchanged_rewrite_preserves_prior_evidence_without_resynth",
+			sourceText: "这款 500 瓦的机器今天不去商店。",
+			rewriteFn: func(req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+				return &provider.SpokenScriptAdaptationResult{SpokenText: req.MeaningText}, nil
+			},
+			wantStatus: "REVIEW_REQUIRED",
+			wantCalls:  1,
+		},
+		{
+			name:       "number_corruption_rejected_without_resynth",
+			sourceText: "这台机器有 500 瓦功率。",
+			rewriteFn: func(req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+				return &provider.SpokenScriptAdaptationResult{SpokenText: "Bản dịch 600 công suất."}, nil
+			},
+			wantStatus: "REVIEW_REQUIRED",
+			wantCalls:  1,
+		},
+		{
+			name:       "negation_corruption_rejected_without_resynth",
+			sourceText: "我今天不去商店。",
+			rewriteFn: func(req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+				return &provider.SpokenScriptAdaptationResult{SpokenText: "Bản dịch hôm nay đi cửa hàng."}, nil
+			},
+			wantStatus: "REVIEW_REQUIRED",
+			wantCalls:  1,
+		},
+		{
+			name:       "name_corruption_rejected_without_resynth",
+			sourceText: "这款 SUPOR 电饭煲很好用。",
+			rewriteFn: func(req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+				return &provider.SpokenScriptAdaptationResult{SpokenText: "Bản dịch nồi cơm điện dễ dùng."}, nil
+			},
+			wantStatus: "REVIEW_REQUIRED",
+			wantCalls:  1,
+		},
+		{
+			name:       "valid_glossary_localization_passes_qa_and_probes_fresh_audio",
+			sourceText: "这款 SUPOR 500 电饭煲很好用。",
+			glossary:   []domain.GlossaryEntry{{Source: "SUPOR", Target: "SuporVN"}},
+			rewriteFn: func(req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+				return &provider.SpokenScriptAdaptationResult{SpokenText: "Nồi SuporVN 500 rất tốt."}, nil
+			},
+			wantStatus: "PASS",
+			wantCalls:  2,
+			wantText:   "Nồi SuporVN 500 rất tốt.",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := setupHarness(t)
+			jobID, baseRunID := createJobAndRunWithDuration(t, h, 4.0)
+			runID := baseRunID
+			assetID := getJobViaAPI(t, h, jobID).SourceAssetID
+			if len(tc.glossary) > 0 {
+				cfgBytes, _ := json.Marshal(map[string]any{"glossary": tc.glossary})
+				body, _ := json.Marshal(map[string]string{"config_snapshot_json": string(cfgBytes)})
+				respRun, err := http.Post(fmt.Sprintf("%s/api/v1/jobs/%s/runs", h.server.URL, jobID), "application/json", bytes.NewReader(body))
+				if err != nil || respRun.StatusCode != http.StatusCreated {
+					t.Fatalf("create glossary run failed: %v status=%d", err, respRun.StatusCode)
+				}
+				var runOut struct {
+					Run domain.LocalizationRun `json:"run"`
+				}
+				_ = json.NewDecoder(respRun.Body).Decode(&runOut)
+				respRun.Body.Close()
+				runID = runOut.Run.ID
+				if p, ok := h.registry.Get("fake_llm_translator"); ok {
+					p.(*provider.FakeTranslationProvider).CustomTranslations["vi:"+tc.sourceText] = "Chiếc nồi cơm điện SuporVN 500 này thật sự rất dễ dùng."
+				}
+			}
+			segments := []domain.TranslationInputSegment{
+				{
+					Index:      0,
+					SpeakerID:  "SPEAKER_00",
+					StartMs:    0,
+					EndMs:      1000,
+					SourceText: tc.sourceText,
+				},
+			}
+			dubVariant := setupDubScriptForSeam1Lang(t, h, runID, assetID, "vi", segments)
+			initialSpoken := dubVariant.Segments[0].SpokenText
+
+			// Use VieNeu voice so fixed-rate escalation does not run and rewrite is tested directly.
+			vieneuVoice := provider.VieNeuPresetVoices()[0]
+			_, voiceAssign := runAssignVoices(t, h, assetID, map[string]any{
+				"run_id":          runID,
+				"target_language": "vi",
+				"custom_assignments": map[string]domain.VoiceProfile{
+					"SPEAKER_00": vieneuVoice,
+				},
+			})
+
+			p, ok := h.registry.Get("fake_vieneu_tts_vi")
+			if !ok {
+				t.Fatal("missing fake_vieneu_tts_vi")
+			}
+			fakeVieNeu := p.(*provider.FakeTTSProvider)
+			fakeVieNeu.Invocations = 0
+			// Attempt 1 (initial text) -> 1400ms (overruns 1000ms slot).
+			// Attempt 2 (rewritten text) -> 800ms (fits 1000ms slot).
+			fakeVieNeu.DurationMs = 800
+			fakeVieNeu.CustomDurations = map[int]int64{0: 1400}
+
+			h.dubbingSvc.ConfigureSpokenAdapter(seam1SpokenAdapterFunc(func(_ context.Context, req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+				// On the second call inside fakeVieNeu (if rewrite is accepted), return 800ms
+				fakeVieNeu.CustomDurations = nil
+				return tc.rewriteFn(req)
+			}))
+
+			respSynth, out := runDubSynthesize(t, h, assetID, map[string]any{
+				"run_id":                 runID,
+				"target_language":        "vi",
+				"dub_script_variant_cas": dubVariant.CASHash,
+				"voice_assignment_cas":   voiceAssign.CASHash,
+			})
+			if respSynth.StatusCode != http.StatusCreated || out == nil {
+				t.Fatalf("dub-synthesize failed: %d", respSynth.StatusCode)
+			}
+			if out.OverallStatus != tc.wantStatus {
+				t.Fatalf("expected status %s, got %s", tc.wantStatus, out.OverallStatus)
+			}
+			if fakeVieNeu.Invocations != tc.wantCalls {
+				t.Fatalf("expected %d TTS invocations, got %d", tc.wantCalls, fakeVieNeu.Invocations)
+			}
+			attempts, err := h.db.ListProviderAttempts(context.Background(), runID, "tts")
+			if err != nil || len(attempts) != tc.wantCalls {
+				t.Fatalf("expected %d ProviderAttempt rows, got %d (err=%v)", tc.wantCalls, len(attempts), err)
+			}
+			if out.FitPlans[0].AttemptCount != tc.wantCalls {
+				t.Fatalf("expected FitPlan.AttemptCount=%d, got %d", tc.wantCalls, out.FitPlans[0].AttemptCount)
+			}
+			if tc.wantStatus == "PASS" {
+				if out.Segments[0].SpokenText != tc.wantText || out.Segments[0].MeasuredDurationMs != 800 {
+					t.Fatalf("expected accepted rewrite %q with 800ms probed audio, got text=%q dur=%d",
+						tc.wantText, out.Segments[0].SpokenText, out.Segments[0].MeasuredDurationMs)
+				}
+			} else {
+				if out.ReviewSegments[0].SpokenText != initialSpoken || out.ReviewSegments[0].MeasuredDurationMs != 1400 || out.ReviewSegments[0].AttemptCount != 1 {
+					t.Fatalf("expected honest prior review evidence (text=%q dur=1400 attempts=1), got %+v",
+						initialSpoken, out.ReviewSegments[0])
+				}
+			}
+		})
 	}
 }

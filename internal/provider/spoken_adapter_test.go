@@ -149,3 +149,93 @@ func TestSpokenScriptAdapter_ProtectedTermsPreservedByGlossaryMatching(t *testin
 		t.Fatalf("expected spoken text to preserve protected term 'OpenAI', got %q", res.SpokenText)
 	}
 }
+
+// Issue #154 meaning safety: the measured-overrun tier must never drop a qualifier whose
+// removal changes negation scope. "không hoàn toàn đồng ý" (does not entirely agree) must not
+// collapse into "không đồng ý" (does not agree), and "not really working" must not collapse
+// into "not working". MeaningFirstQAGate preserves polarity presence, not polarity scope, so
+// an unguarded intensifier rule can pass QA while changing what the sentence claims.
+func TestRewriteMeasuredOverrunSpokenText_PreservesNegationScopeQualifiers(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		lang string
+		text string
+	}{
+		{"vi_khong_hoan_toan", "vi", "Anh ấy không hoàn toàn đồng ý với kế hoạch này."},
+		{"vi_khong_thuc_su", "vi", "Nó không thực sự hoạt động."},
+		{"vi_khong_that_su", "vi", "Đây không thật sự là vấn đề."},
+		// Verified counterexample: "rất" is removable on its own, but here the negation marker
+		// directly before it is a standalone "no" that deleting "rất" would fold into scope of
+		// "rõ ràng", turning "said no, very clearly" into "do not speak clearly".
+		{"vi_khong_rat_standalone_no", "vi", "Tôi nói không rất rõ ràng."},
+		{"vi_khong_rat_la_standalone_no", "vi", "Cô ấy nói không rất là rõ."},
+		{"en_not_really", "en", "It is not really working."},
+		{"en_not_actually", "en", "That is not actually true."},
+		{"en_not_very", "en", "The result is not very good."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RewriteMeasuredOverrunSpokenText(tc.text, tc.lang)
+			if got != tc.text {
+				t.Fatalf("measured overrun must not change negation scope: got %q want %q", got, tc.text)
+			}
+		})
+	}
+}
+
+// The same seam: an actual measured overrun must still return the negated qualifier intact
+// instead of a shorter sentence whose claim is stronger than the source.
+func TestSpokenScriptAdapter_MeasuredOverrunPreservesNegatedQualifier(t *testing.T) {
+	a := NewDefaultSpokenScriptAdapter()
+	for _, tc := range []struct {
+		name    string
+		meaning string
+	}{
+		{"scoped_qualifier", "Anh ấy không hoàn toàn đồng ý với kế hoạch này."},
+		{"standalone_negation_before_intensifier", "Tôi nói không rất rõ ràng."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := a.AdaptSpokenScript(context.Background(), SpokenScriptAdaptationRequest{
+				SourceText:         "他并不完全同意这个计划。",
+				SourceLanguage:     "zh",
+				MeaningText:        tc.meaning,
+				TargetLanguage:     "vi",
+				SlotDurationMs:     1200,
+				MeasuredDurationMs: 1500,
+				OverrunMs:          300,
+			})
+			if err != nil {
+				t.Fatalf("AdaptSpokenScript failed: %v", err)
+			}
+			if res.SpokenText != tc.meaning {
+				t.Fatalf("measured overrun must keep the negated qualifier: got %q want %q", res.SpokenText, tc.meaning)
+			}
+		})
+	}
+}
+
+// Shrinking the rule set must not disable the tier: intensifiers that a Vietnamese negation
+// cannot scope stay removable, and facts/numbers/plain negation stay untouched.
+func TestRewriteMeasuredOverrunSpokenText_ShortensScopeSafeIntensifiersOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		lang string
+		text string
+		want string
+	}{
+		{"vi_rat", "vi", "Đây là điều rất quan trọng.", "Đây là điều quan trọng."},
+		{"vi_rat_la", "vi", "Cô ấy rất là thông minh.", "Cô ấy thông minh."},
+		{"vi_vo_cung", "vi", "Cảnh này vô cùng đẹp.", "Cảnh này đẹp."},
+		{"vi_number_kept", "vi", "Cỗ máy này có công suất 500 watt.", "Cỗ máy này có công suất 500 watt."},
+		{"vi_negation_kept", "vi", "Tôi sẽ không đi.", "Tôi sẽ không đi."},
+		// The negation guard is scoped to the intensifier's own clause: an earlier negated
+		// sentence must not disable the tier for text that carries no negation of its own.
+		{"vi_rat_after_negated_sentence", "vi", "Tôi không thích cà phê. Món này rất ngon.", "Tôi không thích cà phê. Món này ngon."},
+		{"vi_rat_la_after_negated_clause", "vi", "Nó không thực sự hoạt động, nhưng thiết kế rất là đẹp.", "Nó không thực sự hoạt động, nhưng thiết kế đẹp."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RewriteMeasuredOverrunSpokenText(tc.text, tc.lang); got != tc.want {
+				t.Fatalf("got %q want %q", got, tc.want)
+			}
+		})
+	}
+}

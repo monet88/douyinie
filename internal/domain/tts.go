@@ -44,9 +44,9 @@ const (
 	VoiceAssignmentSchemaVersion = 1
 	// DubSegmentsSchemaVersion is part of the TTS stage cache identity, so it must move
 	// whenever a DubSegmentsVariant's persisted contract or synthesis semantics change.
-	// Version 3 adds the pinned playback-window, canonical source-membership, transcript,
-	// audio-role-plan, and fit-policy evidence required by the current mixing contract.
-	DubSegmentsSchemaVersion = 3
+	// Version 4 adds verified native-speed calibration identity (CalibrationID,
+	// NativeSpeedEnvelopes) and per-source-lineage recovery semantics (#154).
+	DubSegmentsSchemaVersion = 4
 )
 
 // VoiceProfile represents a preset or cloned voice configuration.
@@ -205,6 +205,7 @@ type DubbingFitPlan struct {
 	DubPlaybackEndMs   int64     `json:"dub_playback_end_ms"`
 	EffectiveReserveMs int64     `json:"effective_reserve_ms"`
 	FitPolicyID        string    `json:"fit_policy_id"`
+	CalibrationID      string    `json:"calibration_id,omitempty"`
 	SpeechBlockIndices []int     `json:"speech_block_indices,omitempty"`
 	Decision           FitAction `json:"decision"` // ACCEPT | RESYNTH | REWRITE | REGROUP | REVIEW
 	DecisionReason     string    `json:"decision_reason,omitempty"`
@@ -223,6 +224,7 @@ type TTSCandidate struct {
 	PredictedDurationMs int64        `json:"predicted_duration_ms"`
 	MeasuredDurationMs  int64        `json:"measured_duration_ms"`
 	SpeedFactor         float64      `json:"speed_factor"`
+	CalibrationID       string       `json:"calibration_id,omitempty"`
 	AttemptNumber       int          `json:"attempt_number"`
 	ProbedAt            time.Time    `json:"probed_at"`
 }
@@ -248,6 +250,7 @@ type DubSegment struct {
 	NaturalGapAfterMs  int64        `json:"natural_gap_after_ms"`
 	DubPlaybackEndMs   int64        `json:"dub_playback_end_ms"`
 	EffectiveReserveMs int64        `json:"effective_reserve_ms"`
+	CalibrationID      string       `json:"calibration_id,omitempty"`
 }
 
 // DubSegmentReview records an unselected candidate or segment flagged for operator review.
@@ -269,6 +272,7 @@ type DubSegmentReview struct {
 	AttemptCount       int          `json:"attempt_count"`
 	DubPlaybackEndMs   int64        `json:"dub_playback_end_ms"`
 	EffectiveReserveMs int64        `json:"effective_reserve_ms"`
+	CalibrationID      string       `json:"calibration_id,omitempty"`
 }
 
 // VoiceEscalationReasonFixedRateOverrun is the deterministic reason recorded when a
@@ -301,27 +305,52 @@ type VoiceProviderEscalation struct {
 	Resolved bool `json:"resolved"`
 }
 
+// NativeSpeedEnvelope is the explicitly verified native-speed range of one
+// provider/model/voice-profile lane. A boolean capability feature is not
+// calibration: only a well-formed envelope whose CalibrationID names attributable
+// profile evidence may authorize the single measured native-speed attempt, and
+// the identity travels into the fit evidence and the stage cache key. There is no
+// global automatic speed ceiling.
+type NativeSpeedEnvelope struct {
+	ProviderID     string  `json:"provider_id"`
+	ModelID        string  `json:"model_id"`
+	ModelVersion   string  `json:"model_version"`
+	VoiceProfileID string  `json:"voice_profile_id"`
+	MinSpeed       float64 `json:"min_speed"`
+	MaxSpeed       float64 `json:"max_speed"`
+	// Verified marks an envelope backed by attributable profile evidence. An
+	// unverified/undeclared entry is structurally valid but never authorizes a
+	// rate change: the lane stays natural-only with the other remedies intact.
+	Verified      bool   `json:"verified"`
+	CalibrationID string `json:"calibration_id"`
+}
+
 // FitControllerConfig holds parameters for the measured-duration fit controller.
 type FitControllerConfig struct {
-	MaxSpeedMultiplier   float64 `json:"max_speed_multiplier,omitempty"`
-	MinNaturalGapMs      int64   `json:"min_natural_gap_ms,omitempty"`
-	MaxNaturalGapMs      int64   `json:"max_natural_gap_ms,omitempty"`
-	DefaultNaturalGapMs  int64   `json:"default_natural_gap_ms,omitempty"`
-	AllowRegroupSameTurn bool    `json:"allow_regroup_same_turn,omitempty"`
-	ReserveRatio         float64 `json:"reserve_ratio,omitempty"`
-	PolicyVersion        string  `json:"policy_version,omitempty"`
+	// NativeSpeedEnvelopes is the only source of automatic native speed. Empty
+	// (the default) keeps every lane natural-only: absent, unverified, fixed-rate
+	// or misconfigured lanes must still reach rewrite/regroup/review instead of
+	// requesting a speed the provider cannot honor.
+	NativeSpeedEnvelopes []NativeSpeedEnvelope `json:"native_speed_envelopes,omitempty"`
+	MinNaturalGapMs      int64                 `json:"min_natural_gap_ms,omitempty"`
+	MaxNaturalGapMs      int64                 `json:"max_natural_gap_ms,omitempty"`
+	DefaultNaturalGapMs  int64                 `json:"default_natural_gap_ms,omitempty"`
+	AllowRegroupSameTurn bool                  `json:"allow_regroup_same_turn,omitempty"`
+	ReserveRatio         float64               `json:"reserve_ratio,omitempty"`
+	PolicyVersion        string                `json:"policy_version,omitempty"`
 }
 
 // DefaultFitControllerConfig returns the standard fit controller configuration.
 func DefaultFitControllerConfig() FitControllerConfig {
 	return FitControllerConfig{
-		MaxSpeedMultiplier:   1.25,
 		MinNaturalGapMs:      50,
 		MaxNaturalGapMs:      400,
 		DefaultNaturalGapMs:  150,
 		AllowRegroupSameTurn: true,
 		ReserveRatio:         0.30,
-		PolicyVersion:        "playback-window-v1",
+		// v2 removes the implicit <=1.15 permission and the global 1.25 native
+		// envelope; a native attempt now needs a declared verified calibration.
+		PolicyVersion: "playback-window-v2",
 	}
 }
 
