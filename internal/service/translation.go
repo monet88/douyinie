@@ -624,8 +624,11 @@ func (s *TranslationService) resolveCanonicalRolePlan(ctx context.Context, asset
 // ResolveRunScopedAudioRolePlan resolves the AudioRolePlan that governs every run-scoped decision derived
 // from source audio: canonical segmentation, playback boundary, the no-dub decision, synthesis, audition,
 // and mix. A run pins the plan its audio_role_plan stage consumed, so a newer plan saved for the same asset
-// must never change what an older run already froze. Without a run pin - a fresh run, or a caller that is
-// not run-scoped - the asset's current plan applies, exactly as it did at run time.
+// must never change what an older run already froze (#153).
+//
+// For a run-scoped decision (runID != ""), missing, failed, interrupted, corrupt, or wrong-asset pinned
+// audio_role_plan evidence fails closed with a typed sentinel error; it never silently adopts asset-latest.
+// Without a run pin (runID == "") - a non-run caller - the asset's current plan applies as a legacy fallback.
 func ResolveRunScopedAudioRolePlan(ctx context.Context, db *storage.DB, store *cas.Store, assetID, runID string) (*domain.AudioRolePlan, error) {
 	if db == nil || strings.TrimSpace(assetID) == "" {
 		return nil, nil
@@ -635,9 +638,17 @@ func ResolveRunScopedAudioRolePlan(ctx context.Context, db *storage.DB, store *c
 		if err != nil {
 			return nil, fmt.Errorf("resolve run %s audio role plan lineage: %w", runID, err)
 		}
-		if pinnedCAS != "" {
-			return LoadPinnedAudioRolePlanFromCAS(store, pinnedCAS)
+		if pinnedCAS == "" {
+			return nil, fmt.Errorf("%w for run %s asset %s", domain.ErrRunPinnedAudioRolePlanMissing, runID, assetID)
 		}
+		plan, err := LoadPinnedAudioRolePlanFromCAS(store, pinnedCAS)
+		if err != nil {
+			return nil, err
+		}
+		if plan.AssetID != assetID {
+			return nil, fmt.Errorf("%w: plan %s belongs to asset %q, not %q", domain.ErrAudioRolePlanOwnershipMismatch, pinnedCAS, plan.AssetID, assetID)
+		}
+		return plan, nil
 	}
 	plan, err := db.GetAudioRolePlan(ctx, assetID)
 	if err != nil {
@@ -1025,9 +1036,30 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 		sourceLang = "zh"
 	}
 	in.SourceLanguage = sourceLang
+	// 1. Load meaning-first TranslationVariant
+	transVariant, transCAS, err := s.loadTranslationVariant(ctx, in.AssetID, in.RunID, in.TargetLanguage, in.TranslationVariantCAS)
+	if err != nil {
+		return nil, fmt.Errorf("load translation variant for dub script adaptation: %w", err)
+	}
+	in.TranslationVariantCAS = transCAS
+
 	// Fail closed if AudioRolePlan is missing, unreadable, or contains no dub-eligible dialogue.
 	if s.db == nil || strings.TrimSpace(in.AssetID) == "" {
 		return nil, domain.ErrAudioRolePlanRequired
+	}
+	// The run's pinned transcript is the authority for both the adaptation boundary and the
+	// translation lineage the run consumed: resolve it unconditionally (missing, corrupt, or
+	// wrong-asset evidence fails closed) and require the translation variant to name exactly that
+	// artifact, so a variant produced from a different run's transcript can never be adapted here.
+	pinnedTranscriptCAS, err := resolveRunTranscriptCAS(ctx, s.db, in.RunID, in.AssetID, "dub script adaptation")
+	if err != nil {
+		return nil, fmt.Errorf("resolve run transcript lineage for dub script adaptation: %w", err)
+	}
+	if pinnedTranscriptCAS == "" {
+		return nil, fmt.Errorf("%w for run %s", domain.ErrTranscriptLineageMissing, in.RunID)
+	}
+	if strings.TrimSpace(transVariant.TranscriptArtifactCAS) != pinnedTranscriptCAS {
+		return nil, fmt.Errorf("run %s %w for dub script adaptation: translation variant transcript=%q run transcript=%q", in.RunID, domain.ErrTranscriptLineageMismatch, transVariant.TranscriptArtifactCAS, pinnedTranscriptCAS)
 	}
 	rolePlan, err := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, in.AssetID, in.RunID)
 	if err != nil {
@@ -1040,14 +1072,19 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 		return nil, domain.ErrNoDubbingRequired
 	}
 
-	// 1. Load meaning-first TranslationVariant
-	transVariant, transCAS, err := s.loadTranslationVariant(ctx, in.AssetID, in.TargetLanguage, in.TranslationVariantCAS)
+	// The adaptation boundary is derived from run-pinned evidence only: the exact
+	// transcript artifact the translation was produced from, plus the run's pinned
+	// AudioRolePlan. A missing, corrupt, or wrong-asset pin fails closed instead of
+	// silently borrowing against a different artifact.
+	transcript, err := s.loadPinnedTranscriptArtifact(ctx, in.AssetID, in.RunID, transVariant.TranscriptArtifactCAS)
 	if err != nil {
-		return nil, fmt.Errorf("load translation variant for dub script adaptation: %w", err)
+		return nil, fmt.Errorf("load pinned transcript for dub script adaptation: %w", err)
 	}
-	in.TranslationVariantCAS = transCAS
-	// 2. Compute deterministic provenance cache identity
-	provenanceHash, err := s.computeDubScriptProvenanceHash(in, transVariant)
+
+	// 2. Compute deterministic provenance cache identity, including the pinned
+	// role-plan identity: two runs with the same translation but different pinned
+	// plans must not share a dub script.
+	provenanceHash, err := s.computeDubScriptProvenanceHash(in, transVariant, rolePlan)
 	if err != nil {
 		return nil, fmt.Errorf("compute dub script cache identity: %w", err)
 	}
@@ -1081,7 +1118,7 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 		adapter = provider.NewDefaultSpokenScriptAdapter()
 	}
 
-	for i, seg := range transVariant.Segments {
+	for _, seg := range transVariant.Segments {
 		slotDurationMs := seg.EndMs - seg.StartMs
 		if slotDurationMs <= 0 {
 			dubSegments = append(dubSegments, domain.DubScriptSegment{
@@ -1096,13 +1133,20 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 		}
 
 		srcCPS := provider.EstimateSourceSpeakingRate(seg.SourceText, in.SourceLanguage, slotDurationMs)
-		hasNextTurn := i+1 < len(transVariant.Segments)
+		// Borrowing is optional and evidence-gated by the immutable transcript boundary,
+		// never by the position of the next TranslationVariant row: consecutive rows may
+		// belong to different speakers (so the gap between them is a different turn, not
+		// this turn's tail), and an intervening singing/music-vocal or uncertain region
+		// must stop the boundary even when the next row lies beyond it. A zero boundary
+		// means no later boundary exists, so there is nothing to borrow (#153).
+		nextBoundaryMs, err := playbackBoundaryForBlock(seg.Index, seg.StartMs, seg.EndMs, transcript, rolePlan)
+		if err != nil {
+			return nil, fmt.Errorf("resolve playback boundary for segment %d: %w", seg.Index, err)
+		}
+		hasNextTurn := nextBoundaryMs > seg.EndMs
 		var sourceGapAfterMs int64
 		if hasNextTurn {
-			sourceGapAfterMs = transVariant.Segments[i+1].StartMs - seg.EndMs
-			if sourceGapAfterMs < 0 {
-				sourceGapAfterMs = 0
-			}
+			sourceGapAfterMs = nextBoundaryMs - seg.EndMs
 		}
 
 		meaningText := seg.TargetText
@@ -1274,7 +1318,13 @@ func (s *TranslationService) AdaptDubScript(ctx context.Context, in domain.DubSc
 	return variant, nil
 }
 
-func (s *TranslationService) loadTranslationVariant(ctx context.Context, assetID, targetLang, casHash string) (*domain.TranslationVariant, string, error) {
+// loadTranslationVariant resolves and loads the meaning-first TranslationVariant a run consumed.
+//
+// An omitted casHash is resolved from run-scoped translation evidence only: a run that reused a
+// cached translation still owns no index row, but the stage execution names the exact artifact it
+// consumed. It never falls back to the asset's latest translation, which may belong to a different
+// run and a different transcript (#153).
+func (s *TranslationService) loadTranslationVariant(ctx context.Context, assetID, runID, targetLang, casHash string) (*domain.TranslationVariant, string, error) {
 	if s.cas == nil {
 		return nil, "", fmt.Errorf("CAS store required to load translation variant")
 	}
@@ -1284,11 +1334,38 @@ func (s *TranslationService) loadTranslationVariant(ctx context.Context, assetID
 		if s.db == nil {
 			return nil, "", fmt.Errorf("database required to find translation variant index")
 		}
-		idx, err := s.db.GetTranslationVariantIndex(ctx, assetID, targetLang)
-		if err != nil {
-			return nil, "", fmt.Errorf("translation variant not found for asset %s: %w", assetID, err)
+		if strings.TrimSpace(runID) != "" {
+			idx, err := s.db.GetTranslationVariantIndexByRun(ctx, runID)
+			if err != nil {
+				// A run that reused a cached translation owns no index row of its own; the stage
+				// execution still pins the exact artifact the run consumed.
+				casHash, stageErr := s.stageTranslationArtifactHash(ctx, runID)
+				if stageErr != nil {
+					return nil, "", stageErr
+				}
+				if casHash == "" {
+					return nil, "", fmt.Errorf("translation variant not found for run %s: %w", runID, err)
+				}
+				resolvedCAS = casHash
+			} else {
+				if idx.AssetID != assetID {
+					return nil, "", fmt.Errorf("translation variant run %s belongs to asset %s, not %s", runID, idx.AssetID, assetID)
+				}
+				if !strings.EqualFold(idx.TargetLanguage, targetLang) {
+					return nil, "", fmt.Errorf("translation variant run %s target_language mismatch: expected %s, got %s", runID, targetLang, idx.TargetLanguage)
+				}
+				resolvedCAS = idx.CASHash
+			}
+		} else {
+			idx, err := s.db.GetTranslationVariantIndex(ctx, assetID, targetLang)
+			if err != nil {
+				return nil, "", fmt.Errorf("translation variant not found for asset %s: %w", assetID, err)
+			}
+			resolvedCAS = idx.CASHash
 		}
-		resolvedCAS = idx.CASHash
+	}
+	if strings.TrimSpace(resolvedCAS) == "" {
+		return nil, "", fmt.Errorf("translation variant for run %s resolved no CAS artifact", runID)
 	}
 
 	rc, err := s.cas.Get(resolvedCAS)
@@ -1317,17 +1394,79 @@ func (s *TranslationService) loadTranslationVariant(ctx context.Context, assetID
 	return &variant, resolvedCAS, nil
 }
 
-func (s *TranslationService) computeDubScriptProvenanceHash(in domain.DubScriptJobInput, transVariant *domain.TranslationVariant) (string, error) {
+// stageTranslationArtifactHash resolves the translation artifact a run recorded consuming, for the
+// cached-reuse case where the run owns no index row of its own.
+func (s *TranslationService) stageTranslationArtifactHash(ctx context.Context, runID string) (string, error) {
+	if s.db == nil {
+		return "", nil
+	}
+	casHash, err := s.db.GetStageArtifactHash(ctx, runID, "translation")
+	if err != nil {
+		return "", fmt.Errorf("resolve run %s translation artifact: %w", runID, err)
+	}
+	return casHash, nil
+}
+
+// loadPinnedTranscriptArtifact loads the exact transcript artifact a TranslationVariant was produced
+// from, for deriving playback boundaries. It reads the full domain.TranscriptArtifact (not just the
+// CAS hash) because the boundary walk needs the speech-block timing, and it fails closed when the pin
+// is missing, unreadable, undecodable, unowned, or belongs to a different asset.
+func (s *TranslationService) loadPinnedTranscriptArtifact(ctx context.Context, assetID, runID, casHash string) (*domain.TranscriptArtifact, error) {
+	if s.cas == nil {
+		return nil, fmt.Errorf("%w: CAS store required to load pinned transcript", domain.ErrTranscriptLineageProofFailed)
+	}
+	resolvedCAS := strings.TrimSpace(casHash)
+	if resolvedCAS == "" {
+		pinnedCAS, err := resolveRunTranscriptCAS(ctx, s.db, runID, assetID, "dub script adaptation")
+		if err != nil {
+			return nil, err
+		}
+		resolvedCAS = pinnedCAS
+	}
+	if resolvedCAS == "" {
+		return nil, fmt.Errorf("%w for run %s", domain.ErrTranscriptLineageMissing, runID)
+	}
+	rc, err := s.cas.Get(resolvedCAS)
+	if err != nil {
+		return nil, fmt.Errorf("%w: read pinned transcript from CAS (%s): %v", domain.ErrTranscriptLineageProofFailed, resolvedCAS, err)
+	}
+	defer rc.Close()
+	var transcript domain.TranscriptArtifact
+	if err := json.NewDecoder(rc).Decode(&transcript); err != nil {
+		return nil, fmt.Errorf("%w: decode pinned transcript (%s): %v", domain.ErrTranscriptLineageProofFailed, resolvedCAS, err)
+	}
+	if transcript.AssetID != "" && transcript.AssetID != assetID {
+		return nil, fmt.Errorf("pinned transcript %s %w: asset %q != %q", resolvedCAS, domain.ErrTranscriptLineageMismatch, transcript.AssetID, assetID)
+	}
+	return &transcript, nil
+}
+
+func (s *TranslationService) computeDubScriptProvenanceHash(in domain.DubScriptJobInput, transVariant *domain.TranslationVariant, rolePlan *domain.AudioRolePlan) (string, error) {
 	inputHashes := []string{transVariant.ProvenanceHash}
 	if in.TranslationVariantCAS != "" {
 		inputHashes = append(inputHashes, in.TranslationVariantCAS)
 	}
+	// The transcript the boundary was derived from and the pinned AudioRolePlan both
+	// determine the dub script's timing: a plan with different protected regions makes a
+	// different script from identical translation input.
+	if transcriptCAS := strings.TrimSpace(transVariant.TranscriptArtifactCAS); transcriptCAS != "" {
+		inputHashes = append(inputHashes, transcriptCAS)
+	}
+	rolePlanHash := ""
+	if rolePlan != nil {
+		rolePlanHash = strings.TrimSpace(rolePlan.CASHash)
+	}
+	if rolePlanHash == "" {
+		return "", fmt.Errorf("%w: pinned audio role plan identity is missing for run %s", domain.ErrRunPinnedAudioRolePlanMissing, in.RunID)
+	}
+	inputHashes = append(inputHashes, rolePlanHash)
 	return cas.ComputeStageCacheKey(domain.StageCacheIdentityInput{
 		Stage:       "dub_script",
 		InputHashes: inputHashes,
 		SemanticConfig: map[string]any{
-			"source_language": in.SourceLanguage,
-			"adaptation_mode": "shorten_first_source_relative_cadence_v2",
+			"source_language":     in.SourceLanguage,
+			"adaptation_mode":     "shorten_first_source_relative_cadence_v2",
+			"audio_role_plan_cas": rolePlanHash,
 		},
 		ProviderID:    transVariant.ProviderID,
 		ModelName:     transVariant.ModelName,

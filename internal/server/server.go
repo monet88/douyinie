@@ -185,6 +185,11 @@ func New(cfg Config) *Server {
 			cfg.ReviewSvc.SetRenderService(cfg.RenderSvc)
 		}
 	}
+	if cfg.Router != nil && cfg.DB != nil && cfg.CASStore != nil {
+		cfg.Router.SetAudioRolePlanResolver(func(ctx context.Context, assetID, runID string) (*domain.AudioRolePlan, error) {
+			return service.ResolveRunScopedAudioRolePlan(ctx, cfg.DB, cfg.CASStore, assetID, runID)
+		})
+	}
 	if cfg.AudioRoleSvc != nil && cfg.Router != nil {
 		cfg.AudioRoleSvc.ConfigureRouter(cfg.Router)
 	}
@@ -707,14 +712,65 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 
 	// 1. AudioRolePlan
 	var rolePlan *domain.AudioRolePlan
-	if reusable, casHash := isStageReusable("audio_role_plan"); reusable && casHash != "" {
-		if plan, err := service.LoadPinnedAudioRolePlanFromCAS(s.casStore, casHash); err == nil {
-			rolePlan = plan
+	if priorRoleStage, ok := latestStageMap["audio_role_plan"]; ok && priorRoleStage.Status == domain.StageStatusSucceeded {
+		if priorRoleStage.ArtifactSHA256 == "" {
+			return s.failRun(ctx, runID, "audio_role_plan", "pinned audio role plan artifact hash is empty")
 		}
+		plan, err := service.LoadPinnedAudioRolePlanFromCAS(s.casStore, priorRoleStage.ArtifactSHA256)
+		if err != nil {
+			return s.failRun(ctx, runID, "audio_role_plan", fmt.Sprintf("failed to load pinned audio role plan from CAS: %v", err))
+		}
+		if plan == nil {
+			return s.failRun(ctx, runID, "audio_role_plan", "pinned audio role plan artifact is nil")
+		}
+		if plan.AssetID != assetID {
+			return s.failRun(ctx, runID, "audio_role_plan", fmt.Sprintf("%v: plan %s belongs to asset %q, not %q", domain.ErrAudioRolePlanOwnershipMismatch, priorRoleStage.ArtifactSHA256, plan.AssetID, assetID))
+		}
+		rolePlan = plan
 	}
 	if rolePlan == nil {
-		if plan, err := service.ResolveRunScopedAudioRolePlan(ctx, s.db, s.casStore, assetID, runID); err == nil {
-			rolePlan = plan
+		// Fresh executeRun may intentionally reuse an existing asset plan only if it explicitly binds that
+		// exact CAS to the run by recording the audio_role_plan stage success before downstream stages consume it (#153).
+		// A run with ANY prior audio_role_plan attempt (failed, interrupted, etc.) is NOT a fresh run and must NOT bind asset-latest.
+		_, hasPriorAttempt := latestStageMap["audio_role_plan"]
+		if !hasPriorAttempt {
+			p, err := s.db.GetAudioRolePlan(ctx, assetID)
+			if err != nil && !errors.Is(err, storage.ErrNotFound) {
+				return s.failRun(ctx, runID, "audio_role_plan", fmt.Sprintf("failed to get audio role plan for asset %s: %v", assetID, err))
+			}
+			if p != nil {
+				casHash := p.CASHash
+				if s.casStore != nil {
+					if casHash == "" || !s.casStore.Exists(casHash) {
+						b, err := json.Marshal(p)
+						if err != nil {
+							return s.failRun(ctx, runID, "audio_role_plan", fmt.Sprintf("failed to marshal audio role plan: %v", err))
+						}
+						obj, err := s.casStore.Put(bytes.NewReader(b))
+						if err != nil {
+							return s.failRun(ctx, runID, "audio_role_plan", fmt.Sprintf("failed to store audio role plan artifact: %v", err))
+						}
+						casHash = obj.SHA256
+						p.CASHash = casHash
+					}
+				}
+				if casHash == "" {
+					return s.failRun(ctx, runID, "audio_role_plan", "audio role plan artifact hash is empty")
+				}
+				se, err := startStage("audio_role_plan")
+				if err != nil {
+					return s.failRun(ctx, runID, "audio_role_plan", fmt.Sprintf("failed to record stage start: %v", err))
+				}
+				se.Status = domain.StageStatusSucceeded
+				se.ArtifactSHA256 = casHash
+				nowFin := time.Now().UTC()
+				se.CompletedAt = &nowFin
+				se.UpdatedAt = nowFin
+				if err := s.db.UpdateStageExecution(ctx, *se); err != nil {
+					return s.failRun(ctx, runID, "audio_role_plan", fmt.Sprintf("failed to record stage completion: %v", err))
+				}
+				rolePlan = p
+			}
 		}
 	}
 	if rolePlan == nil {
@@ -742,6 +798,16 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 			}
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 				return err
+			}
+
+			if genPlan == nil {
+				return s.failRun(ctx, runID, "audio_role_plan", "generated audio role plan is nil")
+			}
+			if strings.TrimSpace(genPlan.CASHash) == "" {
+				return s.failRun(ctx, runID, "audio_role_plan", "generated audio role plan artifact hash is empty")
+			}
+			if genPlan.AssetID != assetID {
+				return s.failRun(ctx, runID, "audio_role_plan", fmt.Sprintf("%v: generated plan belongs to asset %q, not %q", domain.ErrAudioRolePlanOwnershipMismatch, genPlan.AssetID, assetID))
 			}
 
 			rolePlan = genPlan
@@ -2028,6 +2094,7 @@ func (s *Server) handleSaveAudioRolePlan(w http.ResponseWriter, r *http.Request)
 	}
 
 	var body struct {
+		RunID    string                `json:"run_id,omitempty"`
 		Segments []domain.AudioSegment `json:"segments"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -2035,6 +2102,42 @@ func (s *Server) handleSaveAudioRolePlan(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	runID := strings.TrimSpace(body.RunID)
+	if runID != "" {
+		run, err := s.db.GetRun(r.Context(), runID)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("run %s not found", runID))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		job, err := s.db.GetJob(r.Context(), run.JobID)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("job %s for run %s not found", run.JobID, runID))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if job.SourceAssetID != assetID {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("run %s belongs to asset %s, not %s", runID, job.SourceAssetID, assetID))
+			return
+		}
+		stages, err := s.db.ListStageExecutions(r.Context(), runID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		for _, st := range stages {
+			if st.Stage == "audio_role_plan" {
+				writeError(w, http.StatusConflict, fmt.Sprintf("run %s already has audio_role_plan stage execution attempt (status: %s)", runID, st.Status))
+				return
+			}
+		}
+	}
 	for _, seg := range body.Segments {
 		switch seg.Role {
 		case domain.AudioRoleNarrationDialogue,
@@ -2057,6 +2160,28 @@ func (s *Server) handleSaveAudioRolePlan(w http.ResponseWriter, r *http.Request)
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if runID != "" {
+		if strings.TrimSpace(plan.CASHash) == "" {
+			writeError(w, http.StatusInternalServerError, "audio role plan artifact hash is empty")
+			return
+		}
+		now := time.Now().UTC()
+		se := domain.StageExecution{
+			ID:             uuid.NewString(),
+			RunID:          runID,
+			Stage:          "audio_role_plan",
+			Status:         domain.StageStatusSucceeded,
+			ArtifactSHA256: plan.CASHash,
+			StartedAt:      &now,
+			CompletedAt:    &now,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		if err := s.db.CreateStageExecution(r.Context(), se); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("record audio_role_plan stage execution: %v", err))
+			return
+		}
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]any{"audio_role_plan": plan})
@@ -2204,43 +2329,127 @@ func (s *Server) handleRunSpeechUnderstand(w http.ResponseWriter, r *http.Reques
 	plan, err := service.ResolveRunScopedAudioRolePlan(r.Context(), s.db, s.casStore, assetID, body.RunID)
 	if err == nil {
 		rolePlan = plan
+	} else if errors.Is(err, domain.ErrRunPinnedAudioRolePlanMissing) {
+		// Fresh run with no prior audio_role_plan attempt: check if any prior stage execution exists for this run.
+		// If the run has a prior failed/interrupted/corrupt audio_role_plan attempt, fail closed.
+		priorStages, pErr := s.db.ListStageExecutions(r.Context(), body.RunID)
+		if pErr != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("list prior stages for run %s: %v", body.RunID, pErr))
+			return
+		}
+		hasPriorAttempt := false
+		for _, st := range priorStages {
+			if st.Stage == "audio_role_plan" {
+				hasPriorAttempt = true
+				break
+			}
+		}
+		if hasPriorAttempt {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		// Fresh run with no prior audio_role_plan attempt:
+		// First check if an existing asset-level plan exists that can be bound to this run.
+		p, aErr := s.db.GetAudioRolePlan(r.Context(), assetID)
+		if aErr != nil && !errors.Is(aErr, storage.ErrNotFound) {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("load asset audio role plan: %v", aErr))
+			return
+		}
+		if p != nil {
+			casHash := p.CASHash
+			if s.casStore != nil {
+				if casHash == "" || !s.casStore.Exists(casHash) {
+					b, mErr := json.Marshal(p)
+					if mErr != nil {
+						writeError(w, http.StatusInternalServerError, fmt.Sprintf("marshal audio role plan: %v", mErr))
+						return
+					}
+					obj, putErr := s.casStore.Put(bytes.NewReader(b))
+					if putErr != nil {
+						writeError(w, http.StatusInternalServerError, fmt.Sprintf("store audio role plan artifact: %v", putErr))
+						return
+					}
+					casHash = obj.SHA256
+					p.CASHash = casHash
+				}
+			}
+			if casHash == "" {
+				writeError(w, http.StatusInternalServerError, "audio role plan artifact hash is empty")
+				return
+			}
+			now := time.Now().UTC()
+			se := domain.StageExecution{
+				ID:             uuid.NewString(),
+				RunID:          body.RunID,
+				Stage:          "audio_role_plan",
+				Status:         domain.StageStatusSucceeded,
+				ArtifactSHA256: casHash,
+				StartedAt:      &now,
+				CompletedAt:    &now,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}
+			if createErr := s.db.CreateStageExecution(r.Context(), se); createErr != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("record audio_role_plan stage execution: %v", createErr))
+				return
+			}
+			rolePlan = p
+		}
+
+		// If still nil, attempt automatic prerequisite generation on the normal production speech path.
+		if rolePlan == nil && s.audioRoleSvc != nil {
+			genPlan, genErr := s.audioRoleSvc.GenerateAudioRolePlan(r.Context(), service.AudioRolePlanInput{
+				AssetID: assetID,
+				RunID:   body.RunID,
+			})
+			if genErr != nil {
+				if errors.Is(genErr, domain.ErrAudioRoleAnalyzerUnavailable) ||
+					errors.Is(genErr, domain.ErrNoEligibleProvider) ||
+					errors.Is(genErr, domain.ErrPolicyBlocked) ||
+					errors.Is(genErr, domain.ErrLicenseManifestMissing) ||
+					errors.Is(genErr, domain.ErrSnapshotUnverified) ||
+					errors.Is(genErr, domain.ErrSnapshotDigestMismatch) ||
+					errors.Is(genErr, domain.ErrSnapshotMutatedRehashRequired) ||
+					errors.Is(genErr, domain.ErrSnapshotFileCorrupted) ||
+					errors.Is(genErr, domain.ErrAudioRoleModelAssetMissing) ||
+					errors.Is(genErr, domain.ErrCircuitOpen) {
+					writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("automatic audio role plan analyzer unavailable: %v", genErr))
+					return
+				}
+				if errors.Is(genErr, domain.ErrAudioRolePreflightRequired) ||
+					errors.Is(genErr, domain.ErrAudioRoleEvidenceMissing) {
+					writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("automatic audio role plan prerequisite missing: %v", genErr))
+					return
+				}
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("automatic audio role plan generation failed: %v", genErr))
+				return
+			}
+			if genPlan == nil || genPlan.CASHash == "" {
+				writeError(w, http.StatusInternalServerError, "generated audio role plan missing or missing CAS artifact")
+				return
+			}
+			now := time.Now().UTC()
+			se := domain.StageExecution{
+				ID:             uuid.NewString(),
+				RunID:          body.RunID,
+				Stage:          "audio_role_plan",
+				Status:         domain.StageStatusSucceeded,
+				ArtifactSHA256: genPlan.CASHash,
+				StartedAt:      &now,
+				CompletedAt:    &now,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}
+			if createErr := s.db.CreateStageExecution(r.Context(), se); createErr != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("record audio_role_plan stage execution: %v", createErr))
+				return
+			}
+			rolePlan = genPlan
+		}
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
-	}
-
-	// Automatic prerequisite generation on the normal production speech path:
-	// If no AudioRolePlan has been pre-seeded or generated for this asset,
-	// automatically generate and persist the canonical plan using production
-	// source analysis before invoking SpeechService.
-	if rolePlan == nil && s.audioRoleSvc != nil {
-		genPlan, err := s.audioRoleSvc.GenerateAudioRolePlan(r.Context(), service.AudioRolePlanInput{
-			AssetID: assetID,
-			RunID:   body.RunID,
-		})
-		if err != nil {
-			if errors.Is(err, domain.ErrAudioRoleAnalyzerUnavailable) ||
-				errors.Is(err, domain.ErrNoEligibleProvider) ||
-				errors.Is(err, domain.ErrPolicyBlocked) ||
-				errors.Is(err, domain.ErrLicenseManifestMissing) ||
-				errors.Is(err, domain.ErrSnapshotUnverified) ||
-				errors.Is(err, domain.ErrSnapshotDigestMismatch) ||
-				errors.Is(err, domain.ErrSnapshotMutatedRehashRequired) ||
-				errors.Is(err, domain.ErrSnapshotFileCorrupted) ||
-				errors.Is(err, domain.ErrAudioRoleModelAssetMissing) ||
-				errors.Is(err, domain.ErrCircuitOpen) {
-				writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("automatic audio role plan analyzer unavailable: %v", err))
-				return
-			}
-			if errors.Is(err, domain.ErrAudioRolePreflightRequired) ||
-				errors.Is(err, domain.ErrAudioRoleEvidenceMissing) {
-				writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("automatic audio role plan prerequisite missing: %v", err))
-				return
-			}
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("automatic audio role plan generation failed: %v", err))
-			return
-		}
-		rolePlan = genPlan
 	}
 
 	// Resolve the source media from the asset's CAS metadata on the RuntimeHost
@@ -3071,7 +3280,10 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		Posture            domain.ReviewPosture `json:"posture"`
 		ReviewPosture      domain.ReviewPosture `json:"review_posture"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
 
 	if body.Posture == "" {
 		if body.ReviewPosture != "" {
@@ -3117,6 +3329,9 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cfg["glossary"] = frozen
+	} else {
+		// New runs must persist an explicit frozen empty glossary ("glossary":[]) when caller supplies none (#151).
+		cfg["glossary"] = []domain.GlossaryEntry{}
 	}
 
 	if body.Posture != "" {
@@ -4151,6 +4366,40 @@ func (s *Server) handleLocalizeVisualTrack(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Visual localization is run-scoped: the frozen run glossary only applies
+	// when the request names its run, so reject a missing run_id here rather than
+	// letting the visual lane translate against an unfrozen request glossary (#151).
+	if strings.TrimSpace(body.RunID) == "" {
+		writeError(w, http.StatusBadRequest, "run_id is required")
+		return
+	}
+	// Ownership proof before the service reads any run-scoped lineage: the visual lane consumes
+	// this run's pinned translation/glossary evidence, so a caller-supplied run_id must be proven
+	// to exist and to belong to this asset. A run whose job cannot be resolved fails closed rather
+	// than being localized against this asset's evidence.
+	run, err := s.db.GetRun(r.Context(), body.RunID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("run %s not found", body.RunID))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	job, err := s.db.GetJob(r.Context(), run.JobID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("job %s for run %s not found", run.JobID, body.RunID))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if job.SourceAssetID != asset.ID {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("run %s belongs to asset %s, not %s", body.RunID, job.SourceAssetID, asset.ID))
+		return
+	}
+
 	targetLang := strings.ToLower(strings.TrimSpace(body.TargetLanguage))
 	if targetLang == "" {
 		targetLang = domain.TargetLanguageVI
@@ -4179,6 +4428,12 @@ func (s *Server) handleLocalizeVisualTrack(w http.ResponseWriter, r *http.Reques
 		}
 		if errors.Is(err, domain.ErrRegionOverrideInvalid) || errors.Is(err, domain.ErrInvalidTargetLanguage) {
 			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, domain.ErrTranslationOwnershipMismatch) {
+			// A supplied translation variant that this run does not own is a caller error, not a
+			// server failure: the run-scoped lineage proof refused it by design (#153).
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
 			return
 		}
 		if errors.Is(err, domain.ErrSubtitleOverlapsProtectedRegion) || errors.Is(err, domain.ErrTranslationFailed) {

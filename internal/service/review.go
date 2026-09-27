@@ -929,7 +929,7 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 		return nil, fmt.Errorf("resolve run transcript lineage for voice reassignment: %w", err)
 	}
 	if strings.TrimSpace(transcriptCAS) == "" {
-		dubScript, _, loadErr := s.dubbingSvc.loadDubScriptVariant(ctx, in.AssetID, targetLang, dubScriptIdx.CASHash)
+		dubScript, _, loadErr := s.dubbingSvc.loadDubScriptVariant(ctx, in.AssetID, pinnedRunID, targetLang, dubScriptIdx.CASHash)
 		if loadErr != nil {
 			return nil, fmt.Errorf("load exact dub script lineage for voice reassignment: %w", loadErr)
 		}
@@ -1623,10 +1623,11 @@ func (s *ReviewService) EvaluateFinalRenderHandoff(ctx context.Context, in domai
 var finalRenderDeliveryStages = []string{"audio_mix", "render_plan", "render_preview"}
 
 // staleDeliveryLineage reports why a run may not hand off for final render, or "" when its delivery lineage
-// is current. The explicit final render resolves the asset-latest render plan and executes the dub mix that
+// is current. The explicit final render resolves the run's own render plan and executes the dub mix that
 // plan pins, so a correction that superseded this run's mix or render plan leaves the run holding artifacts
-// the correction replaced; handing off would publish them. Read failures are returned: a lineage this
-// cannot describe must never be reported as fresh.
+// the correction replaced; handing off would publish them. Only this run's evidence is read: an asset-latest
+// plan belongs to another run. Read failures are returned: a lineage this cannot describe must never be
+// reported as fresh.
 func (s *ReviewService) staleDeliveryLineage(ctx context.Context, assetID, targetLang, runID string) (string, error) {
 	if s.db == nil || strings.TrimSpace(runID) == "" {
 		return "", nil
@@ -1669,17 +1670,28 @@ func (s *ReviewService) staleDeliveryLineage(ctx context.Context, assetID, targe
 		planCAS = strings.TrimSpace(se.ArtifactSHA256)
 	}
 	if planCAS == "" {
-		// With no plan pinned to the run, the handoff renders the asset's latest plan.
-		idx, err := s.db.GetRenderPlanIndex(ctx, assetID, targetLang)
+		// The run's own render-plan index row is the only other lineage evidence: an asset-latest plan
+		// belongs to whichever run wrote it last and cannot stand in for this run's lineage (#153).
+		idx, err := s.db.GetRenderPlanIndexByRun(ctx, runID)
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return "", fmt.Errorf("read asset %s render plan lineage: %w", assetID, err)
+			return "", fmt.Errorf("read run %s render plan lineage: %w", runID, err)
 		}
 		if idx != nil {
+			if idx.AssetID != assetID || !strings.EqualFold(idx.TargetLanguage, targetLang) {
+				return "", fmt.Errorf("run %s render plan lineage belongs to asset %s language %s, not %s/%s",
+					runID, idx.AssetID, idx.TargetLanguage, assetID, targetLang)
+			}
 			planCAS = strings.TrimSpace(idx.CASHash)
 		}
 	}
-	if mixCAS == "" || planCAS == "" {
+	if mixCAS == "" {
 		return "", nil
+	}
+	if planCAS == "" {
+		// A run holding a mix but no plan of its own has no describable delivery lineage: the handoff
+		// would resolve the plan from evidence this run never pinned, so refuse instead of reporting
+		// the run fresh (#153).
+		return fmt.Sprintf("final render handoff refused: run %s has no render plan in its own lineage; re-freeze the render plan from its current dub mix before final render", runID), nil
 	}
 
 	rc, err := s.cas.Get(planCAS)

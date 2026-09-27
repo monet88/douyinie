@@ -174,9 +174,7 @@ func TestAudioMixService_ZeroSpokenSpeechPassthrough(t *testing.T) {
 		},
 		CreatedAt: time.Now().UTC(),
 	}
-	if err := db.SaveAudioRolePlan(ctx, rolePlan); err != nil {
-		t.Fatalf("save audio role plan: %v", err)
-	}
+	service.PinAudioRolePlanForTest(ctx, db, casStore, runID, rolePlan)
 
 	mixArtifact, err := mixSvc.MixAudio(ctx, service.AudioMixInput{
 		RunID:          runID,
@@ -258,8 +256,7 @@ func TestAudioMixService_ZeroDurationSlotOverrun_Refused(t *testing.T) {
 		},
 		CreatedAt: time.Now().UTC(),
 	}
-	_ = db.SaveAudioRolePlan(ctx, rolePlan)
-
+	service.PinAudioRolePlanForTest(ctx, db, casStore, runID, rolePlan)
 	// Stems artifact
 	stems := domain.AudioStemArtifacts{
 		ID:      uuid.NewString(),
@@ -409,6 +406,26 @@ func mixFixtureWithDubEligibleSpeech(t *testing.T, db *storage.DB, casStore *cas
 		ByteSize:            int64(len(dummyMedia)),
 		CreatedAt:           time.Now().UTC(),
 	})
+	jobID := "job_" + runID
+	if err := db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             jobID,
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{
+		ID:                 runID,
+		JobID:              jobID,
+		Status:             "running",
+		ConfigSnapshotJSON: `{"glossary":[]}`,
+		CreatedAt:          time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
 	_ = db.SavePreflightReport(ctx, domain.PreflightReport{
 		ID:                     "preflight_" + assetID,
 		AssetID:                assetID,
@@ -471,7 +488,7 @@ func mixFixtureWithDubEligibleSpeech(t *testing.T, db *storage.DB, casStore *cas
 	}); err != nil {
 		t.Fatalf("save transcript artifact index: %v", err)
 	}
-	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
 		ID:             uuid.NewString(),
 		RunID:          runID,
 		Stage:          "audio_role_plan",
@@ -479,8 +496,10 @@ func mixFixtureWithDubEligibleSpeech(t *testing.T, db *storage.DB, casStore *cas
 		ArtifactSHA256: roleObj.SHA256,
 		CreatedAt:      time.Now().UTC(),
 		UpdatedAt:      time.Now().UTC(),
-	})
-	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+	}); err != nil {
+		t.Fatalf("create audio_role_plan stage: %v", err)
+	}
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
 		ID:             uuid.NewString(),
 		RunID:          runID,
 		Stage:          "speech_understand",
@@ -488,7 +507,9 @@ func mixFixtureWithDubEligibleSpeech(t *testing.T, db *storage.DB, casStore *cas
 		ArtifactSHA256: transcriptObj.SHA256,
 		CreatedAt:      time.Now().UTC(),
 		UpdatedAt:      time.Now().UTC(),
-	})
+	}); err != nil {
+		t.Fatalf("create speech_understand stage: %v", err)
+	}
 	stems := domain.AudioStemArtifacts{
 		ID:      uuid.NewString(),
 		AssetID: assetID,
@@ -543,8 +564,25 @@ func TestAudioMixService_SeparateAudio_UsesNormalizedPreflightAudio_NotRawMP4(t 
 	if err != nil {
 		t.Fatalf("save source asset: %v", err)
 	}
-
-	// 2. Put valid normalized 16 kHz mono WAV in CAS as PreflightReport
+	// Pinned AudioRolePlan for runID
+	rolePlan := domain.AudioRolePlan{
+		ID:        "role-" + assetID,
+		AssetID:   assetID,
+		Segments:  []domain.AudioSegment{{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleNarrationDialogue}},
+		CreatedAt: time.Now().UTC(),
+	}
+	roleBytes, _ := json.Marshal(rolePlan)
+	roleObj, _ := casStore.Put(bytes.NewReader(roleBytes))
+	_ = db.CreateJob(ctx, domain.LocalizationJob{ID: "job_" + runID, SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: time.Now().UTC()})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: "job_" + runID, Status: "running", CreatedAt: time.Now().UTC()})
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "audio_role_plan",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: roleObj.SHA256,
+		CreatedAt:      time.Now().UTC(),
+	})
 	normWAVBytes := media.GeneratePCM16WAV(16000, 1, 2000)
 	wavObj, err := casStore.Put(bytes.NewReader(normWAVBytes))
 	if err != nil {
@@ -960,7 +998,25 @@ func TestAudioMixService_SeparateAudio_SchemaVersion2_BypassesLegacyV1Cache(t *t
 	if err != nil {
 		t.Fatalf("save legacy stems index: %v", err)
 	}
-
+	// Pinned AudioRolePlan for runID
+	schemaRolePlan := domain.AudioRolePlan{
+		ID:        "role-" + assetID,
+		AssetID:   assetID,
+		Segments:  []domain.AudioSegment{{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleNarrationDialogue}},
+		CreatedAt: time.Now().UTC(),
+	}
+	schemaRoleBytes, _ := json.Marshal(schemaRolePlan)
+	schemaRoleObj, _ := casStore.Put(bytes.NewReader(schemaRoleBytes))
+	_ = db.CreateJob(ctx, domain.LocalizationJob{ID: "job_" + runID, SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: time.Now().UTC()})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: "job_" + runID, Status: "running", CreatedAt: time.Now().UTC()})
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "audio_role_plan",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: schemaRoleObj.SHA256,
+		CreatedAt:      time.Now().UTC(),
+	})
 	stems, err := mixSvc.SeparateAudio(ctx, service.AudioSeparationInput{
 		RunID:   runID,
 		AssetID: assetID,
@@ -1027,8 +1083,7 @@ func TestAudioMixService_FrozenFitControllerPolicyRespected(t *testing.T) {
 	rpBytes, _ := json.Marshal(rolePlan)
 	rpObj, _ := casStore.Put(bytes.NewReader(rpBytes))
 	rolePlan.CASHash = rpObj.SHA256
-	_ = db.SaveAudioRolePlan(ctx, rolePlan)
-
+	service.PinAudioRolePlanForTest(ctx, db, casStore, runID, rolePlan)
 	// Transcript
 	transcript := domain.TranscriptArtifact{
 		AssetID: assetID,
@@ -1187,8 +1242,7 @@ func TestAudioMixService_CASAuthorityAndPathBypassForbidden(t *testing.T) {
 	rpBytes, _ := json.Marshal(rolePlan)
 	rpObj, _ := casStore.Put(bytes.NewReader(rpBytes))
 	rolePlan.CASHash = rpObj.SHA256
-	_ = db.SaveAudioRolePlan(ctx, rolePlan)
-
+	service.PinAudioRolePlanForTest(ctx, db, casStore, runID, rolePlan)
 	transcript := domain.TranscriptArtifact{
 		AssetID: assetID,
 		SpeechBlocks: []domain.SpeechBlock{
@@ -1348,8 +1402,7 @@ func TestAudioMixService_GroupedSegmentStartingAt0ms_Accepted(t *testing.T) {
 	rpBytes, _ := json.Marshal(rolePlan)
 	rpObj, _ := casStore.Put(bytes.NewReader(rpBytes))
 	rolePlan.CASHash = rpObj.SHA256
-	_ = db.SaveAudioRolePlan(ctx, rolePlan)
-
+	service.PinAudioRolePlanForTest(ctx, db, casStore, runID, rolePlan)
 	// Transcript with 2 contiguous blocks, first starting at 0ms
 	transcript := domain.TranscriptArtifact{
 		AssetID: assetID,
@@ -1519,9 +1572,7 @@ func buildFrameExactFixture(t *testing.T, db *storage.DB, casStore *cas.Store, c
 	roleBytes, _ := json.Marshal(rolePlan)
 	roleObj, _ := casStore.Put(bytes.NewReader(roleBytes))
 	rolePlan.CASHash = roleObj.SHA256
-	if err := db.SaveAudioRolePlan(ctx, rolePlan); err != nil {
-		t.Fatalf("save audio role plan: %v", err)
-	}
+	service.PinAudioRolePlanForTest(ctx, db, casStore, runID, rolePlan)
 
 	transcript := domain.TranscriptArtifact{
 		AssetID: assetID,
@@ -1855,5 +1906,72 @@ func TestAudioMixService_MixAudio_RunScopedAudioRolePlan_NeverAdoptsNewerNoDubPl
 	}
 	if mixArtifact.DubSegmentsCAS != dubSegObj.SHA256 {
 		t.Errorf("expected mix to pin DubSegmentsCAS %s, got %s", dubSegObj.SHA256, mixArtifact.DubSegmentsCAS)
+	}
+}
+func TestAudioMixService_MixAudio_ForeignNoDubPlanInDubSegments_Refused(t *testing.T) {
+	mixSvc, db, casStore, _, _ := setupAudioMixTestHarness(t)
+	ctx := context.Background()
+
+	// 1. Run A pins dialogue Plan A
+	assetID, runID, stemsCAS := mixFixtureWithDubEligibleSpeech(t, db, casStore)
+
+	// 2. Put a foreign/stale no-dub Plan B in CAS
+	planB := domain.AudioRolePlan{
+		ID: "planB-foreign-" + assetID, AssetID: assetID, ProviderID: "test-role-provider",
+		ModelName: "test-role-model", ModelVersion: "1", ProvenanceHash: "prov-planB-foreign-" + assetID,
+		CreatedAt: time.Now().UTC().Add(time.Minute), Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 35000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+	}
+	planBBytes, _ := json.Marshal(planB)
+	planBObj, err := casStore.Put(bytes.NewReader(planBBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Construct a DubSegments artifact that points to no-dub Plan B instead of Run A's Plan A
+	_, _, fitPolicyID := service.NewFitController().ResolvePlaybackWindow(3000, 0)
+	dubSegments := domain.DubSegmentsVariant{
+		ID:                    uuid.NewString(),
+		SchemaVersion:         domain.DubSegmentsSchemaVersion,
+		AssetID:               assetID,
+		RunID:                 runID,
+		TargetLanguage:        "vi",
+		DubScriptVariantCAS:   "fake-script-cas",
+		VoiceAssignmentCAS:    "fake-voice-cas",
+		TranscriptArtifactCAS: "fake-transcript-cas",
+		AudioRolePlanCAS:      planBObj.SHA256, // points to no-dub Plan B
+		FitPolicyID:           fitPolicyID,
+		OverallStatus:         "PASS",
+		Segments:              []domain.DubSegment{},
+	}
+	dubSegBytes, _ := json.Marshal(dubSegments)
+	dubSegObj, err := casStore.Put(bytes.NewReader(dubSegBytes))
+	if err != nil {
+		t.Fatalf("put dub segments: %v", err)
+	}
+
+	// 4. MixAudio must REFUSE/fail closed; it must NEVER return a PASS passthrough!
+	mixArtifact, err := mixSvc.MixAudio(ctx, service.AudioMixInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+		DubSegmentsCAS: dubSegObj.SHA256,
+		AudioStemsCAS:  stemsCAS,
+	})
+	if err == nil {
+		t.Fatalf("SECURITY VIOLATION: foreign DubSegments pointing to no-dub Plan B resulted in nil error!")
+	}
+	if !errors.Is(err, domain.ErrMixerOverrunRefused) {
+		t.Fatalf("expected ErrMixerOverrunRefused, got %v", err)
+	}
+	if mixArtifact == nil {
+		t.Fatal("expected non-nil DubMixArtifact")
+	}
+	if mixArtifact.OverallStatus == "PASS" {
+		t.Fatalf("SECURITY VIOLATION: foreign DubSegments pointing to no-dub Plan B resulted in PASS passthrough!")
+	}
+	if mixArtifact.OverallStatus != "REFUSED" {
+		t.Fatalf("expected OverallStatus=REFUSED, got %q", mixArtifact.OverallStatus)
 	}
 }

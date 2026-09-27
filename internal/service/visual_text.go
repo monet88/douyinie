@@ -633,7 +633,7 @@ type LocalizeVisualTrackInput struct {
 	ExecutionProfile       domain.ExecutionProfile          `json:"execution_profile,omitempty"`
 	AuthorizedCredentials  []string                         `json:"authorized_credentials,omitempty"`
 	ConsentGranted         bool                             `json:"consent_granted,omitempty"`
-	CoverColor            string                        `json:"cover_color,omitempty"`
+	CoverColor             string                           `json:"cover_color,omitempty"`
 }
 
 // ApplyRegionOverrides applies direct-manipulation overrides (drag/resize/reclassify/text) to a TextRegionPlan.
@@ -1378,6 +1378,46 @@ func clampCoverBox(box domain.BoundingBox, frameWidth, frameHeight, padding int)
 	return domain.CoverBox{X: x, Y: y, Width: right - x, Height: bottom - y}
 }
 
+// proveRunTranslationBinding proves that an explicitly supplied TranslationVariant belongs to the
+// run being localized. The run's pinned translation stage execution is the authority when it exists;
+// without one the artifact has to name the run itself, so an artifact that names no run — or another
+// run — is refused. The asset/language index is deliberately never consulted: that is asset-latest
+// state which a run may have superseded, and this lane is run-scoped (#153).
+func (s *VisualTextService) proveRunTranslationBinding(ctx context.Context, in LocalizeVisualTrackInput, casHash string) error {
+	pinnedCAS, err := s.stageArtifactHash(ctx, in.RunID, "translation")
+	if err != nil {
+		return err
+	}
+	if pinnedCAS != "" {
+		if pinnedCAS != casHash {
+			return fmt.Errorf("%w: run %s pinned translation variant %s, supplied %s",
+				domain.ErrTranslationOwnershipMismatch, in.RunID, pinnedCAS, casHash)
+		}
+		return nil
+	}
+	if s.cas == nil {
+		return fmt.Errorf("%w: CAS store required to prove translation variant %s lineage", domain.ErrTranslationOwnershipMismatch, casHash)
+	}
+	rc, err := s.cas.Get(casHash)
+	if err != nil {
+		return fmt.Errorf("%w: read supplied translation variant %s: %v", domain.ErrTranslationOwnershipMismatch, casHash, err)
+	}
+	defer rc.Close()
+	var variant domain.TranslationVariant
+	if err := json.NewDecoder(rc).Decode(&variant); err != nil {
+		return fmt.Errorf("%w: decode supplied translation variant %s: %v", domain.ErrTranslationOwnershipMismatch, casHash, err)
+	}
+	if variant.AssetID != in.AssetID || !strings.EqualFold(variant.TargetLanguage, in.TargetLanguage) {
+		return fmt.Errorf("%w: translation variant %s belongs to asset %q target %q, not %q/%q",
+			domain.ErrTranslationOwnershipMismatch, casHash, variant.AssetID, variant.TargetLanguage, in.AssetID, in.TargetLanguage)
+	}
+	if strings.TrimSpace(variant.RunID) != in.RunID {
+		return fmt.Errorf("%w: translation variant %s belongs to run %q, not %q",
+			domain.ErrTranslationOwnershipMismatch, casHash, variant.RunID, in.RunID)
+	}
+	return nil
+}
+
 // LocalizeVisualTrack builds the LocalizedVisualTrack (and underlying LocalizedSubtitleTrack)
 // with deterministic in-place cover/overlay, standard instructional UI terminology,
 // scale-aware compact fit-content subtitle box, and scene-aware non-occlusion.
@@ -1385,46 +1425,53 @@ func (s *VisualTextService) LocalizeVisualTrack(ctx context.Context, in Localize
 	if strings.TrimSpace(in.AssetID) == "" {
 		return nil, errors.New("asset_id is required")
 	}
+	// Visual localization is run-scoped: both overlay roles (semantic_text and
+	// instructional_ui_text) translate through the ephemeral inline lane, and only
+	// a run_id makes that lane consume the run's frozen glossary. An empty run_id
+	// would silently translate against the request-local glossary instead (#151).
+	if strings.TrimSpace(in.RunID) == "" {
+		return nil, errors.New("run_id is required for visual localization")
+	}
 	if !domain.IsValidTargetLanguage(in.TargetLanguage) {
 		return nil, fmt.Errorf("%w: %s", domain.ErrInvalidTargetLanguage, in.TargetLanguage)
 	}
 
-	// Prefer the caller-pinned speech TranslationVariant artifact when provided.
-	// This keeps retries/resumes stable even when a previous visual-track attempt
-	// wrote newer overlay translations into the asset/language index. Legacy
-	// callers without an explicit CAS continue to resolve the latest index row.
+	// Prefer the caller-pinned speech TranslationVariant artifact when provided. This keeps
+	// retries/resumes stable even when a previous visual-track attempt wrote a newer overlay
+	// translation for the same run into the run's index. An explicit CAS must still be proven to
+	// belong to this run: matching asset and language alone cannot tell two runs apart (#153).
 	explicitTransCAS := strings.TrimSpace(in.TranslationVariantCAS)
 	canonicalTransCAS := explicitTransCAS
 	var transIdx *storage.TranslationVariantIndex
-	if canonicalTransCAS == "" {
+	if explicitTransCAS != "" {
+		if err := s.proveRunTranslationBinding(ctx, in, explicitTransCAS); err != nil {
+			return nil, err
+		}
+	} else {
 		var err error
-		if strings.TrimSpace(in.RunID) != "" {
-			transIdx, err = s.db.GetTranslationVariantIndexByRun(ctx, in.RunID)
-			if err == nil && transIdx != nil && (transIdx.AssetID != in.AssetID || !strings.EqualFold(transIdx.TargetLanguage, in.TargetLanguage)) {
-				return nil, fmt.Errorf("translation variant run binding mismatch for run %s", in.RunID)
+		transIdx, err = s.db.GetTranslationVariantIndexByRun(ctx, in.RunID)
+		if err == nil && transIdx != nil && (transIdx.AssetID != in.AssetID || !strings.EqualFold(transIdx.TargetLanguage, in.TargetLanguage)) {
+			return nil, fmt.Errorf("translation variant run binding mismatch for run %s", in.RunID)
+		}
+		if errors.Is(err, storage.ErrNotFound) {
+			// A run that reused a cached translation owns no index row of its own; the artifact
+			// is still bound to this run by the stage execution that consumed it. Without this
+			// the visual lane finds no variant and silently burns the SOURCE caption text as the
+			// localized subtitle (live evidence, run 3adede59: a fresh run on a fully cached
+			// pipeline rendered the Chinese captions over their own covers).
+			casHash, hashErr := s.stageArtifactHash(ctx, in.RunID, "translation")
+			if hashErr != nil {
+				return nil, hashErr
 			}
-			if errors.Is(err, storage.ErrNotFound) {
-				// A run that reused a cached translation owns no index row of its own; the artifact
-				// is still bound to this run by the stage execution that consumed it. Without this
-				// the visual lane finds no variant and silently burns the SOURCE caption text as the
-				// localized subtitle (live evidence, run 3adede59: a fresh run on a fully cached
-				// pipeline rendered the Chinese captions over their own covers).
-				casHash, hashErr := s.stageArtifactHash(ctx, in.RunID, "translation")
-				if hashErr != nil {
-					return nil, hashErr
+			if casHash != "" {
+				transIdx = &storage.TranslationVariantIndex{
+					AssetID:        in.AssetID,
+					RunID:          in.RunID,
+					TargetLanguage: in.TargetLanguage,
+					CASHash:        casHash,
 				}
-				if casHash != "" {
-					transIdx = &storage.TranslationVariantIndex{
-						AssetID:        in.AssetID,
-						RunID:          in.RunID,
-						TargetLanguage: in.TargetLanguage,
-						CASHash:        casHash,
-					}
-					err = nil
-				}
+				err = nil
 			}
-		} else {
-			transIdx, err = s.db.GetTranslationVariantIndex(ctx, in.AssetID, in.TargetLanguage)
 		}
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
 			return nil, fmt.Errorf("query translation variant index: %w", err)

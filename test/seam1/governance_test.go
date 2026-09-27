@@ -1213,16 +1213,8 @@ func setupRunAndPlan(t *testing.T, h *testHarness) string {
 	if err != nil {
 		t.Fatalf("failed to get job: %v", err)
 	}
-	plan := domain.AudioRolePlan{
-		ID:      uuid.NewString(),
-		AssetID: job.SourceAssetID,
-		Segments: []domain.AudioSegment{
-			{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue},
-		},
-		CreatedAt: time.Now().UTC(),
-	}
-	if err := h.db.SaveAudioRolePlan(ctx, plan); err != nil {
-		t.Fatalf("failed to save audio role plan: %v", err)
-	}
+	saveAndPinAudioRolePlan(t, h, job.SourceAssetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue},
+	})
 	return runID
 }

@@ -118,17 +118,9 @@ func TestSeam1_AudioRolePlan_SingingTriageOnly(t *testing.T) {
 	assetID := job.SourceAssetID
 
 	// Plan contains ASR-positive singing
-	planPayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleSingingMusicVocal},
-		},
-	}
-	body, _ := json.Marshal(planPayload)
-	saveResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("save plan failed: %v", err)
-	}
-	saveResp.Body.Close()
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleSingingMusicVocal},
+	})
 
 	var mu sync.Mutex
 	executorCalled := false
@@ -197,17 +189,9 @@ func TestSeam1_AudioRolePlan_UncertainRoleReviewRequired(t *testing.T) {
 	assetID := job.SourceAssetID
 
 	// Plan contains uncertain role segment
-	planPayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleUncertain},
-		},
-	}
-	body, _ := json.Marshal(planPayload)
-	saveResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("save plan failed: %v", err)
-	}
-	saveResp.Body.Close()
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleUncertain},
+	})
 
 	h.SetExecutor(func(ctx context.Context, p provider.Provider, attemptNumber int) error {
 		return nil
@@ -247,17 +231,9 @@ func TestSeam1_AudioRolePlan_NoDubRouteAllowedForRenderOnly(t *testing.T) {
 	assetID := job.SourceAssetID
 
 	// Plan contains only BGM (no-dub eligible speech)
-	planPayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleInstrumentalBgm},
-		},
-	}
-	body, _ := json.Marshal(planPayload)
-	saveResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("save plan failed: %v", err)
-	}
-	saveResp.Body.Close()
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleInstrumentalBgm},
+	})
 
 	var mu sync.Mutex
 	var executorCalls []string
@@ -391,18 +367,10 @@ func TestSeam1_AudioRolePlan_MixedNarrationAndSinging(t *testing.T) {
 	assetID := job.SourceAssetID
 
 	// Plan contains BOTH narration and singing
-	planPayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue},
-			{StartMs: 1000, EndMs: 2000, Role: domain.AudioRoleSingingMusicVocal},
-		},
-	}
-	body, _ := json.Marshal(planPayload)
-	saveResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("save plan failed: %v", err)
-	}
-	saveResp.Body.Close()
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue},
+		{StartMs: 1000, EndMs: 2000, Role: domain.AudioRoleSingingMusicVocal},
+	})
 
 	executorCalled := false
 	h.SetExecutor(func(ctx context.Context, p provider.Provider, attemptNumber int) error {

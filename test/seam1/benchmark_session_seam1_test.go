@@ -25,6 +25,7 @@ func testBenchmarkIdentity() benchmark.SessionIdentityInput {
 			"zero_overrun_strict": true,
 			"profile":             "hybrid",
 			"max_retries":         1,
+			"glossary":            []domain.GlossaryEntry{},
 		},
 		ProviderBaselines: []benchmark.ProviderBaseline{
 			{

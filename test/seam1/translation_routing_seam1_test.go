@@ -527,6 +527,9 @@ func TestSeam1_VisualTrack_LocalProfile_DisablesTranslation(t *testing.T) {
 	h := setupCustomTranslationHarness(t, reg)
 	assetID, jobID := seedSeam1AssetAndJob(t, h.db)
 	runID := "run-vt-local-" + uuid.NewString()
+	// The visual lane is run-scoped and proves the run belongs to the asset, so the request must
+	// name a real run on this job.
+	seedSeam1Run(t, h.db, assetID, jobID, runID)
 
 	// 4. Detect text
 	detectBody, _ := json.Marshal(map[string]any{"run_id": runID})
@@ -630,6 +633,7 @@ func TestSeam1_VisualTrack_HybridProfile_ConsentAndCredentials(t *testing.T) {
 
 	// Detect text
 	runIDConsentMissing := "run-vt-hybrid-noconsent-" + uuid.NewString()
+	seedSeam1Run(t, h.db, assetID, jobID, runIDConsentMissing)
 	detectBody, _ := json.Marshal(map[string]any{"run_id": runIDConsentMissing})
 	dResp, err := http.Post(h.ts.URL+"/api/v1/assets/"+assetID+"/detect-text", "application/json", bytes.NewReader(detectBody))
 	if err != nil {
@@ -659,6 +663,7 @@ func TestSeam1_VisualTrack_HybridProfile_ConsentAndCredentials(t *testing.T) {
 
 	// 2. Call visual-track with Hybrid profile, valid credential, and consent_granted=true
 	runIDConsentGranted := "run-vt-hybrid-consent-" + uuid.NewString()
+	seedSeam1Run(t, h.db, assetID, jobID, runIDConsentGranted)
 	detectBody2, _ := json.Marshal(map[string]any{"run_id": runIDConsentGranted})
 	dResp2, _ := http.Post(h.ts.URL+"/api/v1/assets/"+assetID+"/detect-text", "application/json", bytes.NewReader(detectBody2))
 	dResp2.Body.Close()

@@ -339,7 +339,7 @@ func TestSeam1_AcceptanceGate_NormativeInvariants(t *testing.T) {
 			assetID := job.SourceAssetID
 			targetLang := domain.TargetLanguageVI
 
-			saveAudioRolePlan(t, h, assetID, fg.rolePlan)
+			saveAudioRolePlan(t, h, assetID, runID, fg.rolePlan)
 
 			// --- Dubbed branch: translation → dub script → voice → TTS fit gate ---
 			var dubSegments *domain.DubSegmentsVariant
@@ -491,10 +491,15 @@ func runFixtureDubScript(t *testing.T, h *testHarness, assetID, runID, translati
 	return v
 }
 
-// saveAudioRolePlan persists the fixture's audio role plan through the Seam 1 API.
-func saveAudioRolePlan(t *testing.T, h *testHarness, assetID string, segs []domain.AudioSegment) {
+// saveAudioRolePlan persists the fixture's audio role plan through the Seam 1 API
+// and records a succeeded audio_role_plan stage execution for the run.
+func saveAudioRolePlan(t *testing.T, h *testHarness, assetID, runID string, segs []domain.AudioSegment) {
 	t.Helper()
-	body, _ := json.Marshal(map[string]any{"segments": segs})
+	payload := map[string]any{"segments": segs}
+	if strings.TrimSpace(runID) != "" {
+		payload["run_id"] = strings.TrimSpace(runID)
+	}
+	body, _ := json.Marshal(payload)
 	resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("save audio role plan: %v", err)

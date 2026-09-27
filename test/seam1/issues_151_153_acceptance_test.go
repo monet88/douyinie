@@ -265,21 +265,9 @@ func TestSeam1_Issue153_AudioMixAcceptsBorrowedPlaybackWindowAndPinsCAS(t *testi
 		t.Fatalf("separate-stems status=%d", resp.StatusCode)
 	}
 
-	roleBody, _ := json.Marshal(map[string]any{"segments": []domain.AudioSegment{
+	rolePlan := saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
 		{StartMs: 1000, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
-	}})
-	resp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
-	if err != nil {
-		t.Fatalf("POST audio-role-plan: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		t.Fatalf("audio-role-plan status=%d", resp.StatusCode)
-	}
-	rolePlan, err := h.db.GetAudioRolePlan(context.Background(), assetID)
-	if err != nil {
-		t.Fatalf("get audio role plan: %v", err)
-	}
+	})
 
 	source := []domain.TranslationInputSegment{
 		{Index: 0, SourceText: "first", SpeakerID: "SPEAKER_00", StartMs: 1000, EndMs: 3000},
@@ -333,7 +321,10 @@ func TestSeam1_Issue153_AudioMixAcceptsBorrowedPlaybackWindowAndPinsCAS(t *testi
 		t.Fatalf("borrowed playback window should mix successfully: status=%d mix=%+v", resp.StatusCode, mix)
 	}
 	assertSeam1MixedAudioSamples(t, h.casStore, mix.AudioCASHash, 3000)
-
+	if len(mix.PreservationPlan.SpeechWindows) != 1 || mix.PreservationPlan.SpeechWindows[0].EndMs != 3000 {
+		t.Fatalf("suppression must stay the eligible source union (end=3000), not the borrowed envelope (end=%d): %+v",
+			playbackEndMs, mix.PreservationPlan.SpeechWindows)
+	}
 	mixReq["dub_segments_cas"] = strings.Repeat("f", 64)
 	resp, _ = runAudioMix(t, h, assetID, mixReq)
 	expectSeam1MixRefusal(t, resp, http.StatusUnprocessableEntity, "is unreadable")
@@ -384,12 +375,9 @@ func TestSeam1_Issue153_PlaybackWindowBoundaryMatrix(t *testing.T) {
 		assetID := job.SourceAssetID
 
 		_, stems := runSeparateStems(t, h, assetID, map[string]any{"run_id": runID})
-		roleBody, _ := json.Marshal(map[string]any{"segments": []domain.AudioSegment{
+		rolePlan := saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
 			{StartMs: 1000, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
-		}})
-		resp, _ := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
-		resp.Body.Close()
-		rolePlan, _ := h.db.GetAudioRolePlan(context.Background(), assetID)
+		})
 
 		source := []domain.TranslationInputSegment{
 			{Index: 0, SourceText: "first", SpeakerID: "SPEAKER_00", StartMs: 1000, EndMs: 3000},
@@ -539,25 +527,38 @@ func TestSeam1_Issue153_PlaybackWindowBoundaryMatrix(t *testing.T) {
 		}
 
 		// 5. Missing middle clip: eligible blocks 0 and 1, but block 1 is omitted -> REFUSED
-		twoSegRoleBody, _ := json.Marshal(map[string]any{"segments": []domain.AudioSegment{
+		respRun2, err := http.Post(h.server.URL+"/api/v1/jobs/"+jobID+"/runs", "application/json", nil)
+		if err != nil || respRun2.StatusCode != http.StatusCreated {
+			t.Fatalf("create fresh run for case 5 failed: %v", err)
+		}
+		var runRes2 struct {
+			Run domain.LocalizationRun `json:"run"`
+		}
+		_ = json.NewDecoder(respRun2.Body).Decode(&runRes2)
+		respRun2.Body.Close()
+		runID2 := runRes2.Run.ID
+
+		twoRolePlan := saveAndPinAudioRolePlan(t, h, assetID, runID2, []domain.AudioSegment{
 			{StartMs: 1000, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
 			{StartMs: 5000, EndMs: 6000, Role: domain.AudioRoleNarrationDialogue},
-		}})
-		respTwo, _ := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(twoSegRoleBody))
-		respTwo.Body.Close()
-		twoRolePlan, _ := h.db.GetAudioRolePlan(context.Background(), assetID)
+		})
+		lineage2 := pinSeam1DubLineage(t, h, runID2, assetID, "vi", source)
 		missingMiddleVariant := cloneVariant(exactVariant)
 		missingMiddleVariant.ID = "missing-middle-refuse"
+		missingMiddleVariant.RunID = runID2
+		missingMiddleVariant.DubScriptVariantCAS = lineage2.DubScriptCAS
+		missingMiddleVariant.VoiceAssignmentCAS = lineage2.VoiceAssignmentCAS
+		missingMiddleVariant.TranscriptArtifactCAS = lineage2.TranscriptCAS
 		missingMiddleVariant.AudioRolePlanCAS = twoRolePlan.CASHash
 		missingMiddleVariant.ProvenanceHash = "missing-middle-prov"
 		bMissing, _ := json.Marshal(missingMiddleVariant)
 		vMissingObj, _ := h.casStore.Put(bytes.NewReader(bMissing))
 		_ = h.db.SaveDubSegmentsVariantIndex(context.Background(), storage.DubSegmentsVariantIndex{
-			ID: missingMiddleVariant.ID, AssetID: assetID, RunID: runID, JobID: jobID, TargetLanguage: "vi",
+			ID: missingMiddleVariant.ID, AssetID: assetID, RunID: runID2, JobID: jobID, TargetLanguage: "vi",
 			CASHash: vMissingObj.SHA256, ProvenanceHash: missingMiddleVariant.ProvenanceHash, OverallStatus: "PASS", CreatedAt: missingMiddleVariant.CreatedAt,
 		})
 		respMissing, mixMissing := runAudioMix(t, h, assetID, map[string]any{
-			"run_id": runID, "job_id": jobID, "target_language": "vi",
+			"run_id": runID2, "job_id": jobID, "target_language": "vi",
 			"dub_segments_cas": vMissingObj.SHA256, "audio_stems_cas": stems.CASHash,
 		})
 		expectSeam1MixRefusal(t, respMissing, http.StatusUnprocessableEntity, "dub-eligible source member 1 has no accepted replacement clip")
@@ -569,6 +570,10 @@ func TestSeam1_Issue153_PlaybackWindowBoundaryMatrix(t *testing.T) {
 		// the asset currently holds (case 5 replaced it), so the refusal is the membership scan's.
 		foreignVariant := cloneVariant(exactVariant)
 		foreignVariant.ID = "foreign-member-refuse"
+		foreignVariant.RunID = runID2
+		foreignVariant.DubScriptVariantCAS = lineage2.DubScriptCAS
+		foreignVariant.VoiceAssignmentCAS = lineage2.VoiceAssignmentCAS
+		foreignVariant.TranscriptArtifactCAS = lineage2.TranscriptCAS
 		foreignVariant.AudioRolePlanCAS = twoRolePlan.CASHash
 		foreignVariant.Segments[0].SpeechBlockIndices = []int{99}
 		foreignVariant.FitPlans[0].SpeechBlockIndices = []int{99}
@@ -576,11 +581,11 @@ func TestSeam1_Issue153_PlaybackWindowBoundaryMatrix(t *testing.T) {
 		bForeign, _ := json.Marshal(foreignVariant)
 		vForeignObj, _ := h.casStore.Put(bytes.NewReader(bForeign))
 		_ = h.db.SaveDubSegmentsVariantIndex(context.Background(), storage.DubSegmentsVariantIndex{
-			ID: foreignVariant.ID, AssetID: assetID, RunID: runID, JobID: jobID, TargetLanguage: "vi",
+			ID: foreignVariant.ID, AssetID: assetID, RunID: runID2, JobID: jobID, TargetLanguage: "vi",
 			CASHash: vForeignObj.SHA256, ProvenanceHash: foreignVariant.ProvenanceHash, OverallStatus: "PASS", CreatedAt: foreignVariant.CreatedAt,
 		})
 		respForeign, mixForeign := runAudioMix(t, h, assetID, map[string]any{
-			"run_id": runID, "job_id": jobID, "target_language": "vi",
+			"run_id": runID2, "job_id": jobID, "target_language": "vi",
 			"dub_segments_cas": vForeignObj.SHA256, "audio_stems_cas": stems.CASHash,
 		})
 		expectSeam1MixRefusal(t, respForeign, http.StatusUnprocessableEntity, "segment 0 references foreign or non-dub-eligible source member 99")
@@ -729,7 +734,7 @@ func TestSeam1_Issue153_ProtectedRegionBlocksBorrowedPlaybackWindow(t *testing.T
 			assetID := job.SourceAssetID
 
 			_, stems := runSeparateStems(t, h, assetID, map[string]any{"run_id": runID})
-			postAudioRolePlan(t, h.server.URL, assetID, []domain.AudioSegment{
+			saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
 				{StartMs: 1000, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
 				{StartMs: 3200, EndMs: 4800, Role: tc.role},
 			})
@@ -796,7 +801,7 @@ func TestSeam1_Issue153_AdjacentSpeechTurnBlocksBorrowing(t *testing.T) {
 	assetID := job.SourceAssetID
 
 	_, stems := runSeparateStems(t, h, assetID, map[string]any{"run_id": runID})
-	postAudioRolePlan(t, h.server.URL, assetID, []domain.AudioSegment{
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
 		{StartMs: 1000, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
 		{StartMs: 3000, EndMs: 4500, Role: domain.AudioRoleNarrationDialogue},
 	})
@@ -857,7 +862,7 @@ func TestSeam1_Issue153_DuplicateSourceMemberCoverageRefused(t *testing.T) {
 	assetID := job.SourceAssetID
 
 	_, stems := runSeparateStems(t, h, assetID, map[string]any{"run_id": runID})
-	postAudioRolePlan(t, h.server.URL, assetID, []domain.AudioSegment{
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
 		{StartMs: 1000, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
 	})
 	source := []domain.TranslationInputSegment{
@@ -1000,22 +1005,11 @@ func TestSeam1_Issue153_RegroupNeverCrossesPreservedInternalSoundtrack(t *testin
 	}
 
 	// 2. AudioRolePlan with dialogue [0, 1000], singing gap [1000, 1300] (300ms < 600ms), dialogue [1300, 3000]
-	rolePayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue},
-			{StartMs: 1000, EndMs: 1300, Role: domain.AudioRoleSingingMusicVocal},
-			{StartMs: 1300, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
-		},
-	}
-	roleBody, _ := json.Marshal(rolePayload)
-	respRole, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(roleBody))
-	if err != nil {
-		t.Fatalf("audio-role-plan request failed: %v", err)
-	}
-	if respRole.StatusCode != http.StatusCreated && respRole.StatusCode != http.StatusOK {
-		t.Fatalf("audio-role-plan status=%d", respRole.StatusCode)
-	}
-
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue},
+		{StartMs: 1000, EndMs: 1300, Role: domain.AudioRoleSingingMusicVocal},
+		{StartMs: 1300, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
+	})
 	// 3. Transcript with 2 speech blocks separated by the 300ms singing gap
 	transcript := domain.TranscriptArtifact{
 		ID:             "transcript-regroup-gap-" + assetID,
@@ -1173,13 +1167,9 @@ func TestSeam1_Issue151_FrozenGlossary_CorrectionAndDirectAPI(t *testing.T) {
 	runID := runOut.Run.ID
 
 	// Seed AudioRolePlan and pinned transcript lineage for the run
-	rolePayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
-		},
-	}
-	roleBody, _ := json.Marshal(rolePayload)
-	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(roleBody))
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
+	})
 
 	transcriptJSON := fmt.Sprintf(`{"asset_id":%q,"speech_blocks":[{"index":0,"start_ms":0,"end_ms":1500,"source_text":"OpenAI 是一个机构","speaker_id":"SPEAKER_00","segment_type":"speech"}]}`, assetID)
 	tObj, _ := h.casStore.Put(bytes.NewReader([]byte(transcriptJSON)))
@@ -1296,4 +1286,221 @@ func TestSeam1_Issue151_FrozenGlossary_CorrectionAndDirectAPI(t *testing.T) {
 		t.Fatalf("POST inspector/correct-text failed: status=%d err=%v body=%s", corrResp.StatusCode, err, buf.String())
 	}
 	corrResp.Body.Close()
+}
+
+func TestSeam1_Issue153_MixRefusesForeignAssetStems(t *testing.T) {
+	h := setupHarness(t)
+	jobIDA, runIDA := createJobAndRunWithDuration(t, h, 5.0)
+	assetIDA := getJobViaAPI(t, h, jobIDA).SourceAssetID
+
+	jobIDB, runIDB := createJobAndRunWithDuration(t, h, 6.0)
+	assetIDB := getJobViaAPI(t, h, jobIDB).SourceAssetID
+
+	respStemsB, stemsB := runSeparateStems(t, h, assetIDB, map[string]any{"run_id": runIDB})
+	if respStemsB.StatusCode != http.StatusCreated && respStemsB.StatusCode != http.StatusOK {
+		t.Fatalf("separate stems asset B: %d", respStemsB.StatusCode)
+	}
+
+	sourceA := []domain.TranslationInputSegment{
+		{Index: 0, SourceText: "hello", SpeakerID: "SPEAKER_00", StartMs: 1000, EndMs: 3000},
+	}
+	lineageA := pinSeam1DubLineage(t, h, runIDA, assetIDA, "vi", sourceA)
+	rolePlanCAS := lineageA.AudioRolePlanCAS
+
+	wav := media.GeneratePCM16WAV(16000, 1, 2000)
+	audioObj, _ := h.casStore.Put(bytes.NewReader(wav))
+	_, _, fitPolicyID := service.NewFitController().ResolvePlaybackWindow(3000, 0)
+	dubSegsA := domain.DubSegmentsVariant{
+		ID: "dub-a-stems-test", SchemaVersion: domain.DubSegmentsSchemaVersion,
+		AssetID: assetIDA, RunID: runIDA, JobID: jobIDA, TargetLanguage: "vi",
+		DubScriptVariantCAS: lineageA.DubScriptCAS, VoiceAssignmentCAS: lineageA.VoiceAssignmentCAS,
+		TranscriptArtifactCAS: lineageA.TranscriptCAS, AudioRolePlanCAS: rolePlanCAS,
+		FitPolicyID: fitPolicyID, OverallStatus: "PASS",
+		Segments: []domain.DubSegment{{
+			Index: 0, StartMs: 1000, EndMs: 3000, SlotDurationMs: 2000, MeasuredDurationMs: 2000,
+			AudioSHA256: audioObj.SHA256, FitDecision: domain.FitActionAccept,
+			DubPlaybackEndMs: 3000, EffectiveReserveMs: 0,
+		}},
+		FitPlans: []domain.DubbingFitPlan{{
+			SegmentIndex: 0, SpeakerID: "SPEAKER_00", SlotDurationMs: 2000, UsableSlotMs: 2000,
+			MeasuredDurationMs: 2000, DubPlaybackEndMs: 3000, EffectiveReserveMs: 0,
+			FitPolicyID: fitPolicyID, SpeechBlockIndices: []int{0}, Decision: domain.FitActionAccept,
+		}},
+		CreatedAt: time.Now().UTC(),
+	}
+	dsBytes, _ := json.Marshal(dubSegsA)
+	dsObj, _ := h.casStore.Put(bytes.NewReader(dsBytes))
+	_ = h.db.SaveDubSegmentsVariantIndex(context.Background(), storage.DubSegmentsVariantIndex{
+		ID: dubSegsA.ID, AssetID: assetIDA, RunID: runIDA, TargetLanguage: "vi",
+		CASHash: dsObj.SHA256, OverallStatus: "PASS", CreatedAt: dubSegsA.CreatedAt,
+	})
+
+	// Mix for asset A with stems from asset B must be refused
+	respMix, _ := runAudioMix(t, h, assetIDA, map[string]any{
+		"run_id": runIDA, "job_id": jobIDA, "target_language": "vi",
+		"dub_segments_cas": dsObj.SHA256,
+		"audio_stems_cas":  stemsB.CASHash,
+	})
+	defer respMix.Body.Close()
+	buf := new(bytes.Buffer)
+	_, _ = buf.ReadFrom(respMix.Body)
+	if respMix.StatusCode != http.StatusInternalServerError && respMix.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 500/422 for foreign stems, got %d: %s", respMix.StatusCode, buf.String())
+	}
+	if !strings.Contains(buf.String(), "is incompatible with current asset/schema") {
+		t.Fatalf("expected error body to contain 'is incompatible with current asset/schema', got: %s", buf.String())
+	}
+}
+
+func TestSeam1_Issue153_FreezeRenderPlan_EnforcesDubMixOwnershipAndLineage(t *testing.T) {
+	h := setupHarness(t)
+	jobIDA, runIDA := createJobAndRunWithDuration(t, h, 5.0)
+	assetIDA := getJobViaAPI(t, h, jobIDA).SourceAssetID
+
+	jobIDB, runIDB := createJobAndRunWithDuration(t, h, 6.0)
+	assetIDB := getJobViaAPI(t, h, jobIDB).SourceAssetID
+
+	// 1. Create a valid PASS mix for Asset B
+	wavDummy := media.GeneratePCM16WAV(16000, 1, 1000)
+	audioDummyObj, _ := h.casStore.Put(bytes.NewReader(wavDummy))
+	mixB := domain.DubMixArtifact{
+		ID: "mix-b-" + assetIDB, SchemaVersion: domain.DubMixSchemaVersion,
+		AssetID: assetIDB, RunID: runIDB, JobID: jobIDB, TargetLanguage: "vi",
+		AudioCASHash: audioDummyObj.SHA256, OverallStatus: "PASS", CreatedAt: time.Now().UTC(),
+	}
+	mixBBytes, _ := json.Marshal(mixB)
+	mixBObj, _ := h.casStore.Put(bytes.NewReader(mixBBytes))
+	// Freeze on Asset A supplying Asset B's mix CAS must fail with ErrRenderOwnershipMismatch (HTTP 409 or 400)
+	respB, _ := runFreezeRenderPlan(t, h, assetIDA, map[string]any{
+		"run_id": runIDA, "job_id": jobIDA, "target_language": "vi",
+		"dub_mix_cas":   mixBObj.SHA256,
+		"subtitle_cues": []domain.SubtitleCue{{StartMs: 1000, EndMs: 2000, Text: "hi"}},
+	})
+	defer respB.Body.Close()
+	if respB.StatusCode != http.StatusConflict && respB.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 409/400 for foreign dub mix, got %d", respB.StatusCode)
+	}
+
+	// 2. Mix belongs to Asset A, but produced for another run (Run Other), not recorded in runIDA
+	mixOtherRun := domain.DubMixArtifact{
+		ID: "mix-other-" + assetIDA, SchemaVersion: domain.DubMixSchemaVersion,
+		AssetID: assetIDA, RunID: "other-run-id", JobID: jobIDA, TargetLanguage: "vi",
+		AudioCASHash: audioDummyObj.SHA256, OverallStatus: "PASS", CreatedAt: time.Now().UTC(),
+	}
+	mixOtherBytes, _ := json.Marshal(mixOtherRun)
+	mixOtherObj, _ := h.casStore.Put(bytes.NewReader(mixOtherBytes))
+
+	respOther, _ := runFreezeRenderPlan(t, h, assetIDA, map[string]any{
+		"run_id": runIDA, "job_id": jobIDA, "target_language": "vi",
+		"dub_mix_cas":   mixOtherObj.SHA256,
+		"subtitle_cues": []domain.SubtitleCue{{StartMs: 1000, EndMs: 2000, Text: "hi"}},
+	})
+	defer respOther.Body.Close()
+	if respOther.StatusCode != http.StatusConflict && respOther.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 409/400 for unproven other-run dub mix, got %d", respOther.StatusCode)
+	}
+
+	// 3. Omitting DubMixCAS when run has no mix index or audio_mix stage artifact must fail closed (never asset-latest)
+	respNoMix, _ := runFreezeRenderPlan(t, h, assetIDA, map[string]any{
+		"run_id": runIDA, "job_id": jobIDA, "target_language": "vi",
+		"subtitle_cues": []domain.SubtitleCue{{StartMs: 1000, EndMs: 2000, Text: "hi"}},
+	})
+	defer respNoMix.Body.Close()
+	if respNoMix.StatusCode != http.StatusNotFound && respNoMix.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 404/422 when run pins no mix, got %d", respNoMix.StatusCode)
+	}
+}
+
+func TestSeam1_Issue153_FreezeRenderPlan_EnforcesSubtitlePlanOwnership(t *testing.T) {
+	h := setupHarness(t)
+	jobIDA, runIDA := createJobAndRunWithDuration(t, h, 5.0)
+	assetIDA := getJobViaAPI(t, h, jobIDA).SourceAssetID
+
+	jobIDB, runIDB := createJobAndRunWithDuration(t, h, 6.0)
+	assetIDB := getJobViaAPI(t, h, jobIDB).SourceAssetID
+
+	// Valid PASS mix for Asset A
+	wavA := media.GeneratePCM16WAV(16000, 1, 1000)
+	audioAObj, _ := h.casStore.Put(bytes.NewReader(wavA))
+	mixA := domain.DubMixArtifact{
+		ID: "mix-a-" + assetIDA, SchemaVersion: domain.DubMixSchemaVersion,
+		AssetID: assetIDA, RunID: runIDA, JobID: jobIDA, TargetLanguage: "vi",
+		AudioCASHash: audioAObj.SHA256, OverallStatus: "PASS", CreatedAt: time.Now().UTC(),
+	}
+	mixABytes, _ := json.Marshal(mixA)
+	mixAObj, _ := h.casStore.Put(bytes.NewReader(mixABytes))
+	_ = h.db.SaveDubMixArtifactIndex(context.Background(), storage.DubMixArtifactIndex{
+		ID: mixA.ID, AssetID: assetIDA, RunID: runIDA, TargetLanguage: "vi",
+		CASHash: mixAObj.SHA256, OverallStatus: "PASS", CreatedAt: mixA.CreatedAt,
+	})
+
+	// Foreign SubtitlePlanArtifact (Asset B)
+	subB := domain.SubtitlePlanArtifact{
+		ID: "sub-b-" + assetIDB, SchemaVersion: domain.SubtitlePlanSchemaVersion,
+		AssetID: assetIDB, RunID: runIDB, JobID: jobIDB, TargetLanguage: "vi",
+		Format: "compact_fit_cues", Cues: []domain.SubtitleCue{{StartMs: 0, EndMs: 1000, Text: "hi"}},
+		CreatedAt: time.Now().UTC(),
+	}
+	subBBytes, _ := json.Marshal(subB)
+	subBObj, _ := h.casStore.Put(bytes.NewReader(subBBytes))
+
+	respSubB, _ := runFreezeRenderPlan(t, h, assetIDA, map[string]any{
+		"run_id": runIDA, "job_id": jobIDA, "target_language": "vi",
+		"dub_mix_cas":       mixAObj.SHA256,
+		"subtitle_plan_cas": subBObj.SHA256,
+	})
+	defer respSubB.Body.Close()
+	if respSubB.StatusCode != http.StatusBadRequest && respSubB.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 400/409 for foreign subtitle plan, got %d", respSubB.StatusCode)
+	}
+}
+
+func TestSeam1_Issue153_RenderPreviewAndFinal_EnforceOwnership(t *testing.T) {
+	h := setupHarness(t)
+	jobIDA, runIDA := createJobAndRunWithDuration(t, h, 5.0)
+	assetIDA := getJobViaAPI(t, h, jobIDA).SourceAssetID
+	_ = assetIDA
+	jobIDB, _ := createJobAndRunWithDuration(t, h, 6.0)
+	assetIDB := getJobViaAPI(t, h, jobIDB).SourceAssetID
+
+	// Attempt to run preview for Asset A using Run ID of Asset B
+	previewReq := map[string]any{
+		"run_id":          runIDA,
+		"job_id":          jobIDA,
+		"target_language": "vi",
+	}
+	reqBytes, _ := json.Marshal(previewReq)
+	// Post to Asset B endpoint with Run A
+	resp, err := http.Post(
+		fmt.Sprintf("%s/api/v1/assets/%s/render/preview", h.server.URL, assetIDB),
+		"application/json",
+		bytes.NewReader(reqBytes),
+	)
+	if err != nil {
+		t.Fatalf("post render-preview: %v", err)
+	}
+	defer resp.Body.Close()
+	buf := new(bytes.Buffer)
+	_, _ = buf.ReadFrom(resp.Body)
+	if resp.StatusCode != http.StatusConflict && resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 409/400 for cross-asset render preview, got %d: %s", resp.StatusCode, buf.String())
+	}
+}
+
+func TestSeam1_Issue151_MalformedRunCreationReturns400(t *testing.T) {
+	h := setupHarness(t)
+	jobID, _ := createJobAndRunWithDuration(t, h, 5.0)
+
+	resp, err := http.Post(
+		fmt.Sprintf("%s/api/v1/jobs/%s/runs", h.server.URL, jobID),
+		"application/json",
+		bytes.NewReader([]byte("{malformed-json")),
+	)
+	if err != nil {
+		t.Fatalf("post malformed run creation: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for malformed json body, got %d", resp.StatusCode)
+	}
 }

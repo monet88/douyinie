@@ -127,7 +127,13 @@ func (s *AudioMixService) SeparateAudio(ctx context.Context, input AudioSeparati
 	}
 	_ = f.Close()
 
-	rolePlan, _ := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, input.AssetID, input.RunID)
+	rolePlan, err := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, input.AssetID, input.RunID)
+	if err != nil {
+		if !errors.Is(err, domain.ErrRunPinnedAudioRolePlanMissing) {
+			return nil, fmt.Errorf("resolve audio role plan for separation: %w", err)
+		}
+		rolePlan = nil
+	}
 
 	// If router is available, pre-route to check for cached artifact by provenance across eligible order
 	sourceAudioRef := worker.ArtifactRef{
@@ -447,29 +453,10 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 	// A run-scoped mix must resolve the plan pinned by that run's audio_role_plan stage CAS;
 	// a newer asset-latest plan must never change an older run's dub-eligibility or mix decisions.
 	rolePlan, err := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, input.AssetID, input.RunID)
-	if s.cas != nil {
-		dubCAS := input.DubSegmentsCAS
-		if dubCAS == "" && input.RunID != "" && s.db != nil {
-			if idx, err := s.db.GetDubSegmentsVariantIndexByRun(ctx, input.RunID); err == nil && idx != nil {
-				dubCAS = idx.CASHash
-			}
-		}
-		if dubCAS != "" {
-			if rc, err := s.cas.Get(dubCAS); err == nil {
-				var ds domain.DubSegmentsVariant
-				if err := json.NewDecoder(rc).Decode(&ds); err == nil && ds.AudioRolePlanCAS != "" {
-					if p, err := LoadPinnedAudioRolePlanFromCAS(s.cas, ds.AudioRolePlanCAS); err == nil {
-						rolePlan = p
-					}
-				}
-				rc.Close()
-			}
-		}
+	if err != nil {
+		return nil, fmt.Errorf("resolve audio role plan for mix: %w", err)
 	}
 	if rolePlan == nil {
-		rolePlan, err = s.db.GetAudioRolePlan(ctx, input.AssetID)
-	}
-	if err != nil || rolePlan == nil {
 		return nil, domain.ErrAudioRolePlanRequired
 	}
 
@@ -591,6 +578,10 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 		}
 		if stemsArtifact == nil {
 			return nil, fmt.Errorf("explicit audio stems CAS %s is unreadable or invalid", input.AudioStemsCAS)
+		}
+		if stemsArtifact.AssetID != input.AssetID || (stemsArtifact.SchemaVersion != 0 && stemsArtifact.SchemaVersion != domain.AudioStemsSchemaVersion) {
+			return nil, fmt.Errorf("%w: stems artifact is incompatible with current asset/schema (asset=%s, expected=%s)",
+				domain.ErrSoundtrackPreservationFailed, stemsArtifact.AssetID, input.AssetID)
 		}
 	}
 	if stemsArtifact == nil {

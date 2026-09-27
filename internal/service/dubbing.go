@@ -89,13 +89,16 @@ func (s *DubbingService) AssignVoices(ctx context.Context, in domain.VoiceAssign
 
 	// Check if video has audio role plan with no dub-eligible dialogue (no-speech bypass)
 	if s.db != nil && in.AssetID != "" {
-		rolePlan, err := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, in.AssetID, in.RunID)
-		if err == nil && rolePlan != nil {
+		resolveRunID := strings.TrimSpace(in.RunID)
+		rolePlan, err := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, in.AssetID, resolveRunID)
+		if err != nil {
+			if resolveRunID != "" {
+				return nil, fmt.Errorf("resolve run-scoped audio role plan for voice assignment: %w", err)
+			}
+		} else if rolePlan != nil {
 			if !domain.IsDubEligible(rolePlan) {
 				return nil, domain.ErrNoDubbingRequired
 			}
-		} else if err != nil {
-			return nil, fmt.Errorf("get audio role plan: %w", err)
 		}
 	}
 	// 1. Resolve distinct speakers from TranscriptArtifact or DubScriptVariant
@@ -324,7 +327,7 @@ func (s *DubbingService) resolveVoiceAssignmentLineageCAS(ctx context.Context, i
 		}
 		if authoritativeDubScriptCAS == "" && s.cas != nil {
 			// The run pins no script here, so the supplied artifact's own binding is the only proof left.
-			dubScript, _, err := s.loadDubScriptVariant(ctx, in.AssetID, targetLang, suppliedDubScriptCAS)
+			dubScript, _, err := s.loadDubScriptVariant(ctx, in.AssetID, in.RunID, targetLang, suppliedDubScriptCAS)
 			if err != nil {
 				return "", "", fmt.Errorf("prove supplied dub script lineage for voice assignment: %w", err)
 			}
@@ -355,7 +358,7 @@ func (s *DubbingService) resolveVoiceAssignmentLineageCAS(ctx context.Context, i
 	if authoritativeTranscriptCAS == "" && suppliedTranscriptCAS == "" && dubScriptCAS != "" {
 		// Nothing pins a transcript for this run: the dub script's translation contract still
 		// names the one it was built from. Only used to fill, never to override a supplied value.
-		dubScript, _, err := s.loadDubScriptVariant(ctx, in.AssetID, targetLang, dubScriptCAS)
+		dubScript, _, err := s.loadDubScriptVariant(ctx, in.AssetID, in.RunID, targetLang, dubScriptCAS)
 		if err != nil {
 			return "", "", fmt.Errorf("resolve dub script lineage for voice assignment: %w", err)
 		}
@@ -665,7 +668,8 @@ func (s *DubbingService) AuditionVoice(ctx context.Context, in domain.VoiceAudit
 				return nil, fmt.Errorf("%w: missing database for contextual audition", domain.ErrAudioRolePlanRequired)
 			}
 		} else {
-			rp, err := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, in.AssetID, in.RunID)
+			resolveRunID := strings.TrimSpace(in.RunID)
+			rp, err := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, in.AssetID, resolveRunID)
 			if err != nil {
 				return nil, fmt.Errorf("%w: failed to get audio role plan for asset %s: %v", domain.ErrAudioRolePlanRequired, in.AssetID, err)
 			}
@@ -1173,7 +1177,7 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 	// 1. Load the exact dub script and voice assignment before resolving any omitted
 	// transcript reference. Their persisted lineage is an allowed current-run proof;
 	// asset-latest state is not.
-	dubScript, dubScriptCAS, err := s.loadDubScriptVariant(ctx, in.AssetID, targetLang, in.DubScriptVariantCAS)
+	dubScript, dubScriptCAS, err := s.loadDubScriptVariant(ctx, in.AssetID, in.RunID, targetLang, in.DubScriptVariantCAS)
 	if err != nil {
 		return nil, fmt.Errorf("load dub script for synthesis: %w", err)
 	}
@@ -1269,7 +1273,7 @@ func (s *DubbingService) CanReuseVariant(ctx context.Context, in domain.DubbingJ
 	if variant.FitPolicyID == "" || variant.FitPolicyID != fc.policyID() {
 		return false
 	}
-	dubScript, dubCAS, err := s.loadDubScriptVariant(ctx, in.AssetID, in.TargetLanguage, in.DubScriptVariantCAS)
+	dubScript, dubCAS, err := s.loadDubScriptVariant(ctx, in.AssetID, in.RunID, in.TargetLanguage, in.DubScriptVariantCAS)
 	if err != nil || dubCAS != in.DubScriptVariantCAS {
 		return false
 	}
@@ -2724,19 +2728,45 @@ func (s *DubbingService) transcriptCASFromTranslationVariant(assetID, targetLang
 	return variant.TranscriptArtifactCAS, nil
 }
 
-// loadDubScriptVariant loads the DubScriptVariant from CAS or SQLite.
-func (s *DubbingService) loadDubScriptVariant(ctx context.Context, assetID, targetLang, explicitCAS string) (*domain.DubScriptVariant, string, error) {
+// loadDubScriptVariant loads the DubScriptVariant from CAS or from the run's own evidence.
+//
+// An omitted explicitCAS resolves from run-scoped evidence only: the run's dub-script index row, or
+// the artifact the run's dub_script stage execution pinned. The asset/language index is never
+// consulted here — every caller of this loader is run-scoped, and adopting the asset's latest script
+// would silently synthesize another run's text while claiming this run's lineage (#153). A caller
+// that supplies no run_id is refused instead of being served asset-latest state.
+func (s *DubbingService) loadDubScriptVariant(ctx context.Context, assetID, runID, targetLang, explicitCAS string) (*domain.DubScriptVariant, string, error) {
 	if s.cas == nil || s.db == nil {
 		return nil, "", fmt.Errorf("database and CAS store required to load dub script variant")
 	}
 
 	casHash := explicitCAS
 	if casHash == "" {
-		idx, err := s.db.GetDubScriptVariantIndex(ctx, assetID, targetLang)
-		if err != nil {
-			return nil, "", fmt.Errorf("dub script variant not found for asset %s in language %s: %w", assetID, targetLang, err)
+		if strings.TrimSpace(runID) == "" {
+			return nil, "", fmt.Errorf("%w: run_id is required to resolve a dub script variant", domain.ErrDubScriptRequiredForDubbing)
 		}
-		casHash = idx.CASHash
+		idx, err := s.db.GetDubScriptVariantIndexByRun(ctx, runID)
+		switch {
+		case err == nil && idx != nil:
+			if idx.AssetID != assetID || !strings.EqualFold(idx.TargetLanguage, targetLang) {
+				return nil, "", fmt.Errorf("%w: run %s dub script variant belongs to asset %s language %s, not %s/%s",
+					domain.ErrTranslationOwnershipMismatch, runID, idx.AssetID, idx.TargetLanguage, assetID, targetLang)
+			}
+			casHash = idx.CASHash
+		case err != nil && !errors.Is(err, storage.ErrNotFound):
+			return nil, "", fmt.Errorf("resolve run %s dub script lineage: %w", runID, err)
+		default:
+			// The run reused a cached dub script and so owns no index row of its own; its dub_script
+			// stage execution still pinned the exact artifact the run consumed.
+			pinnedCAS, hashErr := s.db.GetStageArtifactHash(ctx, runID, "dub_script")
+			if hashErr != nil {
+				return nil, "", fmt.Errorf("resolve run %s dub script stage artifact: %w", runID, hashErr)
+			}
+			if pinnedCAS == "" {
+				return nil, "", fmt.Errorf("%w: run %s pins no dub script variant", domain.ErrDubScriptRequiredForDubbing, runID)
+			}
+			casHash = pinnedCAS
+		}
 	}
 
 	rc, err := s.cas.Get(casHash)

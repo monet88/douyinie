@@ -90,6 +90,16 @@ func seedReviewRun(t *testing.T, db *storage.DB, assetID, runID string) string {
 	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: jobID, Status: "running", ConfigSnapshotJSON: "{}", CreatedAt: now}); err != nil {
 		t.Fatalf("create review fixture run: %v", err)
 	}
+	if p, err := db.GetAudioRolePlan(ctx, assetID); err == nil && p != nil && p.CASHash != "" {
+		_ = db.CreateStageExecution(ctx, domain.StageExecution{
+			ID:             uuid.NewString(),
+			RunID:          runID,
+			Stage:          "audio_role_plan",
+			Status:         domain.StageStatusSucceeded,
+			ArtifactSHA256: p.CASHash,
+			CreatedAt:      now.Add(-time.Hour),
+		})
+	}
 	return jobID
 }
 
@@ -325,7 +335,7 @@ func setupFullReviewHarnessWithRender(t *testing.T) (*service.ReviewService, *st
 	return reviewSvc, db, casStore, renderSvc, assetID
 }
 
-func pinReviewTranslationTranscript(t *testing.T, casStore *cas.Store, v *domain.TranslationVariant) {
+func pinReviewTranslationTranscript(t *testing.T, db *storage.DB, casStore *cas.Store, v *domain.TranslationVariant) {
 	t.Helper()
 	blocks := make([]domain.SpeechBlock, 0, len(v.Segments))
 	inputSegments := make([]domain.TranslationInputSegment, 0, len(v.Segments))
@@ -333,7 +343,7 @@ func pinReviewTranslationTranscript(t *testing.T, casStore *cas.Store, v *domain
 		blocks = append(blocks, domain.SpeechBlock{Index: seg.Index, StartMs: seg.StartMs, EndMs: seg.EndMs, SourceText: seg.SourceText, SpeakerID: seg.SpeakerID, SegmentType: domain.SpeechBlockTypeSpeech})
 		inputSegments = append(inputSegments, domain.TranslationInputSegment{Index: seg.Index, SourceText: seg.SourceText, SpeakerID: seg.SpeakerID, StartMs: seg.StartMs, EndMs: seg.EndMs})
 	}
-	artifact := domain.TranscriptArtifact{AssetID: v.AssetID, SpeechBlocks: blocks}
+	artifact := domain.TranscriptArtifact{AssetID: v.AssetID, RunID: v.RunID, SpeechBlocks: blocks}
 	b, err := json.Marshal(artifact)
 	if err != nil {
 		t.Fatalf("marshal review transcript: %v", err)
@@ -343,6 +353,16 @@ func pinReviewTranslationTranscript(t *testing.T, casStore *cas.Store, v *domain
 		t.Fatalf("put review transcript: %v", err)
 	}
 	v.TranscriptArtifactCAS = obj.SHA256
+	if db != nil && strings.TrimSpace(v.RunID) != "" {
+		_ = db.SaveTranscriptArtifactIndex(context.Background(), storage.TranscriptArtifactIndex{
+			ID:             "transcript-" + v.RunID,
+			AssetID:        v.AssetID,
+			RunID:          v.RunID,
+			CASHash:        obj.SHA256,
+			ProvenanceHash: "prov-transcript-" + v.RunID,
+			CreatedAt:      time.Now().UTC(),
+		})
+	}
 	if v.EffectiveGlossary.Hash == "" {
 		glossaryBytes, err := json.Marshal([]domain.GlossaryEntry{})
 		if err != nil {
@@ -958,7 +978,7 @@ func TestReviewService_CorrectTargetText_TargetedRerunAndAutoResolution(t *testi
 		},
 		CreatedAt: time.Now().UTC(),
 	}
-	pinReviewTranslationTranscript(t, casStore, &transVar)
+	pinReviewTranslationTranscript(t, db, casStore, &transVar)
 	tBytes, _ := json.Marshal(transVar)
 	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
 	_ = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
@@ -1157,7 +1177,7 @@ func TestReviewService_CorrectTargetText_ResolvesSparseSegmentIndices(t *testing
 		},
 		CreatedAt: time.Now().UTC(),
 	}
-	pinReviewTranslationTranscript(t, casStore, &transVar)
+	pinReviewTranslationTranscript(t, db, casStore, &transVar)
 	tBytes, _ := json.Marshal(transVar)
 	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
 	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
@@ -1254,7 +1274,7 @@ func TestReviewService_CorrectTargetText_BeforeVisualStage_RebuildsDubOnly(t *te
 		},
 		CreatedAt: time.Now().UTC(),
 	}
-	pinReviewTranslationTranscript(t, casStore, &transVar)
+	pinReviewTranslationTranscript(t, db, casStore, &transVar)
 	tBytes, _ := json.Marshal(transVar)
 	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
 	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
@@ -1333,6 +1353,16 @@ func TestReviewService_CorrectTargetText_RecordsRebuiltStagesForResume(t *testin
 	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: "job-resume-1", Status: "interrupted", CreatedAt: now}); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	if p, err := db.GetAudioRolePlan(ctx, assetID); err == nil && p != nil && p.CASHash != "" {
+		_ = db.CreateStageExecution(ctx, domain.StageExecution{
+			ID:             uuid.NewString(),
+			RunID:          runID,
+			Stage:          "audio_role_plan",
+			Status:         domain.StageStatusSucceeded,
+			ArtifactSHA256: p.CASHash,
+			CreatedAt:      now.Add(-time.Hour),
+		})
+	}
 	staleCAS := "stale-dub-synthesize-cas"
 	if err := db.CreateStageExecution(ctx, domain.StageExecution{
 		ID: "se-stale", RunID: runID, Stage: "dub_synthesize", Status: domain.StageStatusSucceeded,
@@ -1342,14 +1372,15 @@ func TestReviewService_CorrectTargetText_RecordsRebuiltStagesForResume(t *testin
 	}
 
 	transVar := domain.TranslationVariant{
-		ID: "trans-resume-1", SchemaVersion: domain.TranslationSchemaVersion, ContractID: service.TranslationContractID, AssetID: assetID, TargetLanguage: "vi", SourceLanguage: "zh",
+		ID: "trans-resume-1", SchemaVersion: domain.TranslationSchemaVersion, ContractID: service.TranslationContractID,
+		AssetID: assetID, RunID: runID, JobID: "job-resume-1", TargetLanguage: "vi", SourceLanguage: "zh",
 		ProvenanceHash: "prov-trans-resume", OverallQAScore: 0.5,
 		Segments: []domain.TranslationSegment{
 			{Index: 0, SourceText: "点击右上角", TargetText: "Nhấn vào góc trên bên phải của màn hình", StartMs: 0, EndMs: 1500, QAConfidence: 0.9, PassedQAGate: true},
 		},
 		CreatedAt: time.Now().UTC(),
 	}
-	pinReviewTranslationTranscript(t, casStore, &transVar)
+	pinReviewTranslationTranscript(t, db, casStore, &transVar)
 	tBytes, _ := json.Marshal(transVar)
 	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
 	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
@@ -1432,7 +1463,7 @@ func TestReviewService_CorrectTargetText_MissingRequiredServices_FailsClosed(t *
 		},
 		CreatedAt: time.Now().UTC(),
 	}
-	pinReviewTranslationTranscript(t, casStore, &transVar)
+	pinReviewTranslationTranscript(t, db, casStore, &transVar)
 	tBytes, _ := json.Marshal(transVar)
 	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
 	_ = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
@@ -1887,6 +1918,16 @@ func TestReviewService_ReassignVoice_VisualTrackFailClosed(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	if p, err := db.GetAudioRolePlan(ctx, assetID); err == nil && p != nil && p.CASHash != "" {
+		_ = db.CreateStageExecution(ctx, domain.StageExecution{
+			ID:             uuid.NewString(),
+			RunID:          runID,
+			Stage:          "audio_role_plan",
+			Status:         domain.StageStatusSucceeded,
+			ArtifactSHA256: p.CASHash,
+			CreatedAt:      now.Add(-time.Hour),
+		})
+	}
 	transVar := domain.TranslationVariant{
 		ID:             "trans-fc-1",
 		SchemaVersion:  domain.TranslationSchemaVersion,
@@ -1900,7 +1941,7 @@ func TestReviewService_ReassignVoice_VisualTrackFailClosed(t *testing.T) {
 		},
 		CreatedAt: now,
 	}
-	pinReviewTranslationTranscript(t, casStore, &transVar)
+	pinReviewTranslationTranscript(t, db, casStore, &transVar)
 	transBytes, _ := json.Marshal(transVar)
 	transObj, err := casStore.Put(bytes.NewReader(transBytes))
 	if err != nil {
@@ -2746,7 +2787,7 @@ func TestReviewService_CorrectTargetText_RejectsIncompatibleLineage(t *testing.T
 		},
 		CreatedAt: time.Now().UTC(),
 	}
-	pinReviewTranslationTranscript(t, casStore, &transVar)
+	pinReviewTranslationTranscript(t, db, casStore, &transVar)
 	tBytes, _ := json.Marshal(transVar)
 	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
 	_ = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
@@ -3679,7 +3720,14 @@ func TestReviewService_CorrectTargetText_InputHashMatchesWhenTranscriptHasExclud
 	rpObj, _ := casStore.Put(bytes.NewReader(rpBytes))
 	rolePlan.CASHash = rpObj.SHA256
 	_ = db.SaveAudioRolePlan(ctx, rolePlan)
-
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "audio_role_plan",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: rpObj.SHA256,
+		CreatedAt:      time.Now().UTC().Add(-time.Hour),
+	})
 	// Pinned transcript with dialogue block (0) and singing block (1)
 	transcript := domain.TranscriptArtifact{
 		ID:      "transcript-" + runID,
@@ -3692,6 +3740,14 @@ func TestReviewService_CorrectTargetText_InputHashMatchesWhenTranscriptHasExclud
 	}
 	tBytes, _ := json.Marshal(transcript)
 	tObj, _ := casStore.Put(bytes.NewReader(tBytes))
+	_ = db.SaveTranscriptArtifactIndex(ctx, storage.TranscriptArtifactIndex{
+		ID:             transcript.ID,
+		AssetID:        assetID,
+		RunID:          runID,
+		CASHash:        tObj.SHA256,
+		ProvenanceHash: "prov-transcript-" + runID,
+		CreatedAt:      transcript.CreatedAt,
+	})
 
 	// Canonical translation segments from unified predicate contain ONLY segment 0
 	canonicalSegs := domain.CanonicalTranslationSegments(&transcript, &rolePlan)
@@ -4093,7 +4149,7 @@ func TestReviewService_CorrectTargetText_UnresolvablePinnedRolePlanFailsClosed(t
 		},
 		CreatedAt: time.Now().UTC(),
 	}
-	pinReviewTranslationTranscript(t, casStore, &transVar)
+	pinReviewTranslationTranscript(t, db, casStore, &transVar)
 	tvBytes, _ := json.Marshal(transVar)
 	tvObj, _ := casStore.Put(bytes.NewReader(tvBytes))
 	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
@@ -4149,7 +4205,7 @@ func seedCorrectionVariantForTest(t *testing.T, db *storage.DB, casStore *cas.St
 		},
 		CreatedAt: time.Now().UTC(),
 	}
-	pinReviewTranslationTranscript(t, casStore, &transVar)
+	pinReviewTranslationTranscript(t, db, casStore, &transVar)
 	b, _ := json.Marshal(transVar)
 	obj, _ := casStore.Put(bytes.NewReader(b))
 	if err := db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
@@ -4357,5 +4413,199 @@ func TestReviewService_EvaluateFinalRenderHandoff_RefusesStaleDeliveryLineageUnt
 	}
 	if !handoff.CanStartFinalRender {
 		t.Fatalf("expected an eligible handoff once the lineage is re-frozen, got %+v", handoff)
+	}
+}
+
+// seedDistinctDubMixForRun writes a second PASS dub mix artifact for one run. Two runs that freeze plans
+// from the same mix produce the same plan provenance (it excludes run/job), so a distinct mix is what makes
+// a second run own a genuinely different, newer asset-latest RenderPlan.
+func seedDistinctDubMixForRun(t *testing.T, casStore *cas.Store, baseCAS, runID string) string {
+	t.Helper()
+	rc, err := casStore.Get(baseCAS)
+	if err != nil {
+		t.Fatalf("read base dub mix %s: %v", baseCAS, err)
+	}
+	var mix domain.DubMixArtifact
+	decodeErr := json.NewDecoder(rc).Decode(&mix)
+	_ = rc.Close()
+	if decodeErr != nil {
+		t.Fatalf("decode base dub mix %s: %v", baseCAS, decodeErr)
+	}
+	mix.ID = "dubmix-alt-" + runID
+	mix.RunID = runID
+	altBytes, err := json.Marshal(mix)
+	if err != nil {
+		t.Fatalf("marshal alternate dub mix: %v", err)
+	}
+	obj, err := casStore.Put(bytes.NewReader(altBytes))
+	if err != nil {
+		t.Fatalf("put alternate dub mix: %v", err)
+	}
+	return obj.SHA256
+}
+
+// A run-scoped final render resolves its RenderPlan from that run's own evidence: an omitted plan_cas /
+// plan_provenance must never pick up another run's newer asset-latest plan, and a run that owns no plan
+// evidence fails closed. Asset-scoped calls (no run_id) keep the asset-latest semantics (#153).
+func TestRenderService_OmittedPlanCASStaysRunScoped(t *testing.T) {
+	_, db, casStore, renderSvc, assetID := setupFullReviewHarnessWithRender(t)
+	ctx := context.Background()
+
+	runA := "run-plan-scope-a"
+	jobA := seedReviewRun(t, db, assetID, runA)
+	mixA := bindBaselineDubMixToRun(t, db, assetID, "vi", runA)
+	planA, err := renderSvc.FreezeRenderPlan(ctx, service.RenderPlanInput{
+		RunID: runA, JobID: jobA, AssetID: assetID, TargetLanguage: "vi", DubMixCAS: mixA,
+	})
+	if err != nil {
+		t.Fatalf("freeze run A render plan: %v", err)
+	}
+
+	// Run B freezes a newer plan from its own mix, so it becomes the asset-latest plan row.
+	runB := "run-plan-scope-b"
+	jobB := seedReviewRun(t, db, assetID, runB)
+	mixB := seedDistinctDubMixForRun(t, casStore, mixA, runB)
+	planB, err := renderSvc.FreezeRenderPlan(ctx, service.RenderPlanInput{
+		RunID: runB, JobID: jobB, AssetID: assetID, TargetLanguage: "vi", DubMixCAS: mixB,
+	})
+	if err != nil {
+		t.Fatalf("freeze run B render plan: %v", err)
+	}
+	if planB.CASHash == planA.CASHash {
+		t.Fatalf("fixture precondition: run B plan must differ from run A plan (%s)", planA.CASHash)
+	}
+	latest, err := db.GetRenderPlanIndex(ctx, assetID, "vi")
+	if err != nil || latest.CASHash != planB.CASHash {
+		t.Fatalf("fixture precondition: asset-latest plan must be run B's %s, got %+v (err=%v)", planB.CASHash, latest, err)
+	}
+
+	// Run A names no plan_cas/plan_provenance: it must execute its own plan, never the asset-latest plan
+	// that run B froze last.
+	artA, err := renderSvc.RenderFinal(ctx, service.RenderExecutionInput{
+		RunID: runA, JobID: jobA, AssetID: assetID, TargetLanguage: "vi",
+	})
+	if err != nil {
+		t.Fatalf("run A final render: %v", err)
+	}
+	if artA.ConsumedPlan.PlanCASHash != planA.CASHash || artA.ConsumedPlan.PlanProvenanceHash != planA.ProvenanceHash {
+		t.Fatalf("run A consumed plan %s/%s, want its own %s/%s (asset-latest is %s)",
+			artA.ConsumedPlan.PlanCASHash, artA.ConsumedPlan.PlanProvenanceHash,
+			planA.CASHash, planA.ProvenanceHash, planB.CASHash)
+	}
+	if artA.ConsumedPlan.DubMixCASHash != mixA {
+		t.Fatalf("run A rendered dub mix %s, want its own %s (run B's is %s)",
+			artA.ConsumedPlan.DubMixCASHash, mixA, mixB)
+	}
+
+	// A run with no render-plan evidence at all fails closed rather than borrowing run B's plan.
+	runC := "run-plan-scope-c"
+	jobC := seedReviewRun(t, db, assetID, runC)
+	bindBaselineDubMixToRun(t, db, assetID, "vi", runC)
+	_, err = renderSvc.RenderFinal(ctx, service.RenderExecutionInput{
+		RunID: runC, JobID: jobC, AssetID: assetID, TargetLanguage: "vi",
+	})
+	if !errors.Is(err, domain.ErrRenderPlanNotFound) {
+		t.Fatalf("a run without render-plan evidence must fail closed, got %v", err)
+	}
+
+	// Asset-scoped render keeps resolving the asset-latest plan.
+	preview, err := renderSvc.RenderPreview(ctx, service.RenderExecutionInput{
+		AssetID: assetID, TargetLanguage: "vi",
+	})
+	if err != nil {
+		t.Fatalf("asset-scoped preview render: %v", err)
+	}
+	if preview.ConsumedPlan.PlanCASHash != planB.CASHash {
+		t.Fatalf("asset-scoped preview consumed plan %s, want asset-latest %s",
+			preview.ConsumedPlan.PlanCASHash, planB.CASHash)
+	}
+}
+
+// The final-render handoff gate reads only this run's delivery lineage: another run's newer asset-latest
+// plan that happens to pin this run's mix is not this run's plan, so the handoff must refuse instead of
+// reporting the run fresh (#153).
+func TestReviewService_EvaluateFinalRenderHandoff_DoesNotAdoptOtherRunAssetLatestPlan(t *testing.T) {
+	svc, db, _, renderSvc, assetID := setupFullReviewHarnessWithRender(t)
+	ctx := context.Background()
+
+	runA := "run-handoff-scope-a"
+	jobA := seedReviewRun(t, db, assetID, runA)
+	mixA := bindBaselineDubMixToRun(t, db, assetID, "vi", runA)
+	recordRunDeliveryStage(t, db, runA, "audio_mix", mixA)
+	// Run A never froze a plan of its own.
+
+	// Run B froze a newer plan from the very same mix and owns the asset-latest row the gate used to inspect.
+	runB := "run-handoff-scope-b"
+	jobB := seedReviewRun(t, db, assetID, runB)
+	recordRunDeliveryStage(t, db, runB, "audio_mix", mixA)
+	planB, err := renderSvc.FreezeRenderPlan(ctx, service.RenderPlanInput{
+		RunID: runB, JobID: jobB, AssetID: assetID, TargetLanguage: "vi", DubMixCAS: mixA,
+	})
+	if err != nil {
+		t.Fatalf("freeze run B render plan: %v", err)
+	}
+	latest, err := db.GetRenderPlanIndex(ctx, assetID, "vi")
+	if err != nil || latest.CASHash != planB.CASHash {
+		t.Fatalf("fixture precondition: asset-latest plan must be run B's %s, got %+v (err=%v)", planB.CASHash, latest, err)
+	}
+	if _, err := db.GetRenderPlanIndexByRun(ctx, runA); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("fixture precondition: run A must own no render plan row, got %v", err)
+	}
+
+	_, err = svc.EvaluateFinalRenderHandoff(ctx, domain.FinalRenderHandoffInput{
+		AssetID: assetID, RunID: runA, JobID: jobA, TargetLanguage: "vi", Posture: domain.ReviewPostureReview,
+	})
+	if err == nil || !strings.Contains(err.Error(), "final render handoff refused") {
+		t.Fatalf("expected the handoff to refuse run A's missing own-plan lineage, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "no render plan") {
+		t.Fatalf("refusal must name the missing run-owned render plan, got: %v", err)
+	}
+}
+
+func TestRenderService_ResolvePlan_RejectsOtherRunExplicitPlanWithoutProof(t *testing.T) {
+	_, db, _, renderSvc, assetID := setupFullReviewHarnessWithRender(t)
+	ctx := context.Background()
+
+	runA := "run-plan-explicit-a"
+	jobA := seedReviewRun(t, db, assetID, runA)
+	mixA := bindBaselineDubMixToRun(t, db, assetID, "vi", runA)
+	planA, err := renderSvc.FreezeRenderPlan(ctx, service.RenderPlanInput{
+		RunID: runA, JobID: jobA, AssetID: assetID, TargetLanguage: "vi", DubMixCAS: mixA,
+	})
+	if err != nil {
+		t.Fatalf("freeze run A plan: %v", err)
+	}
+
+	runB := "run-plan-explicit-b"
+	jobB := seedReviewRun(t, db, assetID, runB)
+	bindBaselineDubMixToRun(t, db, assetID, "vi", runB)
+
+	// 1. Explicit PlanCAS from Run A supplied to Run B without proof must be rejected with ErrRenderOwnershipMismatch
+	_, err = renderSvc.RenderFinal(ctx, service.RenderExecutionInput{
+		RunID: runB, JobID: jobB, AssetID: assetID, TargetLanguage: "vi", PlanCAS: planA.CASHash,
+	})
+	if !errors.Is(err, domain.ErrRenderOwnershipMismatch) {
+		t.Fatalf("expected ErrRenderOwnershipMismatch for unproven explicit PlanCAS, got: %v", err)
+	}
+
+	// 2. Explicit PlanProvenance from Run A supplied to Run B without proof must be rejected with ErrRenderOwnershipMismatch
+	_, err = renderSvc.RenderFinal(ctx, service.RenderExecutionInput{
+		RunID: runB, JobID: jobB, AssetID: assetID, TargetLanguage: "vi", PlanProvenance: planA.ProvenanceHash,
+	})
+	if !errors.Is(err, domain.ErrRenderOwnershipMismatch) {
+		t.Fatalf("expected ErrRenderOwnershipMismatch for unproven explicit PlanProvenance, got: %v", err)
+	}
+
+	// 3. With explicit current-run proof (e.g. stage execution recorded for Run B reusing planA), it is accepted
+	recordRunDeliveryStage(t, db, runB, "render_plan", planA.CASHash)
+	artB, err := renderSvc.RenderFinal(ctx, service.RenderExecutionInput{
+		RunID: runB, JobID: jobB, AssetID: assetID, TargetLanguage: "vi", PlanCAS: planA.CASHash,
+	})
+	if err != nil {
+		t.Fatalf("expected explicit PlanCAS to succeed with current-run stage proof, got: %v", err)
+	}
+	if artB.ConsumedPlan.PlanCASHash != planA.CASHash {
+		t.Fatalf("consumed plan mismatch: %s != %s", artB.ConsumedPlan.PlanCASHash, planA.CASHash)
 	}
 }

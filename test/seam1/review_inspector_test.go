@@ -1501,20 +1501,9 @@ func TestSeam1_RegionOverride_Reclassify_Drag_Resize_Relabel_TargetedInvalidatio
 	// Setup the DubMix on the selected run itself. Creating it through
 	// setupAssetWithDubMix would mint a second run for the same deduped asset,
 	// which no longer satisfies selected-run correction semantics.
-	rolePayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleInstrumentalBgm},
-		},
-	}
-	roleBody, _ := json.Marshal(rolePayload)
-	roleResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
-	if err != nil {
-		t.Fatalf("setup audio role plan failed: %v", err)
-	}
-	if roleResp.StatusCode != http.StatusCreated {
-		t.Fatalf("setup audio role plan failed: status=%d", roleResp.StatusCode)
-	}
-	_ = roleResp.Body.Close()
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleInstrumentalBgm},
+	})
 
 	sepResp, stems := runSeparateStems(t, h, assetID, map[string]any{"run_id": runID})
 	if sepResp.StatusCode != http.StatusCreated || stems == nil {
@@ -1732,8 +1721,25 @@ func TestSeam1_FinalRenderHandoff_QueueZero_AutoVsReview(t *testing.T) {
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
-	// 1. Setup dub mix
-	_, _, _, dubMix := setupAssetWithDubMix(t, h)
+	// 1. Setup dub mix on this exact run
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleInstrumentalBgm},
+	})
+
+	sepResp, stems := runSeparateStems(t, h, assetID, map[string]any{"run_id": runID})
+	if sepResp.StatusCode != http.StatusCreated || stems == nil {
+		t.Fatalf("setup separate stems failed: status=%d", sepResp.StatusCode)
+	}
+	_ = sepResp.Body.Close()
+
+	mixResp, dubMix := runAudioMix(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": domain.TargetLanguageVI,
+	})
+	if mixResp.StatusCode != http.StatusCreated || dubMix == nil {
+		t.Fatalf("setup audio mix failed: status=%d", mixResp.StatusCode)
+	}
+	_ = mixResp.Body.Close()
 
 	// Overwrite AudioRolePlan with an uncertain segment -> creates 1 pending review exception
 	rolePayload := map[string]any{
@@ -1742,8 +1748,11 @@ func TestSeam1_FinalRenderHandoff_QueueZero_AutoVsReview(t *testing.T) {
 		},
 	}
 	roleBody, _ := json.Marshal(rolePayload)
-	_, _ = http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
-
+	roleResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
+	if err != nil || roleResp.StatusCode != http.StatusCreated {
+		t.Fatalf("overwrite audio role plan failed: %v", err)
+	}
+	roleResp.Body.Close()
 	_, rPlan := runFreezeRenderPlan(t, h, assetID, map[string]any{
 		"run_id":          runID,
 		"job_id":          jobID,
@@ -2045,20 +2054,9 @@ func TestSeam1_RegionOverride_OutOfFrameFailsClosedWithoutMutatingState(t *testi
 		t.Fatalf("save text region plan index: %v", err)
 	}
 
-	rolePayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleInstrumentalBgm},
-		},
-	}
-	roleBody, _ := json.Marshal(rolePayload)
-	roleResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
-	if err != nil {
-		t.Fatalf("setup audio role plan failed: %v", err)
-	}
-	if roleResp.StatusCode != http.StatusCreated {
-		t.Fatalf("setup audio role plan failed: status=%d", roleResp.StatusCode)
-	}
-	_ = roleResp.Body.Close()
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleInstrumentalBgm},
+	})
 
 	sepResp, stems := runSeparateStems(t, h, assetID, map[string]any{"run_id": runID})
 	if sepResp.StatusCode != http.StatusCreated || stems == nil {

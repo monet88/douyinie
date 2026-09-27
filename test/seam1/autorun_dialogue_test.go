@@ -900,6 +900,9 @@ func TestSeam1_DubbingService_AssignVoices_ExplicitCAS_Validation(t *testing.T) 
 		t.Fatalf("create run in DB: %v", err)
 	}
 
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue},
+	})
 	// Store a valid transcript in CAS for assetID, runID
 	validTranscript := domain.TranscriptArtifact{
 		ID:      "t-1",

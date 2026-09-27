@@ -223,12 +223,15 @@ func (c *RuntimeHostClient) GetRun(ctx context.Context, runID string) (*domain.L
 }
 
 // SaveAudioRolePlan calls POST /api/v1/assets/{id}/audio-role-plan.
-func (c *RuntimeHostClient) SaveAudioRolePlan(ctx context.Context, assetID string, segments []domain.AudioSegment) (*domain.AudioRolePlan, error) {
+func (c *RuntimeHostClient) SaveAudioRolePlan(ctx context.Context, assetID, runID string, segments []domain.AudioSegment) (*domain.AudioRolePlan, error) {
 	payload := map[string]any{
 		"segments": segments,
 	}
+	if strings.TrimSpace(runID) != "" {
+		payload["run_id"] = strings.TrimSpace(runID)
+	}
 	var res struct {
-		Plan domain.AudioRolePlan `json:"plan"`
+		Plan domain.AudioRolePlan `json:"audio_role_plan"`
 	}
 	if _, err := c.doJSON(ctx, http.MethodPost, fmt.Sprintf("/api/v1/assets/%s/audio-role-plan", assetID), payload, &res); err != nil {
 		return nil, fmt.Errorf("save audio role plan: %w", err)

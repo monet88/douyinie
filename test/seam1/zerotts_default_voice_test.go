@@ -36,6 +36,7 @@ func setupDubScriptForSeam1Lang(t *testing.T, h *testHarness, runID, assetID, ta
 	pinSeam1TranscriptForSegments(t, h, runID, assetID, segments)
 
 	planBody, _ := json.Marshal(map[string]any{
+		"run_id": runID,
 		"segments": []domain.AudioSegment{
 			{StartMs: 0, EndMs: 20000, Role: domain.AudioRoleNarrationDialogue},
 		},
@@ -225,13 +226,9 @@ func TestSeam1_ZeroTTS_AuditionOutsideUnattendedRotation(t *testing.T) {
 	manual := presets[provider.DefaultVIUnattendedVoiceCount]
 
 	// Audio role plan with dub-eligible dialogue is required for audition.
-	planBody, _ := json.Marshal(map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
-		},
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
 	})
-	planResp, _ := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
-	planResp.Body.Close()
 
 	resp, payload := runAudition(t, h, assetID, map[string]any{
 		"run_id":          runID,

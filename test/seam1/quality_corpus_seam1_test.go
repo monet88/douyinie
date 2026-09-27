@@ -718,7 +718,15 @@ func TestSeam1_QualityCorpus_SyntheticRegression_BoundProfile48Executions(t *tes
 
 	for _, m := range summary.CaseMetrics {
 		if m.Status != "PASS" {
-			t.Logf("Case %s [%s] FAILED: %v", m.CaseID, m.Profile, m.FailReasons)
+			t.Logf("Case %s [%s] status=%s FailReasons: %v", m.CaseID, m.Profile, m.Status, m.FailReasons)
+			if qce, ok := session.QualityCases[m.CaseID]; ok && qce != nil {
+				t.Logf("  Case %s ErrorMessage: %q Status: %s", m.CaseID, qce.ErrorMessage, qce.Status)
+				for stageName, stageEv := range qce.Stages {
+					if stageEv.Status == "FAILED" || stageEv.ErrorMessage != "" {
+						t.Logf("    Stage %s: Status=%s Error=%q", stageName, stageEv.Status, stageEv.ErrorMessage)
+					}
+				}
+			}
 		}
 	}
 	if summary.HybridRollup.FailCount > 0 {

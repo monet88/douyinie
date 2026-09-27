@@ -21,6 +21,26 @@ var (
 	ErrDiarizationNoCandidates = errors.New("no diarization results from any provider candidate")
 	// ErrAudioRolePlanRequired is returned when no audio role plan exists for the asset.
 	ErrAudioRolePlanRequired = errors.New("audio role plan required before speech understanding")
+	// ErrRunPinnedAudioRolePlanMissing is returned when a run-scoped caller needs the AudioRolePlan the
+	// run's audio_role_plan stage pinned, but the run holds no successful pinned artifact for it. A
+	// run-scoped decision fails closed on it; it must never fall back to the asset's latest plan (#153).
+	ErrRunPinnedAudioRolePlanMissing error = runPinnedAudioRolePlanMissingError{}
+)
+
+type runPinnedAudioRolePlanMissingError struct{}
+
+func (runPinnedAudioRolePlanMissingError) Error() string {
+	return "missing run-pinned audio_role_plan artifact"
+}
+
+func (runPinnedAudioRolePlanMissingError) Is(target error) bool {
+	return target == ErrRunPinnedAudioRolePlanMissing || target == ErrAudioRolePlanRequired
+}
+
+var (
+	// ErrAudioRolePlanOwnershipMismatch is returned when a pinned AudioRolePlan artifact does not prove it
+	// belongs to the asset the caller is resolving lineage for, so it cannot be trusted as that asset's plan.
+	ErrAudioRolePlanOwnershipMismatch = errors.New("pinned audio role plan asset ownership mismatch")
 )
 
 // ASRRawSegment represents a raw ASR recognition result from one VAD turn.

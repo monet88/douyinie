@@ -709,11 +709,11 @@ func (r *BenchmarkRunner) ExecuteQualityCase(ctx context.Context, input QualityC
 	var audioRoleCAS string
 	if len(input.AudioRoleSegments) > 0 {
 		err := runStage("audio_role_plan", func() (string, error) {
-			plan, err := r.client.SaveAudioRolePlan(ctx, qc.SourceAssetID, input.AudioRoleSegments)
+			plan, err := r.client.SaveAudioRolePlan(ctx, qc.SourceAssetID, qc.RunID, input.AudioRoleSegments)
 			if err != nil {
 				return "", err
 			}
-			return plan.ID, nil
+			return plan.CASHash, nil
 		})
 		if err != nil {
 			return qc, err

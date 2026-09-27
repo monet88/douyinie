@@ -13,6 +13,7 @@ import (
 	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -22,20 +23,30 @@ func setupDubScriptForSeam1(t *testing.T, h *testHarness, runID, assetID string,
 	t.Helper()
 	pinSeam1TranscriptForSegments(t, h, runID, assetID, segments)
 
-	// 1. Audio role plan with narration/dialogue
-	planPayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 20000, Role: domain.AudioRoleNarrationDialogue},
-		},
-	}
-	planBody, _ := json.Marshal(planPayload)
-	planResp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
-	if err != nil {
-		t.Fatalf("save audio role plan failed: %v", err)
-	}
-	defer planResp.Body.Close()
-	if planResp.StatusCode != http.StatusOK && planResp.StatusCode != http.StatusCreated {
-		t.Fatalf("expected 200 or 201 for audio role plan, got %d", planResp.StatusCode)
+	// 1. Audio role plan with narration/dialogue (only if not already pinned by caller)
+	pinnedPlanCAS, _ := h.db.GetStageArtifactHash(context.Background(), runID, "audio_role_plan")
+	if pinnedPlanCAS == "" {
+		maxEnd := int64(20000)
+		for _, s := range segments {
+			if s.EndMs > maxEnd {
+				maxEnd = s.EndMs
+			}
+		}
+		planPayload := map[string]any{
+			"run_id": runID,
+			"segments": []domain.AudioSegment{
+				{StartMs: 0, EndMs: maxEnd, Role: domain.AudioRoleNarrationDialogue},
+			},
+		}
+		planBody, _ := json.Marshal(planPayload)
+		planResp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+		if err != nil {
+			t.Fatalf("save audio role plan failed: %v", err)
+		}
+		defer planResp.Body.Close()
+		if planResp.StatusCode != http.StatusOK && planResp.StatusCode != http.StatusCreated {
+			t.Fatalf("expected 200 or 201 for audio role plan, got %d", planResp.StatusCode)
+		}
 	}
 
 	transReq := map[string]any{
@@ -104,9 +115,28 @@ type seam1DubLineage struct {
 func pinSeam1DubLineage(t *testing.T, h *testHarness, runID, assetID, targetLang string, segments []domain.TranslationInputSegment) seam1DubLineage {
 	t.Helper()
 	transcriptCAS := pinSeam1TranscriptForSegments(t, h, runID, assetID, segments)
-	rolePlan, err := h.db.GetAudioRolePlan(context.Background(), assetID)
-	if err != nil {
-		t.Fatalf("get seam1 audio role plan: %v", err)
+	pinnedPlanCAS, _ := h.db.GetStageArtifactHash(context.Background(), runID, "audio_role_plan")
+	var rolePlan domain.AudioRolePlan
+	if pinnedPlanCAS == "" {
+		plan, err := h.db.GetAudioRolePlan(context.Background(), assetID)
+		var planSegments []domain.AudioSegment
+		if err == nil && plan != nil && len(plan.Segments) > 0 {
+			planSegments = plan.Segments
+		} else {
+			planSegments = []domain.AudioSegment{
+				{StartMs: 0, EndMs: 20000, Role: domain.AudioRoleNarrationDialogue},
+			}
+		}
+		rolePlan = saveAndPinAudioRolePlan(t, h, assetID, runID, planSegments)
+	} else {
+		plan, err := h.db.GetAudioRolePlan(context.Background(), assetID)
+		if err != nil {
+			t.Fatalf("get seam1 audio role plan: %v", err)
+		}
+		rolePlan = *plan
+	}
+	if strings.TrimSpace(rolePlan.CASHash) == "" {
+		t.Fatalf("get seam1 audio role plan: missing CASHash")
 	}
 	respTrans, transVariant := runTranslation(t, h, assetID, map[string]any{
 		"run_id": runID, "target_language": targetLang, "segments": segments,
@@ -387,6 +417,7 @@ func TestSeam1_TTS_VoiceAssignmentFrozenPerRun(t *testing.T) {
 
 	// Setup audio role plan
 	planPayload := map[string]any{
+		"run_id": runID,
 		"segments": []domain.AudioSegment{
 			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
 		},
@@ -561,6 +592,7 @@ func TestSeam1_TTS_VoiceAuditionEndpoint(t *testing.T) {
 
 	// Setup audio role plan
 	planPayload := map[string]any{
+		"run_id": runID,
 		"segments": []domain.AudioSegment{
 			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
 		},
@@ -815,7 +847,9 @@ func TestSeam1_TTS_CrossRunVoiceAssignmentIsolation(t *testing.T) {
 	jobID, runID1 := createJobAndRun(t, h)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
-
+	saveAndPinAudioRolePlan(t, h, assetID, runID1, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+	})
 	// Create run 2 for same job
 	runResp, err := http.Post(h.server.URL+"/api/v1/jobs/"+jobID+"/runs", "application/json", nil)
 	if err != nil || runResp.StatusCode != http.StatusCreated {
@@ -826,7 +860,9 @@ func TestSeam1_TTS_CrossRunVoiceAssignmentIsolation(t *testing.T) {
 	}
 	_ = json.NewDecoder(runResp.Body).Decode(&run2)
 	runID2 := run2.Run.ID
-
+	saveAndPinAudioRolePlan(t, h, assetID, runID2, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+	})
 	// 1. Assign voices for run 1
 	resp1, assign1 := runAssignVoices(t, h, assetID, map[string]any{
 		"run_id":          runID1,
@@ -866,7 +902,9 @@ func TestSeam1_TTS_VoiceAssignment_SameRun_ConflictingReassignmentReturns409(t *
 	jobID, runID := createJobAndRun(t, h)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
-
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+	})
 	// 1. Initial VoiceAssignment for Run
 	resp1, assign1 := runAssignVoices(t, h, assetID, map[string]any{
 		"run_id":          runID,
@@ -1045,13 +1083,9 @@ func TestSeam1_TTS_VoiceAudition_NoSpeech_SkipsAuditionAndAssignment(t *testing.
 	assetID := job.SourceAssetID
 
 	// 1. AudioRolePlan with ONLY instrumental BGM (zero dub-eligible dialogue)
-	planPayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 8000, Role: domain.AudioRoleInstrumentalBgm},
-		},
-	}
-	planBody, _ := json.Marshal(planPayload)
-	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 8000, Role: domain.AudioRoleInstrumentalBgm},
+	})
 
 	// 2. Call Voice Audition -> returns 422 Unprocessable Entity with "No dubbing required"
 	auditionPayload := map[string]any{
@@ -1119,18 +1153,6 @@ func TestSeam1_TTS_VoiceAudition_Contextual_MidVideoSegmentAndFailClosed(t *test
 		t.Fatalf("failed to setup dub script variant")
 	}
 
-	// 2. Setup audio role plan with multiple segments across a 60-second video:
-	// 0-10s: Intro BGM, 10-25s: Singing/Music-Vocal, 25-29s: Dialogue (mid-video), 29-60s: Outro BGM
-	planPayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleInstrumentalBgm},
-			{StartMs: 10000, EndMs: 25000, Role: domain.AudioRoleSingingMusicVocal},
-			{StartMs: 25000, EndMs: 29000, Role: domain.AudioRoleNarrationDialogue},
-			{StartMs: 29000, EndMs: 60000, Role: domain.AudioRoleInstrumentalBgm},
-		},
-	}
-	planBody, _ := json.Marshal(planPayload)
-	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
 	// 3. Setup long source stems (60s = 60000ms) for background and vocals
 	bgPCM := media.GeneratePCM16WAV(16000, 1, 60000)
 	bgCASObj, err := h.casStore.Put(bytes.NewReader(bgPCM))
@@ -1239,8 +1261,12 @@ func TestSeam1_TTS_VoiceAudition_Contextual_MidVideoSegmentAndFailClosed(t *test
 	job2 := getJobViaAPI(t, h2, jobID2)
 	assetID2 := job2.SourceAssetID
 
-	planBody2, _ := json.Marshal(planPayload)
-	_, _ = http.Post(h2.server.URL+"/api/v1/assets/"+assetID2+"/audio-role-plan", "application/json", bytes.NewReader(planBody2))
+	saveAndPinAudioRolePlan(t, h2, assetID2, runID2, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleInstrumentalBgm},
+		{StartMs: 10000, EndMs: 25000, Role: domain.AudioRoleSingingMusicVocal},
+		{StartMs: 25000, EndMs: 29000, Role: domain.AudioRoleNarrationDialogue},
+		{StartMs: 29000, EndMs: 60000, Role: domain.AudioRoleInstrumentalBgm},
+	})
 	_, _ = setupDubScriptForSeam1(t, h2, runID2, assetID2, segments)
 
 	auditionPayload2 := map[string]any{
@@ -1320,15 +1346,11 @@ func TestSeam1_TTS_VoiceAudition_Contextual_FailClosedAndNearEnd(t *testing.T) {
 	})
 
 	// Setup audio role plan (13s-15s near source end)
-	planPayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 13000, Role: domain.AudioRoleInstrumentalBgm},
-			{StartMs: 13000, EndMs: 15000, Role: domain.AudioRoleNarrationDialogue},
-			{StartMs: 15000, EndMs: 20000, Role: domain.AudioRoleInstrumentalBgm},
-		},
-	}
-	planBody, _ := json.Marshal(planPayload)
-	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 13000, Role: domain.AudioRoleInstrumentalBgm},
+		{StartMs: 13000, EndMs: 15000, Role: domain.AudioRoleNarrationDialogue},
+		{StartMs: 15000, EndMs: 20000, Role: domain.AudioRoleInstrumentalBgm},
+	})
 
 	auditionPayload := map[string]any{
 		"run_id":          runID,
@@ -1402,7 +1424,7 @@ func TestSeam1_TTS_VoiceAudition_Contextual_FailClosedAndNearEnd(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestSeam1_TTS_VoiceAudition_Contextual_UncoveredSuppressionAndBrokenVocals(t *testing.T) {
 	h := setupHarness(t)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, _ := createJobAndRun(t, h)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -1411,6 +1433,24 @@ func TestSeam1_TTS_VoiceAudition_Contextual_UncoveredSuppressionAndBrokenVocals(
 	bgCASObj, err := h.casStore.Put(bytes.NewReader(bgPCM))
 	if err != nil {
 		t.Fatalf("put background stem: %v", err)
+	}
+	// Each subtest is a distinct externally-driven decision, and a run pins its plan exactly once,
+	// so each subtest gets its own run: the plan-in-progress is deleted so the next run's plan can
+	// be saved before that run pins it.
+	createFreshRun := func(t *testing.T) string {
+		t.Helper()
+		respRun, err := http.Post(h.server.URL+"/api/v1/jobs/"+jobID+"/runs", "application/json", nil)
+		if err != nil || respRun.StatusCode != http.StatusCreated {
+			t.Fatalf("create fresh run failed: %v", err)
+		}
+		defer respRun.Body.Close()
+		var runRes struct {
+			Run domain.LocalizationRun `json:"run"`
+		}
+		if err := json.NewDecoder(respRun.Body).Decode(&runRes); err != nil {
+			t.Fatalf("decode fresh run: %v", err)
+		}
+		return runRes.Run.ID
 	}
 	// 2. Setup DubScriptVariant with segment at 2000ms-6000ms (4s)
 	segments := []domain.TranslationInputSegment{
@@ -1422,37 +1462,53 @@ func TestSeam1_TTS_VoiceAudition_Contextual_UncoveredSuppressionAndBrokenVocals(
 			EndMs:      6000,
 		},
 	}
-	_, dubVariant := setupDubScriptForSeam1(t, h, runID, assetID, segments)
-	if dubVariant == nil {
-		t.Fatalf("setup dub script variant failed")
+	// The audition is run-scoped: it reads this run's pinned plan, this run's dub-script
+	// variant, and this run's transcript proof. Each subtest therefore freezes its own
+	// lineage on a fresh run, since a run pins its audio_role_plan exactly once.
+	setupRun := func(t *testing.T, plan []domain.AudioSegment) string {
+		t.Helper()
+		runID := createFreshRun(t)
+		pinSeam1TranscriptForSegments(t, h, runID, assetID, segments)
+		saveAndPinAudioRolePlan(t, h, assetID, runID, plan)
+		respTrans, transVariant := runTranslation(t, h, assetID, map[string]any{
+			"run_id": runID, "target_language": "vi", "segments": segments,
+		})
+		if respTrans.StatusCode != http.StatusCreated || transVariant == nil {
+			t.Fatalf("translation failed: status %d", respTrans.StatusCode)
+		}
+		respDub, dubVariant := runDubScript(t, h, assetID, map[string]any{
+			"run_id": runID, "target_language": "vi", "translation_variant_cas": transVariant.CASHash,
+		})
+		if respDub.StatusCode != http.StatusCreated || dubVariant == nil {
+			t.Fatalf("dub script adaptation failed: status %d", respDub.StatusCode)
+		}
+		return runID
 	}
 
-	auditionPayload := map[string]any{
-		"run_id":          runID,
-		"target_language": "vi",
-		"voice": domain.VoiceProfile{
-			ID:         "vieneu_vi_truc_ly",
-			ProviderID: "fake_vieneu_tts_vi",
-			VoiceID:    "Trúc Ly",
-			Name:       "VieNeu Trúc Ly (Nữ Tự nhiên)",
-			Language:   "vi",
-		},
-		"is_contextual": true,
-		"segment_index": 0,
+	auditionPayload := func(runID string) []byte {
+		b, _ := json.Marshal(map[string]any{
+			"run_id":          runID,
+			"target_language": "vi",
+			"voice": domain.VoiceProfile{
+				ID:         "vieneu_vi_truc_ly",
+				ProviderID: "fake_vieneu_tts_vi",
+				VoiceID:    "Trúc Ly",
+				Name:       "VieNeu Trúc Ly (Nữ Tự nhiên)",
+				Language:   "vi",
+			},
+			"is_contextual": true,
+			"segment_index": 0,
+		})
+		return b
 	}
-	bodyBytes, _ := json.Marshal(auditionPayload)
 
 	t.Run("UncoveredDialogueSuppression_FailsClosed", func(t *testing.T) {
 		// AudioRolePlan dialogue only covers 2000ms-3000ms (speech is 2000ms-3500ms from fake TTS)
-		planPayload := map[string]any{
-			"segments": []domain.AudioSegment{
-				{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleInstrumentalBgm},
-				{StartMs: 2000, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
-				{StartMs: 3000, EndMs: 20000, Role: domain.AudioRoleInstrumentalBgm},
-			},
-		}
-		planBody, _ := json.Marshal(planPayload)
-		_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+		runID := setupRun(t, []domain.AudioSegment{
+			{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleInstrumentalBgm},
+			{StartMs: 2000, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 3000, EndMs: 20000, Role: domain.AudioRoleInstrumentalBgm},
+		})
 
 		stemArtifact := domain.AudioStemArtifacts{
 			ID:            "stem_art_uncovered_test",
@@ -1487,7 +1543,7 @@ func TestSeam1_TTS_VoiceAudition_Contextual_UncoveredSuppressionAndBrokenVocals(
 			CreatedAt:      time.Now().UTC(),
 		})
 
-		resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-audition", "application/json", bytes.NewReader(bodyBytes))
+		resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-audition", "application/json", bytes.NewReader(auditionPayload(runID)))
 		if err != nil {
 			t.Fatalf("POST voice-audition failed: %v", err)
 		}
@@ -1499,15 +1555,11 @@ func TestSeam1_TTS_VoiceAudition_Contextual_UncoveredSuppressionAndBrokenVocals(
 
 	t.Run("BrokenDeclaredVocalsStem_FailsClosed", func(t *testing.T) {
 		// Valid full dialogue covering 2000ms-6000ms
-		planPayload := map[string]any{
-			"segments": []domain.AudioSegment{
-				{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleInstrumentalBgm},
-				{StartMs: 2000, EndMs: 6000, Role: domain.AudioRoleNarrationDialogue},
-				{StartMs: 6000, EndMs: 20000, Role: domain.AudioRoleInstrumentalBgm},
-			},
-		}
-		planBody, _ := json.Marshal(planPayload)
-		_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
+		runID := setupRun(t, []domain.AudioSegment{
+			{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleInstrumentalBgm},
+			{StartMs: 2000, EndMs: 6000, Role: domain.AudioRoleNarrationDialogue},
+			{StartMs: 6000, EndMs: 20000, Role: domain.AudioRoleInstrumentalBgm},
+		})
 
 		// Stems artifact declares a vocals stem with missing CAS hash
 		stemArtifact := domain.AudioStemArtifacts{
@@ -1551,7 +1603,7 @@ func TestSeam1_TTS_VoiceAudition_Contextual_UncoveredSuppressionAndBrokenVocals(
 			CreatedAt:      time.Now().UTC(),
 		})
 
-		resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-audition", "application/json", bytes.NewReader(bodyBytes))
+		resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-audition", "application/json", bytes.NewReader(auditionPayload(runID)))
 		if err != nil {
 			t.Fatalf("POST voice-audition failed: %v", err)
 		}
@@ -1567,7 +1619,7 @@ func TestSeam1_TTS_VoiceAudition_Contextual_UncoveredSuppressionAndBrokenVocals(
 // ---------------------------------------------------------------------------
 func TestSeam1_TTS_VoiceAudition_Contextual_SlotOverrunFailsClosed_AndSecondaryMetadata(t *testing.T) {
 	h := setupHarness(t)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, _ := createJobAndRun(t, h)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -1610,29 +1662,36 @@ func TestSeam1_TTS_VoiceAudition_Contextual_SlotOverrunFailsClosed_AndSecondaryM
 		CreatedAt:      time.Now().UTC(),
 	})
 
-	// 2. AudioRolePlan with dialogue from 0ms to 10000ms
-	_ = h.db.SaveAudioRolePlan(context.Background(), domain.AudioRolePlan{
-		ID:        uuid.NewString(),
-		AssetID:   assetID,
-		CreatedAt: time.Now().UTC(),
-		Segments: []domain.AudioSegment{
-			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
-			{StartMs: 10000, EndMs: 30000, Role: domain.AudioRoleInstrumentalBgm},
-		},
-	})
+	createFreshRun := func(t *testing.T) string {
+		t.Helper()
+		respRun, err := http.Post(h.server.URL+"/api/v1/jobs/"+jobID+"/runs", "application/json", nil)
+		if err != nil || respRun.StatusCode != http.StatusCreated {
+			t.Fatalf("create fresh run failed: %v", err)
+		}
+		defer respRun.Body.Close()
+		var runRes struct {
+			Run domain.LocalizationRun `json:"run"`
+		}
+		if err := json.NewDecoder(respRun.Body).Decode(&runRes); err != nil {
+			t.Fatalf("decode fresh run: %v", err)
+		}
+		return runRes.Run.ID
+	}
 
-	auditionPayload := map[string]any{
-		"run_id":          runID,
-		"target_language": "vi",
-		"voice": domain.VoiceProfile{
-			ID:         "vieneu_vi_female_1",
-			ProviderID: "fake_vieneu_tts_vi",
-			VoiceID:    "vi_f1",
-			Name:       "VieNeu Nữ",
-			Language:   "vi",
-		},
-		"is_contextual": true,
-		"segment_index": 0,
+	auditionPayload := func(runID string) map[string]any {
+		return map[string]any{
+			"run_id":          runID,
+			"target_language": "vi",
+			"voice": domain.VoiceProfile{
+				ID:         "vieneu_vi_female_1",
+				ProviderID: "fake_vieneu_tts_vi",
+				VoiceID:    "vi_f1",
+				Name:       "VieNeu Nữ",
+				Language:   "vi",
+			},
+			"is_contextual": true,
+			"segment_index": 0,
+		}
 	}
 
 	t.Run("SlotOverrun_FailsClosed", func(t *testing.T) {
@@ -1648,9 +1707,10 @@ func TestSeam1_TTS_VoiceAudition_Contextual_SlotOverrunFailsClosed_AndSecondaryM
 				EndMs:      3000, // 1000ms slot
 			},
 		}
+		runID := createFreshRun(t)
 		_, _ = setupDubScriptForSeam1(t, h, runID, assetID, segmentsOverrun)
 
-		bodyBytes, _ := json.Marshal(auditionPayload)
+		bodyBytes, _ := json.Marshal(auditionPayload(runID))
 		resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-audition", "application/json", bytes.NewReader(bodyBytes))
 		if err != nil {
 			t.Fatalf("POST voice-audition failed: %v", err)
@@ -1673,9 +1733,10 @@ func TestSeam1_TTS_VoiceAudition_Contextual_SlotOverrunFailsClosed_AndSecondaryM
 				EndMs:      3500, // 1500ms slot
 			},
 		}
+		runID := createFreshRun(t)
 		_, _ = setupDubScriptForSeam1(t, h, runID, assetID, segmentsExact)
 
-		bodyBytes, _ := json.Marshal(auditionPayload)
+		bodyBytes, _ := json.Marshal(auditionPayload(runID))
 		resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/voice-audition", "application/json", bytes.NewReader(bodyBytes))
 		if err != nil {
 			t.Fatalf("POST voice-audition failed: %v", err)

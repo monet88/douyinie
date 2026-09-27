@@ -35,15 +35,19 @@ type RouteResult struct {
 	Decision         domain.SelectionDecision
 }
 
+// AudioRolePlanResolver resolves an AudioRolePlan for run-pinned lineage checks.
+type AudioRolePlanResolver func(ctx context.Context, assetID, runID string) (*domain.AudioRolePlan, error)
+
 // Router orchestrates policy-before-health provider selection, credential-backed authorization, and execution provenance.
 type Router struct {
-	registry    *Registry
-	policySvc   *governance.PolicyService
-	licenseSvc  *governance.LicenseService
-	credSvc     *governance.CredentialService
-	snapshotSvc *governance.SnapshotService
-	circuit     *CircuitBreaker
-	db          *storage.DB
+	registry         *Registry
+	policySvc        *governance.PolicyService
+	licenseSvc       *governance.LicenseService
+	credSvc          *governance.CredentialService
+	snapshotSvc      *governance.SnapshotService
+	circuit          *CircuitBreaker
+	db               *storage.DB
+	rolePlanResolver AudioRolePlanResolver
 }
 
 // NewRouter creates a new ProviderRouter.
@@ -66,6 +70,11 @@ func NewRouter(
 		circuit:    circuit,
 		db:         db,
 	}
+}
+
+// SetAudioRolePlanResolver configures the run-scoped role plan resolver seam.
+func (r *Router) SetAudioRolePlanResolver(resolver AudioRolePlanResolver) {
+	r.rolePlanResolver = resolver
 }
 
 // Circuit returns the underlying circuit breaker.
@@ -139,16 +148,33 @@ func (r *Router) Route(ctx context.Context, req RouteRequest) (*RouteResult, err
 				}
 				job = j
 				if job != nil {
-					p, err := r.db.GetAudioRolePlan(ctx, job.SourceAssetID)
-					if err != nil {
-						if !errors.Is(err, storage.ErrNotFound) {
-							return nil, fmt.Errorf("failed to get audio role plan due to storage failure: %w", err)
-						}
-						if isDubStage {
+					if req.RunID != "" && isDubStage && r.rolePlanResolver == nil {
+						return nil, fmt.Errorf("audio role plan required for dub stage: nil role plan resolver")
+					}
+					if r.rolePlanResolver != nil && req.RunID != "" {
+						p, err := r.rolePlanResolver(ctx, job.SourceAssetID, req.RunID)
+						switch {
+						case err == nil:
+							plan = p
+						case isDubStage || !errors.Is(err, domain.ErrRunPinnedAudioRolePlanMissing):
+							// Only the run-pinned-plan-missing sentinel is an expected absence, and only on
+							// stages that can proceed without a plan. Every other resolver failure —
+							// including a storage failure — fails closed instead of routing on an
+							// unproven plan (#153).
 							return nil, fmt.Errorf("audio role plan required for dub stage: %w", err)
 						}
+					} else {
+						p, err := r.db.GetAudioRolePlan(ctx, job.SourceAssetID)
+						if err != nil {
+							if !errors.Is(err, storage.ErrNotFound) {
+								return nil, fmt.Errorf("failed to get audio role plan due to storage failure: %w", err)
+							}
+							if isDubStage {
+								return nil, fmt.Errorf("audio role plan required for dub stage: %w", err)
+							}
+						}
+						plan = p
 					}
-					plan = p
 				} else if isDubStage {
 					return nil, fmt.Errorf("job not found: audio role plan required for dub stage: %w", storage.ErrNotFound)
 				}

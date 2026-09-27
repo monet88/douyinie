@@ -458,7 +458,12 @@ func TestTranslationService_PathologicalASRRepetition_SkippedFromTranslation(t *
 	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{ID: assetID, RightsAttestationID: attID, SHA256: "fake-sha", ByteSize: 100, CreatedAt: time.Now().UTC()})
 	_ = db.CreateJob(ctx, domain.LocalizationJob{ID: "j1", SourceAssetID: assetID, TargetLanguage: "en", CreatedAt: time.Now().UTC()})
 	_ = db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: "j1", Status: "running", CreatedAt: time.Now().UTC()})
-
+	service.PinAudioRolePlanForTest(ctx, db, casStore, runID, domain.AudioRolePlan{
+		AssetID: assetID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 7000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	})
 	// Save transcript containing real speech and pathological repetition noise
 	transcript := domain.TranscriptArtifact{
 		ID:      uuid.NewString(),
@@ -1446,5 +1451,124 @@ func TestTranslationVariant_SchemaGate_RefusesStaleSchemaOrWrongContract(t *test
 	})
 	if err == nil || !strings.Contains(err.Error(), "translation variant does not satisfy current translation contract") {
 		t.Fatalf("expected AdaptDubScript to fail closed on mismatched ContractID, got: %v", err)
+	}
+}
+func TestResolveRunScopedAudioRolePlan_StrictRunLineage_FailsClosed(t *testing.T) {
+	db, casStore, _, _ := setupTranslationTestEnv(t)
+	ctx := context.Background()
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	now := time.Now().UTC()
+	// Seed source asset first so FK constraints hold
+	raID := "att-" + assetID
+	if err := db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              raID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	}); err != nil {
+		t.Fatalf("create attestation: %v", err)
+	}
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		SHA256:              "sha-" + assetID,
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		RightsAttestationID: raID,
+		CreatedAt:           now,
+	}); err != nil {
+		t.Fatalf("create source asset: %v", err)
+	}
+
+	// Seed asset-latest AudioRolePlan
+	assetPlan := domain.AudioRolePlan{
+		ID:        "plan-asset-" + assetID,
+		AssetID:   assetID,
+		Segments:  []domain.AudioSegment{{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleNarrationDialogue}},
+		CreatedAt: now,
+	}
+	if err := db.SaveAudioRolePlan(ctx, assetPlan); err != nil {
+		t.Fatalf("save asset plan: %v", err)
+	}
+
+	// Case 1: Run has no audio_role_plan stage artifact -> must fail closed, never return asset-latest
+	_, err := service.ResolveRunScopedAudioRolePlan(ctx, db, casStore, assetID, runID)
+	if err == nil || !errors.Is(err, domain.ErrRunPinnedAudioRolePlanMissing) {
+		t.Fatalf("expected ErrRunPinnedAudioRolePlanMissing for run without pinned plan, got %v", err)
+	}
+
+	// Case 2: Run has pinned audio_role_plan artifact belonging to a different asset -> ownership mismatch
+	foreignAssetID := "foreign-asset-" + uuid.NewString()[:8]
+	foreignPlan := domain.AudioRolePlan{
+		ID:        "plan-foreign",
+		AssetID:   foreignAssetID,
+		Segments:  []domain.AudioSegment{{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleNarrationDialogue}},
+		CreatedAt: now,
+	}
+	fBytes, _ := json.Marshal(foreignPlan)
+	fObj, err := casStore.Put(bytes.NewReader(fBytes))
+	if err != nil {
+		t.Fatalf("put foreign plan in cas: %v", err)
+	}
+	jobID := "job_" + runID
+	if err := db.CreateJob(ctx, domain.LocalizationJob{ID: jobID, SourceAssetID: assetID, TargetLanguage: "vi", CreatedAt: now}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: runID, JobID: jobID, Status: "running", CreatedAt: now}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runID,
+		Stage:          "audio_role_plan",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: fObj.SHA256,
+		CreatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create stage execution: %v", err)
+	}
+
+	_, err = service.ResolveRunScopedAudioRolePlan(ctx, db, casStore, assetID, runID)
+	if err == nil || !errors.Is(err, domain.ErrAudioRolePlanOwnershipMismatch) {
+		t.Fatalf("expected ErrAudioRolePlanOwnershipMismatch for foreign asset plan, got %v", err)
+	}
+
+	// Case 3: Run-scoped plan with empty AssetID -> unproven ownership fails closed
+	unprovenPlan := domain.AudioRolePlan{
+		ID:        "plan-unproven",
+		AssetID:   "",
+		Segments:  []domain.AudioSegment{{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleNarrationDialogue}},
+		CreatedAt: now,
+	}
+	uBytes, _ := json.Marshal(unprovenPlan)
+	uObj, err := casStore.Put(bytes.NewReader(uBytes))
+	if err != nil {
+		t.Fatalf("put unproven plan in cas: %v", err)
+	}
+	unprovenRunID := uuid.NewString()
+	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: unprovenRunID, JobID: jobID, Status: "running", CreatedAt: now}); err != nil {
+		t.Fatalf("create unproven run: %v", err)
+	}
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          unprovenRunID,
+		Stage:          "audio_role_plan",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: uObj.SHA256,
+		CreatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create unproven stage execution: %v", err)
+	}
+	_, err = service.ResolveRunScopedAudioRolePlan(ctx, db, casStore, assetID, unprovenRunID)
+	if err == nil || !errors.Is(err, domain.ErrAudioRolePlanOwnershipMismatch) {
+		t.Fatalf("expected ErrAudioRolePlanOwnershipMismatch for unproven (empty) AssetID, got %v", err)
+	}
+	// Case 4: Non-run caller (runID == "") retains asset-latest fallback
+	loaded, err := service.ResolveRunScopedAudioRolePlan(ctx, db, casStore, assetID, "")
+	if err != nil {
+		t.Fatalf("expected non-run caller to resolve asset-latest, got err: %v", err)
+	}
+	if loaded == nil || loaded.ID != assetPlan.ID {
+		t.Fatalf("expected non-run caller to get asset plan %s, got %+v", assetPlan.ID, loaded)
 	}
 }

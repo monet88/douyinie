@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -73,6 +74,9 @@ func setupTestRouter(t *testing.T) (*provider.Router, *storage.DB, *provider.Reg
 	})
 
 	router := provider.NewRouter(reg, polSvc, licSvc, credSvc, circuit, db)
+	router.SetAudioRolePlanResolver(func(ctx context.Context, assetID, runID string) (*domain.AudioRolePlan, error) {
+		return db.GetAudioRolePlan(ctx, assetID)
+	})
 	return router, db, reg, polSvc, licSvc, credSvc
 }
 
@@ -802,5 +806,254 @@ func seedDefaultAudioRolePlan(t *testing.T, db *storage.DB, runID string) {
 	}
 	if err := db.SaveAudioRolePlan(ctx, plan); err != nil {
 		t.Fatalf("failed to save dummy plan: %v", err)
+	}
+}
+func TestRouter_TTS_RunPinnedAudioRolePlan_NeverAdoptsNewerNoDubPlan(t *testing.T) {
+	router, db, _, _, _, _ := setupTestRouter(t)
+	ctx := context.Background()
+
+	assetID := "asset-router-tts-" + uuid.NewString()[:8]
+	runID := "run-router-tts-" + uuid.NewString()[:8]
+	jobID := "job-router-tts-" + uuid.NewString()[:8]
+	now := time.Now().UTC()
+
+	// 1. Setup SourceAsset, Job, and Run A
+	raID := uuid.NewString()
+	_ = db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              raID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	})
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		SHA256:              "sha-" + assetID,
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		OriginalFilename:    "dummy.mp4",
+		RightsAttestationID: raID,
+		CASPath:             "dummy.mp4",
+		CreatedAt:           now,
+	})
+	_ = db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             jobID,
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	_ = db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        runID,
+		JobID:     jobID,
+		Status:    "running",
+		CreatedAt: now,
+	})
+
+	// 2. Plan A has dialogue (dub-eligible)
+	planA := domain.AudioRolePlan{
+		ID:      "planA-" + assetID,
+		AssetID: assetID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 5000, Role: domain.AudioRoleNarrationDialogue},
+		},
+		CreatedAt: now,
+	}
+
+	// 3. Asset later gets no-dub Plan B (only instrumental BGM)
+	planB := domain.AudioRolePlan{
+		ID:      "planB-" + assetID,
+		AssetID: assetID,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 35000, Role: domain.AudioRoleInstrumentalBgm},
+		},
+		CreatedAt: now.Add(time.Minute),
+	}
+	if err := db.SaveAudioRolePlan(ctx, planB); err != nil {
+		t.Fatalf("save plan B: %v", err)
+	}
+
+	// Wire rolePlanResolver that returns Run A's pinned Plan A
+	router.SetAudioRolePlanResolver(func(ctx context.Context, aID, rID string) (*domain.AudioRolePlan, error) {
+		if rID == runID && aID == assetID {
+			return &planA, nil
+		}
+		return nil, domain.ErrRunPinnedAudioRolePlanMissing
+	})
+
+	// 4. Real Route() path for Run A with Stage == TypeTTS
+	res, err := router.Route(ctx, provider.RouteRequest{
+		RunID:    runID,
+		Stage:    provider.TypeTTS,
+		Language: "vi",
+	})
+	if err != nil {
+		t.Fatalf("Route failed: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected non-nil RouteResult")
+	}
+
+	// If it incorrectly used asset-latest Plan B, PolicyCheckResult would be BYPASS and SelectedProvider nil
+	if res.Decision.PolicyCheckResult == "BYPASS" {
+		t.Fatalf("Route incorrectly adopted newer no-dub Plan B and BYPASSED dub stage for Run A!")
+	}
+	if res.SelectedProvider == nil {
+		t.Fatalf("expected SelectedProvider to be routed for Run A, got nil")
+	}
+}
+
+func TestRouter_DubStage_NonemptyRunID_NilRolePlanResolver_ReturnsError(t *testing.T) {
+	router, db, _, _, _, _ := setupTestRouter(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	assetID := "asset-nil-resolver-" + uuid.NewString()
+	ra := domain.RightsAttestation{
+		ID:              "ra-nil-" + uuid.NewString(),
+		AttestationType: "test",
+		DeclaredBy:      "tester",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	}
+	_ = db.CreateRightsAttestation(ctx, ra)
+	_ = db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		SHA256:              "sha256-nil-resolver",
+		RightsAttestationID: ra.ID,
+		CreatedAt:           now,
+	})
+
+	jobID := "job-nil-" + uuid.NewString()
+	_ = db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             jobID,
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		Status:         "queued",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+
+	runID := "run-nil-" + uuid.NewString()
+	_ = db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        runID,
+		JobID:     jobID,
+		Status:    "running",
+		CreatedAt: now,
+	})
+
+	// Seed asset-level valid role plan with narration dialogue
+	plan := domain.AudioRolePlan{
+		ID:        "plan-asset-" + assetID,
+		AssetID:   assetID,
+		CreatedAt: now,
+		Segments: []domain.AudioSegment{
+			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+		},
+	}
+	if err := db.SaveAudioRolePlan(ctx, plan); err != nil {
+		t.Fatalf("save audio role plan: %v", err)
+	}
+
+	// Ensure rolePlanResolver is explicitly nil
+	router.SetAudioRolePlanResolver(nil)
+
+	// Route for dub stage (TTS) with nonempty RunID must return an error and never fallback to asset plan
+	res, err := router.Route(ctx, provider.RouteRequest{
+		RunID:    runID,
+		Stage:    provider.TypeTTS,
+		Language: "vi",
+	})
+	if err == nil {
+		t.Fatalf("expected error from Route when rolePlanResolver is nil for dub stage with run_id, got res: %+v", res)
+	}
+	if !strings.Contains(err.Error(), "audio role plan required for dub stage") {
+		t.Errorf("expected error message to contain 'audio role plan required for dub stage', got: %v", err)
+	}
+	if res != nil {
+		t.Errorf("expected nil RouteResult on error, got: %+v", res)
+	}
+}
+
+func TestRouter_NonDubStage_PropagatesNonSentinelResolverFailures(t *testing.T) {
+	router, db, _, _, _, _ := setupTestRouter(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	ra := domain.RightsAttestation{
+		ID:              "ra-nondub-" + uuid.NewString(),
+		AttestationType: "test",
+		DeclaredBy:      "tester",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	}
+	_ = db.CreateRightsAttestation(ctx, ra)
+
+	assetID := "test-asset-nondub-fail"
+	err := db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		SHA256:              "dummy",
+		RightsAttestationID: ra.ID,
+		CreatedAt:           now,
+	})
+	if err != nil {
+		t.Fatalf("create source asset: %v", err)
+	}
+
+	jobID := "test-job-nondub-fail"
+	err = db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             jobID,
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		CreatedAt:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	runID := "test-run-nondub-fail"
+	err = db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        runID,
+		JobID:     jobID,
+		Status:    "queued",
+		CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	// Wire a resolver that returns an unexpected storage/infrastructure error
+	expectedErr := errors.New("simulated database connection refused")
+	router.SetAudioRolePlanResolver(func(ctx context.Context, aID, rID string) (*domain.AudioRolePlan, error) {
+		return nil, expectedErr
+	})
+
+	// Non-dub stage (e.g. ASR / speech_understand)
+	_, err = router.Route(ctx, provider.RouteRequest{
+		RunID:    runID,
+		Stage:    provider.TypeASR,
+		Language: "zh",
+	})
+	if err == nil {
+		t.Fatalf("expected error from Route when resolver returns non-sentinel error on non-dub stage")
+	}
+	if !errors.Is(err, expectedErr) && !strings.Contains(err.Error(), expectedErr.Error()) {
+		t.Errorf("expected error to contain %v, got %v", expectedErr, err)
+	}
+
+	// When resolver returns ErrRunPinnedAudioRolePlanMissing on non-dub stage, it must be tolerated
+	router.SetAudioRolePlanResolver(func(ctx context.Context, aID, rID string) (*domain.AudioRolePlan, error) {
+		return nil, domain.ErrRunPinnedAudioRolePlanMissing
+	})
+	res, err := router.Route(ctx, provider.RouteRequest{
+		RunID:    runID,
+		Stage:    provider.TypeASR,
+		Language: "zh",
+	})
+	if err != nil {
+		t.Fatalf("expected ErrRunPinnedAudioRolePlanMissing to be tolerated on non-dub stage, got: %v", err)
+	}
+	if res == nil {
+		t.Fatalf("expected RouteResult on tolerated absence")
 	}
 }

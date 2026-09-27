@@ -286,22 +286,9 @@ func TestSeam1_AudioMix_IndependentTestingWithFakeDubAudio(t *testing.T) {
 		Index: 0, SourceText: "fake source", SpeakerID: "SPEAKER_00", StartMs: 1000, EndMs: 3000,
 	}}
 
-	// Audio role plan with [1000, 3000ms]
-	planPayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 1000, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
-		},
-	}
-	planBody, _ := json.Marshal(planPayload)
-	planResp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
-	if err != nil {
-		t.Fatalf("save audio role plan: %v", err)
-	}
-	planResp.Body.Close()
-	rolePlan, err := h.db.GetAudioRolePlan(context.Background(), assetID)
-	if err != nil {
-		t.Fatalf("get audio role plan: %v", err)
-	}
+	_ = saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 1000, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
+	})
 	lineage := pinSeam1DubLineage(t, h, runID, assetID, "en", segments)
 
 	// Directly construct an accepted DubSegmentsVariant with fake 16kHz audio clips
@@ -320,7 +307,7 @@ func TestSeam1_AudioMix_IndependentTestingWithFakeDubAudio(t *testing.T) {
 		DubScriptVariantCAS:   lineage.DubScriptCAS,
 		VoiceAssignmentCAS:    lineage.VoiceAssignmentCAS,
 		TranscriptArtifactCAS: lineage.TranscriptCAS,
-		AudioRolePlanCAS:      rolePlan.CASHash,
+		AudioRolePlanCAS:      lineage.AudioRolePlanCAS,
 		FitPolicyID:           seam1CurrentFitPolicyID(t),
 		OverallStatus:         "PASS",
 		Segments: []domain.DubSegment{
@@ -380,16 +367,6 @@ func TestSeam1_AudioMix_SingingVocalsPreservedInSoundtrack(t *testing.T) {
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
-	// Audio role plan with both narration and singing segments
-	planPayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleNarrationDialogue},
-			{StartMs: 2001, EndMs: 6000, Role: domain.AudioRoleSingingMusicVocal},
-		},
-	}
-	planBody, _ := json.Marshal(planPayload)
-	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
-
 	// Only narration segment enters dubbing
 	segments := []domain.TranslationInputSegment{
 		{
@@ -403,19 +380,10 @@ func TestSeam1_AudioMix_SingingVocalsPreservedInSoundtrack(t *testing.T) {
 	pinSeam1TranscriptForSegments(t, h, runID, assetID, segments)
 
 	// 1. Audio role plan with both narration and singing segments
-	singingPlanPayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleNarrationDialogue},
-			{StartMs: 2001, EndMs: 6000, Role: domain.AudioRoleSingingMusicVocal},
-		},
-	}
-	singingPlanBody, _ := json.Marshal(singingPlanPayload)
-	singingPlanResp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(singingPlanBody))
-	if err != nil {
-		t.Fatalf("save audio role plan failed: %v", err)
-	}
-	defer singingPlanResp.Body.Close()
-
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 2000, Role: domain.AudioRoleNarrationDialogue},
+		{StartMs: 2001, EndMs: 6000, Role: domain.AudioRoleSingingMusicVocal},
+	})
 	transReq := map[string]any{
 		"run_id":          runID,
 		"target_language": "vi",
@@ -478,14 +446,9 @@ func TestSeam1_AudioMix_ZeroSpokenSpeech_PassthroughPreservation(t *testing.T) {
 	assetID := job.SourceAssetID
 
 	// Audio role plan with 0 spoken lines (pure BGM / instrumental)
-	planPayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleInstrumentalBgm},
-		},
-	}
-	planBody, _ := json.Marshal(planPayload)
-	_, _ = http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
-
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleInstrumentalBgm},
+	})
 	respMix, mix := runAudioMix(t, h, assetID, map[string]any{
 		"run_id":          runID,
 		"target_language": "vi",
@@ -1111,8 +1074,8 @@ func TestSeam1_AudioMix_MissingAudioRolePlanFailsClosed(t *testing.T) {
 		Error string `json:"error"`
 	}
 	_ = json.NewDecoder(respMix.Body).Decode(&errBody)
-	if !strings.Contains(errBody.Error, "audio role plan required") {
-		t.Errorf("expected error containing 'audio role plan required', got %q", errBody.Error)
+	if !strings.Contains(errBody.Error, "missing run-pinned audio_role_plan artifact") && !strings.Contains(errBody.Error, "audio role plan required") {
+		t.Errorf("expected error containing 'missing run-pinned audio_role_plan artifact', got %q", errBody.Error)
 	}
 
 	// Verify no dub mix artifact was persisted in DB
