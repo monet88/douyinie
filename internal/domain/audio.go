@@ -6,12 +6,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
 var (
-	// ErrMixerOverrunRefused is returned when AudioMixService encounters a candidate segment whose measured duration exceeds its immutable slot.
-	ErrMixerOverrunRefused = errors.New("audio mixer refused: candidate duration overruns immutable source slot")
+	// ErrMixerOverrunRefused is returned when AudioMixService cannot prove the accepted
+	// playback/coverage contract for the replacement waveform.
+	ErrMixerOverrunRefused = errors.New("audio mixer refused: replacement violates accepted playback or coverage contract")
 	// ErrMixerAnchorDrift is returned when AudioMixService detects attempt to shift or alter source timing anchors.
 	ErrMixerAnchorDrift = errors.New("audio mixer refused: source timing anchor alteration is prohibited")
 	// ErrSoundtrackPreservationFailed is returned when soundtrack preservation cannot be satisfied.
@@ -20,6 +22,9 @@ var (
 	ErrAudioStemsNotFound = errors.New("audio stem artifacts not found")
 	// ErrDubMixNotFound is returned when DubMixArtifact is not found.
 	ErrDubMixNotFound = errors.New("dub mix artifact not found")
+	// ErrDubMixSchemaStale is returned when a decoded DubMixArtifact predates the current
+	// playback/coverage acceptance contract, so its PASS evidence cannot be trusted.
+	ErrDubMixSchemaStale = errors.New("dub mix artifact schema is stale")
 	// ErrSeparatorFailed is returned when vocal separator fails to isolate stems.
 	ErrSeparatorFailed = errors.New("audio separation failed to produce stems")
 	// ErrAudioRolePreflightRequired is returned when preflight metadata is required to generate an AudioRolePlan.
@@ -31,7 +36,7 @@ var (
 const (
 	AudioRolePlanSchemaVersion = 1
 	AudioStemsSchemaVersion    = 2
-	DubMixSchemaVersion        = 1
+	DubMixSchemaVersion        = 2
 )
 
 // AudioRolePlanProvenance captures deterministic provenance for AudioRolePlan.
@@ -185,6 +190,17 @@ type DubMixArtifact struct {
 	OverallStatus       string                     `json:"overall_status"` // "PASS", "REVIEW_REQUIRED", "REFUSED"
 	RefusalReason       string                     `json:"refusal_reason,omitempty"`
 	CreatedAt           time.Time                  `json:"created_at"`
+}
+
+// ValidateCurrentSchema rejects a decoded DubMixArtifact that predates the current playback/coverage
+// acceptance contract. Legacy rows stay readable as historical evidence, but must never supply
+// re-usable PASS evidence to render, review, bundle, or benchmark consumers: their PASS was decided
+// under superseded playback/coverage rules and could bypass the current acceptance.
+func (d DubMixArtifact) ValidateCurrentSchema() error {
+	if d.SchemaVersion != DubMixSchemaVersion {
+		return fmt.Errorf("%w: artifact schema %d, current %d", ErrDubMixSchemaStale, d.SchemaVersion, DubMixSchemaVersion)
+	}
+	return nil
 }
 
 // ComputeAudioStemsProvenanceHash computes deterministic hash for AudioStemArtifacts.

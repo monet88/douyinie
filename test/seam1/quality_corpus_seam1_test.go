@@ -631,7 +631,9 @@ func TestSeam1_QualityCorpus_SyntheticRegression_BoundProfile48Executions(t *tes
 		}
 	}
 	// Seed all 24 primary assets in SQLite DB and CAS
-	normAudioBytes := media.GeneratePCM16WAV(16000, 1, 3000)
+	// The canonical fake transcript contains speech through 7000ms. Keep the
+	// normalized source waveform long enough for #153's real media-end gate.
+	normAudioBytes := media.GeneratePCM16WAV(16000, 1, 8000)
 	normAudioObj, err := h.casStore.Put(bytes.NewReader(normAudioBytes))
 	if err != nil {
 		t.Fatalf("put normalized audio in CAS: %v", err)
@@ -673,6 +675,7 @@ func TestSeam1_QualityCorpus_SyntheticRegression_BoundProfile48Executions(t *tes
 		} else {
 			assetAudioRoles[p.AssetID] = []domain.AudioSegment{
 				{StartMs: 0, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
+				{StartMs: 3500, EndMs: 7000, Role: domain.AudioRoleNarrationDialogue},
 			}
 		}
 	}
@@ -715,7 +718,15 @@ func TestSeam1_QualityCorpus_SyntheticRegression_BoundProfile48Executions(t *tes
 
 	for _, m := range summary.CaseMetrics {
 		if m.Status != "PASS" {
-			t.Logf("Case %s [%s] FAILED: %v", m.CaseID, m.Profile, m.FailReasons)
+			t.Logf("Case %s [%s] status=%s FailReasons: %v", m.CaseID, m.Profile, m.Status, m.FailReasons)
+			if qce, ok := session.QualityCases[m.CaseID]; ok && qce != nil {
+				t.Logf("  Case %s ErrorMessage: %q Status: %s", m.CaseID, qce.ErrorMessage, qce.Status)
+				for stageName, stageEv := range qce.Stages {
+					if stageEv.Status == "FAILED" || stageEv.ErrorMessage != "" {
+						t.Logf("    Stage %s: Status=%s Error=%q", stageName, stageEv.Status, stageEv.ErrorMessage)
+					}
+				}
+			}
 		}
 	}
 	if summary.HybridRollup.FailCount > 0 {

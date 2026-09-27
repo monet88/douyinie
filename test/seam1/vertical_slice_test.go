@@ -60,23 +60,28 @@ func TestSeam1_FullDub_VerticalSlice_EndToEnd(t *testing.T) {
 			EndMs:      6500,
 		},
 	}
-	transVariant, dubScriptVariant := setupDubScriptForSeam1(t, h, runID, assetID, segments)
+	// Arrange the exact speech-turn plan as the run's single pinned plan: a run pins one
+	// audio_role_plan, so the plan the dub stages consume must be this one from the start.
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
+		{StartMs: 3500, EndMs: 6500, Role: domain.AudioRoleNarrationDialogue},
+	})
+	pinSeam1TranscriptForSegments(t, h, runID, assetID, segments)
+	respTransV, transVariant := runTranslation(t, h, assetID, map[string]any{
+		"run_id": runID, "target_language": "vi", "segments": segments,
+	})
+	if respTransV.StatusCode != http.StatusCreated || transVariant == nil {
+		t.Fatalf("translation failed: status %d", respTransV.StatusCode)
+	}
+	respDubV, dubScriptVariant := runDubScript(t, h, assetID, map[string]any{
+		"run_id": runID, "target_language": "vi", "translation_variant_cas": transVariant.CASHash,
+	})
+	if respDubV.StatusCode != http.StatusCreated || dubScriptVariant == nil {
+		t.Fatalf("dub script adaptation failed: status %d", respDubV.StatusCode)
+	}
 	if len(transVariant.Segments) != 2 || len(dubScriptVariant.Segments) != 2 {
 		t.Fatalf("expected 2 translation & dub script segments, got trans=%d dub=%d", len(transVariant.Segments), len(dubScriptVariant.Segments))
 	}
-	// Overwrite AudioRolePlan to reflect exact speech turns vs BGM intervals
-	rolePayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
-			{StartMs: 3500, EndMs: 6500, Role: domain.AudioRoleNarrationDialogue},
-		},
-	}
-	roleBody, _ := json.Marshal(rolePayload)
-	roleResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
-	if err != nil || (roleResp.StatusCode != http.StatusOK && roleResp.StatusCode != http.StatusCreated) {
-		t.Fatalf("setup audio role plan failed: %v", err)
-	}
-	roleResp.Body.Close()
 	// 6. Voice Assignment (Frozen VoiceAssignment per speaker)
 	assignBody := map[string]any{
 		"run_id":          runID,
@@ -751,6 +756,9 @@ func TestSeam1_FullDub_SubtitleDubSemanticGrounding_Consistency(t *testing.T) {
 	transSegments := []domain.TranslationInputSegment{
 		{Index: 0, SourceText: "今天天气很好。", StartMs: 1000, EndMs: 4000, SpeakerID: "spk_1"},
 	}
+	// Dub-script adaptation derives its playback boundary from the run-pinned transcript, so the
+	// run must pin canonical speech blocks, not a blockless stub.
+	pinSeam1TranscriptForSegments(t, h, runID, assetID, transSegments)
 	respTrans, transVariant := runTranslation(t, h, assetID, map[string]any{
 		"run_id":          runID,
 		"job_id":          jobID,
@@ -763,26 +771,9 @@ func TestSeam1_FullDub_SubtitleDubSemanticGrounding_Consistency(t *testing.T) {
 	}
 
 	// 2. Seed the required AudioRolePlan for this speech-bearing fixture.
-	roleBody, err := json.Marshal(map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 1000, EndMs: 4000, Role: domain.AudioRoleNarrationDialogue},
-		},
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 1000, EndMs: 4000, Role: domain.AudioRoleNarrationDialogue},
 	})
-	if err != nil {
-		t.Fatalf("marshal audio role plan: %v", err)
-	}
-	roleResp, err := http.Post(
-		fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID),
-		"application/json",
-		bytes.NewReader(roleBody),
-	)
-	if err != nil {
-		t.Fatalf("POST audio-role-plan failed: %v", err)
-	}
-	roleResp.Body.Close()
-	if roleResp.StatusCode != http.StatusCreated && roleResp.StatusCode != http.StatusOK {
-		t.Fatalf("POST audio-role-plan failed: %d", roleResp.StatusCode)
-	}
 
 	// 3. Setup DubScriptVariant with shortened spoken copy
 	respDub, dubScriptVariant := runDubScript(t, h, assetID, map[string]any{
@@ -919,14 +910,9 @@ func TestSeam1_FullDub_FreezeRenderPlan_CorruptSubtitleTrack_FailsClosed(t *test
 	assetID := job.SourceAssetID
 
 	// Ingest minimal AudioRolePlan and separate stems
-	rolePayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
-		},
-	}
-	roleBody, _ := json.Marshal(rolePayload)
-	roleResp, _ := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
-	roleResp.Body.Close()
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 3000, Role: domain.AudioRoleNarrationDialogue},
+	})
 
 	sepResp, stems := runSeparateStems(t, h, assetID, map[string]any{"run_id": runID})
 	sepResp.Body.Close()

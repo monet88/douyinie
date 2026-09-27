@@ -148,6 +148,25 @@ func seedSeam1AssetAndJob(t *testing.T, db *storage.DB) (string, string) {
 	return assetID, jobID
 }
 
+func seedSeam1Run(t *testing.T, db *storage.DB, assetID, jobID, runID string) {
+	t.Helper()
+	ctx := context.Background()
+	_ = db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        runID,
+		JobID:     jobID,
+		Status:    "running",
+		CreatedAt: time.Now().UTC(),
+	})
+	_ = db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             "se-" + runID,
+		RunID:          runID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: "fake-sha256-transcript",
+		CreatedAt:      time.Now().UTC(),
+	})
+}
+
 func TestSeam1_Translation_LocalProfile_DisablesTranslation(t *testing.T) {
 	reg := provider.NewRegistry()
 
@@ -179,6 +198,7 @@ func TestSeam1_Translation_LocalProfile_DisablesTranslation(t *testing.T) {
 	h := setupCustomTranslationHarness(t, reg)
 	assetID, jobID := seedSeam1AssetAndJob(t, h.db)
 	runID := "run-" + uuid.NewString()
+	seedSeam1Run(t, h.db, assetID, jobID, runID)
 
 	// 3. POST /api/v1/assets/:id/translation with execution_profile: "local"
 	payload := map[string]any{
@@ -284,6 +304,7 @@ func TestSeam1_Translation_HybridProfile_OrderingAndFallback(t *testing.T) {
 	h := setupCustomTranslationHarness(t, reg)
 	assetID, jobID := seedSeam1AssetAndJob(t, h.db)
 	runID := "run-" + uuid.NewString()
+	seedSeam1Run(t, h.db, assetID, jobID, runID)
 
 	payload := map[string]any{
 		"run_id":                 runID,
@@ -354,6 +375,7 @@ func TestSeam1_Translation_LocalProfile_FailsClosedIfSnapshotUnverified(t *testi
 	h := setupCustomTranslationHarness(t, reg)
 	assetID, jobID := seedSeam1AssetAndJob(t, h.db)
 	runID := "run-" + uuid.NewString()
+	seedSeam1Run(t, h.db, assetID, jobID, runID)
 
 	// Execute with local profile - snapshot is unverified, router must fail closed with 503
 	payload := map[string]any{
@@ -391,6 +413,7 @@ func TestSeam1_Translation_MeaningFirstValidation_FlagsFactOrNegationCorruption(
 	h := setupCustomTranslationHarness(t, reg)
 	assetID, jobID := seedSeam1AssetAndJob(t, h.db)
 	runID := "run-" + uuid.NewString()
+	seedSeam1Run(t, h.db, assetID, jobID, runID)
 
 	payload := map[string]any{
 		"run_id":            runID,
@@ -440,6 +463,7 @@ func TestSeam1_Translation_MissingOrCorruptEnvelopePath_FailsClosed(t *testing.T
 	h := setupCustomTranslationHarness(t, reg)
 	assetID, jobID := seedSeam1AssetAndJob(t, h.db)
 	runID := "run-" + uuid.NewString()
+	seedSeam1Run(t, h.db, assetID, jobID, runID)
 
 	// Even if unrelated model paths are exported in the environment,
 	// missing/inaccessible snapshot envelope path must fail closed!
@@ -503,6 +527,9 @@ func TestSeam1_VisualTrack_LocalProfile_DisablesTranslation(t *testing.T) {
 	h := setupCustomTranslationHarness(t, reg)
 	assetID, jobID := seedSeam1AssetAndJob(t, h.db)
 	runID := "run-vt-local-" + uuid.NewString()
+	// The visual lane is run-scoped and proves the run belongs to the asset, so the request must
+	// name a real run on this job.
+	seedSeam1Run(t, h.db, assetID, jobID, runID)
 
 	// 4. Detect text
 	detectBody, _ := json.Marshal(map[string]any{"run_id": runID})
@@ -606,6 +633,7 @@ func TestSeam1_VisualTrack_HybridProfile_ConsentAndCredentials(t *testing.T) {
 
 	// Detect text
 	runIDConsentMissing := "run-vt-hybrid-noconsent-" + uuid.NewString()
+	seedSeam1Run(t, h.db, assetID, jobID, runIDConsentMissing)
 	detectBody, _ := json.Marshal(map[string]any{"run_id": runIDConsentMissing})
 	dResp, err := http.Post(h.ts.URL+"/api/v1/assets/"+assetID+"/detect-text", "application/json", bytes.NewReader(detectBody))
 	if err != nil {
@@ -635,6 +663,7 @@ func TestSeam1_VisualTrack_HybridProfile_ConsentAndCredentials(t *testing.T) {
 
 	// 2. Call visual-track with Hybrid profile, valid credential, and consent_granted=true
 	runIDConsentGranted := "run-vt-hybrid-consent-" + uuid.NewString()
+	seedSeam1Run(t, h.db, assetID, jobID, runIDConsentGranted)
 	detectBody2, _ := json.Marshal(map[string]any{"run_id": runIDConsentGranted})
 	dResp2, _ := http.Post(h.ts.URL+"/api/v1/assets/"+assetID+"/detect-text", "application/json", bytes.NewReader(detectBody2))
 	dResp2.Body.Close()
@@ -685,6 +714,14 @@ func TestSeam1_Translation_MeaningGateFlag_SurfacesForReviewAndOverride(t *testi
 	jobID, runID := createJobAndRun(t, h)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
+	_ = h.db.CreateStageExecution(context.Background(), domain.StageExecution{
+		ID:             "se-" + runID,
+		RunID:          runID,
+		Stage:          "speech_understand",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: "fake-sha256-transcript",
+		CreatedAt:      time.Now().UTC(),
+	})
 
 	const sourceText = "请不要打开窗户。"
 	const inverted = "Hãy mở cửa sổ ra nhé." // prohibition rendered as an affirmative

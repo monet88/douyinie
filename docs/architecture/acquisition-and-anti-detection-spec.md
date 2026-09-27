@@ -66,7 +66,7 @@ Hiện tại Douyinie đã có `ReviewService` và Seam 1 API. Chúng ta sẽ n�
 ### 3.1 Vấn đề nan giải hiện tại của Douyinie
 - Tiếng Việt thường có độ dài âm tiết dài hơn tiếng Trung khoảng 15% - 30%.
 - Trong Douyinie, invariant chuẩn phòng thu là: `non-1.0 speed fails closed, overrun remediation is rewrite/regroup/review`.
-- Khi câu lồng tiếng Việt dài hơn khoảng trống đối thoại (dialogue gap), `AudioMixService.MixAudio` sẽ từ chối (`ErrMixerOverrunRefused`) và đẩy vào hàng đợi review để người dùng viết lại câu ngắn hơn.
+- Khi waveform lồng tiếng vượt `DubPlaybackEndMs`, va chạm clip lồng tiếng kế tiếp, hoặc không chứng minh được canonical coverage/lineage, `AudioMixService.MixAudio` phải từ chối (`ErrMixerOverrunRefused`) và đưa run về review. `DubPlaybackEndMs` chỉ được mượn có giới hạn từ source silence thật trước canonical speech/vocal boundary kế tiếp; source anchors và video timeline vẫn bất biến.
 
 ### 3.2 Giải pháp "Giãn Hình Theo Phụ Đề" (Dynamic Time-Warping)
 Thay vì ép giọng đọc AI phải nói quá nhanh (nghe như bị giục) hoặc làm chậm toàn bộ video, thuật toán này hoạt động cục bộ:

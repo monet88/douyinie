@@ -97,7 +97,9 @@ func TestSeam1_MultiSpeaker_IndependentAssignment_And_DistinguishabilityQC(t *te
 	}
 	_ = json.NewDecoder(runResp.Body).Decode(&run2)
 	runID2 := run2.Run.ID
-
+	saveAndPinAudioRolePlan(t, h, assetID, runID2, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+	})
 	respSame, assignSame := runAssignVoices(t, h, assetID, map[string]any{
 		"run_id":                 runID2,
 		"target_language":        "vi",
@@ -128,7 +130,9 @@ func TestSeam1_MultiSpeaker_IndependentAssignment_And_DistinguishabilityQC(t *te
 	}
 	_ = json.NewDecoder(runResp3.Body).Decode(&run3)
 	runID3 := run3.Run.ID
-
+	saveAndPinAudioRolePlan(t, h, assetID, runID3, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+	})
 	voiceA := provider.DefaultPresetVoices("vi")[0] // ZeroTTS quangminh
 	voiceB := provider.DefaultPresetVoices("vi")[1] // ZeroTTS maichi
 	respDet, assignDet := runAssignVoices(t, h, assetID, map[string]any{
@@ -158,7 +162,9 @@ func TestSeam1_MultiSpeaker_IndependentAssignment_And_DistinguishabilityQC(t *te
 	}
 	_ = json.NewDecoder(runResp4.Body).Decode(&run4)
 	runID4 := run4.Run.ID
-
+	saveAndPinAudioRolePlan(t, h, assetID, runID4, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+	})
 	duplicateVoice := provider.DefaultPresetVoices("vi")[0]
 	respDup, assignDup := runAssignVoices(t, h, assetID, map[string]any{
 		"run_id":                 runID4,
@@ -543,6 +549,13 @@ func TestSeam1_VoiceChange_DubScriptChangeForcesSynthesisEvenWithSupersession(t 
 	if dubVariant2.CASHash == dubVariant1.CASHash {
 		t.Fatalf("expected different CASHash for modified dub script")
 	}
+	respRefresh, assign3 := runAssignVoices(t, h, assetID, map[string]any{
+		"run_id":          runID,
+		"target_language": "vi",
+	})
+	if (respRefresh.StatusCode != http.StatusCreated && respRefresh.StatusCode != http.StatusOK) || assign3 == nil {
+		t.Fatalf("refresh assignment lineage for modified dub script failed: %d", respRefresh.StatusCode)
+	}
 
 	// Instrument provider invocations
 	zeroTTSProv := defaultVITTSFake(t, h)
@@ -554,7 +567,7 @@ func TestSeam1_VoiceChange_DubScriptChangeForcesSynthesisEvenWithSupersession(t 
 		"run_id":                 runID,
 		"target_language":        "vi",
 		"dub_script_variant_cas": dubVariant2.CASHash,
-		"voice_assignment_cas":   assign2.CASHash,
+		"voice_assignment_cas":   assign3.CASHash,
 	})
 	if respSynth2.StatusCode != http.StatusCreated || variant2 == nil {
 		t.Fatalf("synthesis failed: %d", respSynth2.StatusCode)

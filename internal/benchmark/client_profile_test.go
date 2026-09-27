@@ -112,3 +112,49 @@ func TestRuntimeHostClient_ProfileSensitiveStagesBindRouteOptions(t *testing.T) 
 		}
 	}
 }
+func TestRuntimeHostClient_SaveAudioRolePlan_DecodesAudioRolePlan(t *testing.T) {
+	t.Parallel()
+
+	var capturedPath string
+	var capturedBody map[string]any
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		capturedPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{
+			"audio_role_plan": {
+				"id": "plan-123",
+				"asset_id": "asset-test",
+				"cas_hash": "sha256_plan_hash_abc",
+				"segments": [{"start_ms":0,"end_ms":1000,"role":"dialogue"}]
+			}
+		}`))
+	}))
+	defer ts.Close()
+
+	client := NewRuntimeHostClient(ts.URL, ts.Client())
+	plan, err := client.SaveAudioRolePlan(context.Background(), "asset-test", "run-456", []domain.AudioSegment{
+		{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue},
+	})
+	if err != nil {
+		t.Fatalf("SaveAudioRolePlan failed: %v", err)
+	}
+	if capturedPath != "/api/v1/assets/asset-test/audio-role-plan" {
+		t.Errorf("expected path /api/v1/assets/asset-test/audio-role-plan, got %s", capturedPath)
+	}
+	if capturedBody["run_id"] != "run-456" {
+		t.Errorf("expected run_id run-456, got %v", capturedBody["run_id"])
+	}
+	if plan == nil {
+		t.Fatal("expected non-nil plan")
+	}
+	if plan.ID != "plan-123" {
+		t.Errorf("expected plan ID plan-123, got %s", plan.ID)
+	}
+	if plan.CASHash != "sha256_plan_hash_abc" {
+		t.Errorf("expected CASHash sha256_plan_hash_abc, got %s", plan.CASHash)
+	}
+}

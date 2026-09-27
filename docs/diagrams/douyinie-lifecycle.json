@@ -44,7 +44,7 @@
     { "id": "queued", "type": "start", "label": "Queued", "sublabel": "job registered", "lane": "main", "col": 0, "step": "01", "tag": "entry" },
     { "id": "extracting", "type": "active", "label": "Extracting", "sublabel": "stems & text regions", "lane": "main", "col": 1, "step": "02", "tag": "local GPU" },
     { "id": "translating", "type": "decision", "label": "Translating", "sublabel": "gateway & QA check", "lane": "main", "col": 2, "step": "03", "tag": "remote LLM" },
-    { "id": "dubbing", "type": "waiting", "label": "Dubbing", "sublabel": "timing & mix verify", "lane": "main", "col": 3, "step": "04", "tag": "zero overrun" },
+    { "id": "dubbing", "type": "waiting", "label": "Dubbing", "sublabel": "timing & mix verify", "lane": "main", "col": 3, "step": "04", "tag": "playback window" },
     { "id": "completed", "type": "success", "label": "Completed", "sublabel": "PASS video deliverable", "lane": "main", "col": 4, "step": "05", "tag": "deliverable" },
     { "id": "review_required", "type": "waiting", "label": "Review Required", "sublabel": "confidence / overlap", "lane": "waiting", "col": 0, "tag": "operator stop", "yOffset": -20 },
     { "id": "escalating", "type": "active", "label": "Voice Escalation", "sublabel": "CosyVoice3 fallback", "lane": "recovery", "col": 1, "tag": "speaker scope", "yOffset": -20 },

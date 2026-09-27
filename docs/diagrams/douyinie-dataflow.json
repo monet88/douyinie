@@ -41,7 +41,7 @@
     { "id": "text_plan", "type": "database", "label": "Text Region Plan", "sublabel": "Bounding Polygons", "stage": 1, "row": 2, "tag": "PaddleOCR + Ink" },
     { "id": "transcript", "type": "database", "label": "Transcript", "sublabel": "SpeechBlocks + Timing", "stage": 2, "row": 0, "tag": "Qwen3 + 3D-Speaker" },
     { "id": "translation", "type": "cloud", "label": "Translation", "sublabel": "VI Target Meaning", "stage": 2, "row": 2, "tag": "Gemini -> DeepSeek" },
-    { "id": "dub_segments", "type": "database", "label": "Dub Segments", "sublabel": "ZeroTTS WAV Clips", "stage": 3, "row": 0, "tag": "Zero Overrun" },
+    { "id": "dub_segments", "type": "database", "label": "Dub Segments", "sublabel": "ZeroTTS WAV Clips", "stage": 3, "row": 0, "tag": "Playback Window" },
     { "id": "visual_track", "type": "database", "label": "Visual Track", "sublabel": "Tight Hug Overlays", "stage": 3, "row": 2, "tag": "In-Place Cover" },
     { "id": "final_render", "type": "backend", "label": "Final Render", "sublabel": "Localized Video + Mix", "stage": 4, "row": 1, "tag": "PASS Deliverable" }
   ],

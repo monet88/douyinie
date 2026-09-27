@@ -190,6 +190,28 @@ func absInt64(v int64) int64 {
 	return v
 }
 
+// dubTimingDeviationMs returns the deviation of a dub segment's measured finish
+// (StartMs + MeasuredDurationMs) from its accepted playback interval
+// [StartMs, DubPlaybackEndMs]. DubPlaybackEndMs is the borrowed-silence ceiling and falls
+// back to the immutable source EndMs when no usable ceiling is recorded for the segment.
+// A finish inside the interval — including one that legitimately borrows proven source
+// silence past EndMs — is not an error; only finishing before the immutable source anchor
+// or past the borrowed-silence ceiling deviates.
+func dubTimingDeviationMs(seg domain.DubSegment) int64 {
+	ceiling := seg.EndMs
+	if seg.DubPlaybackEndMs >= seg.EndMs && seg.DubPlaybackEndMs > seg.StartMs {
+		ceiling = seg.DubPlaybackEndMs
+	}
+	finish := seg.StartMs + seg.MeasuredDurationMs
+	if finish > ceiling {
+		return finish - ceiling
+	}
+	if finish < seg.EndMs {
+		return seg.EndMs - finish
+	}
+	return 0
+}
+
 func computeP95(errors []int64) int64 {
 	if len(errors) == 0 {
 		return 0
@@ -598,9 +620,7 @@ func EvaluateCaseQuality(caseEv *QualityCaseEvidence, pack *ReferenceAnnotationP
 		var maxTimingErr int64
 
 		for _, ds := range segs {
-			finish := ds.StartMs + ds.MeasuredDurationMs
-			sourceEnd := ds.EndMs
-			diff := absInt64(finish - sourceEnd)
+			diff := dubTimingDeviationMs(ds)
 			if diff <= 200 {
 				within200Count++
 			}
@@ -625,13 +645,11 @@ func EvaluateCaseQuality(caseEv *QualityCaseEvidence, pack *ReferenceAnnotationP
 			metrics.ReviewReasons = append(metrics.ReviewReasons, fmt.Sprintf("dubbing block timing error %d ms exceeds 500ms threshold", maxTimingErr))
 		}
 
-		// Whole-video cumulative drift under immutable source anchor contract
+		// Whole-video cumulative drift is the last segment's deviation from the same
+		// accepted playback interval used per segment.
 		var cumDrift int64
 		if len(segs) > 0 {
-			lastSeg := segs[len(segs)-1]
-			lastFinish := lastSeg.StartMs + lastSeg.MeasuredDurationMs
-			lastSourceEnd := lastSeg.EndMs
-			cumDrift = absInt64(lastFinish - lastSourceEnd)
+			cumDrift = dubTimingDeviationMs(segs[len(segs)-1])
 		}
 		metrics.CumulativeDriftMs = cumDrift
 		if cumDrift > MaxCumulativeDriftMs {

@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+
+	"github.com/monet88/douyinie/internal/domain"
 )
 
 // SpokenScriptAdapter adapts translated dialogue to fit immutable source timing
@@ -24,6 +26,7 @@ type SpokenScriptAdaptationRequest struct {
 	SourceSpeakingRateCPS float64 // optional source syllable/unit-rate override for deterministic tests
 	SourceGapAfterMs      int64   // immutable source silence from this turn EndMs to the next turn StartMs
 	HasNextTurn           bool
+	ProtectedTerms        []domain.GlossaryEntry
 }
 
 // SpokenScriptAdaptationResult represents the outcome of spoken dialogue adaptation.
@@ -277,6 +280,12 @@ func (a *DefaultSpokenScriptAdapter) AdaptSpokenScript(_ context.Context, req Sp
 	isShortened := false
 	if shouldShorten {
 		candidate := RewriteConciseSpokenText(meaningText, targetLang)
+		for _, term := range req.ProtectedTerms {
+			if domain.GlossaryTermMatches(meaningText, term.Target) && !domain.GlossaryTermMatches(candidate, term.Target) {
+				candidate = meaningText
+				break
+			}
+		}
 		if len(strings.Fields(candidate)) > 0 && len(strings.Fields(candidate)) < targetWords {
 			spokenText = candidate
 			isShortened = true

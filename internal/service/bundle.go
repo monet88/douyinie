@@ -714,8 +714,10 @@ func (s *BundleService) ImportBundle(ctx context.Context, r io.ReaderAt, size in
 			}
 		}
 
-		// Dub mix artifact
-		if dma := runData.DubMixArtifact; dma != nil {
+		// Dub mix artifact. A legacy-schema DubMix is imported as historical payload only: it must
+		// not be re-established as a canonical index row, because render/review would then consume
+		// its pre-current-contract PASS as if it were current acceptance evidence.
+		if dma := runData.DubMixArtifact; dma != nil && dma.ValidateCurrentSchema() == nil {
 			if p, err := s.cas.ResolvePath(dma.AudioCASHash); err == nil {
 				dma.AudioCASPath = p
 			}

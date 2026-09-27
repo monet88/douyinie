@@ -744,6 +744,33 @@ test("a missing artifact (404) stays silent and an identical failure does not sp
   assert.equal(failing.els.toastRegion.children.length, 1, "a persistent failure must be reported once, not on every poll");
 });
 
+test("glossary omitted-match feedback is actionable and does not spam polling", async () => {
+  const h = createHarness();
+  h.setResponder((url) => {
+    const path = new URL(url, "http://localhost").pathname;
+    if (path === "/api/v1/runs/run-1/stages") return { status: 200, payload: { stages: [] } };
+    if (path === "/api/v1/runs/run-1/review-items") return { status: 200, payload: { review_items: [] } };
+    if (path === "/api/v1/runs/run-1") return { status: 200, payload: { run: { id: "run-1", job_id: "job-1", status: "running" } } };
+    if (path === "/api/v1/jobs/job-1") return { status: 200, payload: { job: { id: "job-1", source_asset_id: "asset-1", target_language: "vi" } } };
+    if (path === "/api/v1/assets/asset-1/translation-variant") {
+      return { status: 200, payload: { translation_variant: { cas_hash: "translation-cas", effective_glossary: { omitted_matches: 3 }, segments: [] } } };
+    }
+    if (path === "/api/v1/assets/asset-1/transcript") return { status: 404, payload: { error: "not found" } };
+    return { status: 200, payload: {} };
+  });
+  await h.ready();
+  h.evalIn(runFixture);
+  h.evalIn('state.selectedRunId = "run-1"; state.jobs = [];');
+  await h.evalIn("loadSelectedRun()");
+  await h.evalIn("loadSelectedRun()");
+
+  const toasts = toastMessages(h).filter((t) => t.type.includes("warning"));
+  assert.equal(toasts.length, 1, "the same persisted omission must be reported once across polling");
+  assert.match(toasts[0].text, /3 thuật ngữ/, "feedback must include the omitted count");
+  assert.match(toasts[0].text, /100 mục đầu tiên/, "feedback must explain the effective-glossary cap");
+  assert.match(toasts[0].text, /đưa thuật ngữ quan trọng lên trước|giảm glossary/, "feedback must tell the operator how to resolve the omission");
+});
+
 // Canonical TextRegionPlan geometry: 1080x1920 media, tracked box at
 // canonical (100,200,300,80) from 1000-3000ms and (120,210,300,80) at 2000ms.
 // The rendered player is 800x960, so the video is pillarboxed: scale is exactly

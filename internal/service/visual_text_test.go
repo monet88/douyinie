@@ -1318,6 +1318,173 @@ func TestVisualTextService_LocalizeVisualTrack_ExplicitTranslationCASSurvivesRes
 	}
 }
 
+// An explicit TranslationVariantCAS must be proven to belong to the run being localized: the same
+// asset and language cannot separate two runs, and the visual lane must never render another run's
+// translation rather than fail closed (#153).
+func TestVisualTextService_LocalizeVisualTrack_ExplicitTranslationCASMustBelongToRun(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	otherRunVariant := domain.TranslationVariant{
+		ID:             "trans-other-run",
+		SchemaVersion:  domain.TranslationSchemaVersion,
+		ContractID:     service.TranslationContractID,
+		AssetID:        assetID,
+		RunID:          "run-other",
+		TargetLanguage: "vi",
+		InputHash:      "input-other-run",
+		ProvenanceHash: "prov-other-run",
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "来源", TargetText: "Nguồn khác", PassedQAGate: true, QAConfidence: 0.9, StartMs: 0, EndMs: 1000},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	otherBytes, _ := json.Marshal(otherRunVariant)
+	otherObj, err := casStore.Put(bytes.NewReader(otherBytes))
+	if err != nil {
+		t.Fatalf("put other-run translation variant: %v", err)
+	}
+
+	// (a) The run pins no translation stage, so the artifact's own run binding is the only proof
+	// left - and it names a different run.
+	_, err = svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:                 "run-target",
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: otherObj.SHA256,
+	})
+	if !errors.Is(err, domain.ErrTranslationOwnershipMismatch) {
+		t.Fatalf("translation variant of another run must be refused as an ownership mismatch, got %v", err)
+	}
+
+	// (b) A run that pinned its own translation artifact treats that pin as the authority, so the
+	// other run's artifact cannot be substituted for it.
+	jobID := "job-run-target"
+	if err := db.CreateJob(ctx, domain.LocalizationJob{
+		ID: jobID, SourceAssetID: assetID, TargetLanguage: "vi", Status: "running",
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{
+		ID: "run-target", JobID: jobID, Status: "running", ConfigSnapshotJSON: "{}", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	pinnedVariant := otherRunVariant
+	pinnedVariant.ID = "trans-pinned-run"
+	pinnedVariant.RunID = "run-target"
+	pinnedBytes, _ := json.Marshal(pinnedVariant)
+	pinnedObj, err := casStore.Put(bytes.NewReader(pinnedBytes))
+	if err != nil {
+		t.Fatalf("put pinned translation variant: %v", err)
+	}
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID: uuid.NewString(), RunID: "run-target", Stage: "translation", Status: domain.StageStatusSucceeded,
+		ArtifactSHA256: pinnedObj.SHA256, CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("pin translation stage: %v", err)
+	}
+	_, err = svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:                 "run-target",
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: otherObj.SHA256,
+	})
+	if !errors.Is(err, domain.ErrTranslationOwnershipMismatch) {
+		t.Fatalf("translation variant other than the run's pinned artifact must be refused, got %v", err)
+	}
+}
+
+func TestVisualTextService_LocalizeVisualTrack_DirectTranslationCacheHitRunBinding(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	ctx := context.Background()
+	// Seed valid TextRegionPlan for asset
+	trp := domain.TextRegionPlan{
+		ID: "trp-cache-test", SchemaVersion: domain.TextRegionPlanSchemaVersion,
+		AssetID: assetID, CreatedAt: time.Now().UTC(),
+	}
+	trpBytes, _ := json.Marshal(trp)
+	trpObj, _ := casStore.Put(bytes.NewReader(trpBytes))
+	_ = db.SaveTextRegionPlanIndex(ctx, storage.TextRegionPlanIndex{
+		ID: trp.ID, AssetID: assetID, CASHash: trpObj.SHA256, ProvenanceHash: "prov-trp", CreatedAt: trp.CreatedAt,
+	})
+
+	// 1. Run A produces and pins a TranslationVariant
+	variantA := domain.TranslationVariant{
+		ID:             "trans-variant-a",
+		SchemaVersion:  domain.TranslationSchemaVersion,
+		ContractID:     service.TranslationContractID,
+		AssetID:        assetID,
+		RunID:          "run-a",
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.TranslationSegment{
+			{Index: 0, SourceText: "hello", TargetText: "xin chao"},
+		},
+		ProvenanceHash: "prov-a",
+		CreatedAt:      time.Now().UTC(),
+	}
+	vBytes, _ := json.Marshal(variantA)
+	vObjA, _ := casStore.Put(bytes.NewReader(vBytes))
+
+	// 2. Run B reuses Run A's variant via cache hit, recording stage execution for run-b
+	runBID := "run-b"
+	jobBID := "job-run-b"
+	if err := db.CreateJob(ctx, domain.LocalizationJob{
+		ID: jobBID, SourceAssetID: assetID, TargetLanguage: "vi", Status: "running",
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{
+		ID: runBID, JobID: jobBID, Status: "running", ConfigSnapshotJSON: "{}", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             uuid.NewString(),
+		RunID:          runBID,
+		Stage:          "translation",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: vObjA.SHA256,
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("record translation stage execution for run B: %v", err)
+	}
+
+	// Run B calling LocalizeVisualTrack with explicit TranslationVariantCAS matching its stage proof succeeds
+	setupTestTranslationService(db, casStore, svc)
+	_, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:                 runBID,
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: vObjA.SHA256,
+	})
+	if err != nil {
+		t.Fatalf("expected explicit-CAS proof to succeed for cache-hit run B, got: %v", err)
+	}
+
+	// Arbitrary other-run CAS not pinned by run-b is rejected
+	unpinnedVariant := variantA
+	unpinnedVariant.ID = "trans-variant-unpinned"
+	unpinnedVariant.RunID = "run-c"
+	unpBytes, _ := json.Marshal(unpinnedVariant)
+	unpObj, _ := casStore.Put(bytes.NewReader(unpBytes))
+
+	_, err = svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:                 runBID,
+		AssetID:               assetID,
+		TargetLanguage:        "vi",
+		TranslationVariantCAS: unpObj.SHA256,
+	})
+	if !errors.Is(err, domain.ErrTranslationOwnershipMismatch) {
+		t.Fatalf("expected arbitrary other-run CAS to be rejected with ErrTranslationOwnershipMismatch, got: %v", err)
+	}
+}
+
 func setupTestTranslationService(db *storage.DB, casStore *cas.Store, svc *service.VisualTextService) {
 	transSvc := service.NewTranslationService(db, casStore)
 	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
@@ -2316,6 +2483,20 @@ func TestVisualTextService_LocalizeVisualTrack_DecodedTranslationArtifactOwnersh
 	ctx := context.Background()
 	seedTextRegionPlan(t, db, casStore, assetID, nil)
 	otherAssetID := "other-asset-" + uuid.NewString()[:8]
+	// Visual localization is run-scoped, so the mismatch must be reachable through a
+	// real run lineage: the run pins a translation artifact that belongs to another asset.
+	const runID = "run-ownership-mismatch"
+	jobID := "job-ownership-mismatch"
+	if err := db.CreateJob(ctx, domain.LocalizationJob{
+		ID: jobID, SourceAssetID: assetID, TargetLanguage: "vi", Status: "running", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{
+		ID: runID, JobID: jobID, Status: "running", ConfigSnapshotJSON: "{}", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
 	tVariant := domain.TranslationVariant{
 		ID:             uuid.NewString(),
 		AssetID:        otherAssetID,
@@ -2344,21 +2525,36 @@ func TestVisualTextService_LocalizeVisualTrack_DecodedTranslationArtifactOwnersh
 	_ = db.SaveTranslationVariantIndex(ctx, storage.TranslationVariantIndex{
 		ID:             tVariant.ID,
 		AssetID:        assetID,
+		RunID:          runID,
 		TargetLanguage: "vi",
 		CASHash:        tObj.SHA256,
 		ProvenanceHash: "prov-trans",
 		CreatedAt:      tVariant.CreatedAt,
 	})
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID: uuid.NewString(), RunID: runID, Stage: "translation", Status: domain.StageStatusSucceeded,
+		ArtifactSHA256: tObj.SHA256, CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("pin translation stage: %v", err)
+	}
 	_ = db.SaveDubScriptVariantIndex(ctx, storage.DubScriptVariantIndex{
 		ID:             dVariant.ID,
 		AssetID:        assetID,
+		RunID:          runID,
 		TargetLanguage: "vi",
 		CASHash:        dObj.SHA256,
 		ProvenanceHash: "prov-dub",
 		CreatedAt:      dVariant.CreatedAt,
 	})
+	if err := db.CreateStageExecution(ctx, domain.StageExecution{
+		ID: uuid.NewString(), RunID: runID, Stage: "dub_script", Status: domain.StageStatusSucceeded,
+		ArtifactSHA256: dObj.SHA256, CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("pin dub script stage: %v", err)
+	}
 
 	_, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:                 runID,
 		AssetID:               assetID,
 		TargetLanguage:        "vi",
 		TranslationVariantCAS: "",
@@ -2369,4 +2565,154 @@ func TestVisualTextService_LocalizeVisualTrack_DecodedTranslationArtifactOwnersh
 	if !strings.Contains(err.Error(), "ownership mismatch") {
 		t.Fatalf("expected ownership mismatch error, got %v", err)
 	}
+}
+
+// Visual localization is run-scoped: without a run_id the overlay translation
+// lane cannot consume the run's frozen glossary, so the request must be rejected
+// before any translation work rather than silently using a request-local glossary (#151).
+func TestVisualTextService_LocalizeVisualTrack_MissingRunIDRejected(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	setupTestTranslationService(db, casStore, svc)
+	ctx := context.Background()
+
+	seedTextRegionPlan(t, db, casStore, assetID, []domain.TrackedTextRegion{
+		{
+			ID:          "region-labeled",
+			Role:        domain.TextRoleSemanticText,
+			Text:        "导出",
+			FirstSeenMs: 0,
+			LastSeenMs:  2000,
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 0, Box: domain.BoundingBox{X: 100, Y: 100, Width: 200, Height: 60}, Observed: true},
+			},
+		},
+	})
+
+	_, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err == nil || !strings.Contains(err.Error(), "run_id is required") {
+		t.Fatalf("expected run_id-required rejection for missing run_id, got %v", err)
+	}
+}
+
+// Both overlay roles translate through the ephemeral inline lane, which consumes the
+// frozen run glossary only when the run is named. This proves the run's frozen glossary
+// reaches BOTH semantic_text and instructional_ui_text, and that a conflicting
+// request-local glossary still fails closed against the frozen snapshot (#151).
+func TestVisualTextService_LocalizeVisualTrack_BothRolesConsumeFrozenRunGlossary(t *testing.T) {
+	svc, db, casStore, assetID := setupVisualTextService(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	runID := "run-frozen-glossary"
+	jobID := "job-frozen-glossary"
+	if err := db.CreateJob(ctx, domain.LocalizationJob{
+		ID: jobID, SourceAssetID: assetID, TargetLanguage: "vi", Status: "running", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{
+		ID:                 runID,
+		JobID:              jobID,
+		Status:             "running",
+		ConfigSnapshotJSON: `{"glossary":[{"source":"导出","target":"XUAT_FROZEN"},{"source":"第一步","target":"BUOC_FROZEN"}]}`,
+		CreatedAt:          time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	seedTextRegionPlan(t, db, casStore, assetID, []domain.TrackedTextRegion{
+		{
+			ID:          "region-semantic",
+			Role:        domain.TextRoleSemanticText,
+			Text:        "第一步: 准备",
+			FirstSeenMs: 0,
+			LastSeenMs:  2000,
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 0, Box: domain.BoundingBox{X: 80, Y: 200, Width: 400, Height: 80}, Observed: true},
+			},
+		},
+		{
+			ID:          "region-ui",
+			Role:        domain.TextRoleInstructionalUIText,
+			Text:        "导出",
+			FirstSeenMs: 0,
+			LastSeenMs:  2000,
+			Keyframes: []domain.RegionKeyframe{
+				{TimestampMs: 0, Box: domain.BoundingBox{X: 600, Y: 600, Width: 180, Height: 60}, Observed: true},
+			},
+		},
+	})
+
+	// The ephemeral overlay lane never republishes the canonical variant, so the
+	// frozen glossary the run pinned is observed where the request is actually
+	// consumed: the translation job input handed to the provider.
+	var capturedRequests []domain.TranslationJobInput
+	transSvc := service.NewTranslationService(db, casStore)
+	transSvc.TranslateInvoke = func(ctx context.Context, p provider.Provider, req domain.TranslationJobInput) (*provider.TranslationResult, error) {
+		capturedRequests = append(capturedRequests, req)
+		src := req.Segments[0].SourceText
+		return &provider.TranslationResult{
+			ProviderID:   "fake_trans",
+			ModelName:    "qwen_trans",
+			ModelVersion: "v1",
+			Segments: []domain.TranslationSegment{
+				{Index: 0, SourceText: src, TargetText: "bonjour " + src},
+			},
+		}, nil
+	}
+	svc.SetTranslationService(transSvc)
+
+	_, err := svc.LocalizeVisualTrack(ctx, service.LocalizeVisualTrackInput{
+		RunID:          runID,
+		AssetID:        assetID,
+		TargetLanguage: "vi",
+	})
+	if err != nil {
+		t.Fatalf("localize visual track with frozen run glossary: %v", err)
+	}
+
+	// Each overlay role must have translated at least once, and each request must carry
+	// the frozen target the run pinned for its own source text. Without the frozen run
+	// glossary an ephemeral request would carry an empty (or request-local) glossary.
+	semanticSeen := false
+	uiSeen := false
+	for _, req := range capturedRequests {
+		if !req.Ephemeral {
+			t.Errorf("overlay translation request was not ephemeral: %+v", req)
+		}
+		src := req.Segments[0].SourceText
+		switch {
+		case strings.Contains(src, "第一步"):
+			semanticSeen = true
+			if !glossaryContainsFrozenEntry(req.EffectiveGlossary.Entries, "第一步", "BUOC_FROZEN") {
+				t.Errorf("semantic_text request did not carry the frozen run glossary: %+v", req.EffectiveGlossary.Entries)
+			}
+		case strings.Contains(src, "导出"):
+			uiSeen = true
+			if !glossaryContainsFrozenEntry(req.EffectiveGlossary.Entries, "导出", "XUAT_FROZEN") {
+				t.Errorf("instructional_ui_text request did not carry the frozen run glossary: %+v", req.EffectiveGlossary.Entries)
+			}
+		}
+	}
+	if !semanticSeen {
+		t.Errorf("semantic_text role never reached the translation provider; captured=%d", len(capturedRequests))
+	}
+	if !uiSeen {
+		t.Errorf("instructional_ui_text role never reached the translation provider; captured=%d", len(capturedRequests))
+	}
+}
+
+// glossaryContainsFrozenEntry reports whether the frozen (source, target) pair survived
+// into the effective glossary the request carried.
+func glossaryContainsFrozenEntry(entries []domain.GlossaryEntry, source, target string) bool {
+	for _, e := range entries {
+		if e.Source == source && e.Target == target {
+			return true
+		}
+	}
+	return false
 }

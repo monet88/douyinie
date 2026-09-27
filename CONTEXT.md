@@ -34,7 +34,7 @@ Source-derived spatial and temporal tracking plan for on-screen text with first-
 Calculates cadence and duration adaptation for each speech segment:
 - **Immutable Source Window**: Segment start/end anchors are strictly locked to source speech boundaries.
 - **Shorten First**: Translation must adapt text length to match source speaking tempo before applying audio speed adjustments.
-- **Zero Overrun**: Probe actual synthesized duration; enforce `tts_finish <= source_end` (no adjacent speech overrun).
+- **Playback Window**: Probe actual synthesized waveform duration. Source start/end anchors stay immutable; bounded borrowing may use only proven source silence before the next canonical speech/vocal boundary, with a frozen reserve. The decoded waveform must end at or before `DubPlaybackEndMs` and never collide with adjacent localized speech.
 - **Natural Breathing Room**: Maintain perceptible inter-turn pauses to prevent adjacent sentences from running together.
 
 ### 4.1 Production Translation Routing

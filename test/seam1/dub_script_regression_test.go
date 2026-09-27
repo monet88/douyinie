@@ -1,9 +1,6 @@
 package seam1_test
 
 import (
-	"bytes"
-	"encoding/json"
-	"fmt"
 	"net/http"
 	"testing"
 
@@ -17,20 +14,9 @@ func TestSeam1_DubScript_UnseenTextUsesGenericAdaptationAndPreservesSourceGap(t 
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 	// Save an audio role plan with narration/dialogue so dub script can adapt.
-	planPayload := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
-		},
-	}
-	planBody, _ := json.Marshal(planPayload)
-	planResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(planBody))
-	if err != nil {
-		t.Fatalf("save audio role plan failed: %v", err)
-	}
-	planResp.Body.Close()
-	if planResp.StatusCode != http.StatusCreated && planResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200/201 for audio role plan, got %d", planResp.StatusCode)
-	}
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+	})
 
 	const (
 		source1 = "请打开窗户并检查声音。"
@@ -51,14 +37,18 @@ func TestSeam1_DubScript_UnseenTextUsesGenericAdaptationAndPreservesSourceGap(t 
 		fake.CustomTranslations[source1] = target1
 		fake.CustomTranslations[source2] = target2
 	}
+	transSegments := []domain.TranslationInputSegment{
+		{Index: 0, SourceText: source1, SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 2300},
+		{Index: 1, SourceText: source2, SpeakerID: "SPEAKER_00", StartMs: 2420, EndMs: 3300},
+	}
+	// Pin the run's transcript as canonical speech blocks: dub-script adaptation derives its
+	// playback boundary from the immutable transcript, so a blockless stub no longer resolves.
+	pinSeam1TranscriptForSegments(t, h, runID, assetID, transSegments)
 
 	transReq := map[string]any{
 		"run_id":          runID,
 		"target_language": "vi",
-		"segments": []domain.TranslationInputSegment{
-			{Index: 0, SourceText: source1, SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 2300},
-			{Index: 1, SourceText: source2, SpeakerID: "SPEAKER_00", StartMs: 2420, EndMs: 3300},
-		},
+		"segments":        transSegments,
 	}
 	respTrans, transVariant := runTranslation(t, h, assetID, transReq)
 	if respTrans.StatusCode != http.StatusCreated || transVariant == nil {
@@ -105,20 +95,9 @@ func TestSeam1_DubScript_FittingTextStillRoutesExtremeCadenceDeviationToReview(t
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 	// Save an audio role plan with narration/dialogue so dub script can adapt.
-	planPayload2 := map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
-		},
-	}
-	planBody2, _ := json.Marshal(planPayload2)
-	planResp2, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(planBody2))
-	if err != nil {
-		t.Fatalf("save audio role plan failed: %v", err)
-	}
-	planResp2.Body.Close()
-	if planResp2.StatusCode != http.StatusCreated && planResp2.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200/201 for audio role plan, got %d", planResp2.StatusCode)
-	}
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 10000, Role: domain.AudioRoleNarrationDialogue},
+	})
 
 	const (
 		source = "现在马上快速打开窗户然后立刻继续操作完成所有步骤。"
@@ -135,13 +114,15 @@ func TestSeam1_DubScript_FittingTextStillRoutesExtremeCadenceDeviationToReview(t
 		}
 		fake.CustomTranslations[source] = target
 	}
+	transSegments := []domain.TranslationInputSegment{
+		{Index: 0, SourceText: source, SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 2000},
+	}
+	pinSeam1TranscriptForSegments(t, h, runID, assetID, transSegments)
 
 	transReq := map[string]any{
 		"run_id":          runID,
 		"target_language": "vi",
-		"segments": []domain.TranslationInputSegment{
-			{Index: 0, SourceText: source, SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 2000},
-		},
+		"segments":        transSegments,
 	}
 	respTrans, transVariant := runTranslation(t, h, assetID, transReq)
 	if respTrans.StatusCode != http.StatusCreated || transVariant == nil {

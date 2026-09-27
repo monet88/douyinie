@@ -164,10 +164,58 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 		if err := json.NewDecoder(reader).Decode(&dubMix); err != nil {
 			return nil, fmt.Errorf("decode dub mix from CAS: %w", err)
 		}
+		if dubMix.AssetID != in.AssetID || !strings.EqualFold(dubMix.TargetLanguage, in.TargetLanguage) {
+			return nil, fmt.Errorf("%w: dub mix belongs to asset %s language %s, not %s/%s",
+				domain.ErrRenderOwnershipMismatch, dubMix.AssetID, dubMix.TargetLanguage, in.AssetID, in.TargetLanguage)
+		}
+		if strings.TrimSpace(in.RunID) != "" {
+			// Current-run proof: dubMix must name this run, or this run must have recorded this CAS
+			// in its dub_mix index or audio_mix stage execution.
+			hasRunProof := dubMix.RunID == in.RunID
+			if !hasRunProof {
+				if idx, err := s.db.GetDubMixArtifactIndexByRun(ctx, in.RunID); err == nil && idx != nil && idx.CASHash == dubMixCAS {
+					hasRunProof = true
+				}
+			}
+			if !hasRunProof {
+				if pinned, err := s.db.GetStageArtifactHash(ctx, in.RunID, "audio_mix"); err == nil && pinned == dubMixCAS {
+					hasRunProof = true
+				}
+			}
+			if !hasRunProof {
+				return nil, fmt.Errorf("%w: explicit dub mix %s does not have current-run proof for run %s",
+					domain.ErrRenderOwnershipMismatch, dubMixCAS, in.RunID)
+			}
+		}
 	} else {
-		idx, err := s.db.GetDubMixArtifactIndex(ctx, in.AssetID, in.TargetLanguage)
-		if err != nil {
-			return nil, fmt.Errorf("%w: dub mix artifact missing for asset %s (%s)", domain.ErrRenderSourceNotFound, in.AssetID, in.TargetLanguage)
+		// Run-scoped evidence only: never fall back to asset-latest
+		var idx *storage.DubMixArtifactIndex
+		if runID := strings.TrimSpace(in.RunID); runID != "" {
+			runIdx, runErr := s.db.GetDubMixArtifactIndexByRun(ctx, runID)
+			if runErr == nil && runIdx != nil {
+				if runIdx.AssetID != in.AssetID || !strings.EqualFold(runIdx.TargetLanguage, in.TargetLanguage) {
+					return nil, fmt.Errorf("%w: run %s dub mix belongs to asset %s language %s, not %s/%s",
+						domain.ErrRenderOwnershipMismatch, runID, runIdx.AssetID, runIdx.TargetLanguage, in.AssetID, in.TargetLanguage)
+				}
+				idx = runIdx
+			} else if runErr != nil && !errors.Is(runErr, storage.ErrNotFound) {
+				return nil, fmt.Errorf("%w: read run %s dub mix index: %v", domain.ErrRenderSourceNotFound, runID, runErr)
+			} else {
+				pinnedCAS, hashErr := s.db.GetStageArtifactHash(ctx, runID, "audio_mix")
+				if hashErr != nil {
+					return nil, fmt.Errorf("%w: read run %s audio_mix stage artifact: %v", domain.ErrRenderSourceNotFound, runID, hashErr)
+				}
+				if pinnedCAS == "" {
+					return nil, fmt.Errorf("%w: run %s pins no dub mix artifact", domain.ErrRenderSourceNotFound, runID)
+				}
+				idx = &storage.DubMixArtifactIndex{CASHash: pinnedCAS, AssetID: in.AssetID, TargetLanguage: in.TargetLanguage}
+			}
+		} else {
+			assetIdx, assetErr := s.db.GetDubMixArtifactIndex(ctx, in.AssetID, in.TargetLanguage)
+			if assetErr != nil {
+				return nil, fmt.Errorf("%w: dub mix artifact missing for asset %s (%s)", domain.ErrRenderSourceNotFound, in.AssetID, in.TargetLanguage)
+			}
+			idx = assetIdx
 		}
 		dubMixCAS = idx.CASHash
 		reader, err := s.casStore.Get(dubMixCAS)
@@ -183,6 +231,11 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 	// Invariant: Refused dub mix must not enter rendering
 	if dubMix.OverallStatus != "PASS" {
 		return nil, fmt.Errorf("%w: status is %s (reason: %s)", domain.ErrDubMixNotRenderable, dubMix.OverallStatus, dubMix.RefusalReason)
+	}
+	// Invariant: A legacy DubMix predates the current playback/coverage acceptance contract, so its
+	// PASS cannot be re-used as render evidence; it must be re-derived before it can be rendered.
+	if err := dubMix.ValidateCurrentSchema(); err != nil {
+		return nil, fmt.Errorf("%w: %w", domain.ErrDubMixNotRenderable, err)
 	}
 	if !s.casStore.Exists(dubMix.AudioCASHash) {
 		return nil, fmt.Errorf("%w: dub mix audio file missing in CAS (%s)", domain.ErrRenderSourceNotFound, dubMix.AudioCASHash)
@@ -201,6 +254,14 @@ func (s *RenderService) FreezeRenderPlan(ctx context.Context, in RenderPlanInput
 		var subArt domain.SubtitlePlanArtifact
 		if err := json.NewDecoder(r).Decode(&subArt); err != nil {
 			return nil, fmt.Errorf("decode subtitle plan artifact: %w", err)
+		}
+		if subArt.AssetID != in.AssetID || !strings.EqualFold(subArt.TargetLanguage, in.TargetLanguage) {
+			return nil, fmt.Errorf("%w: subtitle plan belongs to asset %s language %s, not %s/%s",
+				domain.ErrRenderPlanInvalid, subArt.AssetID, subArt.TargetLanguage, in.AssetID, in.TargetLanguage)
+		}
+		if strings.TrimSpace(in.RunID) != "" && strings.TrimSpace(subArt.RunID) != "" && subArt.RunID != in.RunID {
+			return nil, fmt.Errorf("%w: subtitle plan belongs to run %s, not %s",
+				domain.ErrRenderPlanInvalid, subArt.RunID, in.RunID)
 		}
 		cues = subArt.Cues
 		subPlanRef = domain.SubtitlePlanRef{
@@ -595,6 +656,10 @@ type RenderExecutionInput struct {
 // RenderPreview executes a preview render pass consuming the frozen RenderPlan.
 // Uses proxy/lower quality encode settings while preserving identical timeline, subtitle layout, and audio semantics.
 func (s *RenderService) RenderPreview(ctx context.Context, in RenderExecutionInput) (*domain.PreviewRenderArtifact, error) {
+	if err := s.verifyRenderOwnership(ctx, in); err != nil {
+		return nil, err
+	}
+
 	plan, err := s.resolvePlan(ctx, in)
 	if err != nil {
 		return nil, err
@@ -837,7 +902,10 @@ func (s *RenderService) verifyRenderOwnership(ctx context.Context, in RenderExec
 	run, err := s.db.GetRun(ctx, in.RunID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			return fmt.Errorf("%w: run %s does not exist", domain.ErrRenderOwnershipMismatch, in.RunID)
+			if strings.TrimSpace(in.JobID) != "" {
+				return fmt.Errorf("%w: run %s does not exist", domain.ErrRenderOwnershipMismatch, in.RunID)
+			}
+			return nil
 		}
 		return fmt.Errorf("lookup run %s for render ownership: %w", in.RunID, err)
 	}
@@ -898,6 +966,23 @@ func (s *RenderService) resolvePlan(ctx context.Context, in RenderExecutionInput
 		if err := validatePlanBinding(in, &plan); err != nil {
 			return nil, err
 		}
+		if strings.TrimSpace(in.RunID) != "" {
+			hasRunProof := plan.RunID == in.RunID
+			if !hasRunProof {
+				if idx, err := s.db.GetRenderPlanIndexByRun(ctx, in.RunID); err == nil && idx != nil && idx.CASHash == in.PlanCAS {
+					hasRunProof = true
+				}
+			}
+			if !hasRunProof {
+				if pinned, err := s.db.GetStageArtifactHash(ctx, in.RunID, "render_plan"); err == nil && pinned == in.PlanCAS {
+					hasRunProof = true
+				}
+			}
+			if !hasRunProof {
+				return nil, fmt.Errorf("%w: explicit plan CAS %s does not belong to run %s",
+					domain.ErrRenderOwnershipMismatch, in.PlanCAS, in.RunID)
+			}
+		}
 		return &plan, nil
 	}
 
@@ -905,6 +990,23 @@ func (s *RenderService) resolvePlan(ctx context.Context, in RenderExecutionInput
 		idx, err := s.db.GetRenderPlanByProvenance(ctx, in.PlanProvenance)
 		if err != nil {
 			return nil, fmt.Errorf("%w: lookup plan by provenance: %v", domain.ErrRenderPlanNotFound, err)
+		}
+		if strings.TrimSpace(in.RunID) != "" {
+			hasRunProof := idx.RunID == in.RunID
+			if !hasRunProof {
+				if rIdx, err := s.db.GetRenderPlanIndexByRun(ctx, in.RunID); err == nil && rIdx != nil && rIdx.ProvenanceHash == in.PlanProvenance {
+					hasRunProof = true
+				}
+			}
+			if !hasRunProof {
+				if pinned, err := s.db.GetStageArtifactHash(ctx, in.RunID, "render_plan"); err == nil && pinned == idx.CASHash {
+					hasRunProof = true
+				}
+			}
+			if !hasRunProof {
+				return nil, fmt.Errorf("%w: explicit plan provenance %s belongs to run %s, not %s",
+					domain.ErrRenderOwnershipMismatch, in.PlanProvenance, idx.RunID, in.RunID)
+			}
 		}
 		r, err := s.casStore.Get(idx.CASHash)
 		if err != nil {
@@ -923,10 +1025,39 @@ func (s *RenderService) resolvePlan(ctx context.Context, in RenderExecutionInput
 		return &plan, nil
 	}
 
-	// Default: lookup latest render plan for asset + language
-	idx, err := s.db.GetRenderPlanIndex(ctx, in.AssetID, in.TargetLanguage)
-	if err != nil {
-		return nil, fmt.Errorf("%w: latest render plan index missing for asset %s: %v", domain.ErrRenderPlanNotFound, in.AssetID, err)
+	// Default: a run-scoped render resolves the plan from this run's own evidence only, so it can
+	// never execute another run's plan; the asset-latest index is reserved for asset-scoped calls
+	// that name no run (#153).
+	var idx *storage.RenderPlanIndex
+	if runID := strings.TrimSpace(in.RunID); runID != "" {
+		runIdx, runErr := s.db.GetRenderPlanIndexByRun(ctx, runID)
+		switch {
+		case runErr == nil && runIdx != nil:
+			if runIdx.AssetID != in.AssetID || !strings.EqualFold(runIdx.TargetLanguage, in.TargetLanguage) {
+				return nil, fmt.Errorf("%w: run %s render plan belongs to asset %s language %s, not %s/%s",
+					domain.ErrRenderOwnershipMismatch, runID, runIdx.AssetID, runIdx.TargetLanguage, in.AssetID, in.TargetLanguage)
+			}
+			idx = runIdx
+		case runErr != nil && !errors.Is(runErr, storage.ErrNotFound):
+			return nil, fmt.Errorf("%w: read run %s render plan index: %v", domain.ErrRenderPlanNotFound, runID, runErr)
+		default:
+			// The run owns no index row: its render_plan stage execution is the remaining current-run
+			// evidence, and a run that pins nothing fails closed rather than borrowing another run's plan.
+			pinnedCAS, hashErr := s.db.GetStageArtifactHash(ctx, runID, "render_plan")
+			if hashErr != nil {
+				return nil, fmt.Errorf("%w: read run %s render plan stage artifact: %v", domain.ErrRenderPlanNotFound, runID, hashErr)
+			}
+			if pinnedCAS == "" {
+				return nil, fmt.Errorf("%w: run %s pins no render plan", domain.ErrRenderPlanNotFound, runID)
+			}
+			idx = &storage.RenderPlanIndex{CASHash: pinnedCAS}
+		}
+	} else {
+		assetIdx, assetErr := s.db.GetRenderPlanIndex(ctx, in.AssetID, in.TargetLanguage)
+		if assetErr != nil {
+			return nil, fmt.Errorf("%w: latest render plan index missing for asset %s: %v", domain.ErrRenderPlanNotFound, in.AssetID, assetErr)
+		}
+		idx = assetIdx
 	}
 	r, err := s.casStore.Get(idx.CASHash)
 	if err != nil {
@@ -938,7 +1069,9 @@ func (s *RenderService) resolvePlan(ctx context.Context, in RenderExecutionInput
 		return nil, fmt.Errorf("decode plan from CAS: %w", err)
 	}
 	plan.CASHash = idx.CASHash
-	plan.ProvenanceHash = idx.ProvenanceHash
+	if idx.ProvenanceHash != "" {
+		plan.ProvenanceHash = idx.ProvenanceHash
+	}
 	if err := validatePlanBinding(in, &plan); err != nil {
 		return nil, err
 	}

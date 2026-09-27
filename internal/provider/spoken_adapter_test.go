@@ -3,6 +3,8 @@ package provider
 import (
 	"context"
 	"testing"
+
+	"github.com/monet88/douyinie/internal/domain"
 )
 
 func TestSpokenScriptAdapter_UnseenSource_ProducesConciseCandidate(t *testing.T) {
@@ -120,5 +122,30 @@ func TestSpokenScriptAdapter_FlagsSourceRelativeCadenceDeviation(t *testing.T) {
 	}
 	if res.CadenceRatio >= cadenceReviewMinRatio {
 		t.Fatalf("expected cadence ratio below minimum %.2f, got %.3f", cadenceReviewMinRatio, res.CadenceRatio)
+	}
+}
+
+func TestSpokenScriptAdapter_ProtectedTermsPreservedByGlossaryMatching(t *testing.T) {
+	a := NewDefaultSpokenScriptAdapter()
+	ctx := context.Background()
+
+	// If shortening would drop a protected term (checked with word-boundary/CJK matching),
+	// candidate reverts to meaningText.
+	meaning := "Vui lòng mở ứng dụng OpenAI model ngay."
+	res, err := a.AdaptSpokenScript(ctx, SpokenScriptAdaptationRequest{
+		SourceText:     "请打开 OpenAI 模型。",
+		SourceLanguage: "zh",
+		MeaningText:    meaning,
+		TargetLanguage: "vi",
+		SlotDurationMs: 1500, // force shouldShorten = true
+		ProtectedTerms: []domain.GlossaryEntry{
+			{Source: "OpenAI", Target: "OpenAI"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AdaptSpokenScript failed: %v", err)
+	}
+	if !domain.GlossaryTermMatches(res.SpokenText, "OpenAI") {
+		t.Fatalf("expected spoken text to preserve protected term 'OpenAI', got %q", res.SpokenText)
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -107,16 +106,9 @@ func TestSeam1_OperatorUIRegionCorrectionBrowserSmoke(t *testing.T) {
 		t.Fatalf("save text region plan index: %v", err)
 	}
 
-	roleBody, _ := json.Marshal(map[string]any{
-		"segments": []domain.AudioSegment{
-			{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleNarrationDialogue},
-		},
+	saveAndPinAudioRolePlan(t, h, assetID, runID, []domain.AudioSegment{
+		{StartMs: 0, EndMs: 1500, Role: domain.AudioRoleInstrumentalBgm},
 	})
-	roleResp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-role-plan", h.server.URL, assetID), "application/json", bytes.NewReader(roleBody))
-	if err != nil || roleResp.StatusCode != http.StatusCreated {
-		t.Fatalf("setup audio role plan failed: status=%v err=%v", roleResp.StatusCode, err)
-	}
-	_ = roleResp.Body.Close()
 
 	sepResp, stems := runSeparateStems(t, h, assetID, map[string]any{"run_id": runID})
 	if sepResp.StatusCode != http.StatusCreated || stems == nil {

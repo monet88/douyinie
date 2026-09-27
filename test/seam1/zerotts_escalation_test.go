@@ -102,7 +102,7 @@ func runGetVoiceAssignment(t *testing.T, h *testHarness, assetID, runID string) 
 // ---------------------------------------------------------------------------
 func TestSeam1_ZeroTTS_UnresolvedOverrunEscalatesWholeSpeakerToCosyVoice3(t *testing.T) {
 	h := setupHarness(t)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, runID := createJobAndRunWithDuration(t, h, 5.0)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -275,7 +275,7 @@ func TestSeam1_ZeroTTS_UnresolvedOverrunEscalatesWholeSpeakerToCosyVoice3(t *tes
 // ---------------------------------------------------------------------------
 func TestSeam1_ZeroTTS_EscalationUsesFallbackMeasuredSpeedFit(t *testing.T) {
 	h := setupHarness(t)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, runID := createJobAndRunWithDuration(t, h, 5.0)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -339,7 +339,7 @@ func TestSeam1_ZeroTTS_EscalationUsesFallbackMeasuredSpeedFit(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestSeam1_ZeroTTS_EscalationRetryIsDeterministic(t *testing.T) {
 	h := setupHarness(t)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, runID := createJobAndRunWithDuration(t, h, 5.0)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -394,7 +394,7 @@ func TestSeam1_ZeroTTS_EscalationRetryIsDeterministic(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestSeam1_ZeroTTS_EscalationStillOverrunningProjectsReviewWithoutSecondHop(t *testing.T) {
 	h := setupHarness(t)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, runID := createJobAndRunWithDuration(t, h, 5.0)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -461,7 +461,7 @@ func TestSeam1_ZeroTTS_EscalationStillOverrunningProjectsReviewWithoutSecondHop(
 // ---------------------------------------------------------------------------
 func TestSeam1_ZeroTTS_EscalationRequiresEligibleFallbackLane(t *testing.T) {
 	h := setupHarness(t)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, runID := createJobAndRunWithDuration(t, h, 5.0)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -587,7 +587,7 @@ func seedLegacyCachedDubSegmentsVariant(t *testing.T, h *testHarness, dubScriptC
 
 func TestSeam1_ZeroTTS_PreIssue94CachedVariantCannotSatisfyTheEscalationContract(t *testing.T) {
 	h := setupHarness(t)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, runID := createJobAndRunWithDuration(t, h, 5.0)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -710,7 +710,7 @@ func seedPreRuntimeIdentityCachedDubSegmentsVariant(t *testing.T, h *testHarness
 
 func TestSeam1_TTSPinUpgradeCannotBeSatisfiedByPreUpgradeCachedVariant(t *testing.T) {
 	h := setupHarness(t)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, runID := createJobAndRunWithDuration(t, h, 5.0)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -757,7 +757,7 @@ func TestSeam1_TTSPinUpgradeCannotBeSatisfiedByPreUpgradeCachedVariant(t *testin
 // ---------------------------------------------------------------------------
 func TestSeam1_ZeroTTS_ReviewCorrectionReportsTheFinalAssignmentAfterEscalation(t *testing.T) {
 	h := setupHarness(t)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, runID := createJobAndRunWithDuration(t, h, 5.0)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -866,7 +866,7 @@ func TestSeam1_ZeroTTS_ReviewCorrectionReportsTheFinalAssignmentAfterEscalation(
 // ---------------------------------------------------------------------------
 func TestSeam1_ZeroTTS_StaleBaseEscalationCannotClobberNewerOperatorAssignment(t *testing.T) {
 	h := setupHarness(t)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, runID := createJobAndRunWithDuration(t, h, 5.0)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -962,7 +962,7 @@ func TestSeam1_ZeroTTS_StaleBaseEscalationCannotClobberNewerOperatorAssignment(t
 // ---------------------------------------------------------------------------
 func TestSeam1_ZeroTTS_SharedVoiceEscalationAuditsEveryChangedSpeaker(t *testing.T) {
 	h := setupHarness(t)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, runID := createJobAndRunWithDuration(t, h, 5.0)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -1093,7 +1093,7 @@ func seedLegacySchemaPriorDubSegmentsVariant(t *testing.T, h *testHarness, produ
 // ---------------------------------------------------------------------------
 func TestSeam1_ZeroTTS_LegacySchemaPriorVariantIsNotReusedBySupersedingSynthesis(t *testing.T) {
 	h := setupHarness(t)
-	jobID, runID := createJobAndRun(t, h)
+	jobID, runID := createJobAndRunWithDuration(t, h, 5.0)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 

@@ -372,7 +372,7 @@ func TestSeam1_SpeechUnderstand_PersistAndRetrieve(t *testing.T) {
 
 func TestSeam1_SpeechUnderstand_NoDubEligibleReturns422(t *testing.T) {
 	h := setupHarness(t)
-	jobID, _ := createJobAndRun(t, h)
+	jobID, runID := createJobAndRun(t, h)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
@@ -386,7 +386,7 @@ func TestSeam1_SpeechUnderstand_NoDubEligibleReturns422(t *testing.T) {
 	planResp, _ := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(planBody))
 	planResp.Body.Close()
 
-	payload := map[string]any{"run_id": "some-run-id"}
+	payload := map[string]any{"run_id": runID}
 	body, _ := json.Marshal(payload)
 	resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/speech-understand", "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -506,12 +506,12 @@ func TestSeam1_SpeechUnderstand_MissingPlanFailsClosed(t *testing.T) {
 	h := setupHarness(t)
 	// Disable automatic prerequisite generator to test SpeechService fail-closed guard
 	h.srv.SetAudioRoleService(nil)
-	jobID, _ := createJobAndRun(t, h)
+	jobID, runID := createJobAndRun(t, h)
 	job := getJobViaAPI(t, h, jobID)
 	assetID := job.SourceAssetID
 
 	// Deliberately do NOT save an audio role plan.
-	payload := map[string]any{"run_id": "run-no-plan"}
+	payload := map[string]any{"run_id": runID}
 	body, _ := json.Marshal(payload)
 	resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/speech-understand", "application/json", bytes.NewReader(body))
 	if err != nil {

@@ -495,6 +495,26 @@ func TestSpeechService_RunPipeline_ResolvesPreflightNormalizedAudio(t *testing.T
 		},
 	}
 
+	// The run must exist: persistTranscript records the speech_understand stage execution against it
+	// and propagates that failure, so an unrecordable run can never report a successful pipeline.
+	if err := db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             "job-run-1",
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        "run-1",
+		JobID:     "job-run-1",
+		Status:    "running",
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
 	artifact, err := s.RunPipeline(ctx, in)
 	if err != nil {
 		t.Fatalf("RunPipeline failed: %v", err)
@@ -1206,5 +1226,165 @@ func TestSpeechService_RunPipeline_PreflightNormalizedWAVReachedProviders(t *tes
 	}
 	if !strings.HasPrefix(capturedASRRef.Path, tmpDir) {
 		t.Errorf("Normalized ref is not in CAS directory: %q", capturedASRRef.Path)
+	}
+}
+
+// TestSpeechService_PersistTranscriptOwnsStageExecution pins finding 4: persistTranscript is the
+// single owner of the speech_understand stage row. Every RunPipeline execution records exactly one
+// row - the fresh derivation and the provenance cache-hit path alike - and a persistence failure is
+// propagated rather than swallowed, so a run whose lineage cannot be recorded never reports success.
+func TestSpeechService_PersistTranscriptOwnsStageExecution(t *testing.T) {
+	tmpDir := t.TempDir()
+	casStore, err := cas.NewStore(tmpDir)
+	if err != nil {
+		t.Fatalf("setup CAS store: %v", err)
+	}
+	db, err := storage.Open(filepath.Join(tmpDir, "stage_ownership.db"))
+	if err != nil {
+		t.Fatalf("setup DB: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	attID := uuid.NewString()
+	if err := db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              attID,
+		AttestationType: "OPERATOR_EXPLICIT_CONFIRMATION",
+		DeclaredBy:      "test",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	}); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+
+	normWav := filepath.Join(tmpDir, "norm_16k.wav")
+	if err := createValidTestWAV(normWav, 16000, 1, 16000); err != nil {
+		t.Fatalf("create norm wav: %v", err)
+	}
+	normObj, err := casStore.PutFile(normWav)
+	if err != nil {
+		t.Fatalf("put norm wav in CAS: %v", err)
+	}
+
+	assetID := uuid.NewString()
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		SHA256:              "source_video_sha256_stage",
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		OriginalFilename:    "video.mp4",
+		RightsAttestationID: attID,
+		CASPath:             filepath.Join(tmpDir, "video.mp4"),
+		CreatedAt:           now,
+	}); err != nil {
+		t.Fatalf("create source asset: %v", err)
+	}
+	if err := db.SavePreflightReport(ctx, domain.PreflightReport{
+		ID:                     uuid.NewString(),
+		AssetID:                assetID,
+		DurationSec:            1.0,
+		DurationMs:             1000,
+		ContainerFormat:        "mov,mp4,m4a,3gp,3g2,mj2",
+		ContainerValid:         true,
+		FingerprintMatch:       true,
+		NormalizedAudioSHA256:  normObj.SHA256,
+		NormalizedAudioCASPath: normObj.Path,
+		CreatedAt:              now,
+	}); err != nil {
+		t.Fatalf("save preflight report: %v", err)
+	}
+
+	jobID := uuid.NewString()
+	if err := db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             jobID,
+		SourceAssetID:  assetID,
+		TargetLanguage: "vi",
+		Status:         "running",
+		CreatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	runID := uuid.NewString()
+	if err := db.CreateRun(ctx, domain.LocalizationRun{
+		ID:        runID,
+		JobID:     jobID,
+		Status:    "running",
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	s := NewSpeechService(db, casStore)
+	s.ASRInvoke = func(ctx context.Context, req SpeechASRRequest) (*SpeechASRResult, error) {
+		return &SpeechASRResult{
+			ProviderID:   "fake_asr",
+			ModelName:    "qwen3-asr",
+			ModelVersion: "1.7b",
+			LanguageCode: "zh",
+			Segments:     []domain.ASRRawSegment{{StartMs: 0, EndMs: 1000, Text: "测试", Confidence: 0.9}},
+		}, nil
+	}
+	s.AlignerInvoke = func(ctx context.Context, req SpeechAlignmentRequest) (*SpeechAlignmentResult, error) {
+		return &SpeechAlignmentResult{
+			ProviderID:   "fake_align",
+			ModelName:    "Qwen3-ForcedAligner-0.6B",
+			ModelVersion: "0.6b",
+			WordTimings:  []domain.WordTiming{{Word: "测试", StartMs: 0, EndMs: 1000, Confidence: 0.9}},
+		}, nil
+	}
+
+	in := domain.SpeechPipelineInput{
+		RunID:   runID,
+		AssetID: assetID,
+		AudioRolePlan: &domain.AudioRolePlan{
+			Segments: []domain.AudioSegment{{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue}},
+		},
+	}
+
+	if _, err := s.RunPipeline(ctx, in); err != nil {
+		t.Fatalf("fresh RunPipeline failed: %v", err)
+	}
+	freshRows, err := db.ListStageExecutions(ctx, runID)
+	if err != nil {
+		t.Fatalf("list stage executions: %v", err)
+	}
+	if len(freshRows) != 1 {
+		t.Fatalf("fresh derivation must record exactly one speech_understand stage row, got %d: %+v", len(freshRows), freshRows)
+	}
+	if freshRows[0].Stage != "speech_understand" || freshRows[0].Status != domain.StageStatusSucceeded || freshRows[0].ArtifactSHA256 == "" {
+		t.Fatalf("unexpected fresh stage row: %+v", freshRows[0])
+	}
+	freshArtifact := freshRows[0].ArtifactSHA256
+
+	// Second execution over identical inputs reuses the provenance-addressed artifact; it must still
+	// record its own lineage row (exactly one more, same artifact), never a duplicate pair.
+	if _, err := s.RunPipeline(ctx, in); err != nil {
+		t.Fatalf("cache-hit RunPipeline failed: %v", err)
+	}
+	cachedRows, err := db.ListStageExecutions(ctx, runID)
+	if err != nil {
+		t.Fatalf("list stage executions after cache hit: %v", err)
+	}
+	if len(cachedRows) != 2 {
+		t.Fatalf("cache-hit derivation must add exactly one stage row, got %d: %+v", len(cachedRows), cachedRows)
+	}
+	if cachedRows[1].ArtifactSHA256 != freshArtifact {
+		t.Fatalf("cache hit must reuse artifact %s, got %s", freshArtifact, cachedRows[1].ArtifactSHA256)
+	}
+
+	// A run that cannot be recorded must fail loudly instead of reporting success (stage_executions
+	// references localization_runs, so an unknown run violates the FK).
+	unrecordable := in
+	unrecordable.RunID = uuid.NewString()
+	if _, err := s.RunPipeline(ctx, unrecordable); err == nil {
+		t.Fatal("RunPipeline must propagate a stage-execution persistence failure for an unrecordable run")
+	}
+	orphanRows, err := db.ListStageExecutions(ctx, unrecordable.RunID)
+	if err != nil {
+		t.Fatalf("list stage executions for unrecordable run: %v", err)
+	}
+	if len(orphanRows) != 0 {
+		t.Fatalf("expected no lineage rows for the unrecordable run, got %+v", orphanRows)
 	}
 }

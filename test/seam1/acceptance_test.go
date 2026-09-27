@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,6 +41,37 @@ type testHarness struct {
 
 func (h *testHarness) SetExecutor(exec server.Executor) {
 	h.srv.SetExecutor(exec)
+}
+
+func saveAndPinAudioRolePlan(t *testing.T, h *testHarness, assetID, runID string, segments []domain.AudioSegment) domain.AudioRolePlan {
+	t.Helper()
+	// The endpoint is the sole writer of the run's audio_role_plan stage pin: it
+	// records the pinned CAS hash itself when run_id is present. Posting the run
+	// with the segments keeps this helper on that production path instead of
+	// duplicating the lineage write here (#153).
+	body, err := json.Marshal(map[string]any{"run_id": runID, "segments": segments})
+	if err != nil {
+		t.Fatalf("marshal audio role plan: %v", err)
+	}
+	resp, err := http.Post(h.server.URL+"/api/v1/assets/"+assetID+"/audio-role-plan", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("save audio role plan failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("save audio role plan failed: %d body=%s", resp.StatusCode, string(b))
+	}
+	var planRes struct {
+		Plan domain.AudioRolePlan `json:"audio_role_plan"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&planRes); err != nil {
+		t.Fatalf("decode saved audio role plan: %v", err)
+	}
+	if strings.TrimSpace(planRes.Plan.CASHash) == "" {
+		t.Fatalf("saved audio role plan missing CASHash")
+	}
+	return planRes.Plan
 }
 
 type harnessOptions struct {
