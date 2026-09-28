@@ -563,7 +563,26 @@ func TestSeam1_VisualTrack_LocalProfile_DisablesTranslation(t *testing.T) {
 
 func TestSeam1_VisualTrack_HybridProfile_ConsentAndCredentials(t *testing.T) {
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		target := "Xuất"
+		var reqBody struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&reqBody)
+		sourceEcho := "导出"
+		if len(reqBody.Messages) > 0 {
+			var userPayload struct {
+				Segments []struct {
+					SourceText string `json:"source_text"`
+				} `json:"segments"`
+			}
+			_ = json.Unmarshal([]byte(reqBody.Messages[len(reqBody.Messages)-1].Content), &userPayload)
+			if len(userPayload.Segments) > 0 && userPayload.Segments[0].SourceText != "" {
+				sourceEcho = userPayload.Segments[0].SourceText
+			}
+		}
+		target := "Xuất 1"
 		resp := map[string]any{
 			"id":    "chatcmpl-test",
 			"model": "gemini-3.8-flash",
@@ -572,7 +591,7 @@ func TestSeam1_VisualTrack_HybridProfile_ConsentAndCredentials(t *testing.T) {
 					"index": 0,
 					"message": map[string]any{
 						"role":    "assistant",
-						"content": fmt.Sprintf(`{"segments": [{"index": 0, "source_text": "test", "target_text": "%s"}]}`, target),
+						"content": fmt.Sprintf(`{"segments": [{"index": 0, "source_text": %q, "target_text": %q}]}`, sourceEcho, target),
 					},
 					"finish_reason": "stop",
 				},

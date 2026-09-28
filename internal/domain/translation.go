@@ -30,6 +30,10 @@ var (
 	// ErrTranscriptLineageProofFailed is returned when the pinned-lineage proof itself could not be
 	// completed (storage/DB failure). It must not be treated as "no pinned transcript exists".
 	ErrTranscriptLineageProofFailed = errors.New("transcript lineage proof failed")
+	// ErrInvalidCanonicalBatch classifies canonical batch contract violations: repeated indices,
+	// the segment-count ceiling and the aggregate source-byte ceiling. It lets transport layers map
+	// an invalid canonical input to a client error without matching on message text.
+	ErrInvalidCanonicalBatch = errors.New("invalid canonical translation batch")
 )
 
 const (

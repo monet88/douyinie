@@ -2557,7 +2557,16 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 		AuthorizedCredentials []string                         `json:"authorized_credentials,omitempty"`
 		ConsentGranted        bool                             `json:"consent_granted,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	rawBody, err := io.ReadAll(io.LimitReader(r.Body, (1<<20)+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read request body: "+err.Error())
+		return
+	}
+	if len(rawBody) > 1<<20 {
+		writeError(w, http.StatusBadRequest, "translation request body exceeds 1 MiB limit")
+		return
+	}
+	if err := json.Unmarshal(rawBody, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
 		return
 	}
@@ -2616,7 +2625,8 @@ func (s *Server) handleRunTranslation(w http.ResponseWriter, r *http.Request) {
 			errors.Is(err, domain.ErrGlossaryConflict) ||
 			errors.Is(err, domain.ErrTranslationOwnershipMismatch) ||
 			errors.Is(err, domain.ErrTranscriptLineageMissing) ||
-			errors.Is(err, domain.ErrTranscriptLineageMismatch) {
+			errors.Is(err, domain.ErrTranscriptLineageMismatch) ||
+			errors.Is(err, domain.ErrInvalidCanonicalBatch) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}

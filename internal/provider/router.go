@@ -26,6 +26,10 @@ type RouteRequest struct {
 	ExcludedProviders     []string
 	PreferredProviderID   string
 	CandidateInputHash    func(p Provider) string // Optional per-candidate input hash generator for fallback provenance
+	// AttemptProvenance reports invocation-local provenance for one candidate callback: the payload
+	// model, the configured service baseline and the bounded subrequest evidence consumed by the
+	// invocation. It is written onto the existing ProviderAttempt row only.
+	AttemptProvenance func(p Provider) (observedModel, serviceBaselineID, subrequestEvidence string)
 }
 
 // RouteResult returns the selected provider, fallback candidates, and the selection decision.
@@ -800,7 +804,9 @@ func (r *Router) ExecuteRoutedWithRetry(
 				CostUnits:     0.0,
 				CreatedAt:     time.Now().UTC(),
 			}
-			enrichAttemptMetadata(&pa, p)
+			// A circuit-open candidate was never invoked: it must never consume invocation-local
+			// provenance, which still describes the previously executed candidate.
+			enrichStaticAttemptMetadata(&pa, p)
 			if r.db != nil {
 				if err := r.db.RecordProviderAttempt(ctx, pa); err != nil {
 					return fmt.Errorf("fail-closed: record circuit_broken attempt provenance: %w", err)
@@ -869,7 +875,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 					CostUnits:     p.Capability().CostPerUnit,
 					CreatedAt:     time.Now().UTC(),
 				}
-				enrichAttemptMetadata(&pa, p)
+				enrichAttemptMetadata(&pa, p, req)
 				if r.db != nil {
 					if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
 						return fmt.Errorf("fail-closed: record succeeded attempt provenance: %w", errDB)
@@ -883,6 +889,30 @@ func (r *Router) ExecuteRoutedWithRetry(
 
 			lastErr = err
 
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+				pa := domain.ProviderAttempt{
+					ID:            uuid.NewString(),
+					RunID:         req.RunID,
+					Stage:         string(req.Stage),
+					ProviderID:    p.ID(),
+					ModelName:     modelName,
+					ModelVersion:  modelVer,
+					InputHash:     candInputHash,
+					AttemptNumber: attemptGlobal,
+					Status:        "failed",
+					ErrorMessage:  err.Error(),
+					LatencyMs:     latency,
+					CostUnits:     0.0,
+					CreatedAt:     time.Now().UTC(),
+				}
+				enrichAttemptMetadata(&pa, p, req)
+				if r.db != nil {
+					if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
+						return fmt.Errorf("fail-closed: record canceled attempt provenance: %w (original: %v)", errDB, err)
+					}
+				}
+				return err
+			}
 			// 1. Check for non-transient governance/policy/inconsistency errors (FAIL-CLOSED, no retry, no fallback)
 			if errors.Is(err, domain.ErrPolicyBlocked) ||
 				errors.Is(err, domain.ErrConsentRequired) ||
@@ -908,7 +938,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 					CostUnits:     0.0,
 					CreatedAt:     time.Now().UTC(),
 				}
-				enrichAttemptMetadata(&pa, p)
+				enrichAttemptMetadata(&pa, p, req)
 				if r.db != nil {
 					if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
 						return fmt.Errorf("fail-closed: record policy_rejected attempt provenance: %w (original: %v)", errDB, err)
@@ -934,7 +964,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 					CostUnits:     p.Capability().CostPerUnit,
 					CreatedAt:     time.Now().UTC(),
 				}
-				enrichAttemptMetadata(&pa, p)
+				enrichAttemptMetadata(&pa, p, req)
 				if r.db != nil {
 					if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
 						return fmt.Errorf("fail-closed: record quality_failed attempt provenance: %w", errDB)
@@ -959,7 +989,7 @@ func (r *Router) ExecuteRoutedWithRetry(
 				CostUnits:     0.0,
 				CreatedAt:     time.Now().UTC(),
 			}
-			enrichAttemptMetadata(&pa, p)
+			enrichAttemptMetadata(&pa, p, req)
 			if r.db != nil {
 				if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
 					return fmt.Errorf("fail-closed: record failed attempt provenance: %w", errDB)
@@ -974,8 +1004,29 @@ func (r *Router) ExecuteRoutedWithRetry(
 	return fmt.Errorf("all provider candidates failed for stage %s: %w", req.Stage, lastErr)
 }
 
-func enrichAttemptMetadata(pa *domain.ProviderAttempt, p Provider) {
+// enrichStaticAttemptMetadata records provider-static provenance only. It is used for attempts that
+// were never invoked (circuit-open candidates), which must not consume the invocation-local
+// AttemptProvenance payload left behind by the previously executed candidate.
+func enrichStaticAttemptMetadata(pa *domain.ProviderAttempt, p Provider) {
 	prov := ExtractRemoteProvenance(p)
 	pa.ObservedModel = prov.ObservedModel
 	pa.ServiceBaselineID = prov.ServiceBaselineID
+}
+
+func enrichAttemptMetadata(pa *domain.ProviderAttempt, p Provider, req RouteRequest) {
+	enrichStaticAttemptMetadata(pa, p)
+	if req.AttemptProvenance != nil {
+		obs, base, subrequestEvidence := req.AttemptProvenance(p)
+		if obs != "" {
+			pa.ObservedModel = obs
+		}
+		if base != "" {
+			pa.ServiceBaselineID = base
+		}
+		// Failure rows already carry their own error text (which includes the consumed counts when
+		// the bounded budget was exhausted); success rows carry the consumed-count evidence here.
+		if subrequestEvidence != "" && pa.ErrorMessage == "" {
+			pa.ErrorMessage = subrequestEvidence
+		}
+	}
 }

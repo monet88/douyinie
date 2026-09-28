@@ -6,6 +6,43 @@ import (
 	"github.com/monet88/douyinie/internal/domain"
 )
 
+// CandidateWireBudget tracks finite wire call budgets for one Router provider candidate across
+// transport-retry re-entry (Issue #150 A4).
+type CandidateWireBudget struct {
+	TotalCalls    int
+	TargetedCalls int
+}
+
+func NewCandidateWireBudget() *CandidateWireBudget {
+	return &CandidateWireBudget{}
+}
+
+func (b *CandidateWireBudget) RecordWireCall() error {
+	if b == nil {
+		return nil
+	}
+	if b.TotalCalls >= translationWireCallsPerCandidate {
+		return errRepairExhausted("total wire call ceiling reached", b.TotalCalls, b.TargetedCalls)
+	}
+	b.TotalCalls++
+	return nil
+}
+
+func (b *CandidateWireBudget) RecordTargetedCall() error {
+	if b == nil {
+		return nil
+	}
+	if b.TargetedCalls >= translationTargetedCallsPerCandidate {
+		return errRepairExhausted("targeted call ceiling reached", b.TotalCalls, b.TargetedCalls)
+	}
+	if b.TotalCalls >= translationWireCallsPerCandidate {
+		return errRepairExhausted("total wire call ceiling reached", b.TotalCalls, b.TargetedCalls)
+	}
+	b.TargetedCalls++
+	b.TotalCalls++
+	return nil
+}
+
 // TranslationRequest represents the input to a translation provider.
 type TranslationRequest struct {
 	RunID                 string
@@ -14,6 +51,11 @@ type TranslationRequest struct {
 	Segments              []domain.TranslationInputSegment
 	EffectiveGlossary     domain.EffectiveGlossary
 	AuthorizedCredentials []string
+	Budget                *CandidateWireBudget
+	// OnAttemptMetadata reports invocation-local provenance observed during this call: the payload
+	// model, the configured service baseline and the bounded subrequest evidence consumed by the
+	// invocation. It feeds the existing ProviderAttempt row; no separate attempts store exists.
+	OnAttemptMetadata func(observedModel, serviceBaselineID, subrequestEvidence string)
 }
 
 // TranslationResult represents the output from a translation provider.

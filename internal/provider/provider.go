@@ -164,10 +164,9 @@ func (r *Registry) SetRequireSnapshots(require bool) {
 type RemoteProvenance struct {
 	ObservedModel     string
 	ServiceBaselineID string
-	SystemFingerprint string
 }
 
-// ExtractRemoteProvenance extracts observed model, baseline ID, and system fingerprint from a provider if exposed.
+// ExtractRemoteProvenance extracts observed model and baseline ID from a provider if exposed.
 func ExtractRemoteProvenance(p Provider) RemoteProvenance {
 	var prov RemoteProvenance
 	if p == nil {
@@ -178,9 +177,6 @@ func ExtractRemoteProvenance(p Provider) RemoteProvenance {
 	}
 	if bp, ok := p.(interface{ ServiceBaselineID() string }); ok {
 		prov.ServiceBaselineID = bp.ServiceBaselineID()
-	}
-	if fp, ok := p.(interface{ SystemFingerprint() string }); ok {
-		prov.SystemFingerprint = fp.SystemFingerprint()
 	}
 	return prov
 }
