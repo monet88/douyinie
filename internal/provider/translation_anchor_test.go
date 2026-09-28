@@ -183,8 +183,8 @@ func TestAuditAnchoredBatch_ShiftedAndMissingEcho(t *testing.T) {
 func TestClassifyCopy_And_PromotionRules(t *testing.T) {
 	// A2: Copy detection classes:
 	// - Excluded: numeric-only, URL/email, same-script text, authorized unchanged term
-	// - Weak: short/proper-name/title (cross-script, rune count <= 10)
-	// - Strong: meaningful cross-script unchanged copy (rune count > 10)
+	// - Weak: short (<=10 runes) or name/title-only (cross-script) copies
+	// - Strong: meaningful cross-script unchanged copy (sentence content longer than 10 runes)
 	glossary := domain.EffectiveGlossary{
 		Entries: []domain.GlossaryEntry{
 			{Source: "SUPOR", Target: "SUPOR"},
@@ -232,7 +232,10 @@ func TestAuditAnchoredBatch_CopyPromotionBoundary(t *testing.T) {
 
 	longCJK1 := "第一段非常长的主持人解说内容啊" // 15 runes -> strong
 	longCJK2 := "第二段非常长的主持人解说内容啊" // 15 runes -> strong
-	shortCJK := "短标题"             // 3 runes -> weak
+	shortCJK := "短标题"             // 3 runes -> short weak
+	// A long proper-name-only copy is weak as well (#150 A2 name conservatism), so the two boundary
+	// cases below use it as the weak entry.
+	longProperName := "北京字节跳动科技有限公司" // 11 runes -> weak proper name
 
 	// Batch size 5:
 	// If strong = 1, weak = 1 -> strong < 2 -> no promotion. Only strong is a failure.
@@ -258,19 +261,19 @@ func TestAuditAnchoredBatch_CopyPromotionBoundary(t *testing.T) {
 
 	// Now batch size 6 with strong = 2:
 	// strong * 3 = 6. Condition is strong * 3 > batch_size (6 > 6 is false).
-	// So weak copies should NOT be promoted!
+	// So the weak copy must NOT be promoted!
 	expected6 := []domain.TranslationInputSegment{
 		{Index: 0, SourceText: longCJK1},
 		{Index: 1, SourceText: longCJK2},
-		{Index: 2, SourceText: shortCJK},
+		{Index: 2, SourceText: longProperName},
 		{Index: 3, SourceText: "正常翻译段落一"},
 		{Index: 4, SourceText: "正常翻译段落二"},
 		{Index: 5, SourceText: "正常翻译段落三"},
 	}
 	decoded6 := map[int]gatewaySegment{
-		0: {Index: 0, SourceText: longCJK1, TargetText: longCJK1}, // strong
-		1: {Index: 1, SourceText: longCJK2, TargetText: longCJK2}, // strong
-		2: {Index: 2, SourceText: shortCJK, TargetText: shortCJK}, // weak
+		0: {Index: 0, SourceText: longCJK1, TargetText: longCJK1},             // strong
+		1: {Index: 1, SourceText: longCJK2, TargetText: longCJK2},             // strong
+		2: {Index: 2, SourceText: longProperName, TargetText: longProperName}, // weak proper name
 		3: {Index: 3, SourceText: "正常翻译段落一", TargetText: "Đoạn dịch 1"},
 		4: {Index: 4, SourceText: "正常翻译段落二", TargetText: "Đoạn dịch 2"},
 		5: {Index: 5, SourceText: "正常翻译段落三", TargetText: "Đoạn dịch 3"},
@@ -286,18 +289,18 @@ func TestAuditAnchoredBatch_CopyPromotionBoundary(t *testing.T) {
 
 	// Now batch size 5 with strong = 2:
 	// strong = 2 >= 2 AND strong * 3 = 6 > 5 (true!).
-	// Weak copy on segment 2 MUST be promoted!
+	// The weak proper-name copy on segment 2 MUST be promoted!
 	expected5_2 := []domain.TranslationInputSegment{
 		{Index: 0, SourceText: longCJK1},
 		{Index: 1, SourceText: longCJK2},
-		{Index: 2, SourceText: shortCJK},
+		{Index: 2, SourceText: longProperName},
 		{Index: 3, SourceText: "正常翻译段落一"},
 		{Index: 4, SourceText: "正常翻译段落二"},
 	}
 	decoded5_2 := map[int]gatewaySegment{
-		0: {Index: 0, SourceText: longCJK1, TargetText: longCJK1}, // strong
-		1: {Index: 1, SourceText: longCJK2, TargetText: longCJK2}, // strong
-		2: {Index: 2, SourceText: shortCJK, TargetText: shortCJK}, // weak -> promoted!
+		0: {Index: 0, SourceText: longCJK1, TargetText: longCJK1},             // strong
+		1: {Index: 1, SourceText: longCJK2, TargetText: longCJK2},             // strong
+		2: {Index: 2, SourceText: longProperName, TargetText: longProperName}, // weak proper name -> promoted!
 		3: {Index: 3, SourceText: "正常翻译段落一", TargetText: "Đoạn dịch 1"},
 		4: {Index: 4, SourceText: "正常翻译段落二", TargetText: "Đoạn dịch 2"},
 	}
@@ -614,13 +617,31 @@ func TestGatewayTranslationProvider_ProvenanceAggregationAndConcurrency(t *testi
 		tsDisagree.Client(),
 		tsDisagree.URL,
 	)
+	var disagreementObserved, disagreementBaseline, disagreementEvidence string
+	var disagreementReports int
 	_, err := pDis.TranslateText(context.Background(), TranslationRequest{
 		RunID:                 "run-disagree",
 		AuthorizedCredentials: []string{"cred"},
 		Segments:              []domain.TranslationInputSegment{{Index: 0, SourceText: "你好"}},
+		OnAttemptMetadata: func(observedModel, serviceBaselineID, subrequestEvidence string) {
+			disagreementReports++
+			disagreementObserved = observedModel
+			disagreementBaseline = serviceBaselineID
+			disagreementEvidence = subrequestEvidence
+		},
 	})
 	if !errors.Is(err, domain.ErrInconsistentProvenance) {
 		t.Fatalf("expected ErrInconsistentProvenance on model disagreement, got: %v", err)
+	}
+	// Model disagreement fails closed only after publishing its exact invocation provenance.
+	if disagreementReports != 1 {
+		t.Fatalf("expected exactly 1 attempt-metadata report on model disagreement, got %d", disagreementReports)
+	}
+	if disagreementObserved != "gemini-3.8-flash-001" || disagreementBaseline != "baseline-test" {
+		t.Fatalf("expected first-observed model and configured baseline, got observed=%q baseline=%q", disagreementObserved, disagreementBaseline)
+	}
+	if disagreementEvidence != "model disagreement after 2 gateway wire calls (0 targeted) with a 14-call candidate budget" {
+		t.Fatalf("expected exact model-disagreement evidence, got %q", disagreementEvidence)
 	}
 
 	// 2. Mixed fingerprints result in empty SystemFingerprint, while concurrent calls do not contaminate each other
@@ -849,4 +870,50 @@ func TestPrompt_TargetedRepairKeepsSharedMeaningFirstConstraints(t *testing.T) {
 			t.Fatalf("initial prompt lost %q, got:\n%s", want, initial)
 		}
 	}
+}
+
+// TestClassifyCopy_ProperNameAndTitleWeak_ProseStrong pins issue #150 A2 / #152 copy conservatism:
+// long proper-name-only and title-only exact cross-script copies stay weak, while copies with
+// positive deterministic sentence evidence (punctuation or grammatical structure) are strong.
+// Copies with no positive sentence evidence stay weak: the contract is deliberately conservative and
+// never fails a legitimately unchanged name.
+func TestClassifyCopy_ProperNameAndTitleWeak_ProseStrong(t *testing.T) {
+	glossary := domain.EffectiveGlossary{}
+
+	// Proper-name-only and title-only copies stay weak, however long.
+	longProperName := "北京字节跳动科技有限公司" // 11 runes
+	if got := classifyCopy(longProperName, longProperName, "vi", glossary); got != copyWeak {
+		t.Fatalf("long proper-name-only copy must stay copyWeak, got %v", got)
+	}
+	longTitle := "《舌尖上的中国第三季美食纪录片》"
+	if got := classifyCopy(longTitle, longTitle, "vi", glossary); got != copyWeak {
+		t.Fatalf("long title-only copy must stay copyWeak, got %v", got)
+	}
+
+	// Ambiguous punctuation-free prose carries no positive sentence evidence: it stays weak rather
+	// than being promoted to strong, which would risk failing an unchanged proper name.
+	for _, ambiguous := range []string{
+		"春风吹过山谷花香飘满村庄",     // 12 runes, no punctuation, no particle
+		"明天参观北京字节跳动科技有限公司", // sentence-shaped but no punctuation or grammatical marker
+	} {
+		if got := classifyCopy(ambiguous, ambiguous, "vi", glossary); got != copyWeak {
+			t.Fatalf("copy %q without positive sentence evidence must stay copyWeak, got %v", ambiguous, got)
+		}
+	}
+
+	// Positive sentence evidence: punctuation and/or grammatical structure -> strong.
+	for _, sentence := range []string{
+		"北京字节跳动科技有限公司。",        // sentence punctuation
+		"他刚刚加入了一家新的公司",         // 了/的
+		"这是一段非常长的主持人对话内容",      // 这/是/的
+		"今天我们深入评测这款厨房神器",       // 我们/这
+		"它的加热速度比传统锅快三倍以上",      // 它/的
+		"主播推荐《舌尖上的中国第三季》值得观看",  // a title mentioned inside a sentence stays sentence content
+		"《舌尖上的中国第三季》美食纪录片推荐观看", // title with trailing prose content
+	} {
+		if got := classifyCopy(sentence, sentence, "vi", glossary); got != copyStrong {
+			t.Fatalf("prose copy %q with positive sentence evidence must stay copyStrong, got %v", sentence, got)
+		}
+	}
+
 }

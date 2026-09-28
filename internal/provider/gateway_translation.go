@@ -353,7 +353,7 @@ func (p *GatewayTranslationProvider) executeWireCall(
 
 // TranslateText translates input segments under the meaning-first contract with bounded repair.
 // Outbound content is strictly credential-gated; secrets are never logged or stored.
-func (p *GatewayTranslationProvider) TranslateText(ctx context.Context, req TranslationRequest) (*TranslationResult, error) {
+func (p *GatewayTranslationProvider) TranslateText(ctx context.Context, req TranslationRequest) (res *TranslationResult, err error) {
 	if err := ValidateCanonicalBatch(req.Segments); err != nil {
 		return nil, err
 	}
@@ -385,13 +385,16 @@ func (p *GatewayTranslationProvider) TranslateText(ctx context.Context, req Tran
 
 	evidence := &invocationEvidence{}
 	defer func() {
-		if req.OnAttemptMetadata != nil && !evidence.modelDisagreement {
-			obs := evidence.observedModel
-			if obs == "" {
-				obs = p.alias
-			}
-			req.OnAttemptMetadata(obs, p.serviceBaselineID, succeededRepairEvidence(budget.TotalCalls, budget.TargetedCalls))
+		if req.OnAttemptMetadata == nil {
+			return
 		}
+		obs := evidence.observedModel
+		if obs == "" {
+			obs = p.alias
+		}
+		// Bounded subrequest evidence is published for success and failure alike, including model
+		// disagreement, which fails closed only after its exact invocation provenance is reported.
+		req.OnAttemptMetadata(obs, p.serviceBaselineID, repairEvidence(invocationOutcome(err, ctx, evidence.modelDisagreement), budget.TotalCalls, budget.TargetedCalls))
 	}()
 
 	// 2. Initial wire call
@@ -455,7 +458,7 @@ func (p *GatewayTranslationProvider) TranslateText(ctx context.Context, req Tran
 		repaired := false
 
 		for attempt := 1; attempt <= translationTargetedAttemptsPerEntry; attempt++ {
-			if err := budget.RecordTargetedCall(); err != nil {
+			if err := budget.ConsumeTargetedRepair(targetSeg.Index); err != nil {
 				return nil, err
 			}
 			tPayload := p.buildTargetedChatRequest(sourceLang, targetLang, targetSeg, neighbors, req.EffectiveGlossary)
@@ -550,7 +553,7 @@ func (p *GatewayTranslationProvider) repairWholeBatch(
 	evidence *invocationEvidence,
 	budget *CandidateWireBudget,
 ) (batchAudit, error) {
-	if err := budget.RecordWireCall(); err != nil {
+	if err := budget.ConsumeWholeBatchRepair(); err != nil {
 		return batchAudit{}, err
 	}
 	repairPayload := p.buildStrengthenedChatRequest(sourceLang, targetLang, req.Segments, req.EffectiveGlossary, reason)

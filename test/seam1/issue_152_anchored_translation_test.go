@@ -682,53 +682,124 @@ func (p *fixedRetryTranslationProvider) Capability() domain.ProviderCapability {
 	return cap
 }
 
-func TestSeam1_Issue152_RetryReentry_TotalExhaustion_And_CancellationAtEachPhase(t *testing.T) {
-	var geminiCalls int32
-	var deepseekCalls int32
+func TestSeam1_Issue152_RetryReentry_CandidateLocalRepairLimits_And_CancellationAtEachPhase(t *testing.T) {
+	mockSec := func(context.Context, string, string) (string, error) { return "sec-token", nil }
 
-	// Configure the Gemini candidate with a retry budget of 2 through the test-only adapter
-	// (fixedRetryTranslationProvider), since production exposes no retry seam:
-	// Attempt 1 on Gemini:
-	// - Call 1 (initial): 5 segments all empty -> >1/3 flags -> triggers whole-batch repair
-	// - Call 2 (whole-batch): 5 segments all empty -> enters targeted repair
-	// - Call 3 (targeted seg 0 attempt 1): returns empty -> continues
-	// - Call 4 (targeted seg 0 attempt 2): returns HTTP 503 transport error!
-	// Router records ProviderAttempt #1 as "failed" and re-enters Gemini for Attempt 2!
-	// Attempt 2 on Gemini shares the same CandidateWireBudget (4 total calls and 2 targeted calls already used):
-	// - Call 5 (initial): 5 segments all empty
-	// - Call 6 (whole-batch): 5 segments all empty
-	// - Calls 7..14 (8 more targeted calls, reaching 14 total wire calls ceiling!):
-	//   On the next targeted call attempt, budget hits the 14 total wire call ceiling and returns ErrQualityRejected!
-	// Router records ProviderAttempt #2 as "quality_failed" and advances to DeepSeek!
-	// DeepSeek gets its own fresh budget (Call 1 on DeepSeek succeeds!).
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Model string `json:"model"`
+	// Repair state is candidate-local across Router retry re-entry (Issue #152): at most one
+	// whole-batch repair, and at most three targeted attempts per canonical segment index, for the same
+	// candidate. Subcase A proves the whole-batch limit; subcase B proves the per-entry targeted limit.
+	// Both end with Gemini exhausted ("failed" then "quality_failed") and DeepSeek taking over with its
+	// own fresh budget.
+	retryReentryHarness := func(t *testing.T, ts *httptest.Server) *customTranslationHarness {
+		t.Helper()
+		reg := provider.NewRegistry()
+		gemini, _ := provider.NewGatewayTranslationProvider(
+			provider.GatewayGeminiTranslationProviderID,
+			provider.GatewayGeminiModelAlias,
+			"baseline-gemini-retry",
+			0.99,
+			mockSec,
+			ts.Client(),
+			ts.URL,
+		)
+		gemini.SetPolicyState(domain.PolicyAllowed)
+		// Production code exposes no retry seam: this test-only adapter pins the Router-visible retry
+		// budget while delegating every behavior to the real GatewayTranslationProvider.
+		_ = reg.Register(&fixedRetryTranslationProvider{GatewayTranslationProvider: gemini, maxRetries: 2})
+
+		deepseek, _ := provider.NewGatewayTranslationProvider(
+			provider.GatewayDeepSeekTranslationProviderID,
+			provider.GatewayDeepSeekModelAlias,
+			"baseline-deepseek-retry",
+			0.95,
+			mockSec,
+			ts.Client(),
+			ts.URL,
+		)
+		deepseek.SetPolicyState(domain.PolicyAllowed)
+		_ = reg.Register(deepseek)
+		return setupCustomTranslationHarness(t, reg)
+	}
+
+	// assertEvidenceCountsOnce proves the bounded subrequest counts are merged into the existing
+	// attempt evidence exactly once: a failure row keeps its original error text and never gets a
+	// duplicated counts phrase.
+	assertEvidenceCountsOnce := func(t *testing.T, row domain.ProviderAttempt) {
+		t.Helper()
+		if got := strings.Count(row.ErrorMessage, "gateway wire calls"); got != 1 {
+			t.Fatalf("attempt %s/%s must carry bounded subrequest counts exactly once, got %d in %q", row.ProviderID, row.Status, got, row.ErrorMessage)
 		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		if req.Model == provider.GatewayDeepSeekModelAlias {
-			atomic.AddInt32(&deepseekCalls, 1)
-			writeGatewayJSON(w, "deepseek/deepseek-v4.1-flash", "fp_ds", `{"segments":[
-				{"index":0,"source_text":"句0","target_text":"Câu 0"},
-				{"index":1,"source_text":"句1","target_text":"Câu 1"},
-				{"index":2,"source_text":"句2","target_text":"Câu 2"},
-				{"index":3,"source_text":"句3","target_text":"Câu 3"},
-				{"index":4,"source_text":"句4","target_text":"Câu 4"}
-			]}`)
-			return
+	}
+
+	// assertRetryReentryFallback pins the outcome both candidate-local repair subcases share: the
+	// request succeeds through the DeepSeek fallback, Gemini stops after exactly 5 wire calls (each
+	// subcase names why, so the wire shape stays explicit), the fallback receives its own fresh budget,
+	// and the run records 3 ProviderAttempt rows [gemini:failed, gemini:quality_failed,
+	// deepseek:succeeded]. Subcases assert their own row error evidence on the returned rows.
+	assertRetryReentryFallback := func(
+		t *testing.T,
+		h *customTranslationHarness,
+		runID string,
+		status int,
+		v *domain.TranslationVariant,
+		errMsg, stopReason string,
+		geminiCalls, deepseekCalls *int32,
+	) []domain.ProviderAttempt {
+		t.Helper()
+		if status != http.StatusCreated {
+			t.Fatalf("expected 201 via DeepSeek fallback, got %d (%s)", status, errMsg)
 		}
-		c := atomic.AddInt32(&geminiCalls, 1)
-		if c == 4 {
-			http.Error(w, "upstream gateway 503", http.StatusServiceUnavailable)
-			return
+		if got := atomic.LoadInt32(geminiCalls); got != 5 {
+			t.Fatalf("expected Gemini to stop after 5 wire calls %s, got %d", stopReason, got)
 		}
-		// Return valid repair for segment 0, 1, 2 on the 3rd attempt of each in Attempt 2 so it keeps advancing segments until hitting 14 total calls
-		switch c {
-		case 9:
-			writeGatewayJSON(w, "gemini-3.8-flash-001", "fp_g", `{"segments":[{"index":0,"source_text":"句0","target_text":"Câu 0"}]}`)
-		case 12:
-			writeGatewayJSON(w, "gemini-3.8-flash-001", "fp_g", `{"segments":[{"index":1,"source_text":"句1","target_text":"Câu 1"}]}`)
-		default:
+		if got := atomic.LoadInt32(deepseekCalls); got != 1 {
+			t.Fatalf("expected DeepSeek fallback to receive its own fresh budget (1 call), got %d", got)
+		}
+		if v.ProviderID != provider.GatewayDeepSeekTranslationProviderID {
+			t.Fatalf("expected DeepSeek provider, got %s", v.ProviderID)
+		}
+		attempts, _ := h.db.ListProviderAttempts(context.Background(), runID, string(provider.TypeTranslation))
+		if len(attempts) != 3 ||
+			attempts[0].ProviderID != provider.GatewayGeminiTranslationProviderID || attempts[0].Status != "failed" ||
+			attempts[1].ProviderID != provider.GatewayGeminiTranslationProviderID || attempts[1].Status != "quality_failed" ||
+			attempts[2].ProviderID != provider.GatewayDeepSeekTranslationProviderID || attempts[2].Status != "succeeded" {
+			t.Fatalf("expected 3 ProviderAttempt rows [gemini:failed, gemini:quality_failed, deepseek:succeeded], got %+v", attempts)
+		}
+		return attempts
+	}
+
+	t.Run("whole-batch repair is candidate-local across retry re-entry", func(t *testing.T) {
+		var geminiCalls, deepseekCalls int32
+
+		// Gemini (retry budget 2 through the test-only adapter):
+		// - Call 1 (initial): 5 empty targets -> >1/3 flagged -> whole-batch repair
+		// - Call 2 (whole-batch): 5 empty targets -> targeted repair for index 0
+		// - Call 3 (targeted index 0, attempt 1): empty -> continue
+		// - Call 4 (targeted index 0, attempt 2): HTTP 503 transport failure -> "failed" row, retry re-entry
+		// - Call 5 (initial, attempt 2): 5 empty targets -> the candidate-local whole-batch allowance is
+		//   already consumed, so the second whole-batch repair is refused without any wire call:
+		//   "quality_failed" row -> DeepSeek fallback with its own fresh budget.
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				Model string `json:"model"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Model == provider.GatewayDeepSeekModelAlias {
+				atomic.AddInt32(&deepseekCalls, 1)
+				writeGatewayJSON(w, "deepseek/deepseek-v4.1-flash", "fp_ds", `{"segments":[
+					{"index":0,"source_text":"句0","target_text":"Câu 0"},
+					{"index":1,"source_text":"句1","target_text":"Câu 1"},
+					{"index":2,"source_text":"句2","target_text":"Câu 2"},
+					{"index":3,"source_text":"句3","target_text":"Câu 3"},
+					{"index":4,"source_text":"句4","target_text":"Câu 4"}
+				]}`)
+				return
+			}
+			c := atomic.AddInt32(&geminiCalls, 1)
+			if c == 4 {
+				http.Error(w, "upstream gateway 503", http.StatusServiceUnavailable)
+				return
+			}
 			writeGatewayJSON(w, "gemini-3.8-flash-001", "fp_g", `{"segments":[
 				{"index":0,"source_text":"句0","target_text":""},
 				{"index":1,"source_text":"句1","target_text":""},
@@ -736,76 +807,126 @@ func TestSeam1_Issue152_RetryReentry_TotalExhaustion_And_CancellationAtEachPhase
 				{"index":3,"source_text":"句3","target_text":""},
 				{"index":4,"source_text":"句4","target_text":""}
 			]}`)
+		}))
+		defer ts.Close()
+
+		h := retryReentryHarness(t, ts)
+		assetID, jobID := seedSeam1AssetAndJob(t, h.db)
+		runID := "run-retry-wholebatch-" + uuid.NewString()
+		seedSeam1Run(t, h.db, assetID, jobID, runID)
+
+		status, v, errMsg := postSeam1Translate(t, h.ts.URL, assetID, map[string]any{
+			"run_id":                 runID,
+			"job_id":                 jobID,
+			"source_language":        "zh",
+			"target_language":        "vi",
+			"authorized_credentials": []string{"cred"},
+			"segments": []map[string]any{
+				{"index": 0, "source_text": "句0"},
+				{"index": 1, "source_text": "句1"},
+				{"index": 2, "source_text": "句2"},
+				{"index": 3, "source_text": "句3"},
+				{"index": 4, "source_text": "句4"},
+			},
+		})
+		attempts := assertRetryReentryFallback(t, h, runID, status, v, errMsg,
+			"(initial + whole-batch + 2 targeted + re-entry initial) instead of running a second whole-batch repair",
+			&geminiCalls, &deepseekCalls)
+		// Repair subrequests create no extra attempt rows: the transient row keeps its own transport
+		// error and gains the exact bounded subrequest counts.
+		if !strings.Contains(attempts[0].ErrorMessage, "gateway transport failure") ||
+			!strings.Contains(attempts[0].ErrorMessage, "failed after 4 gateway wire calls (2 targeted)") {
+			t.Fatalf("transient failure row must keep its error and carry its counts, got %q", attempts[0].ErrorMessage)
 		}
-	}))
-	defer ts.Close()
-
-	reg := provider.NewRegistry()
-	mockSec := func(context.Context, string, string) (string, error) { return "sec-token", nil }
-	gemini, _ := provider.NewGatewayTranslationProvider(
-		provider.GatewayGeminiTranslationProviderID,
-		provider.GatewayGeminiModelAlias,
-		"baseline-gemini-retry",
-		0.99,
-		mockSec,
-		ts.Client(),
-		ts.URL,
-	)
-	gemini.SetPolicyState(domain.PolicyAllowed)
-	// Production code exposes no retry seam: this test-only adapter pins the Router-visible retry
-	// budget while delegating every behavior to the real GatewayTranslationProvider.
-	_ = reg.Register(&fixedRetryTranslationProvider{GatewayTranslationProvider: gemini, maxRetries: 2})
-
-	deepseek, _ := provider.NewGatewayTranslationProvider(
-		provider.GatewayDeepSeekTranslationProviderID,
-		provider.GatewayDeepSeekModelAlias,
-		"baseline-deepseek-retry",
-		0.95,
-		mockSec,
-		ts.Client(),
-		ts.URL,
-	)
-	deepseek.SetPolicyState(domain.PolicyAllowed)
-	_ = reg.Register(deepseek)
-
-	h := setupCustomTranslationHarness(t, reg)
-	assetID, jobID := seedSeam1AssetAndJob(t, h.db)
-	runID := "run-retry-exhaust-" + uuid.NewString()
-	seedSeam1Run(t, h.db, assetID, jobID, runID)
-
-	status, v, errMsg := postSeam1Translate(t, h.ts.URL, assetID, map[string]any{
-		"run_id":                 runID,
-		"job_id":                 jobID,
-		"source_language":        "zh",
-		"target_language":        "vi",
-		"authorized_credentials": []string{"cred"},
-		"segments": []map[string]any{
-			{"index": 0, "source_text": "句0"},
-			{"index": 1, "source_text": "句1"},
-			{"index": 2, "source_text": "句2"},
-			{"index": 3, "source_text": "句3"},
-			{"index": 4, "source_text": "句4"},
-		},
+		assertEvidenceCountsOnce(t, attempts[0])
+		if !strings.Contains(attempts[1].ErrorMessage, "whole-batch repair already consumed for this candidate") ||
+			!strings.Contains(attempts[1].ErrorMessage, "after 5 gateway wire calls (2 targeted)") {
+			t.Fatalf("re-entry must fail closed on the consumed whole-batch allowance with counts, got %q", attempts[1].ErrorMessage)
+		}
+		assertEvidenceCountsOnce(t, attempts[1])
 	})
-	if status != http.StatusCreated {
-		t.Fatalf("expected 201 via DeepSeek fallback after Gemini 14-call exhaustion, got %d (%s)", status, errMsg)
-	}
-	if atomic.LoadInt32(&geminiCalls) != 14 {
-		t.Fatalf("expected Gemini to stop at exactly 14 wire calls across transport retry re-entry, got %d", geminiCalls)
-	}
-	if atomic.LoadInt32(&deepseekCalls) != 1 {
-		t.Fatalf("expected DeepSeek fallback to receive its own fresh budget (1 call), got %d", deepseekCalls)
-	}
-	if v.ProviderID != provider.GatewayDeepSeekTranslationProviderID {
-		t.Fatalf("expected DeepSeek provider, got %s", v.ProviderID)
-	}
-	attempts, _ := h.db.ListProviderAttempts(context.Background(), runID, string(provider.TypeTranslation))
-	if len(attempts) != 3 ||
-		attempts[0].ProviderID != provider.GatewayGeminiTranslationProviderID || attempts[0].Status != "failed" ||
-		attempts[1].ProviderID != provider.GatewayGeminiTranslationProviderID || attempts[1].Status != "quality_failed" ||
-		attempts[2].ProviderID != provider.GatewayDeepSeekTranslationProviderID || attempts[2].Status != "succeeded" {
-		t.Fatalf("expected 3 ProviderAttempt rows [gemini:failed, gemini:quality_failed, deepseek:succeeded], got %+v", attempts)
-	}
+
+	t.Run("targeted attempts are candidate-local per canonical segment index", func(t *testing.T) {
+		var geminiCalls, deepseekCalls int32
+
+		// 3 canonical segments with exactly 1 flagged entry stay below the >1/3 whole-batch gate, so
+		// index 0 is repaired by targeted calls only:
+		// - Call 1 (initial): index 0 empty -> targeted repair for index 0
+		// - Call 2 (targeted index 0, attempt 1): empty -> continue
+		// - Call 3 (targeted index 0, attempt 2): HTTP 503 transport failure -> "failed" row, retry re-entry
+		// - Call 4 (initial, attempt 2): index 0 empty -> targeted repair for index 0
+		// - Call 5 (targeted index 0, attempt 3): empty -> the fourth attempt for index 0 is refused
+		//   without a wire call: "quality_failed" row -> DeepSeek fallback with a fresh budget.
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				Model    string `json:"model"`
+				Messages []struct {
+					Role    string `json:"role"`
+					Content string `json:"content"`
+				} `json:"messages"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Model == provider.GatewayDeepSeekModelAlias {
+				atomic.AddInt32(&deepseekCalls, 1)
+				writeGatewayJSON(w, "deepseek/deepseek-v4.1-flash", "fp_ds", `{"segments":[
+					{"index":0,"source_text":"句0","target_text":"Câu 0"},
+					{"index":1,"source_text":"句1","target_text":"Câu 1"},
+					{"index":2,"source_text":"句2","target_text":"Câu 2"}
+				]}`)
+				return
+			}
+			isTargeted := false
+			for _, m := range req.Messages {
+				if m.Role == "user" && strings.Contains(m.Content, "read_only_context_neighbors") {
+					isTargeted = true
+				}
+			}
+			c := atomic.AddInt32(&geminiCalls, 1)
+			switch {
+			case c == 3:
+				http.Error(w, "upstream gateway 503", http.StatusServiceUnavailable)
+			case isTargeted:
+				writeGatewayJSON(w, "gemini-3.8-flash-001", "fp_g", `{"segments":[{"index":0,"source_text":"句0","target_text":""}]}`)
+			default:
+				writeGatewayJSON(w, "gemini-3.8-flash-001", "fp_g", `{"segments":[
+					{"index":0,"source_text":"句0","target_text":""},
+					{"index":1,"source_text":"句1","target_text":"Câu 1"},
+					{"index":2,"source_text":"句2","target_text":"Câu 2"}
+				]}`)
+			}
+		}))
+		defer ts.Close()
+
+		h := retryReentryHarness(t, ts)
+		assetID, jobID := seedSeam1AssetAndJob(t, h.db)
+		runID := "run-retry-targeted-" + uuid.NewString()
+		seedSeam1Run(t, h.db, assetID, jobID, runID)
+
+		status, v, errMsg := postSeam1Translate(t, h.ts.URL, assetID, map[string]any{
+			"run_id":                 runID,
+			"job_id":                 jobID,
+			"source_language":        "zh",
+			"target_language":        "vi",
+			"authorized_credentials": []string{"cred"},
+			"segments": []map[string]any{
+				{"index": 0, "source_text": "句0"},
+				{"index": 1, "source_text": "句1"},
+				{"index": 2, "source_text": "句2"},
+			},
+		})
+		attempts := assertRetryReentryFallback(t, h, runID, status, v, errMsg,
+			"with only 3 targeted calls for index 0 across re-entry",
+			&geminiCalls, &deepseekCalls)
+		if !strings.Contains(attempts[0].ErrorMessage, "failed after 3 gateway wire calls (2 targeted)") {
+			t.Fatalf("transient failure row must carry its counts across re-entry, got %q", attempts[0].ErrorMessage)
+		}
+		assertEvidenceCountsOnce(t, attempts[0])
+		if !strings.Contains(attempts[1].ErrorMessage, "targeted repair attempts exhausted for segment 0") ||
+			!strings.Contains(attempts[1].ErrorMessage, "after 5 gateway wire calls (3 targeted)") {
+			t.Fatalf("the fourth targeted attempt for index 0 must be refused with the three-call limit, got %q", attempts[1].ErrorMessage)
+		}
+		assertEvidenceCountsOnce(t, attempts[1])
+	})
 
 	// Cancellation at each repair phase: phase 1 (initial), phase 2 (whole-batch), phase 3 (targeted).
 	// Must stop immediately at the cancelled phase without calling DeepSeek fallback!
@@ -1497,5 +1618,108 @@ func TestSeam1_Issue152_RepairEvidence_SubrequestCountsOnSuccess(t *testing.T) {
 		if !strings.Contains(attempts[0].ErrorMessage, tc.wantEvidence) {
 			t.Fatalf("%s: expected attempt evidence %q, got %q", tc.mode, tc.wantEvidence, attempts[0].ErrorMessage)
 		}
+	}
+}
+
+// TestSeam1_Issue152_ModelDisagreement_PublishesInvocationEvidenceBeforeFailClosed pins #150 A5:
+// observed-model disagreement across the initial call and a repair subrequest fails closed with
+// ErrInconsistentProvenance, but the single ProviderAttempt row still carries the exact
+// invocation-local observed model, configured service baseline and bounded subrequest counts.
+// No fallback candidate may be invoked, and no extra attempt row may be created for repair
+// subrequests.
+func TestSeam1_Issue152_ModelDisagreement_PublishesInvocationEvidenceBeforeFailClosed(t *testing.T) {
+	var geminiCalls, deepseekCalls int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Model == provider.GatewayDeepSeekModelAlias {
+			atomic.AddInt32(&deepseekCalls, 1)
+			writeGatewayJSON(w, "deepseek/deepseek-v4.1-flash", "fp_ds", `{"segments":[{"index":0,"source_text":"句0","target_text":"Câu 0"}]}`)
+			return
+		}
+		c := atomic.AddInt32(&geminiCalls, 1)
+		if c == 1 {
+			// Initial call: one empty target of one segment -> whole-batch repair.
+			writeGatewayJSON(w, "gemini-3.8-flash-001", "fp_g", `{"segments":[{"index":0,"source_text":"句0","target_text":""}]}`)
+			return
+		}
+		// Whole-batch repair answers with a different observed model: provenance disagreement.
+		writeGatewayJSON(w, "gemini-3.8-flash-002-different", "fp_g", `{"segments":[{"index":0,"source_text":"句0","target_text":"Câu 0"}]}`)
+	}))
+	defer ts.Close()
+
+	reg := provider.NewRegistry()
+	mockSec := func(context.Context, string, string) (string, error) { return "sec-token", nil }
+	gemini, _ := provider.NewGatewayTranslationProvider(
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
+		"baseline-gemini-disagree",
+		0.99,
+		mockSec,
+		ts.Client(),
+		ts.URL,
+	)
+	gemini.SetPolicyState(domain.PolicyAllowed)
+	_ = reg.Register(gemini)
+
+	deepseek, _ := provider.NewGatewayTranslationProvider(
+		provider.GatewayDeepSeekTranslationProviderID,
+		provider.GatewayDeepSeekModelAlias,
+		"baseline-deepseek-disagree",
+		0.95,
+		mockSec,
+		ts.Client(),
+		ts.URL,
+	)
+	deepseek.SetPolicyState(domain.PolicyAllowed)
+	_ = reg.Register(deepseek)
+
+	h := setupCustomTranslationHarness(t, reg)
+	assetID, jobID := seedSeam1AssetAndJob(t, h.db)
+	runID := "run-disagree-" + uuid.NewString()
+	seedSeam1Run(t, h.db, assetID, jobID, runID)
+
+	status, _, errMsg := postSeam1Translate(t, h.ts.URL, assetID, map[string]any{
+		"run_id":                 runID,
+		"job_id":                 jobID,
+		"source_language":        "zh",
+		"target_language":        "vi",
+		"authorized_credentials": []string{"cred"},
+		"segments": []map[string]any{
+			{"index": 0, "source_text": "句0"},
+		},
+	})
+	if status != http.StatusInternalServerError {
+		t.Fatalf("expected 500 fail-closed on model disagreement, got %d (%s)", status, errMsg)
+	}
+	if atomic.LoadInt32(&geminiCalls) != 2 || atomic.LoadInt32(&deepseekCalls) != 0 {
+		t.Fatalf("expected 2 gemini calls and no fallback invocation, got gemini=%d deepseek=%d", geminiCalls, deepseekCalls)
+	}
+
+	attempts, _ := h.db.ListProviderAttempts(context.Background(), runID, string(provider.TypeTranslation))
+	if len(attempts) != 1 {
+		t.Fatalf("expected exactly 1 ProviderAttempt row (no extra repair rows), got %+v", attempts)
+	}
+	row := attempts[0]
+	if row.ProviderID != provider.GatewayGeminiTranslationProviderID || row.Status != "policy_rejected" {
+		t.Fatalf("expected gemini policy_rejected row, got %s/%s", row.ProviderID, row.Status)
+	}
+	if row.ObservedModel != "gemini-3.8-flash-001" {
+		t.Fatalf("expected the first invocation-observed model, got %q", row.ObservedModel)
+	}
+	if row.ServiceBaselineID != "baseline-gemini-disagree" {
+		t.Fatalf("expected the configured service baseline, got %q", row.ServiceBaselineID)
+	}
+	if !strings.Contains(row.ErrorMessage, "observed model disagreement across repair responses in translation invocation") {
+		t.Fatalf("row must keep the disagreement error text, got %q", row.ErrorMessage)
+	}
+	if !strings.Contains(row.ErrorMessage, "model disagreement after 2 gateway wire calls (0 targeted) with a 14-call candidate budget") {
+		t.Fatalf("row must carry the exact disagreement invocation evidence, got %q", row.ErrorMessage)
+	}
+	if got := strings.Count(row.ErrorMessage, "gateway wire calls"); got != 1 {
+		t.Fatalf("expected the bounded counts exactly once, got %d in %q", got, row.ErrorMessage)
 	}
 }

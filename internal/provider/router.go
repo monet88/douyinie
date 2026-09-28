@@ -1023,10 +1023,15 @@ func enrichAttemptMetadata(pa *domain.ProviderAttempt, p Provider, req RouteRequ
 		if base != "" {
 			pa.ServiceBaselineID = base
 		}
-		// Failure rows already carry their own error text (which includes the consumed counts when
-		// the bounded budget was exhausted); success rows carry the consumed-count evidence here.
-		if subrequestEvidence != "" && pa.ErrorMessage == "" {
-			pa.ErrorMessage = subrequestEvidence
+		// Failure rows keep their own error text: the bounded subrequest evidence is appended unless
+		// the text already carries the same counts (the errRepairExhausted shape).
+		if subrequestEvidence != "" {
+			switch {
+			case pa.ErrorMessage == "":
+				pa.ErrorMessage = subrequestEvidence
+			case !strings.Contains(pa.ErrorMessage, repairEvidenceCountsToken):
+				pa.ErrorMessage = pa.ErrorMessage + "; " + subrequestEvidence
+			}
 		}
 	}
 }

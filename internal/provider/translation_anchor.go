@@ -1,7 +1,9 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -34,11 +36,38 @@ const (
 	// translationNeighborContextSegments is the maximum number of canonical neighbors on either
 	// side of a targeted repair entry. They are read-only context and are never merged.
 	translationNeighborContextSegments = 2
-	// translationShortCopyMaxRunes keeps short/proper-name/title-only copies weak: an exact
-	// cross-script copy whose normalized source is no longer than this stays weak evidence and
-	// never fails on its own.
+	// translationShortCopyMaxRunes keeps short copies weak: an exact cross-script copy whose
+	// normalized source is no longer than this is name/title-scale content and never fails on its
+	// own. Longer copies are weak unless positive evidence shows prose content
+	// (hasSentenceStructure) (Issue #150 A2 / #152).
 	translationShortCopyMaxRunes = 10
 )
+
+// Copy-classification structure sets (Issue #150 A2 / #152). They participate in the translation
+// contract identity for the same reason the copy thresholds do: changing them changes which exact
+// copies count as untranslated evidence.
+const (
+	// translationSentencePunctuation marks clause or sentence punctuation. Its presence is positive
+	// evidence that a copied segment is prose rather than a bare name or title.
+	translationSentencePunctuation = "。！？，、；：…!?.,;:"
+
+	// translationSentenceParticles is the bounded set of CJK grammatical particles, pronouns and
+	// light verbs. Their presence is deterministic grammatical structure and therefore positive
+	// evidence of sentence content. Ambiguous runes that also occur in organization/national naming
+	// (有, 不, 一, 家, 好, 大, 新, 中, 国, 天, 小) are deliberately excluded so company and brand
+	// names are not mistaken for sentences. This is a closed structural list, not a model.
+	translationSentenceParticles = "的是了在和我你他她它们这那很都就也吗呢吧啊呀哦嗯与及或但而会能可把被给对从到之其"
+)
+
+// titleBracketPairs lists the CJK title decorations as opening -> closing rune; titleBracketRunes is
+// the same set flattened, for detecting a nested or trailing decoration. A copy whose entire content
+// is one bracketed title is title-only; a title merely mentioned inside a sentence does not make the
+// whole segment title-only.
+var titleBracketPairs = []struct{ open, close rune }{
+	{'《', '》'}, {'〈', '〉'}, {'「', '」'}, {'『', '』'}, {'【', '】'}, {'〔', '〕'},
+}
+
+const titleBracketRunes = "《》〈〉「」『』【】〔〕"
 
 // gatewaySegment is one raw translated entry decoded from a gateway payload.
 type gatewaySegment struct {
@@ -281,16 +310,19 @@ const (
 	copyDistinct copyVerdict = iota
 	// copyExcluded is an exact copy that is never evidence of untranslated content.
 	copyExcluded
-	// copyWeak is an exact cross-script copy of short/proper-name/title-only content.
+	// copyWeak is an exact cross-script copy that carries no positive sentence evidence: short
+	// content, a whole title decoration, or bare text with no punctuation and no grammatical
+	// structure (the conservative side of issue #150 A2, where a bare proper name must never fail).
 	copyWeak
 	// copyStrong is a meaningful cross-script unchanged copy.
 	copyStrong
 )
 
-// classifyCopy applies the conservative copy-detection contract (issue #150 A2): only meaningful
-// cross-script unchanged content is strong evidence; numeric-only, URL/email, same-script text and
-// explicitly authorized unchanged terminology are excluded, and short/proper-name/title-only
-// copies stay weak.
+// classifyCopy applies the conservative copy-detection contract (issue #150 A2): strong unchanged
+// copy evidence requires meaningful cross-script untranslated content, i.e. positive evidence that
+// the copied segment is prose. Numeric-only, URL/email, same-script text and explicitly authorized
+// unchanged terminology are excluded, and short, title-only or grammatically structureless copies
+// stay weak.
 func classifyCopy(source, target, targetLang string, glossary domain.EffectiveGlossary) copyVerdict {
 	normSource := normalizeEchoText(source)
 	if normSource == "" || normSource != normalizeEchoText(target) {
@@ -305,10 +337,40 @@ func classifyCopy(source, target, targetLang string, glossary domain.EffectiveGl
 	if !isCrossScriptUntranslated(target, targetLang) {
 		return copyExcluded
 	}
-	if utf8.RuneCountInString(normSource) <= translationShortCopyMaxRunes {
+	if utf8.RuneCountInString(normSource) <= translationShortCopyMaxRunes ||
+		isWholeBracketedTitle(strings.TrimSpace(source)) ||
+		!hasSentenceStructure(source) {
 		return copyWeak
 	}
 	return copyStrong
+}
+
+// hasSentenceStructure reports positive, deterministic evidence that a copied segment is prose rather
+// than a bare proper name or title: sentence/clause punctuation, or one of the closed
+// translationSentenceParticles grammatical markers. The absence of such evidence is not a name
+// detection: it only means the shortened copy-detection contract (issue #150 A2) stays conservative
+// and keeps the copy weak instead of failing a legitimately unchanged name.
+func hasSentenceStructure(source string) bool {
+	return strings.ContainsAny(source, translationSentencePunctuation) ||
+		strings.ContainsAny(source, translationSentenceParticles)
+}
+
+// isWholeBracketedTitle reports whether the entire trimmed content is one CJK title decoration with
+// no nested or trailing decoration, i.e. a title-only segment, which stays weak copy evidence under
+// issue #150 A2. A title merely mentioned inside a sentence is not title-only: that segment is then
+// classified by hasSentenceStructure like any other copy.
+func isWholeBracketedTitle(trimmed string) bool {
+	runes := []rune(trimmed)
+	if len(runes) < 3 {
+		return false
+	}
+	for _, pair := range titleBracketPairs {
+		if runes[0] != pair.open || runes[len(runes)-1] != pair.close {
+			continue
+		}
+		return !strings.ContainsAny(string(runes[1:len(runes)-1]), titleBracketRunes)
+	}
+	return false
 }
 
 // isCrossScriptUntranslated reports whether an exact copy left source-script content in a target
@@ -367,18 +429,38 @@ func authorizedUnchangedTerm(source string, glossary domain.EffectiveGlossary) b
 	return false
 }
 
+// repairEvidenceCountsToken is the stable phrase in the bounded-subrequest evidence shape, used to
+// tell whether an attempt error already carries the counts (so they are never appended twice).
+const repairEvidenceCountsToken = "gateway wire calls"
+
 // errRepairExhausted reports bounded-work exhaustion with the observed subrequest counts. The
 // counts travel with the existing quality-failed attempt evidence (ErrorMessage), so repair
 // outcomes are auditable without a new attempts store.
 func errRepairExhausted(reason string, totalCalls, targetedCalls int) error {
-	return fmt.Errorf("%w: %s after %d gateway wire calls (%d targeted) with a %d-call candidate budget",
-		domain.ErrQualityRejected, reason, totalCalls, targetedCalls, translationWireCallsPerCandidate)
+	return fmt.Errorf("%w: %s", domain.ErrQualityRejected, repairEvidence(reason, totalCalls, targetedCalls))
 }
 
-// succeededRepairEvidence reports the bounded subrequest work consumed by a successful invocation,
-// in the same shape as errRepairExhausted, so success and exhaustion audit identically through the
-// existing attempt evidence.
-func succeededRepairEvidence(totalCalls, targetedCalls int) string {
-	return fmt.Sprintf("succeeded after %d gateway wire calls (%d targeted) with a %d-call candidate budget",
-		totalCalls, targetedCalls, translationWireCallsPerCandidate)
+// repairEvidence reports the bounded subrequest work consumed by one invocation's candidate together
+// with that invocation's outcome, in the same shape as errRepairExhausted, so success, cancellation,
+// exhaustion and repair failures audit identically through the existing attempt evidence (Issue #150
+// A5). The counts are the candidate-local totals the ceilings themselves apply to.
+func repairEvidence(outcome string, totalCalls, targetedCalls int) string {
+	return fmt.Sprintf("%s after %d %s (%d targeted) with a %d-call candidate budget",
+		outcome, totalCalls, repairEvidenceCountsToken, targetedCalls, translationWireCallsPerCandidate)
+}
+
+// invocationOutcome classifies the bounded subrequest work of one invocation for its attempt
+// evidence. Model disagreement is reported as its own outcome because that path fails closed after
+// publishing exact invocation provenance.
+func invocationOutcome(err error, ctx context.Context, modelDisagreement bool) string {
+	switch {
+	case modelDisagreement:
+		return "model disagreement"
+	case err == nil:
+		return "succeeded"
+	case ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+		return "canceled"
+	default:
+		return "failed"
+	}
 }
