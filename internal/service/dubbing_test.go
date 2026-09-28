@@ -4441,11 +4441,14 @@ func TestDubbingService_Issue154_LineageBudgetAndCalibrationCacheInvalidation(t 
 		t.Fatalf("AssignVoices: %v", err)
 	}
 
-	// Configure verified envelope [0.8, 1.5] for VieNeu voice
+	// Configure a verified envelope for the VieNeu voice. The envelope must name the exact lane:
+	// the TTSInvoke hook below reports the voice's provider id as model name at version 1.0.
 	cfg := service.DefaultFitControllerConfig()
 	cfg.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
 		{
 			ProviderID:     vieneuVoice.ProviderID,
+			ModelID:        vieneuVoice.ProviderID,
+			ModelVersion:   "1.0",
 			VoiceProfileID: vieneuVoice.ID,
 			MinSpeed:       0.8,
 			MaxSpeed:       1.5,
@@ -4515,6 +4518,8 @@ func TestDubbingService_Issue154_LineageBudgetAndCalibrationCacheInvalidation(t 
 	cfg2.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
 		{
 			ProviderID:     vieneuVoice.ProviderID,
+			ModelID:        vieneuVoice.ProviderID,
+			ModelVersion:   "1.0",
 			VoiceProfileID: vieneuVoice.ID,
 			MinSpeed:       0.8,
 			MaxSpeed:       1.5,

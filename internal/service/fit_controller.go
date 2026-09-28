@@ -114,14 +114,19 @@ func (fc *FitController) effectiveConfig() FitControllerConfig {
 }
 
 func (fc *FitController) findVerifiedEnvelope(providerID, modelID, modelVersion, voiceProfileID string) *domain.NativeSpeedEnvelope {
-	if strings.TrimSpace(providerID) == "" {
+	// A calibration authorizes a rate change only for the exact lane it was measured on, so the
+	// envelope must declare the full identity (provider, model, model version, voice profile) and
+	// the runtime that actually synthesized the candidate must report the same four values. An
+	// envelope left open on any component, or a runtime that cannot report one, would keep matching
+	// after a model/revision/voice change; it stays natural-only with rewrite/regroup/review intact.
+	if !laneIdentityPresent(providerID) || !laneIdentityPresent(modelID) ||
+		!laneIdentityPresent(modelVersion) || !laneIdentityPresent(voiceProfileID) {
 		return nil
 	}
 	for _, env := range fc.config.NativeSpeedEnvelopes {
-		if !env.Verified || strings.TrimSpace(env.CalibrationID) == "" {
-			continue
-		}
-		if strings.TrimSpace(env.ProviderID) == "" {
+		if !env.Verified || !laneIdentityPresent(env.CalibrationID) ||
+			!laneIdentityPresent(env.ProviderID) || !laneIdentityPresent(env.ModelID) ||
+			!laneIdentityPresent(env.ModelVersion) || !laneIdentityPresent(env.VoiceProfileID) {
 			continue
 		}
 		if !isFinitePositive(env.MinSpeed) || !isFinitePositive(env.MaxSpeed) || env.MinSpeed > env.MaxSpeed {
@@ -130,19 +135,28 @@ func (fc *FitController) findVerifiedEnvelope(providerID, modelID, modelVersion,
 		if !isProviderEquivalent(env.ProviderID, providerID) {
 			continue
 		}
-		if env.ModelID != "" && modelID != "" && !strings.EqualFold(strings.TrimSpace(env.ModelID), strings.TrimSpace(modelID)) && !isProviderEquivalent(env.ModelID, modelID) {
+		// isProviderEquivalent already trims, lowercases and applies the fake_-prefix
+		// equivalence, so it covers case-insensitive equality too: the only inputs it
+		// refuses that a bare EqualFold would accept are exotic Unicode case-fold pairs,
+		// which now fail closed.
+		if !isProviderEquivalent(env.ModelID, modelID) {
 			continue
 		}
-		if env.ModelVersion != "" && modelVersion != "" && !strings.EqualFold(strings.TrimSpace(env.ModelVersion), strings.TrimSpace(modelVersion)) {
+		if !strings.EqualFold(strings.TrimSpace(env.ModelVersion), strings.TrimSpace(modelVersion)) {
 			continue
 		}
-		if env.VoiceProfileID != "" && voiceProfileID != "" && env.VoiceProfileID != voiceProfileID {
+		if env.VoiceProfileID != voiceProfileID {
 			continue
 		}
 		return &env
 	}
 	return nil
 }
+
+// laneIdentityPresent reports whether one calibration identity component is declared or reported.
+// A blank component is the wildcard #150 R2 forbids: it would let one calibration cover a lane it
+// was never measured on.
+func laneIdentityPresent(v string) bool { return strings.TrimSpace(v) != "" }
 
 func isFinitePositive(v float64) bool { return v > 0 && !math.IsNaN(v) && !math.IsInf(v, 0) }
 

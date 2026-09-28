@@ -576,10 +576,14 @@ func TestSeam1_TTS_MeasuredDurationSpeedFitLane(t *testing.T) {
 	}
 
 	// 2. Configure explicit verified NativeSpeedEnvelope calibration and re-run (#154)
+	// The envelope names the lane the fake provider reports: registered id as model name, 1.0.0
+	// as model version (provider.NewFakeTTSProvider), and the assigned voice profile.
 	cfg := service.DefaultFitControllerConfig()
 	cfg.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
 		{
 			ProviderID:     "fake_cosyvoice3_tts",
+			ModelID:        "fake_cosyvoice3_tts",
+			ModelVersion:   "1.0.0",
 			VoiceProfileID: "cosyvoice3_vi_female_1",
 			MinSpeed:       0.8,
 			MaxSpeed:       1.25,

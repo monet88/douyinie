@@ -294,9 +294,13 @@ func TestSeam1_ZeroTTS_EscalationUsesFallbackMeasuredSpeedFit(t *testing.T) {
 	fakeCosy := registerCosyVoiceFallback(t, h, 700, true)
 	fakeCosy.CustomDurations = map[int]int64{0: 1650}
 	cfg := service.DefaultFitControllerConfig()
+	// The escalated CosyVoice lane must declare its full identity: the registered fake reports
+	// its provider id as model name at version 1.0.0, and the preset voice is the VI female one.
 	cfg.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
 		{
 			ProviderID:     "fake_cosyvoice3_tts",
+			ModelID:        "fake_cosyvoice3_tts",
+			ModelVersion:   "1.0.0",
 			VoiceProfileID: "cosyvoice3_vi_female_1",
 			MinSpeed:       0.85,
 			MaxSpeed:       1.25,

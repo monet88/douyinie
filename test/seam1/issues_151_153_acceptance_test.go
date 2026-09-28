@@ -1550,13 +1550,22 @@ func TestSeam1_Issue154_NativeEnvelopesAndCalibrationCacheInvalidation(t *testin
 	}))
 
 	// 1. Non-finite/invalid envelopes (NaN, Inf, zero, inverted) and unverified envelopes must be rejected -> 1 natural synthesis only.
+	// The lane identity is the one the fake CosyVoice provider actually reports: its registered
+	// provider id doubles as model name at version 1.0.0 (provider.NewFakeTTSProvider).
+	cosyLane := func(minSpeed, maxSpeed float64, verified bool, calibrationID string) domain.NativeSpeedEnvelope {
+		return domain.NativeSpeedEnvelope{
+			ProviderID: "fake_cosyvoice3_tts", ModelID: "fake_cosyvoice3_tts", ModelVersion: "1.0.0",
+			VoiceProfileID: "cosyvoice3_vi_female_1", MinSpeed: minSpeed, MaxSpeed: maxSpeed,
+			Verified: verified, CalibrationID: calibrationID,
+		}
+	}
 	invalidCfg := service.DefaultFitControllerConfig()
 	invalidCfg.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
-		{ProviderID: "fake_cosyvoice3_tts", VoiceProfileID: "cosyvoice3_vi_female_1", MinSpeed: math.NaN(), MaxSpeed: 1.25, Verified: true, CalibrationID: "cal-nan"},
-		{ProviderID: "fake_cosyvoice3_tts", VoiceProfileID: "cosyvoice3_vi_female_1", MinSpeed: 0.85, MaxSpeed: math.Inf(1), Verified: true, CalibrationID: "cal-inf"},
-		{ProviderID: "fake_cosyvoice3_tts", VoiceProfileID: "cosyvoice3_vi_female_1", MinSpeed: 0, MaxSpeed: 1.25, Verified: true, CalibrationID: "cal-zero"},
-		{ProviderID: "fake_cosyvoice3_tts", VoiceProfileID: "cosyvoice3_vi_female_1", MinSpeed: 1.3, MaxSpeed: 1.1, Verified: true, CalibrationID: "cal-inv"},
-		{ProviderID: "fake_cosyvoice3_tts", VoiceProfileID: "cosyvoice3_vi_female_1", MinSpeed: 0.85, MaxSpeed: 1.25, Verified: false, CalibrationID: "cal-unverified"},
+		cosyLane(math.NaN(), 1.25, true, "cal-nan"),
+		cosyLane(0.85, math.Inf(1), true, "cal-inf"),
+		cosyLane(0, 1.25, true, "cal-zero"),
+		cosyLane(1.3, 1.1, true, "cal-inv"),
+		cosyLane(0.85, 1.25, false, "cal-unverified"),
 	}
 	h.dubbingSvc.ConfigureFitController(service.NewFitController(invalidCfg))
 
@@ -1581,14 +1590,7 @@ func TestSeam1_Issue154_NativeEnvelopesAndCalibrationCacheInvalidation(t *testin
 	// 2. Configure a valid verified envelope -> invalidates cache, runs 1 natural + 1 native speed retry (2 new calls).
 	validCfg1 := service.DefaultFitControllerConfig()
 	validCfg1.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
-		{
-			ProviderID:     "fake_cosyvoice3_tts",
-			VoiceProfileID: "cosyvoice3_vi_female_1",
-			MinSpeed:       0.85,
-			MaxSpeed:       1.25,
-			Verified:       true,
-			CalibrationID:  "cal-seam1-v1",
-		},
+		cosyLane(0.85, 1.25, true, "cal-seam1-v1"),
 	}
 	h.dubbingSvc.ConfigureFitController(service.NewFitController(validCfg1))
 
@@ -1618,14 +1620,7 @@ func TestSeam1_Issue154_NativeEnvelopesAndCalibrationCacheInvalidation(t *testin
 	// 3. Changing policy/profile calibration identity invalidates cache and re-synthesizes.
 	validCfg2 := validCfg1
 	validCfg2.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
-		{
-			ProviderID:     "fake_cosyvoice3_tts",
-			VoiceProfileID: "cosyvoice3_vi_female_1",
-			MinSpeed:       0.85,
-			MaxSpeed:       1.25,
-			Verified:       true,
-			CalibrationID:  "cal-seam1-v2",
-		},
+		cosyLane(0.85, 1.25, true, "cal-seam1-v2"),
 	}
 	h.dubbingSvc.ConfigureFitController(service.NewFitController(validCfg2))
 

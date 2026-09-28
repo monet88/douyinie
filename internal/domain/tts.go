@@ -310,7 +310,9 @@ type VoiceProviderEscalation struct {
 // calibration: only a well-formed envelope whose CalibrationID names attributable
 // profile evidence may authorize the single measured native-speed attempt, and
 // the identity travels into the fit evidence and the stage cache key. There is no
-// global automatic speed ceiling.
+// global automatic speed ceiling. Every component above is required — provider,
+// model, model version and voice profile must each be declared here and reported
+// by the synthesizing runtime, or the envelope matches nothing.
 type NativeSpeedEnvelope struct {
 	ProviderID     string  `json:"provider_id"`
 	ModelID        string  `json:"model_id"`
