@@ -874,7 +874,10 @@ func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, 
 		return nil
 	})
 	if err != nil {
-		if bestFlagged == nil || !translationFlaggedFallbackAllowed(err) {
+		// The Router treats ctx.Err() != nil as a cancellation even when the returned error still
+		// wraps ErrQualityRejected, so a request context that is already canceled or past its
+		// deadline must never ship the flagged fallback as success.
+		if ctx.Err() != nil || bestFlagged == nil || !translationFlaggedFallbackAllowed(err) {
 			return nil, nil, nil, 0, err
 		}
 		// Every lane tripped the meaning gate. Ship the best of them with per-segment

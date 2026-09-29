@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/provider"
+	"github.com/monet88/douyinie/internal/service"
 	"github.com/monet88/douyinie/internal/storage"
 )
 
@@ -1879,5 +1881,125 @@ func TestSeam1_Issue152_ModelDisagreementWithInvalidMergedOutput_FailsClosedWith
 			}
 			assertEvidenceCountsOnce(t, row)
 		})
+	}
+}
+
+// cancelThenQualityProvider is a test-only adapter for the narrow post-Router fallback race: the later
+// candidate cancels the request context and then returns a quality rejection, so the Router classifies
+// the attempt as a cancellation while the error chain still wraps ErrQualityRejected.
+type cancelThenQualityProvider struct {
+	*provider.GatewayTranslationProvider
+	cancel context.CancelFunc
+	calls  *int32
+}
+
+func (p *cancelThenQualityProvider) TranslateText(_ context.Context, _ provider.TranslationRequest) (*provider.TranslationResult, error) {
+	atomic.AddInt32(p.calls, 1)
+	p.cancel()
+	return nil, fmt.Errorf("%w: forced quality rejection while the request context was canceled", domain.ErrQualityRejected)
+}
+
+// TestSeam1_Issue152_CanceledRequestAfterFlaggedCandidate_FailsClosedWithoutShippingFallback covers the
+// service decision after the Router returns: an earlier candidate is already held as the best
+// meaning-gate-flagged candidate, and the later candidate returns a quality rejection in the same
+// moment the request context becomes canceled. The Router classifies that attempt as a cancellation, so
+// the service must fail closed instead of shipping the flagged fallback as success (Issue #150 A5 /
+// #152 fail-closed semantics).
+//
+// The service is driven directly instead of through HTTP so the test owns the request context and
+// cancellation is deterministic: it happens inside the fallback invocation, never by timing.
+func TestSeam1_Issue152_CanceledRequestAfterFlaggedCandidate_FailsClosedWithoutShippingFallback(t *testing.T) {
+	const sourceText = "请不要打开窗户。"
+	const invertedTarget = "Hãy mở cửa sổ ra nhé." // prohibition rendered as an affirmative
+
+	var geminiCalls, fallbackCalls int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&geminiCalls, 1)
+		// Meaning-gate violation: the candidate is stored as the flagged best effort, not as a pass.
+		writeGatewayJSON(w, "gemini-3.8-flash-001", "fp_flag", fmt.Sprintf(
+			`{"segments":[{"index":0,"source_text":%q,"target_text":%q}]}`, sourceText, invertedTarget))
+	}))
+	defer ts.Close()
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mockSec := func(context.Context, string, string) (string, error) { return "sec-token", nil }
+	reg := provider.NewRegistry()
+	gemini, _ := provider.NewGatewayTranslationProvider(
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
+		"baseline-gemini-cancel-flag",
+		0.99,
+		mockSec,
+		ts.Client(),
+		ts.URL,
+	)
+	gemini.SetPolicyState(domain.PolicyAllowed)
+	_ = reg.Register(gemini)
+
+	fallbackGateway, _ := provider.NewGatewayTranslationProvider(
+		provider.GatewayDeepSeekTranslationProviderID,
+		provider.GatewayDeepSeekModelAlias,
+		"baseline-deepseek-cancel-flag",
+		0.95,
+		mockSec,
+		ts.Client(),
+		ts.URL,
+	)
+	fallbackGateway.SetPolicyState(domain.PolicyAllowed)
+	_ = reg.Register(&cancelThenQualityProvider{GatewayTranslationProvider: fallbackGateway, cancel: cancel, calls: &fallbackCalls})
+
+	h := setupCustomTranslationHarness(t, reg)
+	assetID, jobID := seedSeam1AssetAndJob(t, h.db)
+	runID := "run-cancel-flag-" + uuid.NewString()
+	seedSeam1Run(t, h.db, assetID, jobID, runID)
+
+	svc := service.NewTranslationService(h.db, h.casStore)
+	svc.ConfigureRouter(h.router)
+
+	variant, err := svc.Translate(reqCtx, domain.TranslationJobInput{
+		RunID:                 runID,
+		AssetID:               assetID,
+		JobID:                 jobID,
+		SourceLanguage:        "zh",
+		TargetLanguage:        "vi",
+		AuthorizedCredentials: []string{"cred"},
+		ConsentGranted:        true,
+		Segments: []domain.TranslationInputSegment{
+			{Index: 0, SourceText: sourceText, StartMs: 0, EndMs: 1500},
+		},
+	})
+	if err == nil {
+		t.Fatalf("a canceled request must never ship the flagged fallback as success, got variant %+v", variant)
+	}
+	if variant != nil {
+		t.Fatalf("no variant may be produced after cancellation, got %+v", variant)
+	}
+	if !errors.Is(err, domain.ErrQualityRejected) {
+		t.Fatalf("expected the terminal execution failure instead of the flagged fallback, got %v", err)
+	}
+	if got := atomic.LoadInt32(&geminiCalls); got != 1 {
+		t.Fatalf("expected 1 flagged candidate call, got %d", got)
+	}
+	if got := atomic.LoadInt32(&fallbackCalls); got != 1 {
+		t.Fatalf("expected 1 fallback call, got %d", got)
+	}
+
+	// Pins the race itself: the flagged candidate is a quality failure, and the later candidate's row
+	// was recorded by the Router's cancellation branch while its error still wrapped ErrQualityRejected.
+	attempts, listErr := h.db.ListProviderAttempts(context.Background(), runID, string(provider.TypeTranslation))
+	if listErr != nil {
+		t.Fatalf("ListProviderAttempts failed: %v", listErr)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("expected 2 attempt rows (flagged candidate, canceled fallback), got %+v", attempts)
+	}
+	if attempts[0].Status != "quality_failed" || attempts[1].Status != "failed" {
+		t.Fatalf("expected quality_failed then canceled attempt rows, got %s/%s", attempts[0].Status, attempts[1].Status)
+	}
+	if !strings.Contains(attempts[1].ErrorMessage, "forced quality rejection") {
+		t.Fatalf("the canceled fallback row must keep its own error text, got %q", attempts[1].ErrorMessage)
 	}
 }
