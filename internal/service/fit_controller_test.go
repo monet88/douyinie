@@ -34,8 +34,21 @@ func TestFitController_Accept_WhenWithinUsableSlot(t *testing.T) {
 	}
 }
 
-func TestFitController_Resynth_WhenOverrunWithinSpeedLimit(t *testing.T) {
-	fc := service.NewFitController()
+func TestFitController_Resynth_WhenOverrunWithinVerifiedEnvelope(t *testing.T) {
+	cfg := service.DefaultFitControllerConfig()
+	cfg.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
+		{
+			ProviderID:     "test_tts",
+			ModelID:        "test_model",
+			ModelVersion:   "1.0.0",
+			VoiceProfileID: "test_voice",
+			MinSpeed:       0.8,
+			MaxSpeed:       1.5,
+			Verified:       true,
+			CalibrationID:  "test-cal-1.5",
+		},
+	}
+	fc := service.NewFitController(cfg)
 
 	res := fc.EvaluateCandidate(context.Background(), service.FitEvaluationInput{
 		SegmentIndex:       0,
@@ -46,7 +59,10 @@ func TestFitController_Resynth_WhenOverrunWithinSpeedLimit(t *testing.T) {
 		NextTurnSpeakerID:  "SPEAKER_01",
 		MeasuredDurationMs: 2200, // exceeds slot 2000ms by 200ms (1.10x needed speed)
 		AttemptNumber:      1,
-		SupportsSpeedFit:   true,
+		ProviderID:         "test_tts",
+		ModelID:            "test_model",
+		ModelVersion:       "1.0.0",
+		VoiceProfileID:     "test_voice",
 	})
 
 	if res.Decision != domain.FitActionResynth {
@@ -54,6 +70,9 @@ func TestFitController_Resynth_WhenOverrunWithinSpeedLimit(t *testing.T) {
 	}
 	if res.RecommendedSpeed <= 1.0 {
 		t.Errorf("expected recommended speed > 1.0, got %f", res.RecommendedSpeed)
+	}
+	if res.CalibrationID != "test-cal-1.5" {
+		t.Errorf("expected CalibrationID test-cal-1.5, got %s", res.CalibrationID)
 	}
 	if res.RequiresReview {
 		t.Errorf("expected RequiresReview=false for automated resynth, got true")
@@ -80,6 +99,36 @@ func TestFitController_Rewrite_WhenSpeedFitExhaustedAndCanShorten(t *testing.T) 
 	}
 	if res.RequiresReview {
 		t.Errorf("expected RequiresReview=false for automated rewrite, got true")
+	}
+}
+
+// Issue #154: the lineage rewrite budget is spent by the first accepted rewrite, so an
+// otherwise rewrite-eligible candidate can never be sent through a second one. With no other
+// remedy left for this fixture (no speed envelope, no same-speaker regroup target), the
+// controller must advance past REWRITE to the next decision instead of granting it again.
+func TestFitController_RewriteBudgetBlocksSecondRewriteForLineage(t *testing.T) {
+	ctx := context.Background()
+	fc := service.NewFitController()
+	in := service.FitEvaluationInput{
+		SegmentIndex:       0,
+		SpeakerID:          "SPEAKER_00",
+		StartMs:            0,
+		EndMs:              1000,
+		NextTurnSpeakerID:  "SPEAKER_01", // different speaker: no same-turn regroup remedy
+		MeasuredDurationMs: 2500,
+		AttemptNumber:      1,
+		CanShortenText:     true,
+	}
+
+	// Control: with the budget still intact the same candidate is rewrite-eligible.
+	if control := fc.EvaluateCandidate(ctx, in); control.Decision != domain.FitActionRewrite {
+		t.Fatalf("control: rewrite-eligible candidate must be REWRITE, got %s (%s)", control.Decision, control.Reason)
+	}
+
+	in.RewriteAttemptsForLineage = 1
+	res := fc.EvaluateCandidate(ctx, in)
+	if res.Decision != domain.FitActionReview || !res.RequiresReview || res.ReviewReason != "DURATION_OVERRUN" {
+		t.Fatalf("a lineage that already spent its rewrite budget must not rewrite again: %+v", res)
 	}
 }
 
@@ -156,13 +205,15 @@ func TestFitController_PolicyIdentityCoversEveryEffectiveField(t *testing.T) {
 	}
 
 	variants := map[string]func(*service.FitControllerConfig){
-		"max_speed_multiplier":    func(c *service.FitControllerConfig) { c.MaxSpeedMultiplier = 1.30 },
+		"native_speed_envelopes": func(c *service.FitControllerConfig) {
+			c.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{{ProviderID: "p1", MinSpeed: 0.9, MaxSpeed: 1.3, Verified: true, CalibrationID: "cal-1"}}
+		},
 		"allow_regroup_same_turn": func(c *service.FitControllerConfig) { c.AllowRegroupSameTurn = false },
 		"default_natural_gap_ms":  func(c *service.FitControllerConfig) { c.DefaultNaturalGapMs = 200 },
 		"min_natural_gap_ms":      func(c *service.FitControllerConfig) { c.MinNaturalGapMs = 60 },
 		"max_natural_gap_ms":      func(c *service.FitControllerConfig) { c.MaxNaturalGapMs = 500 },
 		"reserve_ratio":           func(c *service.FitControllerConfig) { c.ReserveRatio = 0.25 },
-		"policy_version":          func(c *service.FitControllerConfig) { c.PolicyVersion = "playback-window-v2" },
+		"policy_version":          func(c *service.FitControllerConfig) { c.PolicyVersion = "playback-window-v3" },
 	}
 	for name, mutate := range variants {
 		cfg := baseCfg
@@ -207,7 +258,7 @@ func TestFitController_UsableSlotPreservesReserveAndPlaybackWindow(t *testing.T)
 	base := service.FitEvaluationInput{
 		SegmentIndex: 0, SpeakerID: "SPEAKER_00",
 		StartMs: 1000, EndMs: 2000, DubPlaybackEndMs: 2400, EffectiveReserveMs: 400,
-		AttemptNumber: 1, CanShortenText: true, SupportsSpeedFit: true,
+		AttemptNumber: 1, CanShortenText: true,
 	}
 
 	// (1) No reserve: usable slot collapses onto the accepted window, exactly as before.
@@ -284,14 +335,28 @@ func TestFitController_UsableSlotPreservesReserveAndPlaybackWindow(t *testing.T)
 
 	// (5) The resynth speed fits the reserve-preserving usable slot (1500/1000), not the window.
 	cfg := service.DefaultFitControllerConfig()
-	cfg.MaxSpeedMultiplier = 1.6
+	cfg.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
+		{
+			ProviderID:     "p_fast",
+			ModelID:        "m_fast",
+			ModelVersion:   "2.1.0",
+			VoiceProfileID: "v_fast",
+			MinSpeed:       1.0,
+			MaxSpeed:       1.6,
+			Verified:       true,
+			CalibrationID:  "cal-fast",
+		},
+	}
 	fast := service.NewFitController(cfg)
+	in.ProviderID = "p_fast"
+	in.ModelID = "m_fast"
+	in.ModelVersion = "2.1.0"
+	in.VoiceProfileID = "v_fast"
 	in.MeasuredDurationMs = 1500
 	res = fast.EvaluateCandidate(ctx, in)
-	if res.Decision != domain.FitActionResynth || res.RecommendedSpeed != 1.5 || res.DurationDeltaMs != 500 {
+	if res.Decision != domain.FitActionResynth || res.RecommendedSpeed != 1.5 || res.DurationDeltaMs != 500 || res.CalibrationID != "cal-fast" {
 		t.Fatalf("resynth must target the usable slot: %+v", res)
 	}
-
 	// (6) A reserve larger than the accepted window still leaves a usable slot of at least one
 	// millisecond instead of dividing by zero.
 	in = base
@@ -424,5 +489,159 @@ func TestFitController_UnresolvablePolicyFailsClosed(t *testing.T) {
 		if again := service.NewFitController(cfg).EvaluateCandidate(ctx, in); again != res {
 			t.Fatalf("%s: invalid policy verdict must be deterministic: %+v != %+v", name, again, res)
 		}
+	}
+}
+
+// Issue #154: Native speed requires an explicit verified provider/model/profile calibration
+// with finite bounds. Absent/undeclared/unverified/fixed-rate profiles stay natural-only
+// with rewrite/regroup/review still reachable; invalid envelope bounds fail policy validation.
+func TestFitController_NativeSpeedEnvelopes_VerificationMatrix(t *testing.T) {
+	ctx := context.Background()
+	baseIn := service.FitEvaluationInput{
+		SegmentIndex:       0,
+		SpeakerID:          "SPEAKER_00",
+		StartMs:            0,
+		EndMs:              1000,
+		DubPlaybackEndMs:   1000,
+		MeasuredDurationMs: 1100, // 1.10x overrun — would have been permitted by legacy <=1.15 implicit rule
+		AttemptNumber:      1,
+		CanShortenText:     true,
+		ProviderID:         "cosyvoice3_tts",
+		ModelID:            "cosyvoice3",
+		ModelVersion:       "3.0.0",
+		VoiceProfileID:     "cosyvoice3_vi_female_1",
+	}
+
+	// 1. Default config (absent envelopes): natural-only -> falls through to REWRITE (not RESYNTH)
+	defaultFC := service.NewFitController()
+	res := defaultFC.EvaluateCandidate(ctx, baseIn)
+	if res.Decision != domain.FitActionRewrite {
+		t.Fatalf("absent envelope must never RESYNTH at 1.10x overrun; got %s (%s)", res.Decision, res.Reason)
+	}
+
+	// The complete calibration of the lane under test: every case below starts from this envelope
+	// and breaks exactly one component, so each refusal is attributable to that component alone.
+	fullEnv := domain.NativeSpeedEnvelope{
+		ProviderID:     "cosyvoice3_tts",
+		ModelID:        "cosyvoice3",
+		ModelVersion:   "3.0.0",
+		VoiceProfileID: "cosyvoice3_vi_female_1",
+		MinSpeed:       0.9,
+		MaxSpeed:       1.2,
+		Verified:       true,
+		CalibrationID:  "cosy-vi-f1-cal-v1",
+	}
+	breakEnv := func(mutate func(*domain.NativeSpeedEnvelope)) domain.NativeSpeedEnvelope {
+		env := fullEnv
+		mutate(&env)
+		return env
+	}
+	breakIn := func(mutate func(*service.FitEvaluationInput)) service.FitEvaluationInput {
+		in := baseIn
+		mutate(&in)
+		return in
+	}
+	// expectNaturalOnly pins the shared failure mode of an unusable calibration: the lane stays
+	// natural-only and the safe remedy after it (REWRITE here) stays reachable.
+	expectNaturalOnly := func(name string, env domain.NativeSpeedEnvelope, in service.FitEvaluationInput) {
+		t.Helper()
+		cfg := service.DefaultFitControllerConfig()
+		cfg.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{env}
+		if got := service.NewFitController(cfg).EvaluateCandidate(ctx, in); got.Decision != domain.FitActionRewrite {
+			t.Fatalf("%s: unusable calibration must stay natural-only (REWRITE), got %s (%s)", name, got.Decision, got.Reason)
+		}
+	}
+
+	// 2. Unverified, or an unattributed CalibrationID: natural-only -> REWRITE. Trimming is
+	// pinned separately by the blank-identity rows in sections 9 and 10.
+	for name, env := range map[string]domain.NativeSpeedEnvelope{
+		"unverified":        breakEnv(func(e *domain.NativeSpeedEnvelope) { e.Verified = false }),
+		"empty_calibration": breakEnv(func(e *domain.NativeSpeedEnvelope) { e.CalibrationID = "" }),
+	} {
+		expectNaturalOnly(name, env, baseIn)
+	}
+
+	// 3. Envelope identity that does not match the selected runtime: natural-only -> REWRITE
+	for name, env := range map[string]domain.NativeSpeedEnvelope{
+		"other_provider": breakEnv(func(e *domain.NativeSpeedEnvelope) { e.ProviderID = "other_tts" }),
+		"other_model":    breakEnv(func(e *domain.NativeSpeedEnvelope) { e.ModelID = "other_model" }),
+		"other_version":  breakEnv(func(e *domain.NativeSpeedEnvelope) { e.ModelVersion = "9.9.9" }),
+		"other_voice":    breakEnv(func(e *domain.NativeSpeedEnvelope) { e.VoiceProfileID = "other_voice" }),
+	} {
+		expectNaturalOnly(name, env, baseIn)
+	}
+
+	// 4. Verified matching envelope: authorizes RESYNTH within [MinSpeed, MaxSpeed]
+	verifiedCfg := service.DefaultFitControllerConfig()
+	verifiedCfg.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{fullEnv}
+	verifiedFC := service.NewFitController(verifiedCfg)
+	res = verifiedFC.EvaluateCandidate(ctx, baseIn)
+	if res.Decision != domain.FitActionResynth || res.CalibrationID != "cosy-vi-f1-cal-v1" {
+		t.Fatalf("verified matching envelope must authorize RESYNTH with CalibrationID, got %+v", res)
+	}
+
+	// 5. Fixed-rate voice stays natural-only even if an envelope is present: the lane cannot
+	// honor a rate change, so it must neither receive the native retry nor emit calibration
+	// evidence claiming the audio was synthesized at a requested speed (#154 / #150 R2).
+	fixedIn := baseIn
+	fixedIn.FixedRateVoice = true
+	res = verifiedFC.EvaluateCandidate(ctx, fixedIn)
+	if res.Decision != domain.FitActionRewrite {
+		t.Fatalf("FixedRateVoice must never RESYNTH even with envelope, got %s", res.Decision)
+	}
+	if res.CalibrationID != "" || res.RecommendedSpeed != 1.0 {
+		t.Fatalf("FixedRateVoice must emit no native-speed evidence, got calibration=%q speed=%.3f", res.CalibrationID, res.RecommendedSpeed)
+	}
+
+	// 6. Lineage native attempt already consumed: refuses second native attempt -> REWRITE
+	consumedIn := baseIn
+	consumedIn.NativeAttemptsForLineage = 1
+	res = verifiedFC.EvaluateCandidate(ctx, consumedIn)
+	if res.Decision != domain.FitActionRewrite {
+		t.Fatalf("exhausted lineage native budget must advance to REWRITE, got %s", res.Decision)
+	}
+
+	// 7. Speed factor outside verified [MinSpeed, MaxSpeed] (e.g. 1.35 > 1.2): advances to REWRITE
+	overMaxIn := baseIn
+	overMaxIn.MeasuredDurationMs = 1350
+	res = verifiedFC.EvaluateCandidate(ctx, overMaxIn)
+	if res.Decision != domain.FitActionRewrite {
+		t.Fatalf("speed factor 1.35 above MaxSpeed 1.20 must advance to REWRITE, got %s", res.Decision)
+	}
+
+	// 8. Non-finite, non-positive, or inverted envelope bounds are rejected: profile stays
+	// natural-only with the other safe remedies (REWRITE) still reachable.
+	for name, env := range map[string]domain.NativeSpeedEnvelope{
+		"zero_min":     breakEnv(func(e *domain.NativeSpeedEnvelope) { e.MinSpeed = 0 }),
+		"negative_min": breakEnv(func(e *domain.NativeSpeedEnvelope) { e.MinSpeed = -1.0 }),
+		"inverted": breakEnv(func(e *domain.NativeSpeedEnvelope) {
+			e.MinSpeed = 1.3
+			e.MaxSpeed = 1.1
+		}),
+		"nan_min": breakEnv(func(e *domain.NativeSpeedEnvelope) { e.MinSpeed = math.NaN() }),
+		"inf_max": breakEnv(func(e *domain.NativeSpeedEnvelope) { e.MaxSpeed = math.Inf(1) }),
+	} {
+		expectNaturalOnly(name, env, baseIn)
+	}
+
+	// 9. An envelope that leaves any identity component open describes no lane at all, so it can
+	// never authorize speed: natural-only -> REWRITE. This is the wildcard #150 R2 forbids.
+	for name, env := range map[string]domain.NativeSpeedEnvelope{
+		"envelope_missing_provider": breakEnv(func(e *domain.NativeSpeedEnvelope) { e.ProviderID = "" }),
+		"envelope_missing_model":    breakEnv(func(e *domain.NativeSpeedEnvelope) { e.ModelID = "" }),
+		"envelope_blank_version":    breakEnv(func(e *domain.NativeSpeedEnvelope) { e.ModelVersion = "  " }),
+		"envelope_missing_voice":    breakEnv(func(e *domain.NativeSpeedEnvelope) { e.VoiceProfileID = "" }),
+	} {
+		expectNaturalOnly(name, env, baseIn)
+	}
+
+	// 10. A runtime that cannot report its own model/model version/voice profile proves no
+	// identity, so even a complete envelope matches nothing: natural-only -> REWRITE.
+	for name, in := range map[string]service.FitEvaluationInput{
+		"runtime_missing_model":   breakIn(func(i *service.FitEvaluationInput) { i.ModelID = "" }),
+		"runtime_missing_version": breakIn(func(i *service.FitEvaluationInput) { i.ModelVersion = "" }),
+		"runtime_blank_voice":     breakIn(func(i *service.FitEvaluationInput) { i.VoiceProfileID = "  " }),
+	} {
+		expectNaturalOnly(name, fullEnv, in)
 	}
 }

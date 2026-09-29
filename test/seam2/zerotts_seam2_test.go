@@ -414,7 +414,6 @@ func runZeroTTSStageWorkerCommand(t *testing.T, pythonBin, snapshotRoot, voiceID
 		"language":               "vi",
 		"voice_id":               voiceID,
 		"speed":                  "1.0",
-		"slot_duration_ms":       "4000",
 		"model_name":             provider.ZeroTTSModelID,
 		"model_version":          provider.ZeroTTSModelVersion,
 		"require_model_snapshot": true,

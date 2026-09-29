@@ -2030,13 +2030,12 @@ class Vieneu:
 		RunID:      "run-tts-py",
 		OutputPath: outPath,
 		Config: map[string]any{
-			"text":             "Xin chào Việt Nam",
-			"model_name":       provider.VieNeuModelID,
-			"model_version":    provider.VieNeuModelVersion,
-			"language":         "vi",
-			"voice_id":         "Trúc Ly",
-			"speed":            "1.0",
-			"slot_duration_ms": "1500",
+			"text":          "Xin chào Việt Nam",
+			"model_name":    provider.VieNeuModelID,
+			"model_version": provider.VieNeuModelVersion,
+			"language":      "vi",
+			"voice_id":      "Trúc Ly",
+			"speed":         "1.0",
 		},
 	}
 	snapEnv := worker.ModelSnapshotEnvelope{

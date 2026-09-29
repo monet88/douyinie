@@ -38,6 +38,23 @@ type DubbingService struct {
 	TTSInvoke TTSInvokeFunc
 }
 
+// lineageRecoveryState tracks per-source-lineage consumption of native-speed and
+// measured-rewrite remedies within one logical synthesis attempt, carrying state
+// across regroup and whole-speaker escalation without resetting budgets.
+type lineageRecoveryState struct {
+	NativeAttempts   map[int]int
+	RewriteAttempts  map[int]int
+	AcceptedRewrites map[int]string
+}
+
+func newLineageRecoveryState() *lineageRecoveryState {
+	return &lineageRecoveryState{
+		NativeAttempts:   make(map[int]int),
+		RewriteAttempts:  make(map[int]int),
+		AcceptedRewrites: make(map[int]string),
+	}
+}
+
 // NewDubbingService creates a new DubbingService instance.
 func NewDubbingService(db *storage.DB, casStore *cas.Store) *DubbingService {
 	return &DubbingService{
@@ -1214,7 +1231,8 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 		return nil, fmt.Errorf("voice assignment transcript lineage mismatch: voice=%q transcript=%q", voiceAssign.TranscriptArtifactCAS, in.TranscriptArtifactCAS)
 	}
 
-	pass, err := s.synthesizeSegmentsPass(ctx, in, dubScript, dubScriptCAS, voiceAssign, voiceAssignCAS, nil, nil)
+	recoveryState := newLineageRecoveryState()
+	pass, err := s.synthesizeSegmentsPass(ctx, in, dubScript, dubScriptCAS, voiceAssign, voiceAssignCAS, nil, nil, recoveryState)
 	if err != nil {
 		return nil, err
 	}
@@ -1235,7 +1253,7 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 			// the unresolved overrun above stays REVIEW instead of reverting it.
 			return pass, nil
 		}
-		return s.synthesizeSegmentsPass(ctx, in, dubScript, dubScriptCAS, superseding, superseding.CASHash, pass, plan.evidence)
+		return s.synthesizeSegmentsPass(ctx, in, dubScript, dubScriptCAS, superseding, superseding.CASHash, pass, plan.evidence, recoveryState)
 	}
 
 	return pass, nil
@@ -1447,7 +1465,7 @@ type speakerEscalationPlan struct {
 // REGROUP | REVIEW). A superseding assignment reuses prior selected segments for every
 // speaker it did not invalidate; priorHint hands the variant an escalation regenerates
 // over in memory instead of relying on the asset-scoped index lookup.
-func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.DubbingJobInput, dubScript *domain.DubScriptVariant, dubScriptCAS string, voiceAssign *domain.VoiceAssignment, voiceAssignCAS string, priorHint *domain.DubSegmentsVariant, escalations []domain.VoiceProviderEscalation) (*domain.DubSegmentsVariant, error) {
+func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.DubbingJobInput, dubScript *domain.DubScriptVariant, dubScriptCAS string, voiceAssign *domain.VoiceAssignment, voiceAssignCAS string, priorHint *domain.DubSegmentsVariant, escalations []domain.VoiceProviderEscalation, recoveryState *lineageRecoveryState) (*domain.DubSegmentsVariant, error) {
 	targetLang := in.TargetLanguage
 	transcript, rolePlan, err := s.loadPlaybackTimeline(ctx, in)
 	if err != nil {
@@ -1681,16 +1699,19 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 		if currentText == "" {
 			currentText = seg.MeaningText
 		}
+		if rw, ok := recoveryState.AcceptedRewrites[seg.Index]; ok && rw != "" {
+			currentText = rw
+		}
 		protectedTerms := glossaryForSource(translationContract.EffectiveGlossary, seg.SourceText)
 
 		attempt := 1
 		currentSpeed := 1.0
+		currentCalibrationID := ""
 		var finalCandidate *domain.TTSCandidate
 		var finalFitPlan domain.DubbingFitPlan
 		var finalDecision domain.FitAction
 		var finalRequiresReview bool
 		var finalReviewReason string
-
 		for attempt <= 3 {
 			synthReq := provider.TTSSynthesisRequest{
 				RunID:          in.RunID,
@@ -1731,35 +1752,49 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				audioSHA = synthRes.AudioSHA256
 			}
 
-			supportsSpeedFit, fixedRateVoice := ttsFitCapabilities(selectedProv)
+			fixedRateVoice := ttsFitCapabilities(selectedProv)
 			if fixedRateVoice {
 				fixedRateSpeakers[spkID] = true
+			}
+			var provID, modelID, modelVer string
+			if selectedProv != nil {
+				provID = selectedProv.ID()
+				modelID, modelVer = selectedProv.ModelInfo()
 			}
 
 			// Evaluate fit
 			measuredFrames, measuredSampleRate := candidateFrameGeometry(synthRes.AudioData)
 			evalInput := FitEvaluationInput{
-				SegmentIndex:       seg.Index,
-				SpeakerID:          spkID,
-				StartMs:            seg.StartMs,
-				EndMs:              seg.EndMs,
-				NextTurnStartMs:    nextTurnStartMs,
-				NextTurnSpeakerID:  nextTurnSpkID,
-				SourceGapAfterMs:   seg.SourceGapAfterMs,
-				MeasuredDurationMs: probedMs,
-				AttemptNumber:      attempt,
-				CurrentSpeed:       currentSpeed,
-				CanShortenText:     len(strings.Fields(currentText)) > 3,
-				SupportsSpeedFit:   supportsSpeedFit,
-				FixedRateVoice:     fixedRateVoice,
-				DubPlaybackEndMs:   playbackEndMs,
-				EffectiveReserveMs: effectiveReserveMs,
-				OutputSampleRate:   outputSampleRate,
-				MeasuredFrames:     measuredFrames,
-				MeasuredSampleRate: measuredSampleRate,
+				SegmentIndex:              seg.Index,
+				SpeakerID:                 spkID,
+				StartMs:                   seg.StartMs,
+				EndMs:                     seg.EndMs,
+				NextTurnStartMs:           nextTurnStartMs,
+				NextTurnSpeakerID:         nextTurnSpkID,
+				SourceGapAfterMs:          seg.SourceGapAfterMs,
+				MeasuredDurationMs:        probedMs,
+				AttemptNumber:             attempt,
+				CurrentSpeed:              currentSpeed,
+				CanShortenText:            len(strings.Fields(currentText)) > 3,
+				FixedRateVoice:            fixedRateVoice,
+				DubPlaybackEndMs:          playbackEndMs,
+				EffectiveReserveMs:        effectiveReserveMs,
+				ProviderID:                provID,
+				ModelID:                   modelID,
+				ModelVersion:              modelVer,
+				VoiceProfileID:            voice.ID,
+				NativeAttemptsForLineage:  recoveryState.NativeAttempts[seg.Index],
+				RewriteAttemptsForLineage: recoveryState.RewriteAttempts[seg.Index],
+				OutputSampleRate:          outputSampleRate,
+				MeasuredFrames:            measuredFrames,
+				MeasuredSampleRate:        measuredSampleRate,
 			}
 
 			evalRes := fc.EvaluateCandidate(ctx, evalInput)
+			activeCalID := currentCalibrationID
+			if activeCalID == "" {
+				activeCalID = evalRes.CalibrationID
+			}
 			finalFitPlan = domain.DubbingFitPlan{
 				SegmentIndex:       seg.Index,
 				SpeakerID:          spkID,
@@ -1775,6 +1810,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				DubPlaybackEndMs:   evalRes.DubPlaybackEndMs,
 				EffectiveReserveMs: evalRes.EffectiveReserveMs,
 				FitPolicyID:        fitPolicyID,
+				CalibrationID:      activeCalID,
 				SpeechBlockIndices: []int{seg.Index},
 			}
 
@@ -1789,6 +1825,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				PredictedDurationMs: synthRes.PredictedDurationMs,
 				MeasuredDurationMs:  probedMs,
 				SpeedFactor:         currentSpeed,
+				CalibrationID:       currentCalibrationID,
 				AttemptNumber:       attempt,
 				ProbedAt:            time.Now().UTC(),
 			}
@@ -1801,46 +1838,64 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 			if evalRes.Decision == domain.FitActionAccept {
 				break
 			} else if evalRes.Decision == domain.FitActionResynth {
-				// Retry with adjusted speed
+				recoveryState.NativeAttempts[seg.Index]++
 				currentSpeed = evalRes.RecommendedSpeed
+				currentCalibrationID = evalRes.CalibrationID
 				attempt++
 			} else if evalRes.Decision == domain.FitActionRewrite {
-				// Shorten phrasing
-				previousText := currentText
+				recoveryState.RewriteAttempts[seg.Index]++
+				rewriteAccepted := false
 				if s.spokenAdapter != nil {
+					// OverrunMs is documented as the measured overrun above PlaybackAllowanceMs,
+					// so it must be measured against that window. The frame-exact REWRITE path can
+					// reach here with a floored millisecond probe that still fits the window while
+					// the resampled waveform does not: substituting DurationDeltaMs there would
+					// report an overrun above a budget the candidate never exceeded, since that
+					// delta is measured against the reserve-reduced usable slot.
+					overrunMs := measuredOverrunAboveAllowanceMs(probedMs, seg.StartMs, playbackEndMs,
+						measuredFrames, measuredSampleRate, outputSampleRate)
 					adaptRes, err := s.spokenAdapter.AdaptSpokenScript(ctx, provider.SpokenScriptAdaptationRequest{
 						SourceText:            seg.SourceText,
 						SourceLanguage:        dubScript.SourceLanguage,
 						MeaningText:           seg.MeaningText,
 						TargetLanguage:        targetLang,
 						SlotDurationMs:        slotDurationMs,
+						PlaybackAllowanceMs:   slotDurationMs,
+						MeasuredDurationMs:    probedMs,
+						OverrunMs:             overrunMs,
 						SourceSpeakingRateCPS: seg.SourceSpeakingRateCPS,
 						SourceGapAfterMs:      seg.SourceGapAfterMs,
 						HasNextTurn:           nextTurnStartMs > 0,
 						ProtectedTerms:        protectedTerms,
 					})
-					if err == nil && adaptRes.SpokenText != "" && adaptRes.SpokenText != currentText {
-						currentText = adaptRes.SpokenText
-					} else {
-						// Simple trim fallback
-						words := strings.Fields(currentText)
-						if len(words) > 2 {
-							candidateText := strings.Join(words[:len(words)-1], " ")
-							if glossaryTargetsPreserved(currentText, candidateText, protectedTerms) {
+					if err == nil && adaptRes != nil {
+						candidateText := strings.TrimSpace(adaptRes.SpokenText)
+						if candidateText != "" && candidateText != strings.TrimSpace(currentText) &&
+							glossaryTargetsPreserved(seg.MeaningText, candidateText, protectedTerms) &&
+							glossaryTargetsPreserved(currentText, candidateText, protectedTerms) {
+							qa := NewMeaningFirstQAGate().ValidateSegment(seg.SourceText, candidateText, dubScript.SourceLanguage, targetLang, protectedTerms)
+							if qa.Passed {
 								currentText = candidateText
+								recoveryState.AcceptedRewrites[seg.Index] = currentText
+								currentSpeed = 1.0
+								currentCalibrationID = ""
+								rewriteAccepted = true
 							}
 						}
 					}
 				}
-				qa := NewMeaningFirstQAGate().ValidateSegment(seg.SourceText, currentText, dubScript.SourceLanguage, targetLang, protectedTerms)
-				if !qa.Passed {
-					// The measured rewrite is only a candidate. If shortening damages
-					// meaning, keep the last meaning-valid text/evidence and let the
-					// bounded fit loop advance to its remaining regroup/review remedy.
-					// Never turn a failed rewrite attempt into the canonical spoken text.
-					currentText = previousText
-					attempt++
-					continue
+				if !rewriteAccepted {
+					// Adapter error, empty/unchanged text, or QA failure preserves honest
+					// prior text and measured evidence without a wasted synthesis/probe,
+					// and advances to the next allowed remedy (regroup or review).
+					evalInput.RewriteAttemptsForLineage = recoveryState.RewriteAttempts[seg.Index]
+					nextRes := fc.EvaluateCandidate(ctx, evalInput)
+					finalDecision = nextRes.Decision
+					finalRequiresReview = nextRes.RequiresReview
+					finalReviewReason = nextRes.ReviewReason
+					finalFitPlan.Decision = nextRes.Decision
+					finalFitPlan.DecisionReason = nextRes.Reason
+					break
 				}
 				attempt++
 			} else {
@@ -1968,11 +2023,24 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 					return nil, fmt.Errorf("regroup probe media duration for segment %d (group %v): %w", seg.Index, consumedIndices, probeErr)
 				}
 
-				supportsSpeedFit, fixedRateVoice := ttsFitCapabilities(selectedProv)
+				fixedRateVoice := ttsFitCapabilities(selectedProv)
 				if fixedRateVoice {
 					fixedRateSpeakers[spkID] = true
 				}
 
+				var groupProvID, groupModelID, groupModelVer string
+				if selectedProv != nil {
+					groupProvID = selectedProv.ID()
+					groupModelID, groupModelVer = selectedProv.ModelInfo()
+				}
+				for _, mIdx := range consumedIndices {
+					if recoveryState.NativeAttempts[seg.Index] > recoveryState.NativeAttempts[mIdx] {
+						recoveryState.NativeAttempts[mIdx] = recoveryState.NativeAttempts[seg.Index]
+					}
+					if recoveryState.RewriteAttempts[seg.Index] > recoveryState.RewriteAttempts[mIdx] {
+						recoveryState.RewriteAttempts[mIdx] = recoveryState.RewriteAttempts[seg.Index]
+					}
+				}
 				regroupFrames, regroupSampleRate := candidateFrameGeometry(synthRes.AudioData)
 				regroupEvalInput := FitEvaluationInput{
 					SegmentIndex:       seg.Index,
@@ -1983,13 +2051,18 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 					NextTurnSpeakerID:  nextNextTurnSpkID,
 					SourceGapAfterMs:   nextSeg.SourceGapAfterMs,
 					MeasuredDurationMs: probedCombinedMs,
-					AttemptNumber:      1,
+					AttemptNumber:      3,
 					CurrentSpeed:       1.0,
-					CanShortenText:     len(strings.Fields(combinedSpokenText)) > 4,
-					SupportsSpeedFit:   supportsSpeedFit,
+					CanShortenText:     false,
 					FixedRateVoice:     fixedRateVoice,
 					DubPlaybackEndMs:   groupPlaybackEndMs,
 					EffectiveReserveMs: groupReserveMs,
+					ProviderID:         groupProvID,
+					ModelID:            groupModelID,
+					ModelVersion:       groupModelVer,
+					VoiceProfileID:     voice.ID,
+					// AttemptNumber 3 already refuses RESYNTH and REWRITE in EvaluateCandidate,
+					// so the regrouped candidate needs no explicit lineage budget consumption.
 					OutputSampleRate:   outputSampleRate,
 					MeasuredFrames:     regroupFrames,
 					MeasuredSampleRate: regroupSampleRate,
@@ -2187,6 +2260,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				NaturalGapAfterMs:  naturalGapAfter,
 				DubPlaybackEndMs:   playbackEndMs,
 				EffectiveReserveMs: effectiveReserveMs,
+				CalibrationID:      finalCandidate.CalibrationID,
 			}
 			selectedSegments = append(selectedSegments, dubSeg)
 		} else {
@@ -2206,8 +2280,10 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				Voice:              voice,
 				FitDecision:        finalDecision,
 				ReviewReason:       finalReviewReason,
+				AttemptCount:       finalFitPlan.AttemptCount,
 				DubPlaybackEndMs:   playbackEndMs,
 				EffectiveReserveMs: effectiveReserveMs,
+				CalibrationID:      finalCandidate.CalibrationID,
 			}
 			reviewSegments = append(reviewSegments, revSeg)
 			overallStatus = "REVIEW_REQUIRED"
@@ -2261,6 +2337,12 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 		overallStatus = "REVIEW_REQUIRED"
 	}
 
+	fitPolicyID := fc.policyID()
+	var fitConfig *domain.FitControllerConfig
+	if fitPolicyID != "" {
+		cfgCopy := fc.effectiveConfig()
+		fitConfig = &cfgCopy
+	}
 	variant := &domain.DubSegmentsVariant{
 		ID:                    uuid.NewString(),
 		SchemaVersion:         domain.DubSegmentsSchemaVersion,
@@ -2272,8 +2354,8 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 		VoiceAssignmentCAS:    voiceAssignCAS,
 		TranscriptArtifactCAS: in.TranscriptArtifactCAS,
 		AudioRolePlanCAS:      in.AudioRolePlanCAS,
-		FitPolicyID:           fc.policyID(),
-		FitConfig:             &fc.config,
+		FitPolicyID:           fitPolicyID,
+		FitConfig:             fitConfig,
 		Segments:              selectedSegments,
 		ReviewSegments:        reviewSegments,
 		FitPlans:              fitPlans,
@@ -2365,6 +2447,27 @@ func candidateFrameGeometry(audio []byte) (int64, int) {
 		return 0, 0
 	}
 	return frames, rate
+}
+
+// measuredOverrunAboveAllowanceMs returns the measured overrun of a synthesized candidate above
+// the accepted playback allowance (playbackEndMs - startMs). The mixer enforces that window
+// frame-exactly, so a candidate whose floored millisecond probe fits the window can still
+// overrun it in frames. That excess is converted back into the window's time base and rounded
+// up, since an excess frame occupies part of the next millisecond; without positive frame
+// evidence only the probe overrun is reported, and a candidate that proves no overrun reports 0.
+func measuredOverrunAboveAllowanceMs(probedMs, startMs, playbackEndMs, measuredFrames int64, measuredSampleRate, outputSampleRate int) int64 {
+	if overrunMs := probedMs - (playbackEndMs - startMs); overrunMs > 0 {
+		return overrunMs
+	}
+	if outputSampleRate <= 0 || measuredFrames <= 0 || measuredSampleRate <= 0 {
+		return 0
+	}
+	excessFrames := media.ResampledPCM16Frames(measuredFrames, measuredSampleRate, outputSampleRate) -
+		media.PlaybackWindowFrames(startMs, playbackEndMs, outputSampleRate)
+	if excessFrames <= 0 {
+		return 0
+	}
+	return (excessFrames*1000 + int64(outputSampleRate) - 1) / int64(outputSampleRate)
 }
 
 // resolveEscalationOutcomes marks whether a whole-speaker regeneration cleared every
@@ -2933,6 +3036,7 @@ func (s *DubbingService) invokeTTSWithFallback(ctx context.Context, req provider
 		PreferredProviderID:   req.Voice.ProviderID,
 	}
 
+	inputHash := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s_%s_%.4f", req.Text, req.Voice.ID, req.Speed))))
 	if req.Voice.ProviderID != "" {
 		// Frozen VoiceAssignment per speaker/run: must strictly invoke req.Voice.ProviderID
 		// without sentence-by-sentence engine hopping, while preserving Router's ExecuteRoutedWithRetry
@@ -2950,7 +3054,6 @@ func (s *DubbingService) invokeTTSWithFallback(ctx context.Context, req provider
 		var result *provider.TTSSynthesisResult
 		var selected provider.Provider
 
-		inputHash := fmt.Sprintf("%x", sha256.Sum256([]byte(req.Text+"_"+req.Voice.ID)))
 		err = s.router.ExecuteRoutedWithRetry(ctx, routeReq, routeRes, inputHash, 2, func(p provider.Provider, attemptNum int) error {
 			ttsProv, ok := p.(provider.TTSProvider)
 			if !ok {
@@ -2982,7 +3085,6 @@ func (s *DubbingService) invokeTTSWithFallback(ctx context.Context, req provider
 	var result *provider.TTSSynthesisResult
 	var selected provider.Provider
 
-	inputHash := fmt.Sprintf("%x", sha256.Sum256([]byte(req.Text+"_"+req.Voice.ID)))
 	err = s.router.ExecuteWithRetry(ctx, routeReq, inputHash, 2, func(p provider.Provider, attemptNum int) error {
 		ttsProv, ok := p.(provider.TTSProvider)
 		if !ok {
@@ -3025,23 +3127,19 @@ func isVoiceAssignmentEquivalent(existing *domain.VoiceAssignment, newAssignment
 	return true
 }
 
-// ttsFitCapabilities reports the rate-control contract of the TTS lane that
-// actually produced a candidate: whether it accepts a measured speed-fit
-// resynthesis, and whether it is a fixed-rate lane that fails closed on any
-// non-1.0 speed request (so overrun must use rewrite/regroup/review instead).
-func ttsFitCapabilities(p provider.Provider) (supportsSpeedFit, fixedRateVoice bool) {
+// ttsFitCapabilities reports whether the TTS lane that actually produced a
+// candidate is a fixed-rate lane that fails closed on any non-1.0 speed request,
+// so overrun must use rewrite/regroup/review instead of a speed resynthesis.
+func ttsFitCapabilities(p provider.Provider) bool {
 	if p == nil {
-		return false, false
+		return false
 	}
 	for _, f := range p.Capability().Features {
-		switch f {
-		case "measured_duration_speed_fit", "zero_overrun_fit":
-			supportsSpeedFit = true
-		case provider.FeatureFixedRateVoice:
-			fixedRateVoice = true
+		if f == provider.FeatureFixedRateVoice {
+			return true
 		}
 	}
-	return supportsSpeedFit, fixedRateVoice
+	return false
 }
 
 // isProviderEquivalent checks if two provider IDs match (allowing fake_ prefix normalization).

@@ -372,7 +372,7 @@ class TestTTSEngineUpstreamContracts(unittest.TestCase):
         self.assertIn("missing required 'infer' method", str(ctx.exception))
 
     def test_run_cosyvoice_tts_exact_upstream_contract_and_speed_fit(self):
-        """CosyVoice3 must call AutoModel with inference_sft and multi-pass speed-fit lane."""
+        """CosyVoice3 must invoke the engine exactly once per request at the requested speed, with no hidden slot-driven second pass."""
         calls = []
 
         class MockCosyVoiceAutoModel:
@@ -382,34 +382,42 @@ class TestTTSEngineUpstreamContracts(unittest.TestCase):
 
             def inference_sft(self, text, spk_id, stream=False, speed=1.0):
                 calls.append({"text": text, "spk_id": spk_id, "stream": stream, "speed": speed})
-                # Natural pass (speed=1.0) -> 48000 samples (2000ms)
-                # Fitted pass (speed=2.0) -> 24000 samples (1000ms)
                 dur_samples = int(48000 / speed)
                 yield {"tts_speech": [0.02] * dur_samples}
 
         tts_engine._COSYVOICE_MODEL_FACTORY = MockCosyVoiceAutoModel
 
-        # Request with slot_duration_ms = 1000 triggering speed-fit
-        resp = run_cosyvoice_tts(
-            text="测试语音合成",
-            language="zh",
-            voice_id="中文女",
-            speed=1.0,
-            slot_duration_ms=1000,
-        )
+        # Request 1: speed=1.0 must perform ONLY 1 engine synthesis - no hidden second pass
+        resp = run_tts({
+            "text": "测试语音合成",
+            "language": "zh",
+            "voice_id": "中文女",
+            "speed": 1.0,
+            "model_name": "cosyvoice3",
+            "model_version": "3.0.0",
+        })
 
-        self.assertEqual(len(calls), 2)
-        # Pass 1: Natural pass with stream=False
+        self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["stream"], False)
         self.assertEqual(calls[0]["speed"], 1.0)
         self.assertEqual(calls[0]["spk_id"], "中文女")
-        # Pass 2: Calibrated speed-fit pass
-        self.assertEqual(calls[1]["stream"], False)
-        self.assertAlmostEqual(calls[1]["speed"], 2.0, delta=0.01)
-
-        self.assertEqual(resp["measured_duration_ms"], 1000)
+        self.assertEqual(resp["measured_duration_ms"], 2000)
         self.assertEqual(resp["predicted_duration_ms"], 2000)
 
+        # Request 2: explicit speed=1.25 performs exactly 1 engine synthesis at speed=1.25
+        resp_fast = run_tts({
+            "text": "测试语音合成",
+            "language": "zh",
+            "voice_id": "中文女",
+            "speed": 1.25,
+            "model_name": "cosyvoice3",
+            "model_version": "3.0.0",
+        })
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["stream"], False)
+        self.assertAlmostEqual(calls[1]["speed"], 1.25, places=4)
+        self.assertEqual(resp_fast["measured_duration_ms"], 1600)
+        self.assertEqual(resp_fast["predicted_duration_ms"], 1600)
     def test_run_kokoro_tts_exact_upstream_contract(self):
         """Kokoro must instantiate KPipeline and extract Result.audio property."""
         calls = []

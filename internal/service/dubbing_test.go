@@ -3,8 +3,11 @@ package service_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -4138,5 +4141,681 @@ func TestDubbingService_SynthesizeAndFit_OmittedDubScriptCASStaysRunScoped(t *te
 	}
 	if segmentsD.DubScriptVariantCAS != scriptA.CASHash {
 		t.Fatalf("run D resolved %s, want its pinned %s", segmentsD.DubScriptVariantCAS, scriptA.CASHash)
+	}
+}
+
+type funcSpokenAdapter func(ctx context.Context, req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error)
+
+func (f funcSpokenAdapter) AdaptSpokenScript(ctx context.Context, req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+	return f(ctx, req)
+}
+
+// Issue #154: Measured rewrite receives actual duration/overrun, playback allowance,
+// canonical meaning, and frozen terminology; removes the last-word deletion fallback;
+// and preserves honest prior text/evidence without fresh TTS/probe when the adapter
+// errors, returns empty/unchanged text, or fails facts/names/numbers/negation/glossary QA.
+func TestDubbingService_Issue154_MeasuredRewrite_HonestFailureAndQAGate(t *testing.T) {
+	cases := []struct {
+		name       string
+		sourceText string
+		meaning    string
+		spoken     string
+		glossary   []domain.GlossaryEntry
+		adapterFn  func(req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error)
+		wantAccept bool
+		wantCalls  int
+		wantText   string
+	}{
+		{
+			name:       "adapter_error_no_last_word_deletion_no_resynth",
+			sourceText: "今天天气真的非常好。",
+			meaning:    "Hôm nay thời tiết thật sự rất đẹp.",
+			spoken:     "Hôm nay thời tiết thật sự rất đẹp.",
+			adapterFn: func(req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+				return nil, errors.New("adapter unavailable")
+			},
+			wantAccept: false,
+			wantCalls:  1,
+			wantText:   "Hôm nay thời tiết thật sự rất đẹp.",
+		},
+		{
+			name:       "empty_rewrite_no_last_word_deletion_no_resynth",
+			sourceText: "今天天气真的非常好。",
+			meaning:    "Hôm nay thời tiết thật sự rất đẹp.",
+			spoken:     "Hôm nay thời tiết thật sự rất đẹp.",
+			adapterFn: func(req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+				return &provider.SpokenScriptAdaptationResult{SpokenText: "   "}, nil
+			},
+			wantAccept: false,
+			wantCalls:  1,
+			wantText:   "Hôm nay thời tiết thật sự rất đẹp.",
+		},
+		{
+			name:       "unchanged_rewrite_no_last_word_deletion_no_resynth",
+			sourceText: "今天天气真的非常好。",
+			meaning:    "Hôm nay thời tiết thật sự rất đẹp.",
+			spoken:     "Hôm nay thời tiết thật sự rất đẹp.",
+			adapterFn: func(req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+				return &provider.SpokenScriptAdaptationResult{SpokenText: req.MeaningText}, nil
+			},
+			wantAccept: false,
+			wantCalls:  1,
+			wantText:   "Hôm nay thời tiết thật sự rất đẹp.",
+		},
+		{
+			name:       "number_corruption_rejected_before_tts",
+			sourceText: "这台机器有 500 瓦功率。",
+			meaning:    "Cỗ máy này có công suất 500 watt.",
+			spoken:     "Cỗ máy này có công suất 500 watt.",
+			adapterFn: func(req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+				return &provider.SpokenScriptAdaptationResult{SpokenText: "Máy có công suất 600 watt."}, nil
+			},
+			wantAccept: false,
+			wantCalls:  1,
+			wantText:   "Cỗ máy này có công suất 500 watt.",
+		},
+		{
+			name:       "negation_corruption_rejected_before_tts",
+			sourceText: "我今天不去商店。",
+			meaning:    "Hôm nay tôi không đi cửa hàng.",
+			spoken:     "Hôm nay tôi không đi cửa hàng.",
+			adapterFn: func(req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+				return &provider.SpokenScriptAdaptationResult{SpokenText: "Hôm nay tôi đi cửa hàng."}, nil
+			},
+			wantAccept: false,
+			wantCalls:  1,
+			wantText:   "Hôm nay tôi không đi cửa hàng.",
+		},
+		{
+			name:       "name_corruption_rejected_before_tts",
+			sourceText: "这款 SUPOR 电饭煲很好用。",
+			meaning:    "Chiếc nồi cơm điện SUPOR này rất dễ dùng.",
+			spoken:     "Chiếc nồi cơm điện SUPOR này rất dễ dùng.",
+			adapterFn: func(req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+				return &provider.SpokenScriptAdaptationResult{SpokenText: "Chiếc nồi cơm điện này dễ dùng."}, nil
+			},
+			wantAccept: false,
+			wantCalls:  1,
+			wantText:   "Chiếc nồi cơm điện SUPOR này rất dễ dùng.",
+		},
+		{
+			name:       "glossary_drop_rejected_before_tts",
+			sourceText: "这款 SUPOR 电饭煲很好用。",
+			meaning:    "Chiếc nồi cơm điện SuporVN này rất dễ dùng.",
+			spoken:     "Chiếc nồi cơm điện SuporVN này rất dễ dùng.",
+			glossary:   []domain.GlossaryEntry{{Source: "SUPOR", Target: "SuporVN"}},
+			adapterFn: func(req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+				return &provider.SpokenScriptAdaptationResult{SpokenText: "Nồi cơm điện SUPOR dễ dùng."}, nil
+			},
+			wantAccept: false,
+			wantCalls:  1,
+			wantText:   "Chiếc nồi cơm điện SuporVN này rất dễ dùng.",
+		},
+		{
+			name:       "valid_glossary_localization_passes_qa_and_probes_fresh_tts",
+			sourceText: "这款 SUPOR 500 电饭煲很好用。",
+			meaning:    "Chiếc nồi cơm điện SuporVN 500 này thật sự rất dễ dùng.",
+			spoken:     "Chiếc nồi cơm điện SuporVN 500 này thật sự rất dễ dùng.",
+			glossary:   []domain.GlossaryEntry{{Source: "SUPOR", Target: "SuporVN"}},
+			adapterFn: func(req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+				if req.MeasuredDurationMs != 1400 || req.PlaybackAllowanceMs != 1000 || req.OverrunMs != 400 {
+					return nil, fmt.Errorf("unexpected rewrite budget: measured=%d allowance=%d overrun=%d", req.MeasuredDurationMs, req.PlaybackAllowanceMs, req.OverrunMs)
+				}
+				if req.MeaningText != "Chiếc nồi cơm điện SuporVN 500 này thật sự rất dễ dùng." {
+					return nil, fmt.Errorf("expected canonical MeaningText, got %q", req.MeaningText)
+				}
+				if len(req.ProtectedTerms) != 1 || req.ProtectedTerms[0].Target != "SuporVN" {
+					return nil, fmt.Errorf("expected frozen ProtectedTerms [SuporVN], got %+v", req.ProtectedTerms)
+				}
+				return &provider.SpokenScriptAdaptationResult{SpokenText: "Nồi SuporVN 500 rất dễ dùng."}, nil
+			},
+			wantAccept: true,
+			wantCalls:  2,
+			wantText:   "Nồi SuporVN 500 rất dễ dùng.",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+			defer db.Close()
+
+			assetID := uuid.NewString()
+			runID := uuid.NewString()
+			setupAssetJobRunAudioRole(t, db, casStore, assetID, runID, "vi")
+
+			dubScript := domain.DubScriptVariant{
+				ID:             uuid.NewString(),
+				SchemaVersion:  domain.DubScriptSchemaVersion,
+				AssetID:        assetID,
+				RunID:          runID,
+				SourceLanguage: "zh",
+				TargetLanguage: "vi",
+				Segments: []domain.DubScriptSegment{
+					{
+						Index:          0,
+						SpeakerID:      "SPEAKER_00",
+						StartMs:        0,
+						EndMs:          1000,
+						SlotDurationMs: 1000,
+						SourceText:     tc.sourceText,
+						MeaningText:    tc.meaning,
+						SpokenText:     tc.spoken,
+					},
+				},
+				CreatedAt: time.Now().UTC(),
+			}
+			pinDubbingScriptLineage(t, db, casStore, &dubScript, runID, tc.glossary...)
+			scriptBytes, _ := json.Marshal(dubScript)
+			scriptCAS, _ := casStore.Put(bytes.NewReader(scriptBytes))
+
+			assign, err := dubSvc.AssignVoices(context.Background(), domain.VoiceAssignmentInput{
+				RunID:          runID,
+				AssetID:        assetID,
+				TargetLanguage: "vi",
+			})
+			if err != nil {
+				t.Fatalf("AssignVoices: %v", err)
+			}
+
+			dubSvc.ConfigureSpokenAdapter(funcSpokenAdapter(func(_ context.Context, req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+				return tc.adapterFn(req)
+			}))
+
+			synthCalls := 0
+			dubSvc.TTSInvoke = func(_ context.Context, p provider.Provider, req provider.TTSSynthesisRequest) (*provider.TTSSynthesisResult, error) {
+				synthCalls++
+				durMs := int64(1400) // Attempt 1 overruns 1000ms slot
+				if synthCalls == 2 {
+					durMs = 850 // Attempt 2 (accepted rewrite) fits 1000ms slot
+				}
+				wav := media.GeneratePCM16WAV(16000, 1, durMs)
+				sum := sha256.Sum256(wav)
+				return &provider.TTSSynthesisResult{
+					AudioData:          wav,
+					AudioSHA256:        hex.EncodeToString(sum[:]),
+					ProviderID:         p.ID(),
+					MeasuredDurationMs: durMs,
+				}, nil
+			}
+
+			variant, err := dubSvc.SynthesizeAndFit(context.Background(), domain.DubbingJobInput{
+				RunID:               runID,
+				AssetID:             assetID,
+				TargetLanguage:      "vi",
+				DubScriptVariantCAS: scriptCAS.SHA256,
+				VoiceAssignmentCAS:  assign.CASHash,
+			})
+			if err != nil {
+				t.Fatalf("SynthesizeAndFit: %v", err)
+			}
+
+			if synthCalls != tc.wantCalls {
+				t.Fatalf("expected %d TTS synthesis calls, got %d", tc.wantCalls, synthCalls)
+			}
+			if len(variant.FitPlans) != 1 || variant.FitPlans[0].AttemptCount != tc.wantCalls {
+				t.Fatalf("FitPlan.AttemptCount must match actual synthesis count %d, got %+v", tc.wantCalls, variant.FitPlans)
+			}
+			if tc.wantAccept {
+				if variant.OverallStatus != "PASS" || len(variant.Segments) != 1 {
+					t.Fatalf("expected PASS with 1 selected segment, got status=%s segments=%d", variant.OverallStatus, len(variant.Segments))
+				}
+				if variant.Segments[0].SpokenText != tc.wantText {
+					t.Fatalf("expected selected SpokenText %q, got %q", tc.wantText, variant.Segments[0].SpokenText)
+				}
+				if variant.Segments[0].MeasuredDurationMs != 850 {
+					t.Fatalf("expected fresh probed duration 850ms, got %dms", variant.Segments[0].MeasuredDurationMs)
+				}
+			} else {
+				if variant.OverallStatus != "REVIEW_REQUIRED" || len(variant.ReviewSegments) != 1 {
+					t.Fatalf("expected REVIEW_REQUIRED with 1 review segment, got status=%s review=%d", variant.OverallStatus, len(variant.ReviewSegments))
+				}
+				rev := variant.ReviewSegments[0]
+				if rev.SpokenText != tc.wantText {
+					t.Fatalf("expected preserved honest prior SpokenText %q (never last-word deleted), got %q", tc.wantText, rev.SpokenText)
+				}
+				if rev.MeasuredDurationMs != 1400 || rev.AttemptCount != 1 {
+					t.Fatalf("expected honest prior measured duration 1400ms and AttemptCount=1, got dur=%d attempts=%d", rev.MeasuredDurationMs, rev.AttemptCount)
+				}
+			}
+		})
+	}
+}
+
+// Issue #154: At most one native retry per source lineage on an explicitly rate-capable and
+// calibrated lane; a second native retry is refused after the retry still overruns; recovery
+// state carries into regroup without budget reset; policy/calibration change invalidates cache
+// identity. The lane is deliberately NOT the production VieNeu lane: that adapter has no engine
+// rate control and its provider is fixed-rate, so it must never reach this path at all
+// (TestProductionSpeechRegistry_VieNeuLaneIsFixedRateNaturalOnly pins that).
+func TestDubbingService_Issue154_LineageBudgetAndCalibrationCacheInvalidation(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, casStore, assetID, runID, "vi")
+
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:            0,
+				SpeakerID:        "SPEAKER_00",
+				StartMs:          0,
+				EndMs:            1000,
+				SlotDurationMs:   1000,
+				SourceText:       "第一句需要测试速度与重组的恢复预算。",
+				MeaningText:      "Câu đầu tiên cần kiểm tra ngân sách khôi phục tốc độ.",
+				SpokenText:       "Câu đầu tiên cần kiểm tra ngân sách khôi phục tốc độ.",
+				SourceGapAfterMs: 100,
+			},
+			{
+				Index:            1,
+				SpeakerID:        "SPEAKER_00",
+				StartMs:          1100,
+				EndMs:            3500,
+				SlotDurationMs:   2400,
+				SourceText:       "第二句合并槽位。",
+				MeaningText:      "Câu hai hợp nhất.",
+				SpokenText:       "Câu hai hợp nhất.",
+				SourceGapAfterMs: 100,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	pinDubbingScriptLineage(t, db, casStore, &dubScript, runID)
+	scriptBytes, _ := json.Marshal(dubScript)
+	scriptCAS, _ := casStore.Put(bytes.NewReader(scriptBytes))
+
+	// Assign an explicitly rate-capable lane: CosyVoice3's adapter really passes the requested
+	// speed into the engine, so a native speed attempt is legitimate here (the production VieNeu
+	// lane is fixed-rate and never reaches this path).
+	fitVoice := provider.CosyVoicePresetVoices("vi")[0]
+	assign, err := dubSvc.AssignVoices(context.Background(), domain.VoiceAssignmentInput{
+		RunID:             runID,
+		AssetID:           assetID,
+		TargetLanguage:    "vi",
+		CustomAssignments: map[string]domain.VoiceProfile{"SPEAKER_00": fitVoice},
+	})
+	if err != nil {
+		t.Fatalf("AssignVoices: %v", err)
+	}
+
+	// Fixture constants, shared by the envelope, the fake engine and the assertions so the
+	// refusal attribution below stays checkable.
+	const (
+		segSlotMs         = 1000 // seg 0 slot: 0-1000ms
+		naturalSegMs      = 1200 // seg 0 at 1.0x: overruns the slot, so 1.20x is requested
+		regroupedMs       = 1800 // regrouped [0,1] at 1.0x: fits its combined window
+		minSpeed          = 0.8
+		maxSpeed          = 1.5
+		realizedSpeedGain = 0.25
+	)
+
+	// Configure a verified envelope for that lane. The envelope must name the exact lane the
+	// TTSInvoke hook reports: the voice's provider id as model name, at version 1.0.
+	envelope := func(calibrationID string) domain.NativeSpeedEnvelope {
+		return domain.NativeSpeedEnvelope{
+			ProviderID:     fitVoice.ProviderID,
+			ModelID:        fitVoice.ProviderID,
+			ModelVersion:   "1.0",
+			VoiceProfileID: fitVoice.ID,
+			MinSpeed:       minSpeed,
+			MaxSpeed:       maxSpeed,
+			Verified:       true,
+			CalibrationID:  calibrationID,
+		}
+	}
+	cfg := service.DefaultFitControllerConfig()
+	cfg.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{envelope("cal-v1")}
+	dubSvc.ConfigureFitController(service.NewFitController(cfg))
+	// Adapter returns unchanged text so rewrite is consumed without a synthesis pass,
+	// advancing directly to regroup after the single native retry overruns.
+	dubSvc.ConfigureSpokenAdapter(funcSpokenAdapter(func(_ context.Context, req provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+		return &provider.SpokenScriptAdaptationResult{SpokenText: req.MeaningText}, nil
+	}))
+
+	// The fake honors req.Speed - the waveform shortens with the request instead of ignoring it -
+	// but realizes only part of the requested gain. That measured shortfall is what the single
+	// retry cannot close, so the retry overruns again and only the consumed lineage budget can be
+	// refusing the second native attempt. Both the requested and the realized factor stay inside
+	// [minSpeed, maxSpeed] by construction: the retry duration never exceeds the natural one.
+	var recordedSpeeds []float64
+	var recordedDurations []int64
+	dubSvc.TTSInvoke = func(_ context.Context, p provider.Provider, req provider.TTSSynthesisRequest) (*provider.TTSSynthesisResult, error) {
+		recordedSpeeds = append(recordedSpeeds, req.Speed)
+		naturalMs := int64(regroupedMs)
+		if len(recordedSpeeds) <= 2 {
+			naturalMs = naturalSegMs
+		}
+		durMs := int64(float64(naturalMs) / (1 + (req.Speed-1)*realizedSpeedGain))
+		recordedDurations = append(recordedDurations, durMs)
+		wav := media.GeneratePCM16WAV(16000, 1, durMs)
+		sum := sha256.Sum256(wav)
+		return &provider.TTSSynthesisResult{
+			AudioData:          wav,
+			AudioSHA256:        hex.EncodeToString(sum[:]),
+			ProviderID:         p.ID(),
+			MeasuredDurationMs: durMs,
+		}, nil
+	}
+
+	jobIn := domain.DubbingJobInput{
+		RunID:               runID,
+		AssetID:             assetID,
+		TargetLanguage:      "vi",
+		DubScriptVariantCAS: scriptCAS.SHA256,
+		VoiceAssignmentCAS:  assign.CASHash,
+	}
+	variant1, err := dubSvc.SynthesizeAndFit(context.Background(), jobIn)
+	if err != nil {
+		t.Fatalf("SynthesizeAndFit: %v", err)
+	}
+
+	// Exactly 3 calls: (1) seg 0 natural 1.0x, (2) seg 0 single native retry >1.0x, (3) regroup [0,1] at 1.0x.
+	// No second native retry and no wasted synthesis on unchanged rewrite!
+	if len(recordedSpeeds) != 3 {
+		t.Fatalf("expected exactly 3 synthesis calls (natural, 1 native retry, 1 regroup), got %d: %v", len(recordedSpeeds), recordedSpeeds)
+	}
+	if recordedSpeeds[0] != 1.0 || recordedSpeeds[1] <= 1.0 || recordedSpeeds[2] != 1.0 {
+		t.Fatalf("unexpected speed sequence: %v", recordedSpeeds)
+	}
+	// The retry really applied the requested speed (its waveform got shorter) and still overran
+	// seg 0's slot, so refusing the second attempt is a lineage-budget decision rather than the
+	// fixture quietly ignoring req.Speed.
+	if recordedDurations[1] >= recordedDurations[0] {
+		t.Fatalf("native retry must expose req.Speed instead of ignoring it: natural=%dms retry=%dms",
+			recordedDurations[0], recordedDurations[1])
+	}
+	if recordedDurations[1] <= segSlotMs {
+		t.Fatalf("fixture must keep the native retry overrunning seg 0's %dms slot, got %dms", segSlotMs, recordedDurations[1])
+	}
+	if variant1.OverallStatus != "PASS" || len(variant1.Segments) != 1 || len(variant1.Segments[0].SpeechBlockIndices) != 2 {
+		t.Fatalf("expected regrouped PASS covering [0,1], got status=%s segments=%+v", variant1.OverallStatus, variant1.Segments)
+	}
+
+	// Changing the calibration ID in FitControllerConfig must invalidate the stage cache key
+	cfg2 := cfg
+	cfg2.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{envelope("cal-v2-updated")}
+	dubSvc.ConfigureFitController(service.NewFitController(cfg2))
+	if dubSvc.CanReuseVariant(context.Background(), jobIn, variant1) {
+		t.Fatal("CanReuseVariant must return false when profile calibration identity changes")
+	}
+}
+
+// Issue #154 R4: an accepted rewrite on a fixed-rate lane still cannot fit its slot (that lane
+// has no engine rate control, so a rewrite is its only in-lane remedy and the lane is fixed at
+// 1.0), so the run escalates the whole speaker to the duration-controlled fallback lane. The
+// escalated pass re-enters with the SAME lineage recovery state: the accepted rewritten text is
+// what the fallback lane synthesizes, and the lineage's spent rewrite budget is not refilled, so
+// the lineage can never be granted a second rewrite.
+func TestDubbingService_Issue154_AcceptedRewriteCarriesIntoSpeakerEscalation(t *testing.T) {
+	dubSvc, db, casStore, reg, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, casStore, assetID, runID, "vi")
+
+	const (
+		originalText  = "Hôm nay thời tiết thật sự rất đẹp."
+		rewrittenText = "Hôm nay trời rất đẹp."
+		segmentSlotMs = 1000
+		fixedLaneMs   = 1500 // overruns the slot for the natural and the rewritten candidate alike
+	)
+
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SpeakerID:      "SPEAKER_00",
+				StartMs:        0,
+				EndMs:          segmentSlotMs,
+				SlotDurationMs: segmentSlotMs,
+				SourceText:     "今天天气真的非常好。",
+				MeaningText:    originalText,
+				SpokenText:     originalText,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	pinDubbingScriptLineage(t, db, casStore, &dubScript, runID)
+	scriptBytes, _ := json.Marshal(dubScript)
+	scriptCAS, _ := casStore.Put(bytes.NewReader(scriptBytes))
+
+	// The unattended VI default lane is a verified fixed-rate preset voice.
+	assign, err := dubSvc.AssignVoices(context.Background(), domain.VoiceAssignmentInput{
+		RunID:             runID,
+		AssetID:           assetID,
+		TargetLanguage:    "vi",
+		CustomAssignments: map[string]domain.VoiceProfile{"SPEAKER_00": provider.DefaultPresetVoices("vi")[0]},
+	})
+	if err != nil {
+		t.Fatalf("AssignVoices: %v", err)
+	}
+
+	fixedProvider, ok := reg.Get("fake_zerotts_tts_vi")
+	if !ok {
+		t.Fatal("the unattended VI fixed-rate lane must be registered")
+	}
+	fixedFake, ok := fixedProvider.(*provider.FakeTTSProvider)
+	if !ok {
+		t.Fatalf("unexpected provider type %T for the fixed-rate lane", fixedProvider)
+	}
+	fixedFake.DurationMs = fixedLaneMs
+
+	// The duration-controlled fallback lane the escalation targets, registered before the run
+	// so the escalation is policy/license eligible.
+	fallbackFake := provider.NewFakeTTSProvider("fake_cosyvoice3_tts", fixedLaneMs)
+	if err := reg.Register(fallbackFake); err != nil {
+		t.Fatalf("register fallback lane: %v", err)
+	}
+	if err := governance.NewLicenseService(db).RegisterManifest(context.Background(), domain.LicenseManifestEntry{
+		DependencyName: "fake_cosyvoice3_tts",
+		Version:        "1.0.0",
+		SHA256:         "sha256_mock_fake_cosyvoice3_tts",
+		SourceRepo:     "github.com/monet88/douyinie/models/fake_cosyvoice3_tts",
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Standard",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("register fallback lane manifest: %v", err)
+	}
+
+	adapterCalls := 0
+	dubSvc.ConfigureSpokenAdapter(funcSpokenAdapter(func(_ context.Context, _ provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+		adapterCalls++
+		return &provider.SpokenScriptAdaptationResult{SpokenText: rewrittenText}, nil
+	}))
+
+	variant, err := dubSvc.SynthesizeAndFit(context.Background(), domain.DubbingJobInput{
+		RunID:               runID,
+		AssetID:             assetID,
+		TargetLanguage:      "vi",
+		DubScriptVariantCAS: scriptCAS.SHA256,
+		VoiceAssignmentCAS:  assign.CASHash,
+	})
+	if err != nil {
+		t.Fatalf("SynthesizeAndFit: %v", err)
+	}
+
+	// Exactly one rewrite for the lineage: the escalated pass must not refill the spent budget.
+	if adapterCalls != 1 {
+		t.Fatalf("the lineage rewrite budget must stay spent across escalation, adapter called %d times", adapterCalls)
+	}
+	if len(variant.Escalations) != 1 {
+		t.Fatalf("the unresolved fixed-rate overrun must escalate the whole speaker once, got %+v", variant.Escalations)
+	}
+	esc := variant.Escalations[0]
+	if esc.FromProviderID != provider.ZeroTTSProviderID || esc.ToProviderID != provider.CosyVoiceProviderID ||
+		len(esc.TriggerSegmentIndices) != 1 || esc.TriggerSegmentIndices[0] != 0 {
+		t.Fatalf("unexpected escalation evidence: %+v", esc)
+	}
+	if esc.Resolved {
+		t.Fatalf("the escalated lane still overruns the slot, so the escalation must stay unresolved: %+v", esc)
+	}
+	if variant.OverallStatus != "REVIEW_REQUIRED" || len(variant.ReviewSegments) != 1 {
+		t.Fatalf("expected an unresolved REVIEW after escalation, got status=%s review=%+v", variant.OverallStatus, variant.ReviewSegments)
+	}
+	if variant.ReviewSegments[0].SpokenText != rewrittenText {
+		t.Fatalf("the accepted rewrite must carry into the escalated pass, got %q", variant.ReviewSegments[0].SpokenText)
+	}
+	if variant.ReviewSegments[0].CalibrationID != "" {
+		t.Fatalf("a fixed-rate lineage must never carry native-speed evidence, got %q", variant.ReviewSegments[0].CalibrationID)
+	}
+}
+
+// Issue #154 AC7: accepting a rewrite returns the candidate to natural playback, so the next
+// synthesis of the rewritten text runs at speed 1.0 and neither the selected segment nor the
+// fit evidence carries the CalibrationID of the native-speed retry spent before the rewrite.
+func TestDubbingService_Issue154_AcceptedRewriteResetsNativeSpeedEvidence(t *testing.T) {
+	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, casStore, assetID, runID, "vi")
+
+	const (
+		segmentSlotMs = 1000
+		originalText  = "Hôm nay thời tiết thật sự rất đẹp."
+		rewrittenText = "Hôm nay trời rất đẹp."
+		// 1200ms natural against a 1000ms slot: the fit must request exactly 1.20x.
+		naturalMs    = 1200
+		retrySpeed   = 1.2
+		realizedGain = 0.25 // the fake lane shortens, but only partly: the retry still overruns
+		rewrittenMs  = 900  // rewritten at natural speed finally fits the slot
+		calibration  = "cal-v1"
+	)
+
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SpeakerID:      "SPEAKER_00",
+				StartMs:        0,
+				EndMs:          segmentSlotMs,
+				SlotDurationMs: segmentSlotMs,
+				SourceText:     "今天天气真的非常好。",
+				MeaningText:    originalText,
+				SpokenText:     originalText,
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	pinDubbingScriptLineage(t, db, casStore, &dubScript, runID)
+	scriptBytes, _ := json.Marshal(dubScript)
+	scriptCAS, _ := casStore.Put(bytes.NewReader(scriptBytes))
+
+	// A rate-capable, calibrated lane: CosyVoice3's adapter honors a requested speed, so the
+	// single native retry is legitimate here.
+	fitVoice := provider.CosyVoicePresetVoices("vi")[0]
+	assign, err := dubSvc.AssignVoices(context.Background(), domain.VoiceAssignmentInput{
+		RunID:             runID,
+		AssetID:           assetID,
+		TargetLanguage:    "vi",
+		CustomAssignments: map[string]domain.VoiceProfile{"SPEAKER_00": fitVoice},
+	})
+	if err != nil {
+		t.Fatalf("AssignVoices: %v", err)
+	}
+
+	cfg := service.DefaultFitControllerConfig()
+	cfg.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{{
+		ProviderID:     fitVoice.ProviderID,
+		ModelID:        fitVoice.ProviderID,
+		ModelVersion:   "1.0",
+		VoiceProfileID: fitVoice.ID,
+		MinSpeed:       0.8,
+		MaxSpeed:       1.5,
+		Verified:       true,
+		CalibrationID:  calibration,
+	}}
+	dubSvc.ConfigureFitController(service.NewFitController(cfg))
+
+	adapterCalls := 0
+	dubSvc.ConfigureSpokenAdapter(funcSpokenAdapter(func(_ context.Context, _ provider.SpokenScriptAdaptationRequest) (*provider.SpokenScriptAdaptationResult, error) {
+		adapterCalls++
+		return &provider.SpokenScriptAdaptationResult{SpokenText: rewrittenText}, nil
+	}))
+
+	var speeds []float64
+	var texts []string
+	dubSvc.TTSInvoke = func(_ context.Context, p provider.Provider, req provider.TTSSynthesisRequest) (*provider.TTSSynthesisResult, error) {
+		speeds = append(speeds, req.Speed)
+		texts = append(texts, req.Text)
+		durMs := int64(rewrittenMs)
+		if req.Text != rewrittenText {
+			durMs = int64(float64(naturalMs) / (1 + (req.Speed-1)*realizedGain))
+		}
+		wav := media.GeneratePCM16WAV(16000, 1, durMs)
+		sum := sha256.Sum256(wav)
+		return &provider.TTSSynthesisResult{
+			AudioData:          wav,
+			AudioSHA256:        hex.EncodeToString(sum[:]),
+			ProviderID:         p.ID(),
+			MeasuredDurationMs: durMs,
+		}, nil
+	}
+
+	variant, err := dubSvc.SynthesizeAndFit(context.Background(), domain.DubbingJobInput{
+		RunID:               runID,
+		AssetID:             assetID,
+		TargetLanguage:      "vi",
+		DubScriptVariantCAS: scriptCAS.SHA256,
+		VoiceAssignmentCAS:  assign.CASHash,
+	})
+	if err != nil {
+		t.Fatalf("SynthesizeAndFit: %v", err)
+	}
+
+	// natural 1.0x -> one calibrated retry -> the accepted rewrite re-synthesized at 1.0x.
+	if len(speeds) != 3 {
+		t.Fatalf("expected exactly 3 synthesis calls (natural, calibrated retry, rewritten), got %d: %v", len(speeds), speeds)
+	}
+	if speeds[0] != 1.0 || speeds[1] != retrySpeed || speeds[2] != 1.0 {
+		t.Fatalf("unexpected speed sequence: %v", speeds)
+	}
+	if texts[0] != originalText || texts[1] != originalText || texts[2] != rewrittenText {
+		t.Fatalf("unexpected synthesized text sequence: %q", texts)
+	}
+	if adapterCalls != 1 {
+		t.Fatalf("exactly one rewrite must be requested, adapter called %d times", adapterCalls)
+	}
+
+	if variant.OverallStatus != "PASS" || len(variant.Segments) != 1 || len(variant.FitPlans) != 1 {
+		t.Fatalf("expected PASS with one selected segment and its fit plan, got status=%s segments=%d plans=%d",
+			variant.OverallStatus, len(variant.Segments), len(variant.FitPlans))
+	}
+	if got := variant.Segments[0].SpokenText; got != rewrittenText {
+		t.Fatalf("expected the accepted rewrite to be selected, got %q", got)
+	}
+	if got := variant.Segments[0].CalibrationID; got != "" {
+		t.Fatalf("natural-speed rewritten selection must not carry a CalibrationID, got %q", got)
+	}
+	plan := variant.FitPlans[0]
+	if plan.AttemptCount != 3 || plan.SpeedFactor != 1.0 || plan.CalibrationID != "" {
+		t.Fatalf("fit evidence must record the natural-speed rewritten attempt without calibration: %+v", plan)
 	}
 }

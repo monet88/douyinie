@@ -52,13 +52,12 @@ func TestSeam2_TTSStage_RealVieNeuSynthesisAndDurationProbe(t *testing.T) {
 		RunID:      "run-vieneu-real",
 		OutputPath: outPath,
 		Config: map[string]any{
-			"text":             "Xin chào Việt Nam, đây là bài kiểm tra tổng hợp giọng nói thực tế.",
-			"model_name":       "vieneu-tts",
-			"model_version":    "1.0.0",
-			"language":         "vi",
-			"voice_id":         "Trúc Ly",
-			"speed":            "1.0",
-			"slot_duration_ms": "5000",
+			"text":          "Xin chào Việt Nam, đây là bài kiểm tra tổng hợp giọng nói thực tế.",
+			"model_name":    "vieneu-tts",
+			"model_version": "1.0.0",
+			"language":      "vi",
+			"voice_id":      "Trúc Ly",
+			"speed":         "1.0",
 		},
 	}
 
@@ -124,7 +123,6 @@ func TestSeam2_TTSStage_RealCosyVoice3SynthesisSpeedFitAndDurationProbe(t *testi
 	}()
 
 	outPath := filepath.Join(t.TempDir(), "out-cosyvoice-real.json")
-	// Request with a constrained slot_duration_ms = 1500ms to trigger speed-fit recalibration
 	cmd := worker.Command{
 		ID:         "cmd-cosyvoice-real",
 		Family:     "tts",
@@ -133,13 +131,12 @@ func TestSeam2_TTSStage_RealCosyVoice3SynthesisSpeedFitAndDurationProbe(t *testi
 		RunID:      "run-cosyvoice-real",
 		OutputPath: outPath,
 		Config: map[string]any{
-			"text":             "八百标兵奔北坡，北坡炮兵并排跑。",
-			"model_name":       "cosyvoice-tts",
-			"model_version":    "3.0.0",
-			"language":         "zh",
-			"voice_id":         "中文女",
-			"speed":            "1.0",
-			"slot_duration_ms": "1500",
+			"text":          "八百标兵奔北坡，北坡炮兵并排跑。",
+			"model_name":    "cosyvoice-tts",
+			"model_version": "3.0.0",
+			"language":      "zh",
+			"voice_id":      "中文女",
+			"speed":         "1.0",
 		},
 	}
 
@@ -171,7 +168,7 @@ func TestSeam2_TTSStage_RealCosyVoice3SynthesisSpeedFitAndDurationProbe(t *testi
 		t.Fatalf("expected positive measured duration from CosyVoice3, got %d", res.MeasuredDurationMs)
 	}
 
-	// Invariant: speed-fit recalibration compressed duration relative to natural pass
+	// Invariant: a single synthesis pass, so measured duration matches the predicted natural duration
 	if res.PredictedDurationMs <= 0 {
 		t.Fatalf("expected predicted (natural pass) duration, got %d", res.PredictedDurationMs)
 	}
@@ -189,6 +186,6 @@ func TestSeam2_TTSStage_RealCosyVoice3SynthesisSpeedFitAndDurationProbe(t *testi
 	if probedDurMs != res.MeasuredDurationMs {
 		t.Errorf("probed duration (%d ms) != measured duration (%d ms)", probedDurMs, res.MeasuredDurationMs)
 	}
-	t.Logf("CosyVoice3 Real Synthesis SUCCESS: natural_pred=%d ms, speed_fit_measured=%d ms, sha256=%s",
+	t.Logf("CosyVoice3 Real Synthesis SUCCESS: predicted=%d ms, measured=%d ms, sha256=%s",
 		res.PredictedDurationMs, res.MeasuredDurationMs, res.AudioSHA256)
 }

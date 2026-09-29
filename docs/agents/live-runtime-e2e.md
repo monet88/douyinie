@@ -240,13 +240,21 @@ Traps:
   `measured_duration_ms` / `slot_duration_ms`. Two ways out, both operator-visible: shorten the wording
   (`Sửa text` → `POST /api/v1/runs/<run>/inspector/correct-text` with `new_target_text` +
   `spoken_text_override`) or give the run a lane that can compress (below).
-- **Why the automatic fit lane may never engage.** The VI default lane (ZeroTTS) is fixed-rate: it rejects any
-  speed other than 1.0, so overrun can only go through rewrite/regroup and then the whole-speaker escalation
-  to the duration-controlled lane (`cosyvoice3_tts`, feature `measured_duration_speed_fit`). That lane is
-  route-eligible only with a license manifest **and** a verified snapshot in the data dir; in the
-  `live-20260918` data dir it has neither, so the router refuses it, no escalation happens, and the overrun
-  stays `REVIEW`. Provision that lane or shorten the text - do not expect the escalation to fire on a box
-  where its weights were never registered.
+- **Why the automatic fit lane may never engage.** The VI default lane (ZeroTTS) and the VieNeu
+  compatibility lane are fixed-rate: they reject any speed other than 1.0, so overrun can only go through
+  rewrite/regroup and then the whole-speaker escalation to the duration-controlled lane (`cosyvoice3_tts`,
+  feature `measured_duration_speed_fit`). That lane is route-eligible only with a license manifest **and**
+  a verified snapshot in the data dir; in the `live-20260918` data dir it has neither, so the router
+  refuses it, no escalation happens, and the overrun stays `REVIEW`. Provision that lane or shorten the
+  text - do not expect the escalation to fire on a box where its weights were never registered.
+- **Provisioning that lane is still not enough to get a speed change.** The single native-speed attempt also
+  requires a verified `NativeSpeedEnvelope` whose provider / model / model-version / voice-profile identity
+  matches the lane that actually synthesized, and which carries an attributable `CalibrationID`;
+  `DefaultFitControllerConfig()` declares none, so nothing is calibrated out of the box. Uncalibrated lanes
+  stay natural-only: the escalated pass can still rewrite or regroup, but it never requests a rate its
+  runtime cannot honor, and an unresolved overrun stays `REVIEW`. A declared calibration is also only an
+  operator attestation - a fixed-rate lane still fails closed on any non-1.0 request, and the attempt is not
+  recorded as speed-adjusted.
 
 ## 5. Read the run back
 

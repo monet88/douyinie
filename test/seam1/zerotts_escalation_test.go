@@ -293,7 +293,22 @@ func TestSeam1_ZeroTTS_EscalationUsesFallbackMeasuredSpeedFit(t *testing.T) {
 	// speed-fit resynthesis must then bring it inside the immutable slot.
 	fakeCosy := registerCosyVoiceFallback(t, h, 700, true)
 	fakeCosy.CustomDurations = map[int]int64{0: 1650}
-
+	cfg := service.DefaultFitControllerConfig()
+	// The escalated CosyVoice lane must declare its full identity: the registered fake reports
+	// its provider id as model name at version 1.0.0, and the preset voice is the VI female one.
+	cfg.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
+		{
+			ProviderID:     "fake_cosyvoice3_tts",
+			ModelID:        "fake_cosyvoice3_tts",
+			ModelVersion:   "1.0.0",
+			VoiceProfileID: "cosyvoice3_vi_female_1",
+			MinSpeed:       0.85,
+			MaxSpeed:       1.25,
+			Verified:       true,
+			CalibrationID:  "cal-cosyvoice3-vi-clone-v1",
+		},
+	}
+	h.dubbingSvc.ConfigureFitController(service.NewFitController(cfg))
 	respSynth, variant := runDubSynthesize(t, h, assetID, map[string]any{
 		"run_id":                 runID,
 		"target_language":        "vi",
@@ -326,6 +341,9 @@ func TestSeam1_ZeroTTS_EscalationUsesFallbackMeasuredSpeedFit(t *testing.T) {
 	}
 	if hardPlan.SpeedFactor <= 1.0 {
 		t.Fatalf("expected a measured speed-fit factor above 1.0, got %.3f", hardPlan.SpeedFactor)
+	}
+	if hardPlan.CalibrationID != "cal-cosyvoice3-vi-clone-v1" {
+		t.Fatalf("expected CalibrationID cal-cosyvoice3-vi-clone-v1, got %q", hardPlan.CalibrationID)
 	}
 	if hardPlan.MeasuredDurationMs > hardPlan.SlotDurationMs {
 		t.Fatalf("speed-fit pass still overruns: measured %dms > slot %dms", hardPlan.MeasuredDurationMs, hardPlan.SlotDurationMs)
