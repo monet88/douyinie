@@ -1183,7 +1183,6 @@ func (p *WorkerTTSProvider) SynthesizeSpeech(ctx context.Context, req TTSSynthes
 	cmd.Config["language"] = req.Language
 	cmd.Config["voice_id"] = req.Voice.VoiceID
 	cmd.Config["speed"] = fmt.Sprintf("%.2f", req.Speed)
-	cmd.Config["slot_duration_ms"] = fmt.Sprintf("%d", req.SlotDurationMs)
 	if p.requiresSnapshot {
 		cmd.Config["require_model_snapshot"] = true
 	}

@@ -387,13 +387,12 @@ class TestTTSEngineUpstreamContracts(unittest.TestCase):
 
         tts_engine._COSYVOICE_MODEL_FACTORY = MockCosyVoiceAutoModel
 
-        # Request 1: speed=1.0 with a constrained slot_duration_ms=1000 must still perform ONLY 1 engine synthesis
+        # Request 1: speed=1.0 must perform ONLY 1 engine synthesis - no hidden second pass
         resp = run_tts({
             "text": "测试语音合成",
             "language": "zh",
             "voice_id": "中文女",
             "speed": 1.0,
-            "slot_duration_ms": 1000,
             "model_name": "cosyvoice3",
             "model_version": "3.0.0",
         })
@@ -411,7 +410,6 @@ class TestTTSEngineUpstreamContracts(unittest.TestCase):
             "language": "zh",
             "voice_id": "中文女",
             "speed": 1.25,
-            "slot_duration_ms": 1000,
             "model_name": "cosyvoice3",
             "model_version": "3.0.0",
         })

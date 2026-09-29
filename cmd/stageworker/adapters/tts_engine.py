@@ -4,7 +4,7 @@ Douyinie StageWorker Adapter: TTS Engines (ZeroTTS, VieNeu, CosyVoice3, Kokoro, 
 Invokes official upstream TTS Python APIs or fails closed with descriptive errors.
 
 Contract:
-- Stdin: JSON request with text, language, voice_id, speed, slot_duration_ms, model_name, model_version, run_id, attempt_id
+- Stdin: JSON request with text, language, voice_id, speed, model_name, model_version, run_id, attempt_id
 - Stdout: JSON response with audio_data (base64 WAV), audio_sha256, measured_duration_ms, predicted_duration_ms
 - Stderr: Human-readable error messages on failure
 - Exit code: 0 on success, non-zero on failure

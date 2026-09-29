@@ -57,6 +57,7 @@ type FitEvaluationInput struct {
 	VoiceProfileID            string  `json:"voice_profile_id,omitempty"`
 	NativeAttemptsForLineage  int     `json:"native_attempts_for_lineage,omitempty"`
 	RewriteAttemptsForLineage int     `json:"rewrite_attempts_for_lineage,omitempty"`
+	// OutputSampleRate is the sample rate of the mix this candidate lands in (the background stem
 	// rate the mixer resamples to); 0 = unknown, and the fit then falls back to the millisecond
 	// window instead of the frame-exact one.
 	OutputSampleRate int `json:"output_sample_rate,omitempty"`

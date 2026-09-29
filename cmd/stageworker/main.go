@@ -589,7 +589,6 @@ func runTTSAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 	lang, _ := cmd.Config["language"].(string)
 	voiceID, _ := cmd.Config["voice_id"].(string)
 	speed, _ := cmd.Config["speed"].(string)
-	slotDur, _ := cmd.Config["slot_duration_ms"].(string)
 	snapEnv, parseErr := worker.GetModelSnapshotEnvelope(cmd.Config)
 	if parseErr != nil {
 		return worker.ArtifactRef{}, worker.NewError("WORKER_SNAPSHOT_PATH_REQUIRED",
@@ -825,17 +824,16 @@ func runTTSAdapter(ctx context.Context, cmd worker.Command, enc *worker.Encoder)
 	}
 
 	req := map[string]any{
-		"text":             text,
-		"language":         lang,
-		"voice_id":         voiceID,
-		"speed":            speed,
-		"slot_duration_ms": slotDur,
-		"run_id":           cmd.RunID,
-		"attempt_id":       cmd.AttemptID,
-		cfgModelName:       modelName,
-		cfgModelVersion:    modelVersion,
-		"model_path":       modelPath,
-		"entrypoint_file":  entrypointFile,
+		"text":            text,
+		"language":        lang,
+		"voice_id":        voiceID,
+		"speed":           speed,
+		"run_id":          cmd.RunID,
+		"attempt_id":      cmd.AttemptID,
+		cfgModelName:      modelName,
+		cfgModelVersion:   modelVersion,
+		"model_path":      modelPath,
+		"entrypoint_file": entrypointFile,
 	}
 	var out struct {
 		AudioData           []byte `json:"audio_data"`
