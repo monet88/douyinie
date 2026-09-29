@@ -1,6 +1,28 @@
 package service
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/monet88/douyinie/internal/provider"
+)
+
+// Issue #154 / #150 R2: the fit controller reads exactly one declaration for "this lane cannot
+// honor a rate change" (ttsFitCapabilities -> FitEvaluationInput.FixedRateVoice). Pinning the
+// production-registered VieNeu lane here keeps the routing half of that contract wired to the
+// lane that actually declares fixed-rate.
+func TestVieNeuProductionLaneIsNeverOfferedNativeSpeed(t *testing.T) {
+	reg, err := provider.NewProductionSpeechRegistry(false)
+	if err != nil {
+		t.Fatalf("NewProductionSpeechRegistry: %v", err)
+	}
+	vieneu, ok := reg.Get(provider.VieNeuProviderID)
+	if !ok {
+		t.Fatalf("missing production lane %s", provider.VieNeuProviderID)
+	}
+	if !ttsFitCapabilities(vieneu) {
+		t.Fatalf("VieNeu must reach the fit controller as fixed-rate, got features %+v", vieneu.Capability().Features)
+	}
+}
 
 // Issue #154 review finding: the spoken adapter's OverrunMs is documented as the measured overrun
 // above PlaybackAllowanceMs, so it must be measured against that window and nothing else. The

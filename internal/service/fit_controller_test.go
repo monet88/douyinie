@@ -550,12 +550,17 @@ func TestFitController_NativeSpeedEnvelopes_VerificationMatrix(t *testing.T) {
 		t.Fatalf("verified matching envelope must authorize RESYNTH with CalibrationID, got %+v", res)
 	}
 
-	// 5. Fixed-rate voice stays natural-only even if an envelope is present
+	// 5. Fixed-rate voice stays natural-only even if an envelope is present: the lane cannot
+	// honor a rate change, so it must neither receive the native retry nor emit calibration
+	// evidence claiming the audio was synthesized at a requested speed (#154 / #150 R2).
 	fixedIn := baseIn
 	fixedIn.FixedRateVoice = true
 	res = verifiedFC.EvaluateCandidate(ctx, fixedIn)
 	if res.Decision != domain.FitActionRewrite {
 		t.Fatalf("FixedRateVoice must never RESYNTH even with envelope, got %s", res.Decision)
+	}
+	if res.CalibrationID != "" || res.RecommendedSpeed != 1.0 {
+		t.Fatalf("FixedRateVoice must emit no native-speed evidence, got calibration=%q speed=%.3f", res.CalibrationID, res.RecommendedSpeed)
 	}
 
 	// 6. Lineage native attempt already consumed: refuses second native attempt -> REWRITE

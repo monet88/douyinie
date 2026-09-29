@@ -173,6 +173,62 @@ func TestProductionSpeechRegistry_ZeroTTSVietnameseLane(t *testing.T) {
 	}
 }
 
+// Issue #154 / #150 R2: the VieNeu adapter has no engine-level rate control (run_vieneu_tts
+// accepts `speed` but calls engine.infer(text=, voice=) without it), so the lane must be
+// truthfully fixed-rate. Otherwise a verified NativeSpeedEnvelope naming it would let the fit
+// controller spend the single native-speed attempt on a rate the runtime silently ignores, and
+// record speed/calibration evidence for audio that was in fact synthesized naturally.
+func TestProductionSpeechRegistry_VieNeuLaneIsFixedRateNaturalOnly(t *testing.T) {
+	reg, err := provider.NewProductionSpeechRegistry(false)
+	if err != nil {
+		t.Fatalf("NewProductionSpeechRegistry: %v", err)
+	}
+
+	vieneu, ok := reg.Get(provider.VieNeuProviderID)
+	if !ok {
+		t.Fatalf("historical VieNeu provider %s missing", provider.VieNeuProviderID)
+	}
+
+	// 1. Routing capability: the lane declares itself fixed-rate, which is the same declaration
+	// the fit controller reads (ttsFitCapabilities -> FitEvaluationInput.FixedRateVoice), so a
+	// native-speed retry can never be offered to it - not even with a verified envelope.
+	fixedRate, advertisesRateControl := false, false
+	for _, feature := range vieneu.Capability().Features {
+		switch feature {
+		case provider.FeatureFixedRateVoice:
+			fixedRate = true
+		case "measured_duration_speed_fit", "zero_overrun_fit":
+			advertisesRateControl = true
+		}
+	}
+	if !fixedRate {
+		t.Fatalf("VieNeu must declare %s: it cannot honor a requested speed", provider.FeatureFixedRateVoice)
+	}
+	if advertisesRateControl {
+		t.Fatalf("VieNeu must not advertise engine rate control: %+v", vieneu.Capability().Features)
+	}
+
+	// 2. Direct invocation: a non-1.0 speed fails closed before any worker synthesis instead of
+	// returning natural audio the caller would record as speed-adjusted.
+	tts, ok := vieneu.(provider.TTSProvider)
+	if !ok {
+		t.Fatalf("%s does not implement TTSProvider", vieneu.ID())
+	}
+	catalog := tts.VoiceCatalog()
+	if _, err = tts.SynthesizeSpeech(context.Background(), provider.TTSSynthesisRequest{
+		RunID:        "run-vieneu-speed",
+		AssetID:      "asset-vieneu-speed",
+		SegmentIndex: 0,
+		SpeakerID:    "SPEAKER_00",
+		Text:         "Xin chào",
+		Language:     "vi",
+		Voice:        catalog[0],
+		Speed:        1.25,
+	}); !errors.Is(err, domain.ErrTTSSpeedUnsupported) {
+		t.Fatalf("VieNeu must fail closed on a non-1.0 speed before synthesis, got %v", err)
+	}
+}
+
 func TestProductionSpeechRegistry_TranslationProvidersAreGatewayOnly(t *testing.T) {
 	reg, err := provider.NewProductionSpeechRegistry(provider.GatewayTranslationConfig{
 		Endpoint:           "https://gateway.example.test/v1",

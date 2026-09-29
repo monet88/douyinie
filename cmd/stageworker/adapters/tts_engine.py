@@ -946,7 +946,6 @@ def run_tts(req: Dict[str, Any]) -> Dict[str, Any]:
     except (ValueError, TypeError):
         speed = 1.0
 
-    slot_duration_ms = int(req.get("slot_duration_ms", 0))
     model_name = req.get("model_name", "vieneu-tts").lower()
     model_version = req.get("model_version", "1.0.0")
     model_path = req.get("model_path")

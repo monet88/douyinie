@@ -4382,8 +4382,12 @@ func TestDubbingService_Issue154_MeasuredRewrite_HonestFailureAndQAGate(t *testi
 	}
 }
 
-// Issue #154: At most one native retry per source lineage; recovery state carries into
-// regroup without budget reset; policy/calibration change invalidates cache identity.
+// Issue #154: At most one native retry per source lineage on an explicitly rate-capable and
+// calibrated lane; a second native retry is refused after the retry still overruns; recovery
+// state carries into regroup without budget reset; policy/calibration change invalidates cache
+// identity. The lane is deliberately NOT the production VieNeu lane: that adapter has no engine
+// rate control and its provider is fixed-rate, so it must never reach this path at all
+// (TestProductionSpeechRegistry_VieNeuLaneIsFixedRateNaturalOnly pins that).
 func TestDubbingService_Issue154_LineageBudgetAndCalibrationCacheInvalidation(t *testing.T) {
 	dubSvc, db, casStore, _, _ := setupDubbingTestHarness(t)
 	defer db.Close()
@@ -4429,33 +4433,47 @@ func TestDubbingService_Issue154_LineageBudgetAndCalibrationCacheInvalidation(t 
 	scriptBytes, _ := json.Marshal(dubScript)
 	scriptCAS, _ := casStore.Put(bytes.NewReader(scriptBytes))
 
-	// Assign non-fixed-rate VieNeu voice so native speed is governed solely by verified envelope
-	vieneuVoice := provider.VieNeuPresetVoices()[0]
+	// Assign an explicitly rate-capable lane: CosyVoice3's adapter really passes the requested
+	// speed into the engine, so a native speed attempt is legitimate here (the production VieNeu
+	// lane is fixed-rate and never reaches this path).
+	fitVoice := provider.CosyVoicePresetVoices("vi")[0]
 	assign, err := dubSvc.AssignVoices(context.Background(), domain.VoiceAssignmentInput{
 		RunID:             runID,
 		AssetID:           assetID,
 		TargetLanguage:    "vi",
-		CustomAssignments: map[string]domain.VoiceProfile{"SPEAKER_00": vieneuVoice},
+		CustomAssignments: map[string]domain.VoiceProfile{"SPEAKER_00": fitVoice},
 	})
 	if err != nil {
 		t.Fatalf("AssignVoices: %v", err)
 	}
 
-	// Configure a verified envelope for the VieNeu voice. The envelope must name the exact lane:
-	// the TTSInvoke hook below reports the voice's provider id as model name at version 1.0.
-	cfg := service.DefaultFitControllerConfig()
-	cfg.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
-		{
-			ProviderID:     vieneuVoice.ProviderID,
-			ModelID:        vieneuVoice.ProviderID,
+	// Fixture constants, shared by the envelope, the fake engine and the assertions so the
+	// refusal attribution below stays checkable.
+	const (
+		segSlotMs         = 1000 // seg 0 slot: 0-1000ms
+		naturalSegMs      = 1200 // seg 0 at 1.0x: overruns the slot, so 1.20x is requested
+		regroupedMs       = 1800 // regrouped [0,1] at 1.0x: fits its combined window
+		minSpeed          = 0.8
+		maxSpeed          = 1.5
+		realizedSpeedGain = 0.25
+	)
+
+	// Configure a verified envelope for that lane. The envelope must name the exact lane the
+	// TTSInvoke hook reports: the voice's provider id as model name, at version 1.0.
+	envelope := func(calibrationID string) domain.NativeSpeedEnvelope {
+		return domain.NativeSpeedEnvelope{
+			ProviderID:     fitVoice.ProviderID,
+			ModelID:        fitVoice.ProviderID,
 			ModelVersion:   "1.0",
-			VoiceProfileID: vieneuVoice.ID,
-			MinSpeed:       0.8,
-			MaxSpeed:       1.5,
+			VoiceProfileID: fitVoice.ID,
+			MinSpeed:       minSpeed,
+			MaxSpeed:       maxSpeed,
 			Verified:       true,
-			CalibrationID:  "cal-v1",
-		},
+			CalibrationID:  calibrationID,
+		}
 	}
+	cfg := service.DefaultFitControllerConfig()
+	cfg.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{envelope("cal-v1")}
 	dubSvc.ConfigureFitController(service.NewFitController(cfg))
 	// Adapter returns unchanged text so rewrite is consumed without a synthesis pass,
 	// advancing directly to regroup after the single native retry overruns.
@@ -4463,22 +4481,21 @@ func TestDubbingService_Issue154_LineageBudgetAndCalibrationCacheInvalidation(t 
 		return &provider.SpokenScriptAdaptationResult{SpokenText: req.MeaningText}, nil
 	}))
 
+	// The fake honors req.Speed - the waveform shortens with the request instead of ignoring it -
+	// but realizes only part of the requested gain. That measured shortfall is what the single
+	// retry cannot close, so the retry overruns again and only the consumed lineage budget can be
+	// refusing the second native attempt. Both the requested and the realized factor stay inside
+	// [minSpeed, maxSpeed] by construction: the retry duration never exceeds the natural one.
 	var recordedSpeeds []float64
+	var recordedDurations []int64
 	dubSvc.TTSInvoke = func(_ context.Context, p provider.Provider, req provider.TTSSynthesisRequest) (*provider.TTSSynthesisResult, error) {
 		recordedSpeeds = append(recordedSpeeds, req.Speed)
-		var durMs int64
-		switch len(recordedSpeeds) {
-		case 1:
-			// Seg 0 natural pass: 1200ms > 1000ms slot (1.20x needed, within [0.8, 1.5])
-			durMs = 1200
-		case 2:
-			// Seg 0 single native retry at >1.0x: still 1100ms > 1000ms slot (1.32x cumulative, still <= 1.5!)
-			// A second native retry MUST be refused because lineage native budget is 1.
-			durMs = 1100
-		default:
-			// Regrouped pass [0, 1] at speed 1.0: fits combined [0, 3500] window
-			durMs = 1800
+		naturalMs := int64(regroupedMs)
+		if len(recordedSpeeds) <= 2 {
+			naturalMs = naturalSegMs
 		}
+		durMs := int64(float64(naturalMs) / (1 + (req.Speed-1)*realizedSpeedGain))
+		recordedDurations = append(recordedDurations, durMs)
 		wav := media.GeneratePCM16WAV(16000, 1, durMs)
 		sum := sha256.Sum256(wav)
 		return &provider.TTSSynthesisResult{
@@ -4509,24 +4526,23 @@ func TestDubbingService_Issue154_LineageBudgetAndCalibrationCacheInvalidation(t 
 	if recordedSpeeds[0] != 1.0 || recordedSpeeds[1] <= 1.0 || recordedSpeeds[2] != 1.0 {
 		t.Fatalf("unexpected speed sequence: %v", recordedSpeeds)
 	}
+	// The retry really applied the requested speed (its waveform got shorter) and still overran
+	// seg 0's slot, so refusing the second attempt is a lineage-budget decision rather than the
+	// fixture quietly ignoring req.Speed.
+	if recordedDurations[1] >= recordedDurations[0] {
+		t.Fatalf("native retry must expose req.Speed instead of ignoring it: natural=%dms retry=%dms",
+			recordedDurations[0], recordedDurations[1])
+	}
+	if recordedDurations[1] <= segSlotMs {
+		t.Fatalf("fixture must keep the native retry overrunning seg 0's %dms slot, got %dms", segSlotMs, recordedDurations[1])
+	}
 	if variant1.OverallStatus != "PASS" || len(variant1.Segments) != 1 || len(variant1.Segments[0].SpeechBlockIndices) != 2 {
 		t.Fatalf("expected regrouped PASS covering [0,1], got status=%s segments=%+v", variant1.OverallStatus, variant1.Segments)
 	}
 
 	// Changing the calibration ID in FitControllerConfig must invalidate the stage cache key
 	cfg2 := cfg
-	cfg2.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{
-		{
-			ProviderID:     vieneuVoice.ProviderID,
-			ModelID:        vieneuVoice.ProviderID,
-			ModelVersion:   "1.0",
-			VoiceProfileID: vieneuVoice.ID,
-			MinSpeed:       0.8,
-			MaxSpeed:       1.5,
-			Verified:       true,
-			CalibrationID:  "cal-v2-updated",
-		},
-	}
+	cfg2.NativeSpeedEnvelopes = []domain.NativeSpeedEnvelope{envelope("cal-v2-updated")}
 	dubSvc.ConfigureFitController(service.NewFitController(cfg2))
 	if dubSvc.CanReuseVariant(context.Background(), jobIn, variant1) {
 		t.Fatal("CanReuseVariant must return false when profile calibration identity changes")

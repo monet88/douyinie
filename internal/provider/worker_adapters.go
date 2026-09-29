@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -634,7 +635,11 @@ func NewProductionSpeechRegistry(opts ...any) (*Registry, error) {
 	}
 
 	// 2. VieNeu VI compatibility lane for historical frozen assignments.
-	vieneu, err := NewWorkerTTSProvider(VieNeuProviderID, VieNeuModelID, VieNeuModelVersion, []string{"vi"}, 0.95)
+	// The adapter has no engine-level rate control and always synthesizes natural audio,
+	// so the lane is truthfully declared fixed-rate: routing never offers it a native
+	// speed change, and a direct non-1.0 speed request fails closed instead of returning
+	// natural audio recorded as speed-adjusted (#154 / #150 R2).
+	vieneu, err := NewWorkerTTSProvider(VieNeuProviderID, VieNeuModelID, VieNeuModelVersion, []string{"vi"}, 0.95, FeatureFixedRateVoice)
 	if err != nil {
 		return nil, err
 	}
@@ -1156,8 +1161,13 @@ func (p *WorkerTTSProvider) SynthesizeSpeech(ctx context.Context, req TTSSynthes
 	if !IsVerifiedTTSVoice(p.id, req.Voice.VoiceID) {
 		return nil, fmt.Errorf("%w: unverified voice preset %q for provider %s", domain.ErrTTSVoiceAssetMissing, req.Voice.VoiceID, p.id)
 	}
-	if p.id == ZeroTTSProviderID && req.Speed != 1.0 {
-		return nil, fmt.Errorf("%w: ZeroTTS requires speed=1.0, got %.3f", domain.ErrTTSSpeedUnsupported, req.Speed)
+	// Fail closed before any worker synthesis on a lane that declares itself fixed-rate: its
+	// adapter would synthesize natural audio and ignore the requested speed, so honoring the call
+	// would return unmodified audio that the caller records as speed-adjusted (#154 / #150 R2).
+	// Enforcement reads the same declaration routing reads, so a lane can never honor a rate
+	// contract different from the one it advertises.
+	if slices.Contains(p.capability.Features, FeatureFixedRateVoice) && req.Speed != 1.0 {
+		return nil, fmt.Errorf("%w: fixed-rate lane %s requires speed=1.0, got %.3f", domain.ErrTTSSpeedUnsupported, p.id, req.Speed)
 	}
 	if err := p.ensureZeroTTSRuntimeIdentity(ctx); err != nil {
 		return nil, err
