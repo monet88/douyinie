@@ -102,6 +102,36 @@ func TestFitController_Rewrite_WhenSpeedFitExhaustedAndCanShorten(t *testing.T) 
 	}
 }
 
+// Issue #154: the lineage rewrite budget is spent by the first accepted rewrite, so an
+// otherwise rewrite-eligible candidate can never be sent through a second one. With no other
+// remedy left for this fixture (no speed envelope, no same-speaker regroup target), the
+// controller must advance past REWRITE to the next decision instead of granting it again.
+func TestFitController_RewriteBudgetBlocksSecondRewriteForLineage(t *testing.T) {
+	ctx := context.Background()
+	fc := service.NewFitController()
+	in := service.FitEvaluationInput{
+		SegmentIndex:       0,
+		SpeakerID:          "SPEAKER_00",
+		StartMs:            0,
+		EndMs:              1000,
+		NextTurnSpeakerID:  "SPEAKER_01", // different speaker: no same-turn regroup remedy
+		MeasuredDurationMs: 2500,
+		AttemptNumber:      1,
+		CanShortenText:     true,
+	}
+
+	// Control: with the budget still intact the same candidate is rewrite-eligible.
+	if control := fc.EvaluateCandidate(ctx, in); control.Decision != domain.FitActionRewrite {
+		t.Fatalf("control: rewrite-eligible candidate must be REWRITE, got %s (%s)", control.Decision, control.Reason)
+	}
+
+	in.RewriteAttemptsForLineage = 1
+	res := fc.EvaluateCandidate(ctx, in)
+	if res.Decision != domain.FitActionReview || !res.RequiresReview || res.ReviewReason != "DURATION_OVERRUN" {
+		t.Fatalf("a lineage that already spent its rewrite budget must not rewrite again: %+v", res)
+	}
+}
+
 func TestFitController_Regroup_WhenSameSpeakerTurnAdjacent(t *testing.T) {
 	fc := service.NewFitController()
 
