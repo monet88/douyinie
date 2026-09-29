@@ -237,6 +237,25 @@ func (e *invocationEvidence) finalFingerprint() string {
 	return first
 }
 
+// modelDisagreementError is the invocation-local provenance failure of one candidate: it is reported
+// as ErrInconsistentProvenance so the Router fails closed instead of advancing to another candidate
+// (Issue #150 A5).
+func modelDisagreementError() error {
+	return fmt.Errorf("%w: observed model disagreement across repair responses in translation invocation", domain.ErrInconsistentProvenance)
+}
+
+// qualityOrProvenanceFailure returns a quality rejection unless this invocation already observed
+// inconsistent provenance, in which case the provenance failure wins. Disagreement is known from the
+// first two responses, so it must take precedence over a structurally invalid merged batch: otherwise
+// a provenance failure would be answered with a retryable quality rejection and a fallback candidate
+// (Issue #150 A5).
+func qualityOrProvenanceFailure(evidence *invocationEvidence, err error) error {
+	if evidence.modelDisagreement {
+		return modelDisagreementError()
+	}
+	return err
+}
+
 // extractNeighbors returns the read-only canonical context segments within
 // translationNeighborContextSegments positions of targetIndex.
 func extractNeighbors(segments []domain.TranslationInputSegment, targetIndex int) []domain.TranslationInputSegment {
@@ -413,7 +432,7 @@ func (p *GatewayTranslationProvider) TranslateText(ctx context.Context, req Tran
 		// Initial unparseable/empty response: trigger whole-batch repair if budget allows
 		repairedAudit, repErr := p.repairWholeBatch(ctx, endpointURL, secret, sourceLang, targetLang, "Initial request failed", "whole-batch repair wire call failed", req, evidence, budget)
 		if repErr != nil {
-			return nil, repErr
+			return nil, qualityOrProvenanceFailure(evidence, repErr)
 		}
 		currentAudit = repairedAudit
 	} else {
@@ -429,7 +448,7 @@ func (p *GatewayTranslationProvider) TranslateText(ctx context.Context, req Tran
 		if needsWholeBatchRepair {
 			repairedAudit, repErr := p.repairWholeBatch(ctx, endpointURL, secret, sourceLang, targetLang, "Initial output failed anchoring or had >1/3 flagged entries", "whole-batch repair failed", req, evidence, budget)
 			if repErr != nil {
-				return nil, repErr
+				return nil, qualityOrProvenanceFailure(evidence, repErr)
 			}
 			currentAudit = repairedAudit
 		} else {
@@ -459,13 +478,13 @@ func (p *GatewayTranslationProvider) TranslateText(ctx context.Context, req Tran
 
 		for attempt := 1; attempt <= translationTargetedAttemptsPerEntry; attempt++ {
 			if err := budget.ConsumeTargetedRepair(targetSeg.Index); err != nil {
-				return nil, err
+				return nil, qualityOrProvenanceFailure(evidence, err)
 			}
 			tPayload := p.buildTargetedChatRequest(sourceLang, targetLang, targetSeg, neighbors, req.EffectiveGlossary)
 			tContent, tErr := p.executeWireCall(ctx, endpointURL, secret, tPayload, evidence)
 			if tErr != nil {
 				if isNonRepairableWireError(tErr, ctx) {
-					return nil, tErr
+					return nil, qualityOrProvenanceFailure(evidence, tErr)
 				}
 				continue
 			}
@@ -492,19 +511,19 @@ func (p *GatewayTranslationProvider) TranslateText(ctx context.Context, req Tran
 		}
 
 		if !repaired {
-			return nil, fmt.Errorf("%w: targeted repair exhausted for segment %d: %s", domain.ErrQualityRejected, targetSeg.Index, fail.Reason)
+			return nil, qualityOrProvenanceFailure(evidence, fmt.Errorf("%w: targeted repair exhausted for segment %d: %s", domain.ErrQualityRejected, targetSeg.Index, fail.Reason))
 		}
 	}
 
 	// 4. Full revalidation of entire merged result (Issue #150 A3)
 	finalAudit := auditAnchoredBatch(req.Segments, currentAudit.Entries, targetLang, req.EffectiveGlossary)
 	if !finalAudit.usable() {
-		return nil, fmt.Errorf("%w: merged translation failed anchored validation: structural=%v, failures=%v", domain.ErrQualityRejected, finalAudit.Structural, finalAudit.Failures)
+		return nil, qualityOrProvenanceFailure(evidence, fmt.Errorf("%w: merged translation failed anchored validation: structural=%v, failures=%v", domain.ErrQualityRejected, finalAudit.Structural, finalAudit.Failures))
 	}
 
-	// 5. Check model disagreement & finalize fingerprint (Issue #150 A5)
+	// 5. Fail closed on model disagreement before any result can be accepted (Issue #150 A5)
 	if evidence.modelDisagreement {
-		return nil, fmt.Errorf("%w: observed model disagreement across repair responses in translation invocation", domain.ErrInconsistentProvenance)
+		return nil, modelDisagreementError()
 	}
 	obsModel := evidence.observedModel
 	if obsModel == "" {

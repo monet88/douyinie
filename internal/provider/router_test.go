@@ -1107,17 +1107,17 @@ func TestRouter_ExecuteRoutedWithRetry_CancellationStopsImmediatelyWithoutFallba
 	if err != nil {
 		t.Fatalf("ListProviderAttempts failed: %v", err)
 	}
-	if len(attempts) > 1 {
-		t.Fatalf("expected at most the single canceled attempt, got %d: %+v", len(attempts), attempts)
+	// The canceled attempt row must still be persisted: the evidence is written through a derived
+	// non-cancelled context, so a canceled request never loses its provenance row.
+	if len(attempts) != 1 {
+		t.Fatalf("expected exactly the single canceled attempt, got %d: %+v", len(attempts), attempts)
 	}
-	if len(attempts) == 1 {
-		att := attempts[0]
-		if att.ProviderID != routeRes.SelectedProvider.ID() || att.Status != "failed" || att.AttemptNumber != 1 {
-			t.Fatalf("unexpected canceled attempt evidence: %+v", att)
-		}
-		if !strings.Contains(att.ErrorMessage, context.Canceled.Error()) {
-			t.Fatalf("canceled attempt must carry its own error text, got %q", att.ErrorMessage)
-		}
+	att := attempts[0]
+	if att.ProviderID != routeRes.SelectedProvider.ID() || att.Status != "failed" || att.AttemptNumber != 1 {
+		t.Fatalf("unexpected canceled attempt evidence: %+v", att)
+	}
+	if !strings.Contains(att.ErrorMessage, context.Canceled.Error()) {
+		t.Fatalf("canceled attempt must carry its own error text, got %q", att.ErrorMessage)
 	}
 
 	decisions, err := db.ListSelectionDecisions(context.Background(), runID, string(provider.TypeTTS))

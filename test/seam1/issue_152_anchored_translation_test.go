@@ -129,6 +129,15 @@ func writeGatewayJSON(w http.ResponseWriter, model, fingerprint, content string)
 	})
 }
 
+// assertEvidenceCountsOnce proves the bounded subrequest counts are merged into the existing attempt
+// evidence exactly once: a row keeps its own error text and never gets a duplicated counts phrase.
+func assertEvidenceCountsOnce(t *testing.T, row domain.ProviderAttempt) {
+	t.Helper()
+	if got := strings.Count(row.ErrorMessage, "gateway wire calls"); got != 1 {
+		t.Fatalf("attempt %s/%s must carry bounded subrequest counts exactly once, got %d in %q", row.ProviderID, row.Status, got, row.ErrorMessage)
+	}
+}
+
 // frozenGlossaryPresent reports whether a gateway user payload carries the frozen request glossary
 // as structured data: an effective_glossary entry with both source and target equal to "SUPOR".
 // It decodes the payload so the assertion cannot be satisfied by the segment source_text echo.
@@ -721,16 +730,6 @@ func TestSeam1_Issue152_RetryReentry_CandidateLocalRepairLimits_And_Cancellation
 		return setupCustomTranslationHarness(t, reg)
 	}
 
-	// assertEvidenceCountsOnce proves the bounded subrequest counts are merged into the existing
-	// attempt evidence exactly once: a failure row keeps its original error text and never gets a
-	// duplicated counts phrase.
-	assertEvidenceCountsOnce := func(t *testing.T, row domain.ProviderAttempt) {
-		t.Helper()
-		if got := strings.Count(row.ErrorMessage, "gateway wire calls"); got != 1 {
-			t.Fatalf("attempt %s/%s must carry bounded subrequest counts exactly once, got %d in %q", row.ProviderID, row.Status, got, row.ErrorMessage)
-		}
-	}
-
 	// assertRetryReentryFallback pins the outcome both candidate-local repair subcases share: the
 	// request succeeds through the DeepSeek fallback, Gemini stops after exactly 5 wire calls (each
 	// subcase names why, so the wire shape stays explicit), the fallback receives its own fresh budget,
@@ -1024,6 +1023,23 @@ func TestSeam1_Issue152_RetryReentry_CandidateLocalRepairLimits_And_Cancellation
 		if atomic.LoadInt32(&fallbackHit) != 0 {
 			t.Fatalf("cancelAtCall=%d: cancellation must never fall back to DeepSeek, got %d fallback calls", cancelAtCall, fallbackHit)
 		}
+
+		// A cancellation is evidence too: the canceled candidate's attempt row must be persisted with
+		// its own error text and bounded subrequest counts, even though its request context is done.
+		attemptsC, errC := hC.db.ListProviderAttempts(context.Background(), rC, string(provider.TypeTranslation))
+		if errC != nil {
+			t.Fatalf("cancelAtCall=%d: ListProviderAttempts failed: %v", cancelAtCall, errC)
+		}
+		if len(attemptsC) != 1 {
+			t.Fatalf("cancelAtCall=%d: expected exactly 1 canceled attempt row, got %+v", cancelAtCall, attemptsC)
+		}
+		if attemptsC[0].ProviderID != provider.GatewayGeminiTranslationProviderID || attemptsC[0].Status != "failed" {
+			t.Fatalf("cancelAtCall=%d: unexpected canceled attempt row %s/%s", cancelAtCall, attemptsC[0].ProviderID, attemptsC[0].Status)
+		}
+		if !strings.Contains(attemptsC[0].ErrorMessage, "canceled after ") {
+			t.Fatalf("cancelAtCall=%d: canceled row must carry its bounded subrequest evidence, got %q", cancelAtCall, attemptsC[0].ErrorMessage)
+		}
+		assertEvidenceCountsOnce(t, attemptsC[0])
 	}
 }
 
@@ -1719,7 +1735,149 @@ func TestSeam1_Issue152_ModelDisagreement_PublishesInvocationEvidenceBeforeFailC
 	if !strings.Contains(row.ErrorMessage, "model disagreement after 2 gateway wire calls (0 targeted) with a 14-call candidate budget") {
 		t.Fatalf("row must carry the exact disagreement invocation evidence, got %q", row.ErrorMessage)
 	}
-	if got := strings.Count(row.ErrorMessage, "gateway wire calls"); got != 1 {
-		t.Fatalf("expected the bounded counts exactly once, got %d in %q", got, row.ErrorMessage)
+	assertEvidenceCountsOnce(t, row)
+}
+
+// TestSeam1_Issue152_ModelDisagreementWithInvalidMergedOutput_FailsClosedWithoutFallback pins the
+// provenance precedence: when one invocation both observes two different models AND leaves the
+// merged batch structurally invalid, the candidate must fail closed as inconsistent provenance
+// instead of degrading into a retryable quality rejection that lets the Router advance to the
+// fallback lane (Issue #150 A5). The structural rejection and the provenance failure coincide here,
+// and provenance must win.
+func TestSeam1_Issue152_ModelDisagreementWithInvalidMergedOutput_FailsClosedWithoutFallback(t *testing.T) {
+	mockSec := func(context.Context, string, string) (string, error) { return "sec-token", nil }
+
+	// Both cases observe two different models in one invocation and leave the merged batch invalid:
+	// "batch_residual" is rejected inside the single whole-batch repair, "targeted_exhaustion" after
+	// three targeted attempts. Either way the provenance failure must win over the structural
+	// rejection, otherwise the Router would answer it with the DeepSeek fallback lane.
+	cases := []struct {
+		name         string
+		mode         string
+		wantGemini   int32
+		wantEvidence string
+	}{
+		{
+			name:         "whole-batch repair leaves residual structure",
+			mode:         "batch_residual",
+			wantGemini:   2,
+			wantEvidence: "model disagreement after 2 gateway wire calls (0 targeted) with a 14-call candidate budget",
+		},
+		{
+			name:         "targeted repair exhausted with invalid merged output",
+			mode:         "targeted_exhaustion",
+			wantGemini:   5,
+			wantEvidence: "model disagreement after 5 gateway wire calls (3 targeted) with a 14-call candidate budget",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var geminiCalls, deepseekCalls int32
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					Model string `json:"model"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				if req.Model == provider.GatewayDeepSeekModelAlias {
+					// The fallback lane must never be reached: only its call counter is asserted.
+					atomic.AddInt32(&deepseekCalls, 1)
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				c := atomic.AddInt32(&geminiCalls, 1)
+				if c == 1 {
+					// Initial call: one empty target of one segment -> whole-batch repair.
+					writeGatewayJSON(w, "gemini-3.8-flash-001", "fp_g", `{"segments":[{"index":0,"source_text":"句0","target_text":""}]}`)
+					return
+				}
+				if tc.mode == "batch_residual" {
+					// The single whole-batch allowance reports the other model AND repeats the index,
+					// so the batch is still structurally invalid when the repair is rejected.
+					writeGatewayJSON(w, "gemini-3.8-flash-002-different", "fp_g", `{"segments":[
+						{"index":0,"source_text":"句0","target_text":"Câu 0"},
+						{"index":0,"source_text":"句0","target_text":"Câu 0"}
+					]}`)
+					return
+				}
+				// Targeted repair reports the other model AND keeps the echo mismatched, so every
+				// targeted attempt is refused and the merged batch is never repaired.
+				writeGatewayJSON(w, "gemini-3.8-flash-002-different", "fp_g", `{"segments":[{"index":0,"source_text":"回声不匹配","target_text":"Câu 0"}]}`)
+			}))
+			defer ts.Close()
+
+			reg := provider.NewRegistry()
+			gemini, _ := provider.NewGatewayTranslationProvider(
+				provider.GatewayGeminiTranslationProviderID,
+				provider.GatewayGeminiModelAlias,
+				"baseline-gemini-disagree-invalid",
+				0.99,
+				mockSec,
+				ts.Client(),
+				ts.URL,
+			)
+			gemini.SetPolicyState(domain.PolicyAllowed)
+			_ = reg.Register(gemini)
+
+			deepseek, _ := provider.NewGatewayTranslationProvider(
+				provider.GatewayDeepSeekTranslationProviderID,
+				provider.GatewayDeepSeekModelAlias,
+				"baseline-deepseek-disagree-invalid",
+				0.95,
+				mockSec,
+				ts.Client(),
+				ts.URL,
+			)
+			deepseek.SetPolicyState(domain.PolicyAllowed)
+			_ = reg.Register(deepseek)
+
+			h := setupCustomTranslationHarness(t, reg)
+			assetID, jobID := seedSeam1AssetAndJob(t, h.db)
+			runID := "run-disagree-invalid-" + uuid.NewString()
+			seedSeam1Run(t, h.db, assetID, jobID, runID)
+
+			status, _, errMsg := postSeam1Translate(t, h.ts.URL, assetID, map[string]any{
+				"run_id":                 runID,
+				"job_id":                 jobID,
+				"source_language":        "zh",
+				"target_language":        "vi",
+				"authorized_credentials": []string{"cred"},
+				"segments": []map[string]any{
+					{"index": 0, "source_text": "句0"},
+				},
+			})
+			if status != http.StatusInternalServerError {
+				t.Fatalf("expected 500 fail-closed on provenance disagreement, got %d (%s)", status, errMsg)
+			}
+			if !strings.Contains(errMsg, "observed model disagreement across repair responses in translation invocation") {
+				t.Fatalf("the provenance failure must be reported instead of the structural rejection, got %q", errMsg)
+			}
+			if got := atomic.LoadInt32(&geminiCalls); got != tc.wantGemini {
+				t.Fatalf("expected %d gemini wire calls, got %d", tc.wantGemini, got)
+			}
+			if atomic.LoadInt32(&deepseekCalls) != 0 {
+				t.Fatalf("provenance disagreement must never fall back to another candidate, got %d deepseek calls", deepseekCalls)
+			}
+
+			attempts, _ := h.db.ListProviderAttempts(context.Background(), runID, string(provider.TypeTranslation))
+			if len(attempts) != 1 {
+				t.Fatalf("expected exactly 1 ProviderAttempt row, got %+v", attempts)
+			}
+			row := attempts[0]
+			if row.ProviderID != provider.GatewayGeminiTranslationProviderID || row.Status != "policy_rejected" {
+				t.Fatalf("expected gemini policy_rejected row, got %s/%s", row.ProviderID, row.Status)
+			}
+			if row.ObservedModel != "gemini-3.8-flash-001" {
+				t.Fatalf("expected the first invocation-observed model, got %q", row.ObservedModel)
+			}
+			if row.ServiceBaselineID != "baseline-gemini-disagree-invalid" {
+				t.Fatalf("expected the configured service baseline, got %q", row.ServiceBaselineID)
+			}
+			if !strings.Contains(row.ErrorMessage, tc.wantEvidence) {
+				t.Fatalf("row must carry the exact disagreement invocation evidence, got %q", row.ErrorMessage)
+			}
+			assertEvidenceCountsOnce(t, row)
+		})
 	}
 }

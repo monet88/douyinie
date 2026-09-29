@@ -907,7 +907,10 @@ func (r *Router) ExecuteRoutedWithRetry(
 				}
 				enrichAttemptMetadata(&pa, p, req)
 				if r.db != nil {
-					if errDB := r.db.RecordProviderAttempt(ctx, pa); errDB != nil {
+					// The attempt was canceled, so ctx is already done: record through a derived
+					// non-cancelled context, otherwise the evidence write itself fails and masks the
+					// original cancellation with a provenance-write error.
+					if errDB := r.db.RecordProviderAttempt(context.WithoutCancel(ctx), pa); errDB != nil {
 						return fmt.Errorf("fail-closed: record canceled attempt provenance: %w (original: %v)", errDB, err)
 					}
 				}
