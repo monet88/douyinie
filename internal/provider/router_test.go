@@ -1057,3 +1057,84 @@ func TestRouter_NonDubStage_PropagatesNonSentinelResolverFailures(t *testing.T) 
 		t.Fatalf("expected RouteResult on tolerated absence")
 	}
 }
+
+// TestRouter_ExecuteRoutedWithRetry_CancellationStopsImmediatelyWithoutFallback covers the generic
+// router contract for a canceled/deadline attempt: stop at once, never retry, never advance to a
+// fallback candidate, never trip a circuit breaker, and record at most the canceled attempt evidence.
+func TestRouter_ExecuteRoutedWithRetry_CancellationStopsImmediatelyWithoutFallback(t *testing.T) {
+	router, db, _, _, _, _ := setupTestRouter(t)
+
+	runID := uuid.NewString()
+	seedDefaultAudioRolePlan(t, db, runID)
+	req := provider.RouteRequest{
+		RunID:             runID,
+		Stage:             provider.TypeTTS,
+		Language:          "vi",
+		ExecutionProfile:  domain.ExecutionProfileCloud,
+		ConsentGranted:    true,
+		ExcludedProviders: []string{"fake_zerotts_tts_vi"},
+	}
+
+	routeRes, err := router.Route(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Route failed: %v", err)
+	}
+	if len(routeRes.FallbackOrdered) == 0 {
+		t.Fatalf("test requires at least one fallback candidate to prove fallback is not attempted")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var executed []string
+	err = router.ExecuteRoutedWithRetry(ctx, req, routeRes, "input_cancel_stop", 3, func(p provider.Provider, _ int) error {
+		executed = append(executed, p.ID())
+		cancel()
+		return ctx.Err()
+	})
+	if err == nil {
+		t.Fatalf("expected a cancellation error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation must stay classifiable as context.Canceled, got: %v", err)
+	}
+	if len(executed) != 1 || executed[0] != routeRes.SelectedProvider.ID() {
+		t.Fatalf("cancellation must stop immediately without retry or fallback, executed=%v", executed)
+	}
+
+	// No fallback attempt may be recorded, and no alternate selection decision may be appended.
+	attempts, err := db.ListProviderAttempts(context.Background(), runID, string(provider.TypeTTS))
+	if err != nil {
+		t.Fatalf("ListProviderAttempts failed: %v", err)
+	}
+	// The canceled attempt row must still be persisted: the evidence is written through a derived
+	// non-cancelled context, so a canceled request never loses its provenance row.
+	if len(attempts) != 1 {
+		t.Fatalf("expected exactly the single canceled attempt, got %d: %+v", len(attempts), attempts)
+	}
+	att := attempts[0]
+	if att.ProviderID != routeRes.SelectedProvider.ID() || att.Status != "failed" || att.AttemptNumber != 1 {
+		t.Fatalf("unexpected canceled attempt evidence: %+v", att)
+	}
+	if !strings.Contains(att.ErrorMessage, context.Canceled.Error()) {
+		t.Fatalf("canceled attempt must carry its own error text, got %q", att.ErrorMessage)
+	}
+
+	decisions, err := db.ListSelectionDecisions(context.Background(), runID, string(provider.TypeTTS))
+	if err != nil {
+		t.Fatalf("ListSelectionDecisions failed: %v", err)
+	}
+	if len(decisions) != 1 {
+		t.Fatalf("cancellation must not append an alternate selection decision, got %d", len(decisions))
+	}
+
+	// Cancellation is not a provider failure: no circuit may be tripped for the selected or fallback lanes.
+	if state := router.Circuit().GetState(routeRes.SelectedProvider.ID()); state != provider.CircuitClosed {
+		t.Fatalf("selected provider circuit must stay closed after cancellation, got %s", state)
+	}
+	for _, fb := range routeRes.FallbackOrdered {
+		if state := router.Circuit().GetState(fb.ID()); state != provider.CircuitClosed {
+			t.Fatalf("fallback provider %s circuit must stay closed after cancellation, got %s", fb.ID(), state)
+		}
+	}
+}

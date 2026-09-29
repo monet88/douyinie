@@ -2,9 +2,68 @@ package provider
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/monet88/douyinie/internal/domain"
 )
+
+// CandidateWireBudget tracks finite wire call budgets and bounded repair state for one Router
+// provider candidate across transport-retry re-entry (Issue #150 A4 / #152). Router re-entry of the
+// same candidate reuses this state, so repair limits are candidate-local rather than per
+// TranslateText invocation: at most one whole-batch repair, at most three targeted attempts per
+// canonical segment index, at most twelve targeted and fourteen wire calls in total.
+type CandidateWireBudget struct {
+	TotalCalls    int
+	TargetedCalls int
+
+	wholeBatchConsumed bool
+	targetedPerIndex   map[int]int
+}
+
+func NewCandidateWireBudget() *CandidateWireBudget {
+	return &CandidateWireBudget{targetedPerIndex: make(map[int]int)}
+}
+
+func (b *CandidateWireBudget) RecordWireCall() error {
+	if b.TotalCalls >= translationWireCallsPerCandidate {
+		return errRepairExhausted("total wire call ceiling reached", b.TotalCalls, b.TargetedCalls)
+	}
+	b.TotalCalls++
+	return nil
+}
+
+// ConsumeWholeBatchRepair charges the single candidate-local whole-batch repair allowance before the
+// outbound call. A Router retry re-entry of the same candidate fails closed here instead of running
+// the strengthened whole-batch batch a second time.
+func (b *CandidateWireBudget) ConsumeWholeBatchRepair() error {
+	if b.wholeBatchConsumed {
+		return errRepairExhausted("whole-batch repair already consumed for this candidate", b.TotalCalls, b.TargetedCalls)
+	}
+	if err := b.RecordWireCall(); err != nil {
+		return err
+	}
+	b.wholeBatchConsumed = true
+	return nil
+}
+
+// ConsumeTargetedRepair charges one targeted repair attempt for a canonical segment index before the
+// outbound call. Attempts are counted per canonical index across Router retry re-entry of the same
+// candidate: an entry is repaired at most three times per candidate, and the ceiling applies before
+// the per-segment ceiling is silently restarted.
+func (b *CandidateWireBudget) ConsumeTargetedRepair(index int) error {
+	if b.targetedPerIndex[index] >= translationTargetedAttemptsPerEntry {
+		return errRepairExhausted(fmt.Sprintf("targeted repair attempts exhausted for segment %d", index), b.TotalCalls, b.TargetedCalls)
+	}
+	if b.TargetedCalls >= translationTargetedCallsPerCandidate {
+		return errRepairExhausted("targeted call ceiling reached", b.TotalCalls, b.TargetedCalls)
+	}
+	if err := b.RecordWireCall(); err != nil {
+		return err
+	}
+	b.targetedPerIndex[index]++
+	b.TargetedCalls++
+	return nil
+}
 
 // TranslationRequest represents the input to a translation provider.
 type TranslationRequest struct {
@@ -14,6 +73,11 @@ type TranslationRequest struct {
 	Segments              []domain.TranslationInputSegment
 	EffectiveGlossary     domain.EffectiveGlossary
 	AuthorizedCredentials []string
+	Budget                *CandidateWireBudget
+	// OnAttemptMetadata reports invocation-local provenance observed during this call: the payload
+	// model, the configured service baseline and the bounded subrequest evidence consumed by the
+	// invocation. It feeds the existing ProviderAttempt row; no separate attempts store exists.
+	OnAttemptMetadata func(observedModel, serviceBaselineID, subrequestEvidence string)
 }
 
 // TranslationResult represents the output from a translation provider.

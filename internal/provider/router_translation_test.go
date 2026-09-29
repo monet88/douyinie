@@ -320,3 +320,121 @@ func TestRouter_TranslationAttemptProvenance_RecordsObservedModelAndBaseline(t *
 		t.Fatalf("remote gateway attempt model_name must be empty, got %q", att.ModelName)
 	}
 }
+
+// TestRouter_CircuitOpenCandidate_DoesNotInheritInvocationProvenance is the Issue #152 regression
+// for cross-candidate provenance leakage: a candidate whose circuit is open was never invoked, so its
+// circuit_broken ProviderAttempt must not consume the invocation-local AttemptProvenance payload that
+// still describes the previously executed candidate (here: candidate A).
+func TestRouter_CircuitOpenCandidate_DoesNotInheritInvocationProvenance(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("Open db: %v", err)
+	}
+	defer db.Close()
+
+	const (
+		runID               = "run-circuit-open-provenance"
+		deepseekBaseline    = "baseline-deepseek-circuit-open"
+		invokedObservedA    = "observed-gemini-invocation-A"
+		invokedBaselineA    = "baseline-gemini-invocation-A"
+		invokedEvidenceA    = "subrequests=5 targeted=2 total=14"
+		fallbackAttemptHint = "deepseek fallback must be the circuit-open candidate"
+	)
+
+	reg := provider.NewRegistry()
+	gemini, _ := provider.NewGatewayTranslationProvider(
+		provider.GatewayGeminiTranslationProviderID,
+		provider.GatewayGeminiModelAlias,
+		"baseline-gemini-3.8-flash-2026-08",
+		0.99,
+		"http://127.0.0.1:8080",
+	)
+	gemini.SetPolicyState(domain.PolicyAllowed)
+	_ = reg.Register(gemini)
+
+	deepseek, _ := provider.NewGatewayTranslationProvider(
+		provider.GatewayDeepSeekTranslationProviderID,
+		provider.GatewayDeepSeekModelAlias,
+		deepseekBaseline,
+		0.95,
+		"http://127.0.0.1:8080",
+	)
+	deepseek.SetPolicyState(domain.PolicyAllowed)
+	_ = reg.Register(deepseek)
+
+	router := provider.NewRouter(reg, nil, nil, nil, nil, db)
+
+	// Invocation-local provenance closure, exactly like TranslationService. It is written by the
+	// candidate callback that actually ran and never reset outside that callback.
+	var lastObserved, lastBaseline, lastEvidence string
+	routeReq := provider.RouteRequest{
+		RunID:            runID,
+		Stage:            provider.TypeTranslation,
+		Language:         "vi",
+		ExecutionProfile: domain.ExecutionProfileHybrid,
+		AttemptProvenance: func(p provider.Provider) (string, string, string) {
+			return lastObserved, lastBaseline, lastEvidence
+		},
+	}
+
+	routeRes, err := router.Route(ctx, routeReq)
+	if err != nil {
+		t.Fatalf("Route failed: %v", err)
+	}
+	if routeRes.SelectedProvider.ID() != provider.GatewayGeminiTranslationProviderID {
+		t.Fatalf("expected primary candidate %s, got %s", provider.GatewayGeminiTranslationProviderID, routeRes.SelectedProvider.ID())
+	}
+	if len(routeRes.FallbackOrdered) != 1 || routeRes.FallbackOrdered[0].ID() != provider.GatewayDeepSeekTranslationProviderID {
+		t.Fatalf("expected 1 fallback candidate %s, got %+v", provider.GatewayDeepSeekTranslationProviderID, routeRes.FallbackOrdered)
+	}
+
+	// Trip the circuit for the fallback candidate after routing so execution still reaches it and
+	// records a circuit_broken row without ever invoking it.
+	for range 3 {
+		router.Circuit().RecordFailure(provider.GatewayDeepSeekTranslationProviderID, true)
+	}
+	if router.Circuit().CanAttempt(provider.GatewayDeepSeekTranslationProviderID) {
+		t.Fatalf("expected an open circuit for %s before execution", provider.GatewayDeepSeekTranslationProviderID)
+	}
+
+	err = router.ExecuteRoutedWithRetry(ctx, routeReq, routeRes, "input-hash-circuit-open", 1, func(p provider.Provider, _ int) error {
+		if p.ID() != provider.GatewayGeminiTranslationProviderID {
+			t.Fatalf("only candidate A may be invoked, got %s", p.ID())
+		}
+		lastObserved = invokedObservedA
+		lastBaseline = invokedBaselineA
+		lastEvidence = invokedEvidenceA
+		return domain.ErrQualityRejected
+	})
+	if !errors.Is(err, domain.ErrCircuitOpen) {
+		t.Fatalf("expected execution to end on the open circuit of the fallback candidate, got %v", err)
+	}
+
+	attempts, err := db.ListProviderAttempts(ctx, runID, string(provider.TypeTranslation))
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("expected 2 attempts, got err=%v count=%d", err, len(attempts))
+	}
+
+	invoked, circuitOpen := attempts[0], attempts[1]
+	if invoked.ProviderID != provider.GatewayGeminiTranslationProviderID || invoked.Status != "quality_failed" {
+		t.Fatalf("expected first attempt %s/quality_failed, got %s/%s", provider.GatewayGeminiTranslationProviderID, invoked.ProviderID, invoked.Status)
+	}
+	if invoked.ObservedModel != invokedObservedA || invoked.ServiceBaselineID != invokedBaselineA {
+		t.Fatalf("invoked candidate must keep its own invocation provenance, got observed=%q baseline=%q", invoked.ObservedModel, invoked.ServiceBaselineID)
+	}
+
+	if circuitOpen.ProviderID != provider.GatewayDeepSeekTranslationProviderID || circuitOpen.Status != "circuit_broken" {
+		t.Fatalf("%s: got %s/%s", fallbackAttemptHint, circuitOpen.ProviderID, circuitOpen.Status)
+	}
+	if circuitOpen.ObservedModel == invokedObservedA || circuitOpen.ServiceBaselineID == invokedBaselineA ||
+		circuitOpen.ObservedModel == "" || circuitOpen.ServiceBaselineID == "" {
+		t.Fatalf("circuit-open candidate inherited invocation provenance: observed=%q baseline=%q", circuitOpen.ObservedModel, circuitOpen.ServiceBaselineID)
+	}
+	if circuitOpen.ObservedModel != provider.GatewayDeepSeekModelAlias || circuitOpen.ServiceBaselineID != deepseekBaseline {
+		t.Fatalf("circuit-open candidate must carry only its own static provenance, got observed=%q baseline=%q", circuitOpen.ObservedModel, circuitOpen.ServiceBaselineID)
+	}
+	if circuitOpen.ErrorMessage != domain.ErrCircuitOpen.Error() {
+		t.Fatalf("circuit-open candidate must keep its own error text without invocation evidence, got %q", circuitOpen.ErrorMessage)
+	}
+}

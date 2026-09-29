@@ -21,7 +21,7 @@ import (
 
 const (
 	translationMeaningContractVersion = "facts_names_numbers_negation_v4"
-	TranslationContractID             = translationMeaningContractVersion + "+request_glossary_v1"
+	TranslationContractID             = translationMeaningContractVersion + "+request_glossary_v1+anchored_repair_v1"
 )
 
 // TranslationInvokeFunc executes one translation provider attempt.
@@ -211,6 +211,9 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 	if len(in.Segments) == 0 {
 		return nil, domain.ErrEmptyTranslationInput
 	}
+	if err := provider.ValidateCanonicalBatch(in.Segments); err != nil {
+		return nil, err
+	}
 	// Explicit compatibility proof: when direct segments are provided without an explicit transcript CAS,
 	// allow fallback to the asset's latest transcript index only when candidate segments exactly match.
 	if strings.TrimSpace(in.TranscriptArtifactCAS) == "" && strings.TrimSpace(in.RunID) == "" && s.db != nil && s.cas != nil {
@@ -359,9 +362,6 @@ func (s *TranslationService) Translate(ctx context.Context, in domain.Translatio
 	}
 	if observedModel == "" {
 		observedModel = rp.ObservedModel
-	}
-	if systemFingerprint == "" {
-		systemFingerprint = rp.SystemFingerprint
 	}
 
 	// 6. Build immutable TranslationVariant
@@ -802,6 +802,14 @@ func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, 
 	}
 
 	routeReq := translationRouteRequest(in)
+	candidateBudgets := make(map[string]*provider.CandidateWireBudget)
+	var lastAttemptObservedModel string
+	var lastAttemptBaselineID string
+	var lastAttemptSubrequestEvidence string
+
+	routeReq.AttemptProvenance = func(p provider.Provider) (string, string, string) {
+		return lastAttemptObservedModel, lastAttemptBaselineID, lastAttemptSubrequestEvidence
+	}
 	if routeRes == nil {
 		var err error
 		routeRes, err = s.router.Route(ctx, routeReq)
@@ -829,7 +837,19 @@ func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, 
 	var bestFlagged *flaggedCandidate
 
 	err = s.router.ExecuteRoutedWithRetry(ctx, routeReq, routeRes, inputHash, 1, func(cand provider.Provider, _ int) error {
-		res, invokeErr := s.invokeProvider(ctx, cand, in)
+		lastAttemptObservedModel = ""
+		lastAttemptBaselineID = ""
+		lastAttemptSubrequestEvidence = ""
+		budget, ok := candidateBudgets[cand.ID()]
+		if !ok {
+			budget = provider.NewCandidateWireBudget()
+			candidateBudgets[cand.ID()] = budget
+		}
+		res, invokeErr := s.invokeProviderWithBudget(ctx, cand, in, budget, func(obs, base, subrequestEvidence string) {
+			lastAttemptObservedModel = obs
+			lastAttemptBaselineID = base
+			lastAttemptSubrequestEvidence = subrequestEvidence
+		})
 		if invokeErr != nil {
 			return invokeErr
 		}
@@ -854,7 +874,10 @@ func (s *TranslationService) invokeTranslationWithFallback(ctx context.Context, 
 		return nil
 	})
 	if err != nil {
-		if bestFlagged == nil || !translationFlaggedFallbackAllowed(err) {
+		// The Router treats ctx.Err() != nil as a cancellation even when the returned error still
+		// wraps ErrQualityRejected, so a request context that is already canceled or past its
+		// deadline must never ship the flagged fallback as success.
+		if ctx.Err() != nil || bestFlagged == nil || !translationFlaggedFallbackAllowed(err) {
 			return nil, nil, nil, 0, err
 		}
 		// Every lane tripped the meaning gate. Ship the best of them with per-segment
@@ -889,6 +912,9 @@ var translationFailClosedErrors = []error{
 // meaning-gate rejection (ErrQualityRejected) that the flagged fallback exists for, and not a
 // fail-closed router governance, policy, authorization, or provenance refusal.
 func translationFlaggedFallbackAllowed(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
 	if !errors.Is(err, domain.ErrQualityRejected) {
 		return false
 	}
@@ -995,8 +1021,7 @@ func translationRouteRequest(in domain.TranslationJobInput) provider.RouteReques
 	}
 }
 
-// invokeProvider calls the provider's translation method.
-func (s *TranslationService) invokeProvider(ctx context.Context, p provider.Provider, in domain.TranslationJobInput) (*provider.TranslationResult, error) {
+func (s *TranslationService) invokeProviderWithBudget(ctx context.Context, p provider.Provider, in domain.TranslationJobInput, budget *provider.CandidateWireBudget, onAttempt func(string, string, string)) (*provider.TranslationResult, error) {
 	textProv, ok := p.(provider.TextTranslationProvider)
 	if !ok {
 		return nil, fmt.Errorf("provider %s does not implement TextTranslationProvider", p.ID())
@@ -1009,6 +1034,8 @@ func (s *TranslationService) invokeProvider(ctx context.Context, p provider.Prov
 		Segments:              in.Segments,
 		EffectiveGlossary:     in.EffectiveGlossary,
 		AuthorizedCredentials: in.AuthorizedCredentials,
+		Budget:                budget,
+		OnAttemptMetadata:     onAttempt,
 	}
 
 	return textProv.TranslateText(ctx, req)
