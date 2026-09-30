@@ -46,7 +46,11 @@ const (
 	// whenever a DubSegmentsVariant's persisted contract or synthesis semantics change.
 	// Version 4 adds verified native-speed calibration identity (CalibrationID,
 	// NativeSpeedEnvelopes) and per-source-lineage recovery semantics (#154).
-	DubSegmentsSchemaVersion = 4
+	// Version 5 makes the bounded same-speaker group (#155) the only regroup remedy: one
+	// chosen group per lineage per logical attempt, with canonical membership/anchors and
+	// no iterative growth, so a pre-#155 variant that grew through repeated regroup
+	// synthesis must not be replayed for a #155 request.
+	DubSegmentsSchemaVersion = 5
 )
 
 // VoiceProfile represents a preset or cloned voice configuration.
@@ -209,7 +213,10 @@ type DubbingFitPlan struct {
 	SpeechBlockIndices []int     `json:"speech_block_indices,omitempty"`
 	Decision           FitAction `json:"decision"` // ACCEPT | RESYNTH | REWRITE | REGROUP | REVIEW
 	DecisionReason     string    `json:"decision_reason,omitempty"`
-	AttemptCount       int       `json:"attempt_count"`
+	// AttemptCount is the synthesis attempts this plan's own unit spent: a bounded group
+	// counts its single combined call (never the triggering block's earlier attempts), and
+	// an ungroupable or QA-refused unit that was never synthesized records 0.
+	AttemptCount int `json:"attempt_count"`
 }
 
 // TTSCandidate represents a synthesized candidate waveform.
