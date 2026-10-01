@@ -1491,7 +1491,10 @@ const (
 
 // boundedRegroupMembers returns the canonical members of that group in script order,
 // beginning with the triggering segment at triggerPos; a single member means no group is
-// available. The scan stops at the first speaker, protected-vocal, overlap, gap or
+// available. The trigger must be the pinned canonical block itself - index, anchors and
+// speaker identity included - because a group seeded from a drifted script anchor would
+// merge turns the canonical timeline does not attribute to that trigger. The scan then
+// stops at the first canonical speaker, protected-vocal, overlap, gap or
 // non-adjacent-canonical-block boundary, so a group can never skip a source turn.
 func boundedRegroupMembers(dubScript *domain.DubScriptVariant, transcript *domain.TranscriptArtifact, rolePlan *domain.AudioRolePlan, triggerPos int, triggerSpeaker string) []domain.DubScriptSegment {
 	members := []domain.DubScriptSegment{dubScript.Segments[triggerPos]}
@@ -1499,16 +1502,20 @@ func boundedRegroupMembers(dubScript *domain.DubScriptVariant, transcript *domai
 		return members
 	}
 	prev, ok := canonicalSpeechBlock(transcript, members[0].Index)
-	if !ok {
+	if !ok || prev.StartMs != members[0].StartMs || prev.EndMs != members[0].EndMs ||
+		canonicalSpeaker(prev) != triggerSpeaker {
 		return members
 	}
+	// Same-speaker membership is grounded in the canonical speaker identity: the script's
+	// own labelling may drift and never decides whether a turn belongs to the group.
+	speakerID := canonicalSpeaker(prev)
 	for pos := triggerPos + 1; pos < len(dubScript.Segments) && len(members) < regroupMaxMembers; pos++ {
 		next := dubScript.Segments[pos]
 		// The script turn must be the same canonical block: a divergent or dropped block
 		// is a boundary, not something to merge across.
 		nextBlock, found := canonicalSpeechBlock(transcript, next.Index)
 		if !found || nextBlock.StartMs != next.StartMs || nextBlock.EndMs != next.EndMs ||
-			dubSegmentSpeaker(next) != triggerSpeaker {
+			canonicalSpeaker(nextBlock) != speakerID {
 			break
 		}
 		gapMs := nextBlock.StartMs - prev.EndMs
@@ -1591,13 +1598,25 @@ func canonicalGapIsEmpty(transcript *domain.TranscriptArtifact, prev, next domai
 	return true
 }
 
+// speakerIdentity applies the fallback the synthesis pass attributes to an unlabelled turn, on
+// both the script side and the canonical side, so a membership decision compares one identity.
+func speakerIdentity(speakerID string) string {
+	if speakerID == "" {
+		return "SPEAKER_00"
+	}
+	return speakerID
+}
+
 // dubSegmentSpeaker resolves the script speaker of one segment with the fallback the
 // synthesis pass applies to an unlabelled turn.
 func dubSegmentSpeaker(seg domain.DubScriptSegment) string {
-	if seg.SpeakerID == "" {
-		return "SPEAKER_00"
-	}
-	return seg.SpeakerID
+	return speakerIdentity(seg.SpeakerID)
+}
+
+// canonicalSpeaker resolves the speaker identity the synthesis pass attributes to a canonical
+// SpeechBlock, so a block's identity is comparable with the script speaker of the turn it anchors.
+func canonicalSpeaker(block domain.SpeechBlock) string {
+	return speakerIdentity(block.SpeakerID)
 }
 
 // speakerEscalationPlan carries a whole-speaker escalation to the duration-controlled
@@ -2541,6 +2560,16 @@ func measuredOverrunAboveAllowanceMs(probedMs, startMs, playbackEndMs, measuredF
 	return (excessFrames*1000 + int64(outputSampleRate) - 1) / int64(outputSampleRate)
 }
 
+// unresolvedTimingFailure reports whether a review unit carries the FitController's own
+// unresolved DURATION_OVERRUN verdict. That verdict is the source of truth for a timing
+// failure: a candidate can overrun the accepted playback window frame-exactly while its
+// floored millisecond probe still fits the slot, so a measured-vs-slot comparison alone
+// misses a real failure. Unrelated review reasons (invalid timing, QA refusals, missing
+// replacements) are not timing failures and never qualify.
+func unresolvedTimingFailure(rev domain.DubSegmentReview) bool {
+	return rev.FitDecision == domain.FitActionReview && rev.ReviewReason == "DURATION_OVERRUN"
+}
+
 // resolveEscalationOutcomes marks whether a whole-speaker regeneration cleared every
 // unresolved slot overrun for that speaker. A false outcome is what projects REVIEW.
 func resolveEscalationOutcomes(escalations []domain.VoiceProviderEscalation, reviewSegments []domain.DubSegmentReview) []domain.VoiceProviderEscalation {
@@ -2549,7 +2578,7 @@ func resolveEscalationOutcomes(escalations []domain.VoiceProviderEscalation, rev
 	}
 	unresolved := make(map[string]bool)
 	for _, rev := range reviewSegments {
-		if rev.FitDecision == domain.FitActionReview && rev.SlotDurationMs > 0 && rev.MeasuredDurationMs > rev.SlotDurationMs {
+		if unresolvedTimingFailure(rev) {
 			unresolved[rev.SpeakerID] = true
 		}
 	}
@@ -2578,10 +2607,7 @@ func (s *DubbingService) planSpeakerEscalation(ctx context.Context, in domain.Du
 	triggers := make(map[string][]int)
 	var speakers []string
 	for _, rev := range pass.ReviewSegments {
-		if rev.FitDecision != domain.FitActionReview || !slices.Contains(pass.FixedRateSpeakers, rev.SpeakerID) {
-			continue
-		}
-		if rev.SlotDurationMs <= 0 || rev.MeasuredDurationMs <= rev.SlotDurationMs {
+		if !unresolvedTimingFailure(rev) || !slices.Contains(pass.FixedRateSpeakers, rev.SpeakerID) {
 			continue
 		}
 		from, ok := voiceAssign.Assignments[rev.SpeakerID]

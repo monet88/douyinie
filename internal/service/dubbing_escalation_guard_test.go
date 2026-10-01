@@ -78,3 +78,38 @@ func TestIsEscalationOfBaseRejectsDifferentSharedVoiceScope(t *testing.T) {
 		t.Fatal("an assignment with a different shared-voice scope must not be reused as this escalation")
 	}
 }
+
+// Issue #155 review finding: the FitController's recorded DURATION_OVERRUN verdict - not a
+// measured-vs-slot millisecond comparison - is what makes a fixed-rate speaker's timing
+// failure unresolved. A grouped candidate can fill its accepted playback window in floored
+// milliseconds while its resampled frames do not, so an ms-only predicate would report
+// Resolved=true for a failure the duration-controlled fallback never cleared. An unrelated
+// review reason is not a timing failure and must not keep an escalation unresolved.
+func TestResolveEscalationOutcomesKeepsFrameExactOverrunUnresolved(t *testing.T) {
+	escalations := []domain.VoiceProviderEscalation{{SpeakerID: "SPEAKER_00", Reason: domain.VoiceEscalationReasonFixedRateOverrun}}
+	frameExact := domain.DubSegmentReview{
+		Index: 0, SpeechBlockIndices: []int{0, 1}, SpeakerID: "SPEAKER_00",
+		// The probe fills the slot exactly while the frames placed inside the window exceed it.
+		SlotDurationMs: 2005, MeasuredDurationMs: 2005,
+		FitDecision: domain.FitActionReview, ReviewReason: "DURATION_OVERRUN",
+	}
+
+	resolved := resolveEscalationOutcomes(escalations, []domain.DubSegmentReview{frameExact})
+	if len(resolved) != 1 || resolved[0].Resolved {
+		t.Fatalf("a frame-exact overrun the fallback did not clear must stay unresolved, got %+v", resolved)
+	}
+
+	// A cleared speaker keeps its resolved outcome when no timing failure is left.
+	if cleared := resolveEscalationOutcomes(escalations, nil); len(cleared) != 1 || !cleared[0].Resolved {
+		t.Fatalf("a speaker with no unresolved timing failure must stay resolved, got %+v", cleared)
+	}
+
+	// A review the FitController did not classify as a duration overrun is not a timing
+	// failure, even when its measurement exceeds the slot.
+	unrelated := frameExact
+	unrelated.ReviewReason = "MISSING_REPLACEMENT"
+	unrelated.MeasuredDurationMs = 4000
+	if other := resolveEscalationOutcomes(escalations, []domain.DubSegmentReview{unrelated}); !other[0].Resolved {
+		t.Fatalf("an unrelated review reason must not resolve as an unresolved timing failure, got %+v", other)
+	}
+}

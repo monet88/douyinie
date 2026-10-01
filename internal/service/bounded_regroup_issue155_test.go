@@ -117,6 +117,100 @@ func TestBoundedRegroupMembers_Issue155CapsAtFiveMembers(t *testing.T) {
 	}
 }
 
+// Issue #155 review finding: a group may only start from a trigger that is the pinned
+// canonical SpeechBlock itself, and same-speaker membership is grounded in the canonical
+// transcript identity. A drifted DubScript anchor would otherwise seed a group from a turn
+// the canonical timeline does not carry at that time, and a script that disagrees with the
+// canonical speaker would group across a canonical speaker boundary.
+func TestBoundedRegroupMembers_Issue155TriggerAndMembershipAreCanonical(t *testing.T) {
+	block := func(index int, startMs, endMs int64, speaker string) domain.SpeechBlock {
+		return domain.SpeechBlock{
+			Index: index, SegmentType: domain.SpeechBlockTypeSpeech,
+			StartMs: startMs, EndMs: endMs, SpeakerID: speaker,
+		}
+	}
+	turn := func(index int, startMs, endMs int64, speaker string) domain.DubScriptSegment {
+		return domain.DubScriptSegment{
+			Index: index, SpeakerID: speaker, StartMs: startMs, EndMs: endMs,
+			SourceText: "câu", SpokenText: "câu",
+		}
+	}
+	canonical := []domain.SpeechBlock{
+		block(0, 0, 1000, "SPEAKER_00"),
+		block(1, 1100, 2100, "SPEAKER_00"),
+		block(2, 2200, 3200, "SPEAKER_00"),
+	}
+	agreeingScript := []domain.DubScriptSegment{
+		turn(0, 0, 1000, "SPEAKER_00"), turn(1, 1100, 2100, "SPEAKER_00"), turn(2, 2200, 3200, "SPEAKER_00"),
+	}
+
+	cases := []struct {
+		name           string
+		segments       []domain.DubScriptSegment
+		blocks         []domain.SpeechBlock
+		triggerSpeaker string
+		want           int
+	}{
+		{
+			// The control: the trigger is the canonical block and every member's canonical
+			// speaker agrees, so the group still forms.
+			name: "CanonicalTriggerAndMembersGroup", segments: agreeingScript, blocks: canonical,
+			triggerSpeaker: "SPEAKER_00", want: 3,
+		},
+		{
+			// The trigger's declared start drifts from the canonical block: no group may start.
+			name: "DriftedTriggerTimingNeverStartsAGroup",
+			segments: []domain.DubScriptSegment{
+				turn(0, 50, 1000, "SPEAKER_00"), turn(1, 1100, 2100, "SPEAKER_00"), turn(2, 2200, 3200, "SPEAKER_00"),
+			},
+			blocks: canonical, triggerSpeaker: "SPEAKER_00", want: 1,
+		},
+		{
+			// The trigger's script speaker disagrees with the canonical speaker the voice is
+			// frozen from: no group may start.
+			name: "MismatchedTriggerSpeakerNeverStartsAGroup",
+			segments: []domain.DubScriptSegment{
+				turn(0, 0, 1000, "SPEAKER_07"), turn(1, 1100, 2100, "SPEAKER_07"), turn(2, 2200, 3200, "SPEAKER_07"),
+			},
+			blocks: canonical, triggerSpeaker: "SPEAKER_07", want: 1,
+		},
+		{
+			// The script labels every turn SPEAKER_00, but the canonical transcript attributes
+			// the second turn to another speaker: membership follows the canonical identity.
+			name: "CanonicalSpeakerMismatchBreaksMembership", segments: agreeingScript,
+			blocks: []domain.SpeechBlock{
+				block(0, 0, 1000, "SPEAKER_00"), block(1, 1100, 2100, "SPEAKER_01"), block(2, 2200, 3200, "SPEAKER_00"),
+			},
+			triggerSpeaker: "SPEAKER_00", want: 1,
+		},
+		{
+			// An unlabelled canonical turn is the fallback speaker the script itself resolves
+			// to, so the identity still matches rather than refusing every unlabelled run.
+			name: "UnlabelledCanonicalTriggerKeepsTheFallbackIdentity",
+			segments: []domain.DubScriptSegment{
+				turn(0, 0, 1000, "SPEAKER_00"), turn(1, 1100, 2100, "SPEAKER_00"),
+			},
+			blocks:         []domain.SpeechBlock{block(0, 0, 1000, ""), block(1, 1100, 2100, "")},
+			triggerSpeaker: "SPEAKER_00", want: 2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			script := &domain.DubScriptVariant{Segments: tc.segments}
+			transcript := &domain.TranscriptArtifact{SpeechBlocks: tc.blocks}
+			members := boundedRegroupMembers(script, transcript, &domain.AudioRolePlan{}, 0, tc.triggerSpeaker)
+			if len(members) != tc.want {
+				t.Fatalf("expected %d canonical members, got %d (%+v)", tc.want, len(members), members)
+			}
+			for pos, member := range members {
+				if member.Index != script.Segments[pos].Index {
+					t.Fatalf("member %d must keep its canonical script position, got %+v", pos, members)
+				}
+			}
+		})
+	}
+}
+
 // A provider reporting success without a result must fail the pass closed at the boundary that
 // owns provider invocation: every caller probes result.AudioData, so (nil, nil) returned as
 // success would panic at the probe instead of failing the run.
