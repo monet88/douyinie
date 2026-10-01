@@ -57,6 +57,11 @@ type FitEvaluationInput struct {
 	VoiceProfileID            string  `json:"voice_profile_id,omitempty"`
 	NativeAttemptsForLineage  int     `json:"native_attempts_for_lineage,omitempty"`
 	RewriteAttemptsForLineage int     `json:"rewrite_attempts_for_lineage,omitempty"`
+	// GroupedCandidate marks a candidate that already merges the bounded same-speaker
+	// group of canonical members. Grouping is the last remedy before whole-speaker
+	// escalation, so the flag alone closes regroup, speed and rewrite for this
+	// measurement; the fields above are not consulted for it.
+	GroupedCandidate bool `json:"grouped_candidate,omitempty"`
 	// OutputSampleRate is the sample rate of the mix this candidate lands in (the background stem
 	// rate the mixer resamples to); 0 = unknown, and the fit then falls back to the millisecond
 	// window instead of the frame-exact one.
@@ -186,6 +191,20 @@ func (fc *FitController) ResolvePlaybackWindow(sourceEndMs, nextVocalStartMs int
 	return end, reserve, policyID
 }
 
+// usableWindowMs is the playback window a candidate may fill once the frozen natural reserve is
+// kept free: it never leaves the window, and a non-positive reserve leaves the usable slot equal
+// to the accepted window.
+func usableWindowMs(slotDurationMs, reserveMs int64) int64 {
+	usable := slotDurationMs - reserveMs
+	if usable < 1 {
+		usable = 1
+	}
+	if usable > slotDurationMs {
+		usable = slotDurationMs
+	}
+	return usable
+}
+
 // EvaluateCandidate evaluates a measured synthesized audio candidate against immutable source constraints.
 func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluationInput) FitEvaluationResult {
 	// A controller whose config cannot resolve a frozen policy identity cannot classify anything:
@@ -215,15 +234,8 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 
 	// The usable slot keeps the frozen natural reserve free, so Case 1 accepts only a candidate
 	// that also preserves that pause while Case 2 stays reachable for one that still fits the
-	// wider accepted window and merely consumes part of the reserve. A non-positive reserve
-	// leaves the usable slot equal to the accepted window, preserving the previous behavior.
-	usableSlotMs := slotDurationMs - in.EffectiveReserveMs
-	if usableSlotMs < 1 {
-		usableSlotMs = 1
-	}
-	if usableSlotMs > slotDurationMs {
-		usableSlotMs = slotDurationMs
-	}
+	// wider accepted window and merely consumes part of the reserve.
+	usableSlotMs := usableWindowMs(slotDurationMs, in.EffectiveReserveMs)
 
 	deltaMs := in.MeasuredDurationMs - usableSlotMs
 	hardOverrunMs := in.MeasuredDurationMs - slotDurationMs
@@ -298,7 +310,9 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 	// speed resynthesis is not a remedy for it: overrun must go through
 	// rewrite/regroup/review instead of a request the provider cannot honor.
 	env := fc.findVerifiedEnvelope(in.ProviderID, in.ModelID, in.ModelVersion, in.VoiceProfileID)
-	canResynth := !in.FixedRateVoice && in.AttemptNumber < 2 && in.NativeAttemptsForLineage < 1 &&
+	// A grouped candidate already spent the bounded regrouping remedy and is the last
+	// remedy before escalation, so it may not open a speed attempt of its own.
+	canResynth := !in.GroupedCandidate && !in.FixedRateVoice && in.AttemptNumber < 2 && in.NativeAttemptsForLineage < 1 &&
 		env != nil && isFinitePositive(speedFactor) && speedFactor >= env.MinSpeed && speedFactor <= env.MaxSpeed
 
 	if canResynth {
@@ -320,7 +334,7 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 	}
 
 	// Strategy B: REWRITE (shorten-first text adaptation)
-	canRewrite := in.CanShortenText && in.AttemptNumber < 3 && in.RewriteAttemptsForLineage < 1
+	canRewrite := !in.GroupedCandidate && in.CanShortenText && in.AttemptNumber < 3 && in.RewriteAttemptsForLineage < 1
 	if canRewrite {
 		return FitEvaluationResult{
 			Decision:           domain.FitActionRewrite,
@@ -339,7 +353,7 @@ func (fc *FitController) EvaluateCandidate(ctx context.Context, in FitEvaluation
 	}
 
 	// Strategy C: REGROUP within same speaker turn if adjacent segment belongs to same speaker
-	if fc.config.AllowRegroupSameTurn && in.NextTurnSpeakerID != "" && in.NextTurnSpeakerID == in.SpeakerID && in.SourceGapAfterMs > 0 && in.SourceGapAfterMs < 600 {
+	if !in.GroupedCandidate && fc.config.AllowRegroupSameTurn && in.NextTurnSpeakerID != "" && in.NextTurnSpeakerID == in.SpeakerID && in.SourceGapAfterMs > 0 && in.SourceGapAfterMs < regroupMaxGapMs {
 		return FitEvaluationResult{
 			Decision:           domain.FitActionRegroup,
 			UsableSlotMs:       usableSlotMs,

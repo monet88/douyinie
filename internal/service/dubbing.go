@@ -38,13 +38,37 @@ type DubbingService struct {
 	TTSInvoke TTSInvokeFunc
 }
 
-// lineageRecoveryState tracks per-source-lineage consumption of native-speed and
-// measured-rewrite remedies within one logical synthesis attempt, carrying state
-// across regroup and whole-speaker escalation without resetting budgets.
+// lineageRecoveryState tracks per-source-lineage consumption of native-speed, measured-
+// rewrite and bounded-regroup remedies within one logical synthesis attempt, carrying state
+// across regroup and whole-speaker escalation without resetting budgets or topology.
 type lineageRecoveryState struct {
 	NativeAttempts   map[int]int
 	RewriteAttempts  map[int]int
 	AcceptedRewrites map[int]string
+	// ChosenGroups records, per triggering canonical block index, the bounded group selected
+	// for that trigger within one lineage. Membership is never empty and always begins with
+	// the trigger; only an entry of two or more members carries a topology a later pass
+	// replays, while a shorter one resolves no group and is re-derived from the same pinned
+	// canonical inputs.
+	ChosenGroups map[int]chosenRegroup
+}
+
+// chosenRegroup is one lineage's chosen bounded group: the exact member block indices in
+// source order and the merged text that was selected for them, which stay authoritative
+// when a later pass replays the consumed remedy.
+type chosenRegroup struct {
+	MemberIndices []int
+	SourceText    string
+	SpokenText    string
+}
+
+// regroupPlan is one bounded same-speaker group under consideration: the member script
+// segments in source order with the merged source and spoken text chosen for them.
+type regroupPlan struct {
+	Members       []domain.DubScriptSegment
+	MemberIndices []int
+	SourceText    string
+	SpokenText    string
 }
 
 func newLineageRecoveryState() *lineageRecoveryState {
@@ -52,6 +76,7 @@ func newLineageRecoveryState() *lineageRecoveryState {
 		NativeAttempts:   make(map[int]int),
 		RewriteAttempts:  make(map[int]int),
 		AcceptedRewrites: make(map[int]string),
+		ChosenGroups:     make(map[int]chosenRegroup),
 	}
 }
 
@@ -1452,6 +1477,148 @@ func hasProtectedSoundtrackInGap(startMs, endMs int64, rolePlan *domain.AudioRol
 	return false
 }
 
+// Bounded same-speaker regrouping (Issue #155/R4). A group is the maximal contiguous
+// eligible prefix that starts at the triggering canonical source block: same speaker,
+// strictly positive source gaps below regroupMaxGapMs, no protected singing/uncertain
+// vocal interval and no other canonical speech block in between, capped at
+// regroupMaxMembers members. Membership and boundaries come from the pinned canonical
+// SpeechBlocks/AudioRolePlan, not from filtered DubScript adjacency; ordinary
+// BGM/SFX/ambience is not a grouping barrier.
+const (
+	regroupMaxMembers = 5
+	regroupMaxGapMs   = 600
+)
+
+// boundedRegroupMembers returns the canonical members of that group in script order,
+// beginning with the triggering segment at triggerPos; a single member means no group is
+// available. The trigger must be the pinned canonical block itself - index, anchors and
+// speaker identity included - because a group seeded from a drifted script anchor would
+// merge turns the canonical timeline does not attribute to that trigger. The scan then
+// stops at the first canonical speaker, protected-vocal, overlap, gap or
+// non-adjacent-canonical-block boundary, so a group can never skip a source turn.
+func boundedRegroupMembers(dubScript *domain.DubScriptVariant, transcript *domain.TranscriptArtifact, rolePlan *domain.AudioRolePlan, triggerPos int, triggerSpeaker string) []domain.DubScriptSegment {
+	members := []domain.DubScriptSegment{dubScript.Segments[triggerPos]}
+	if transcript == nil {
+		return members
+	}
+	prev, ok := canonicalSpeechBlock(transcript, members[0].Index)
+	if !ok || prev.StartMs != members[0].StartMs || prev.EndMs != members[0].EndMs ||
+		canonicalSpeaker(prev) != triggerSpeaker {
+		return members
+	}
+	// Same-speaker membership is grounded in the canonical speaker identity: the script's
+	// own labelling may drift and never decides whether a turn belongs to the group.
+	speakerID := canonicalSpeaker(prev)
+	for pos := triggerPos + 1; pos < len(dubScript.Segments) && len(members) < regroupMaxMembers; pos++ {
+		next := dubScript.Segments[pos]
+		// The script turn must be the same canonical block: a divergent or dropped block
+		// is a boundary, not something to merge across.
+		nextBlock, found := canonicalSpeechBlock(transcript, next.Index)
+		if !found || nextBlock.StartMs != next.StartMs || nextBlock.EndMs != next.EndMs ||
+			canonicalSpeaker(nextBlock) != speakerID {
+			break
+		}
+		gapMs := nextBlock.StartMs - prev.EndMs
+		if gapMs <= 0 || gapMs >= regroupMaxGapMs {
+			break
+		}
+		if hasProtectedSoundtrackInGap(prev.EndMs, nextBlock.StartMs, rolePlan) ||
+			!canonicalGapIsEmpty(transcript, prev, nextBlock) {
+			break
+		}
+		members = append(members, next)
+		prev = nextBlock
+	}
+	return members
+}
+
+// boundedRegroupPlan selects that group for a triggering segment and merges its text:
+// member anchors and source text stay canonical, an accepted member rewrite travels with
+// its member, and the text the group was chosen with is what gets synthesized.
+func boundedRegroupPlan(dubScript *domain.DubScriptVariant, transcript *domain.TranscriptArtifact, rolePlan *domain.AudioRolePlan, triggerPos int, triggerSpeaker string, recoveryState *lineageRecoveryState) regroupPlan {
+	members := boundedRegroupMembers(dubScript, transcript, rolePlan, triggerPos, triggerSpeaker)
+	plan := regroupPlan{Members: members, MemberIndices: make([]int, 0, len(members))}
+	sourceParts := make([]string, 0, len(members))
+	spokenParts := make([]string, 0, len(members))
+	for _, member := range members {
+		plan.MemberIndices = append(plan.MemberIndices, member.Index)
+		sourceParts = append(sourceParts, member.SourceText)
+		memberText := member.SpokenText
+		if memberText == "" {
+			memberText = member.MeaningText
+		}
+		if rewritten, ok := recoveryState.AcceptedRewrites[member.Index]; ok && rewritten != "" {
+			memberText = rewritten
+		}
+		spokenParts = append(spokenParts, memberText)
+	}
+	plan.SourceText = strings.Join(sourceParts, " ")
+	plan.SpokenText = strings.Join(spokenParts, " ")
+	return plan
+}
+
+// carriedRegroupPlan resolves the group a lineage already chose against the current script.
+// The recorded members must still sit at the same contiguous script positions, because the
+// recorded topology is never re-selected: anything else leaves fewer than two members, so
+// the spent remedy stays spent without a group.
+func carriedRegroupPlan(dubScript *domain.DubScriptVariant, triggerPos int, chosen chosenRegroup) regroupPlan {
+	plan := regroupPlan{MemberIndices: chosen.MemberIndices, SourceText: chosen.SourceText, SpokenText: chosen.SpokenText}
+	for offset, index := range chosen.MemberIndices {
+		pos := triggerPos + offset
+		if pos >= len(dubScript.Segments) || dubScript.Segments[pos].Index != index {
+			plan.Members = nil
+			break
+		}
+		plan.Members = append(plan.Members, dubScript.Segments[pos])
+	}
+	return plan
+}
+
+// canonicalSpeechBlock resolves one canonical speech block by index.
+func canonicalSpeechBlock(transcript *domain.TranscriptArtifact, index int) (domain.SpeechBlock, bool) {
+	for _, block := range transcript.SpeechBlocks {
+		if block.Index == index && domain.IsSpeechBlock(block) {
+			return block, true
+		}
+	}
+	return domain.SpeechBlock{}, false
+}
+
+// canonicalGapIsEmpty reports whether no other canonical speech block occupies the open
+// interval between two members, so merging them cannot skip a source turn.
+func canonicalGapIsEmpty(transcript *domain.TranscriptArtifact, prev, next domain.SpeechBlock) bool {
+	for _, block := range transcript.SpeechBlocks {
+		if !domain.IsSpeechBlock(block) || block.Index == prev.Index || block.Index == next.Index {
+			continue
+		}
+		if block.StartMs < next.StartMs && block.EndMs > prev.EndMs {
+			return false
+		}
+	}
+	return true
+}
+
+// speakerIdentity applies the fallback the synthesis pass attributes to an unlabelled turn, on
+// both the script side and the canonical side, so a membership decision compares one identity.
+func speakerIdentity(speakerID string) string {
+	if speakerID == "" {
+		return "SPEAKER_00"
+	}
+	return speakerID
+}
+
+// dubSegmentSpeaker resolves the script speaker of one segment with the fallback the
+// synthesis pass applies to an unlabelled turn.
+func dubSegmentSpeaker(seg domain.DubScriptSegment) string {
+	return speakerIdentity(seg.SpeakerID)
+}
+
+// canonicalSpeaker resolves the speaker identity the synthesis pass attributes to a canonical
+// SpeechBlock, so a block's identity is comparable with the script speaker of the turn it anchors.
+func canonicalSpeaker(block domain.SpeechBlock) string {
+	return speakerIdentity(block.SpeakerID)
+}
+
 // speakerEscalationPlan carries a whole-speaker escalation to the duration-controlled
 // fallback lane plus the audit evidence to record on the regenerated variant.
 type speakerEscalationPlan struct {
@@ -1573,10 +1740,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 
 	for i := 0; i < len(dubScript.Segments); i++ {
 		seg := dubScript.Segments[i]
-		spkID := seg.SpeakerID
-		if spkID == "" {
-			spkID = "SPEAKER_00"
-		}
+		spkID := dubSegmentSpeaker(seg)
 		voice, ok := voiceAssign.Assignments[spkID]
 		if !ok || voice.ID == "" {
 			// fallback to default preset voice for target language
@@ -1626,10 +1790,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 					} else {
 						for k := 0; k < groupCount; k++ {
 							currSegK := dubScript.Segments[i+k]
-							currSpkK := currSegK.SpeakerID
-							if currSpkK == "" {
-								currSpkK = "SPEAKER_00"
-							}
+							currSpkK := dubSegmentSpeaker(currSegK)
 							if currSegK.Index != priorSeg.SpeechBlockIndices[k] || currSpkK != spkID {
 								validGrouping = false
 								break
@@ -1712,7 +1873,15 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 		var finalDecision domain.FitAction
 		var finalRequiresReview bool
 		var finalReviewReason string
+		// Issue #155/R4: a lineage that already chose its one bounded group replays that
+		// topology and text instead of probing the lone trigger as a fresh regroup attempt.
+		chosenGroup := recoveryState.ChosenGroups[seg.Index]
+		carriedTopology := len(chosenGroup.MemberIndices) >= 2
 		for attempt <= 3 {
+			if carriedTopology {
+				finalDecision = domain.FitActionRegroup
+				break
+			}
 			synthReq := provider.TTSSynthesisRequest{
 				RunID:          in.RunID,
 				AssetID:        in.AssetID,
@@ -1904,317 +2073,238 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 			}
 		}
 
-		// Handle REGROUP within same speaker turn:
-		// When FitController decides REGROUP, iteratively extend adjacent same-speaker blocks (1..N)
-		// without crossing speaker boundaries, noneligible gaps, or moving later anchors.
+		// Bounded same-speaker regrouping (#155/R4): the FitController asks for REGROUP,
+		// the group is chosen before any synthesis, and only that group's own measured
+		// result may be selected. Everything unresolved stays review evidence.
 		regrouped := false
 		if finalDecision == domain.FitActionRegroup {
-			consumedIndices := []int{seg.Index}
-			combinedStartMs := seg.StartMs
-			combinedEndMs := seg.EndMs
-			combinedSourceText := seg.SourceText
-			combinedSpokenText := currentText
-
-			var lastRegroupSynthRes *provider.TTSSynthesisResult
-			var lastRegroupProbedMs int64
-			var lastRegroupEvalRes FitEvaluationResult
-			var lastRegroupCombinedSlotMs int64
-			var lastRegroupCombinedStartMs int64
-			var lastRegroupCombinedEndMs int64
-			var lastRegroupCombinedSourceText string
-			var lastRegroupCombinedSpokenText string
-			var lastRegroupPlaybackEndMs int64
-			var lastRegroupReserveMs int64
-			var lastRegroupFitPolicyID string
-			var lastRegroupIndices []int
-			lastRegroupReviewReason := "DURATION_OVERRUN"
-
-			currIdx := i
-			for currIdx+1 < len(dubScript.Segments) {
-				nextSeg := dubScript.Segments[currIdx+1]
-				nextSpk := nextSeg.SpeakerID
-				if nextSpk == "" {
-					nextSpk = "SPEAKER_00"
+			// The bounded group is chosen before any synthesis: the maximal contiguous
+			// eligible prefix of canonical same-speaker members starting at this block,
+			// capped at regroupMaxMembers. A group this lineage already chose is replayed
+			// verbatim instead; nothing here grows or re-enters.
+			plan := regroupPlan{}
+			if carriedTopology {
+				plan = carriedRegroupPlan(dubScript, i, chosenGroup)
+			} else {
+				plan = boundedRegroupPlan(dubScript, transcript, rolePlan, i, spkID, recoveryState)
+				// The selection runs against the pinned canonical timeline, so a later pass of
+				// this attempt finds the same group (or none) and replays that choice instead
+				// of spending a second remedy.
+				recoveryState.ChosenGroups[seg.Index] = chosenRegroup{
+					MemberIndices: plan.MemberIndices, SourceText: plan.SourceText, SpokenText: plan.SpokenText,
 				}
-
-				// Verify adjacent same-speaker eligibility and gap constraint
-				prevSeg := dubScript.Segments[currIdx]
-				if nextSpk != spkID || nextSeg.StartMs < prevSeg.EndMs || prevSeg.SourceGapAfterMs <= 0 || prevSeg.SourceGapAfterMs >= 600 {
-					break
+			}
+			members := plan.Members
+			if len(members) < 2 {
+				if carriedTopology {
+					// A lineage that chose a group must still resolve it: this path synthesizes
+					// nothing, so a replayed remedy without its group would leave the review
+					// path with no measured candidate at all.
+					return nil, fmt.Errorf("carried regroup topology for segment %d no longer resolves a group (%d members)", seg.Index, len(members))
 				}
-				if hasProtectedSoundtrackInGap(prevSeg.EndMs, nextSeg.StartMs, rolePlan) {
-					break
+				// Nothing eligible to merge, so grouping has no group: the block keeps its
+				// own measured overrun as honest review evidence. The fit plan records that
+				// verdict, not the REGROUP request it could not act on.
+				finalDecision = domain.FitActionReview
+				finalRequiresReview = true
+				if finalReviewReason == "" {
+					finalReviewReason = "DURATION_OVERRUN"
 				}
+				finalFitPlan.Decision = domain.FitActionReview
+				finalFitPlan.DecisionReason = "no eligible bounded same-speaker group: " + finalReviewReason
+			} else {
+				last := members[len(members)-1]
+				memberIndices := plan.MemberIndices
+				groupSourceText := plan.SourceText
+				groupSpokenText := plan.SpokenText
+				groupStartMs := seg.StartMs
+				groupEndMs := last.EndMs
 
-				consumedIndices = append(consumedIndices, nextSeg.Index)
-				currIdx++
-
-				combinedEndMs = nextSeg.EndMs
-				combinedSlotMs := combinedEndMs - combinedStartMs
-				nextBoundaryMs, boundaryErr := playbackBoundaryForBlock(nextSeg.Index, nextSeg.StartMs, nextSeg.EndMs, transcript, rolePlan)
+				// The group's playback window is the one its final member is bounded by, and
+				// that boundary is what the selected or review evidence records.
+				nextBoundaryMs, boundaryErr := playbackBoundaryForBlock(last.Index, last.StartMs, last.EndMs, transcript, rolePlan)
 				if boundaryErr != nil {
 					return nil, boundaryErr
 				}
-				groupPlaybackEndMs, groupReserveMs, groupFitPolicyID := fc.ResolvePlaybackWindow(combinedEndMs, nextBoundaryMs)
-				groupPlaybackDurationMs := groupPlaybackEndMs - combinedStartMs
-				if groupPlaybackDurationMs <= 0 {
-					return nil, fmt.Errorf("invalid regroup playback window for segment %d", seg.Index)
-				}
-				combinedSourceText = strings.TrimSpace(combinedSourceText + " " + nextSeg.SourceText)
-				nextSpoken := nextSeg.SpokenText
-				if nextSpoken == "" {
-					nextSpoken = nextSeg.MeaningText
-				}
-				combinedSpokenText = strings.TrimSpace(combinedSpokenText + " " + nextSpoken)
-				groupProtectedTerms := glossaryForSource(translationContract.EffectiveGlossary, combinedSourceText)
-				groupQA := NewMeaningFirstQAGate().ValidateSegment(combinedSourceText, combinedSpokenText, dubScript.SourceLanguage, targetLang, groupProtectedTerms)
-				if !groupQA.Passed {
-					// This group never reached synthesis, so any earlier (narrower) group's
-					// measured audio is not evidence for the text/timing recorded here and
-					// must not survive as this review candidate's audio or measured duration.
-					lastRegroupSynthRes = nil
-					lastRegroupProbedMs = 0
-					lastRegroupCombinedSlotMs = combinedSlotMs
-					lastRegroupCombinedStartMs = combinedStartMs
-					lastRegroupCombinedEndMs = combinedEndMs
-					lastRegroupCombinedSourceText = combinedSourceText
-					lastRegroupCombinedSpokenText = combinedSpokenText
-					lastRegroupPlaybackEndMs = groupPlaybackEndMs
-					lastRegroupReserveMs = groupReserveMs
-					lastRegroupFitPolicyID = groupFitPolicyID
-					lastRegroupIndices = append([]int(nil), consumedIndices...)
-					lastRegroupReviewReason = qaReviewReason(seg.Index, groupQA)
-					lastRegroupEvalRes = FitEvaluationResult{
-						Decision: domain.FitActionReview, SlotDurationMs: groupPlaybackDurationMs, UsableSlotMs: groupPlaybackDurationMs,
-						RequiresReview: true, ReviewReason: lastRegroupReviewReason, Reason: "regrouped text failed meaning/glossary QA",
-						DubPlaybackEndMs: groupPlaybackEndMs, EffectiveReserveMs: groupReserveMs, FitPolicyID: groupFitPolicyID,
+				groupPlaybackEndMs, groupReserveMs, groupFitPolicyID := fc.ResolvePlaybackWindow(groupEndMs, nextBoundaryMs)
+				groupSlotMs := groupPlaybackEndMs - groupStartMs
+
+				groupProtectedTerms := glossaryForSource(translationContract.EffectiveGlossary, groupSourceText)
+				groupQA := NewMeaningFirstQAGate().ValidateSegment(groupSourceText, groupSpokenText, dubScript.SourceLanguage, targetLang, groupProtectedTerms)
+
+				// Exactly one combined synthesis and probe for the chosen group, and none at
+				// all when the merged text already fails meaning/glossary QA.
+				var groupAudioPath, groupAudioSHA string
+				var groupProbedMs int64
+				var groupEvalRes FitEvaluationResult
+				accepted := false
+				if groupQA.Passed {
+					synthRes, selectedProv, synthErr := s.invokeTTSWithFallback(ctx, provider.TTSSynthesisRequest{
+						RunID:          in.RunID,
+						AssetID:        in.AssetID,
+						SegmentIndex:   seg.Index,
+						SpeakerID:      spkID,
+						Text:           groupSpokenText,
+						Language:       targetLang,
+						Voice:          voice,
+						Speed:          1.0,
+						SlotDurationMs: groupSlotMs,
+						UsableSlotMs:   groupSlotMs,
+						AttemptNumber:  1,
+					}, in.ExecutionProfile, in.AuthorizedCredentials)
+					if synthErr != nil {
+						return nil, fmt.Errorf("regroup tts synthesis for segment %d (group %v): %w", seg.Index, memberIndices, synthErr)
 					}
-					break
-				}
-
-				var nextNextTurnStartMs int64
-				var nextNextTurnSpkID string
-				if currIdx+1 < len(dubScript.Segments) {
-					nextNextTurnStartMs = dubScript.Segments[currIdx+1].StartMs
-					nextNextTurnSpkID = dubScript.Segments[currIdx+1].SpeakerID
-				}
-
-				synthReq := provider.TTSSynthesisRequest{
-					RunID:          in.RunID,
-					AssetID:        in.AssetID,
-					SegmentIndex:   seg.Index,
-					SpeakerID:      spkID,
-					Text:           combinedSpokenText,
-					Language:       targetLang,
-					Voice:          voice,
-					Speed:          1.0,
-					SlotDurationMs: groupPlaybackDurationMs,
-					UsableSlotMs:   groupPlaybackDurationMs,
-					AttemptNumber:  1,
-				}
-
-				synthRes, selectedProv, err := s.invokeTTSWithFallback(ctx, synthReq, in.ExecutionProfile, in.AuthorizedCredentials)
-				if err != nil {
-					return nil, fmt.Errorf("regroup tts synthesis for segment %d (group %v): %w", seg.Index, consumedIndices, err)
-				}
-
-				probedCombinedMs, probeErr := media.ProbeWAVBytes(synthRes.AudioData)
-				if probeErr != nil || probedCombinedMs <= 0 {
-					return nil, fmt.Errorf("regroup probe media duration for segment %d (group %v): %w", seg.Index, consumedIndices, probeErr)
-				}
-
-				fixedRateVoice := ttsFitCapabilities(selectedProv)
-				if fixedRateVoice {
-					fixedRateSpeakers[spkID] = true
-				}
-
-				var groupProvID, groupModelID, groupModelVer string
-				if selectedProv != nil {
-					groupProvID = selectedProv.ID()
-					groupModelID, groupModelVer = selectedProv.ModelInfo()
-				}
-				for _, mIdx := range consumedIndices {
-					if recoveryState.NativeAttempts[seg.Index] > recoveryState.NativeAttempts[mIdx] {
-						recoveryState.NativeAttempts[mIdx] = recoveryState.NativeAttempts[seg.Index]
+					groupProbedMs, synthErr = media.ProbeWAVBytes(synthRes.AudioData)
+					if synthErr != nil || groupProbedMs <= 0 {
+						return nil, fmt.Errorf("regroup probe media duration for segment %d (group %v): %w", seg.Index, memberIndices, synthErr)
 					}
-					if recoveryState.RewriteAttempts[seg.Index] > recoveryState.RewriteAttempts[mIdx] {
-						recoveryState.RewriteAttempts[mIdx] = recoveryState.RewriteAttempts[seg.Index]
-					}
-				}
-				regroupFrames, regroupSampleRate := candidateFrameGeometry(synthRes.AudioData)
-				regroupEvalInput := FitEvaluationInput{
-					SegmentIndex:       seg.Index,
-					SpeakerID:          spkID,
-					StartMs:            combinedStartMs,
-					EndMs:              combinedEndMs,
-					NextTurnStartMs:    nextNextTurnStartMs,
-					NextTurnSpeakerID:  nextNextTurnSpkID,
-					SourceGapAfterMs:   nextSeg.SourceGapAfterMs,
-					MeasuredDurationMs: probedCombinedMs,
-					AttemptNumber:      3,
-					CurrentSpeed:       1.0,
-					CanShortenText:     false,
-					FixedRateVoice:     fixedRateVoice,
-					DubPlaybackEndMs:   groupPlaybackEndMs,
-					EffectiveReserveMs: groupReserveMs,
-					ProviderID:         groupProvID,
-					ModelID:            groupModelID,
-					ModelVersion:       groupModelVer,
-					VoiceProfileID:     voice.ID,
-					// AttemptNumber 3 already refuses RESYNTH and REWRITE in EvaluateCandidate,
-					// so the regrouped candidate needs no explicit lineage budget consumption.
-					OutputSampleRate:   outputSampleRate,
-					MeasuredFrames:     regroupFrames,
-					MeasuredSampleRate: regroupSampleRate,
-				}
-				regroupEvalRes := fc.EvaluateCandidate(ctx, regroupEvalInput)
-
-				lastRegroupSynthRes = synthRes
-				lastRegroupProbedMs = probedCombinedMs
-				lastRegroupEvalRes = regroupEvalRes
-				lastRegroupCombinedSlotMs = combinedSlotMs
-				lastRegroupCombinedStartMs = combinedStartMs
-				lastRegroupCombinedEndMs = combinedEndMs
-				lastRegroupCombinedSourceText = combinedSourceText
-				lastRegroupCombinedSpokenText = combinedSpokenText
-				lastRegroupPlaybackEndMs = groupPlaybackEndMs
-				lastRegroupReserveMs = groupReserveMs
-				lastRegroupFitPolicyID = groupFitPolicyID
-				lastRegroupIndices = append([]int(nil), consumedIndices...)
-				lastRegroupReviewReason = regroupEvalRes.ReviewReason
-
-				if regroupEvalRes.Decision == domain.FitActionAccept && !regroupEvalRes.RequiresReview && probedCombinedMs <= groupPlaybackDurationMs {
-					// Successfully fit and accepted!
-					var audioPath, audioSHA string
 					if s.cas != nil {
-						casObj, err := s.cas.Put(bytes.NewReader(synthRes.AudioData))
-						if err != nil {
-							return nil, fmt.Errorf("regroup commit audio segment %d to CAS: %w", seg.Index, err)
+						casObj, casErr := s.cas.Put(bytes.NewReader(synthRes.AudioData))
+						if casErr != nil {
+							return nil, fmt.Errorf("regroup commit audio segment %d to CAS: %w", seg.Index, casErr)
 						}
-						audioPath = casObj.Path
-						audioSHA = casObj.SHA256
+						groupAudioPath, groupAudioSHA = casObj.Path, casObj.SHA256
 					} else {
-						audioSHA = synthRes.AudioSHA256
+						groupAudioSHA = synthRes.AudioSHA256
 					}
-
-					dubSeg := domain.DubSegment{
-						Index:              seg.Index,
-						SpeechBlockIndices: consumedIndices,
-						SpeakerID:          spkID,
-						StartMs:            combinedStartMs,
-						EndMs:              combinedEndMs,
-						SlotDurationMs:     combinedSlotMs,
-						SourceText:         combinedSourceText,
-						SpokenText:         combinedSpokenText,
-						AudioCASPath:       audioPath,
-						AudioSHA256:        audioSHA,
-						MeasuredDurationMs: probedCombinedMs,
-						Voice:              voice,
-						FitDecision:        domain.FitActionAccept,
-						ReviewReason:       "",
-						RequiresReview:     false,
-						NaturalGapAfterMs:  regroupEvalRes.NaturalGapMs,
-						DubPlaybackEndMs:   groupPlaybackEndMs,
-						EffectiveReserveMs: groupReserveMs,
+					fixedRateVoice := ttsFitCapabilities(selectedProv)
+					if fixedRateVoice {
+						fixedRateSpeakers[spkID] = true
 					}
-					selectedSegments = append(selectedSegments, dubSeg)
-
-					combinedFitPlan := domain.DubbingFitPlan{
+					var groupProvID, groupModelID, groupModelVer string
+					if selectedProv != nil {
+						groupProvID = selectedProv.ID()
+						groupModelID, groupModelVer = selectedProv.ModelInfo()
+					}
+					groupFrames, groupSampleRate := candidateFrameGeometry(synthRes.AudioData)
+					// GroupedCandidate keeps the group the last remedy of this attempt: no
+					// further regroup, speed or rewrite may be granted from its measurement.
+					groupEvalRes = fc.EvaluateCandidate(ctx, FitEvaluationInput{
 						SegmentIndex:       seg.Index,
 						SpeakerID:          spkID,
-						SlotDurationMs:     combinedSlotMs,
-						UsableSlotMs:       regroupEvalRes.UsableSlotMs,
-						MeasuredDurationMs: probedCombinedMs,
-						DurationDeltaMs:    regroupEvalRes.DurationDeltaMs,
+						StartMs:            groupStartMs,
+						EndMs:              groupEndMs,
+						MeasuredDurationMs: groupProbedMs,
+						AttemptNumber:      1,
+						CurrentSpeed:       1.0,
+						GroupedCandidate:   true,
+						FixedRateVoice:     fixedRateVoice,
+						DubPlaybackEndMs:   groupPlaybackEndMs,
+						EffectiveReserveMs: groupReserveMs,
+						ProviderID:         groupProvID,
+						ModelID:            groupModelID,
+						ModelVersion:       groupModelVer,
+						VoiceProfileID:     voice.ID,
+						OutputSampleRate:   outputSampleRate,
+						MeasuredFrames:     groupFrames,
+						MeasuredSampleRate: groupSampleRate,
+					})
+					accepted = groupEvalRes.Decision == domain.FitActionAccept && !groupEvalRes.RequiresReview &&
+						groupProbedMs <= groupSlotMs
+				}
+				// One combined synthesis is what the group spends, so the evidence records
+				// that call of its own - not the triggering block's earlier attempts - and a
+				// QA-refused group spends none. The playback window is known before any
+				// synthesis, so an unmeasured group still records the slot, usable slot and
+				// reserve it never got to fill while MeasuredDurationMs stays 0.
+				groupAttemptCount := 0
+				groupUsableSlotMs := usableWindowMs(groupSlotMs, groupReserveMs)
+				if groupQA.Passed {
+					groupAttemptCount = 1
+					groupUsableSlotMs = groupEvalRes.UsableSlotMs
+				}
+
+				if accepted {
+					selectedSegments = append(selectedSegments, domain.DubSegment{
+						Index:              seg.Index,
+						SpeechBlockIndices: memberIndices,
+						SpeakerID:          spkID,
+						StartMs:            groupStartMs,
+						EndMs:              groupEndMs,
+						SlotDurationMs:     groupEndMs - groupStartMs,
+						SourceText:         groupSourceText,
+						SpokenText:         groupSpokenText,
+						AudioCASPath:       groupAudioPath,
+						AudioSHA256:        groupAudioSHA,
+						MeasuredDurationMs: groupProbedMs,
+						Voice:              voice,
+						FitDecision:        domain.FitActionAccept,
+						NaturalGapAfterMs:  groupEvalRes.NaturalGapMs,
+						DubPlaybackEndMs:   groupPlaybackEndMs,
+						EffectiveReserveMs: groupReserveMs,
+					})
+					fitPlans = append(fitPlans, domain.DubbingFitPlan{
+						SegmentIndex:       seg.Index,
+						SpeakerID:          spkID,
+						SlotDurationMs:     groupSlotMs,
+						UsableSlotMs:       groupUsableSlotMs,
+						MeasuredDurationMs: groupProbedMs,
+						DurationDeltaMs:    groupEvalRes.DurationDeltaMs,
 						SpeedFactor:        1.0,
-						NaturalGapMs:       regroupEvalRes.NaturalGapMs,
+						NaturalGapMs:       groupEvalRes.NaturalGapMs,
 						Decision:           domain.FitActionAccept,
 						DecisionReason:     "regrouped same-speaker turn into combined slot",
-						AttemptCount:       1,
+						AttemptCount:       groupAttemptCount,
 						DubPlaybackEndMs:   groupPlaybackEndMs,
 						EffectiveReserveMs: groupReserveMs,
 						FitPolicyID:        groupFitPolicyID,
-						SpeechBlockIndices: append([]int(nil), consumedIndices...),
+						SpeechBlockIndices: memberIndices,
+					})
+				} else {
+					// The review unit's operator-facing reason and the fit's own verdict for
+					// that unit are separate evidence: the fit plan keeps what the measured
+					// candidate was actually refused or granted by.
+					reviewReason := groupEvalRes.ReviewReason
+					fitReason := groupEvalRes.Reason
+					if !groupQA.Passed {
+						reviewReason = qaReviewReason(seg.Index, groupQA)
+						fitReason = reviewReason
+					} else if reviewReason == "" {
+						reviewReason = "DURATION_OVERRUN"
 					}
-					fitPlans = append(fitPlans, combinedFitPlan)
-
-					regrouped = true
-					i = currIdx
-					break
+					reviewSegments = append(reviewSegments, domain.DubSegmentReview{
+						Index:              seg.Index,
+						SpeechBlockIndices: memberIndices,
+						SpeakerID:          spkID,
+						StartMs:            groupStartMs,
+						EndMs:              groupEndMs,
+						SlotDurationMs:     groupEndMs - groupStartMs,
+						SourceText:         groupSourceText,
+						SpokenText:         groupSpokenText,
+						AudioCASPath:       groupAudioPath,
+						AudioSHA256:        groupAudioSHA,
+						MeasuredDurationMs: groupProbedMs,
+						Voice:              voice,
+						FitDecision:        domain.FitActionReview,
+						ReviewReason:       reviewReason,
+						AttemptCount:       groupAttemptCount,
+						DubPlaybackEndMs:   groupPlaybackEndMs,
+						EffectiveReserveMs: groupReserveMs,
+					})
+					fitPlans = append(fitPlans, domain.DubbingFitPlan{
+						SegmentIndex:       seg.Index,
+						SpeakerID:          spkID,
+						SlotDurationMs:     groupSlotMs,
+						UsableSlotMs:       groupUsableSlotMs,
+						MeasuredDurationMs: groupProbedMs,
+						DurationDeltaMs:    groupEvalRes.DurationDeltaMs,
+						SpeedFactor:        1.0,
+						Decision:           domain.FitActionReview,
+						DecisionReason:     fitReason,
+						AttemptCount:       groupAttemptCount,
+						DubPlaybackEndMs:   groupPlaybackEndMs,
+						EffectiveReserveMs: groupReserveMs,
+						FitPolicyID:        groupFitPolicyID,
+						SpeechBlockIndices: memberIndices,
+					})
+					overallStatus = "REVIEW_REQUIRED"
 				}
-
-				// If FitController returned REGROUP, loop continues to attempt extending next eligible block
-				if regroupEvalRes.Decision != domain.FitActionRegroup {
-					// Non-regroup decision that is not accept (e.g. REVIEW) -> stop extending
-					break
-				}
-			}
-
-			if !regrouped && len(consumedIndices) > 1 {
-				// Multiple blocks were consumed but remedies remained unresolved -> place entire consumed group in ReviewSegments
-				var audioPath, audioSHA string
-				if lastRegroupSynthRes != nil {
-					if s.cas != nil {
-						casObj, err := s.cas.Put(bytes.NewReader(lastRegroupSynthRes.AudioData))
-						if err == nil {
-							audioPath = casObj.Path
-							audioSHA = casObj.SHA256
-						}
-					} else {
-						audioSHA = lastRegroupSynthRes.AudioSHA256
-					}
-				}
-
-				revReason := lastRegroupReviewReason
-				if revReason == "" {
-					revReason = "DURATION_OVERRUN"
-				}
-
-				revSeg := domain.DubSegmentReview{
-					Index:              seg.Index,
-					SpeechBlockIndices: append([]int(nil), lastRegroupIndices...),
-					SpeakerID:          spkID,
-					StartMs:            lastRegroupCombinedStartMs,
-					EndMs:              lastRegroupCombinedEndMs,
-					SlotDurationMs:     lastRegroupCombinedSlotMs,
-					SourceText:         lastRegroupCombinedSourceText,
-					SpokenText:         lastRegroupCombinedSpokenText,
-					AudioCASPath:       audioPath,
-					AudioSHA256:        audioSHA,
-					MeasuredDurationMs: lastRegroupProbedMs,
-					Voice:              voice,
-					FitDecision:        domain.FitActionReview,
-					ReviewReason:       revReason,
-					AttemptCount:       1,
-					DubPlaybackEndMs:   lastRegroupPlaybackEndMs,
-					EffectiveReserveMs: lastRegroupReserveMs,
-				}
-				reviewSegments = append(reviewSegments, revSeg)
-				overallStatus = "REVIEW_REQUIRED"
-
-				combinedFitPlan := domain.DubbingFitPlan{
-					SegmentIndex:       seg.Index,
-					SpeakerID:          spkID,
-					SlotDurationMs:     lastRegroupCombinedSlotMs,
-					UsableSlotMs:       lastRegroupEvalRes.UsableSlotMs,
-					MeasuredDurationMs: lastRegroupProbedMs,
-					DurationDeltaMs:    lastRegroupEvalRes.DurationDeltaMs,
-					SpeedFactor:        1.0,
-					NaturalGapMs:       0,
-					Decision:           domain.FitActionReview,
-					DecisionReason:     "regrouped same-speaker turn still overruns combined slot",
-					AttemptCount:       1,
-					DubPlaybackEndMs:   lastRegroupPlaybackEndMs,
-					EffectiveReserveMs: lastRegroupReserveMs,
-					FitPolicyID:        lastRegroupFitPolicyID,
-					SpeechBlockIndices: append([]int(nil), lastRegroupIndices...),
-				}
-				fitPlans = append(fitPlans, combinedFitPlan)
-
 				regrouped = true
-				i = currIdx
+				i += len(members) - 1
 			}
 		}
+
 		if regrouped {
 			continue
 		}
@@ -2470,6 +2560,16 @@ func measuredOverrunAboveAllowanceMs(probedMs, startMs, playbackEndMs, measuredF
 	return (excessFrames*1000 + int64(outputSampleRate) - 1) / int64(outputSampleRate)
 }
 
+// unresolvedTimingFailure reports whether a review unit carries the FitController's own
+// unresolved DURATION_OVERRUN verdict. That verdict is the source of truth for a timing
+// failure: a candidate can overrun the accepted playback window frame-exactly while its
+// floored millisecond probe still fits the slot, so a measured-vs-slot comparison alone
+// misses a real failure. Unrelated review reasons (invalid timing, QA refusals, missing
+// replacements) are not timing failures and never qualify.
+func unresolvedTimingFailure(rev domain.DubSegmentReview) bool {
+	return rev.FitDecision == domain.FitActionReview && rev.ReviewReason == "DURATION_OVERRUN"
+}
+
 // resolveEscalationOutcomes marks whether a whole-speaker regeneration cleared every
 // unresolved slot overrun for that speaker. A false outcome is what projects REVIEW.
 func resolveEscalationOutcomes(escalations []domain.VoiceProviderEscalation, reviewSegments []domain.DubSegmentReview) []domain.VoiceProviderEscalation {
@@ -2478,7 +2578,7 @@ func resolveEscalationOutcomes(escalations []domain.VoiceProviderEscalation, rev
 	}
 	unresolved := make(map[string]bool)
 	for _, rev := range reviewSegments {
-		if rev.FitDecision == domain.FitActionReview && rev.SlotDurationMs > 0 && rev.MeasuredDurationMs > rev.SlotDurationMs {
+		if unresolvedTimingFailure(rev) {
 			unresolved[rev.SpeakerID] = true
 		}
 	}
@@ -2507,10 +2607,7 @@ func (s *DubbingService) planSpeakerEscalation(ctx context.Context, in domain.Du
 	triggers := make(map[string][]int)
 	var speakers []string
 	for _, rev := range pass.ReviewSegments {
-		if rev.FitDecision != domain.FitActionReview || !slices.Contains(pass.FixedRateSpeakers, rev.SpeakerID) {
-			continue
-		}
-		if rev.SlotDurationMs <= 0 || rev.MeasuredDurationMs <= rev.SlotDurationMs {
+		if !unresolvedTimingFailure(rev) || !slices.Contains(pass.FixedRateSpeakers, rev.SpeakerID) {
 			continue
 		}
 		from, ok := voiceAssign.Assignments[rev.SpeakerID]
@@ -3007,6 +3104,10 @@ func (s *DubbingService) computeDubSegmentsProvenanceHash(in domain.DubbingJobIn
 	})
 }
 
+// errEmptyTTSResult fails the pass closed when a provider reports success without a result.
+// Every caller probes result.AudioData, so (nil result, nil error) must never leave this boundary.
+var errEmptyTTSResult = errors.New("tts provider returned no synthesis result")
+
 // invokeTTSWithFallback routes and executes TTS attempts with policy-checked fallback.
 func (s *DubbingService) invokeTTSWithFallback(ctx context.Context, req provider.TTSSynthesisRequest, profile domain.ExecutionProfile, creds []string) (*provider.TTSSynthesisResult, provider.Provider, error) {
 	if s.TTSInvoke != nil {
@@ -3020,7 +3121,13 @@ func (s *DubbingService) invokeTTSWithFallback(ctx context.Context, req provider
 			ModelVersion: "1.0",
 		}
 		res, err := s.TTSInvoke(ctx, p, req)
-		return res, p, err
+		if err != nil {
+			return res, p, err
+		}
+		if res == nil {
+			return nil, nil, errEmptyTTSResult
+		}
+		return res, p, nil
 	}
 
 	if s.router == nil {
@@ -3071,6 +3178,9 @@ func (s *DubbingService) invokeTTSWithFallback(ctx context.Context, req provider
 		if err != nil {
 			return nil, nil, fmt.Errorf("frozen tts provider %s failed after retries: %w", req.Voice.ProviderID, err)
 		}
+		if result == nil {
+			return nil, nil, fmt.Errorf("frozen tts provider %s: %w", req.Voice.ProviderID, errEmptyTTSResult)
+		}
 		return result, selected, nil
 	}
 	// Generic routing fallback when no voice provider is frozen
@@ -3101,6 +3211,9 @@ func (s *DubbingService) invokeTTSWithFallback(ctx context.Context, req provider
 
 	if err != nil {
 		return nil, nil, err
+	}
+	if result == nil {
+		return nil, nil, errEmptyTTSResult
 	}
 	return result, selected, nil
 }

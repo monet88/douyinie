@@ -251,8 +251,9 @@ Traps:
   requires a verified `NativeSpeedEnvelope` whose provider / model / model-version / voice-profile identity
   matches the lane that actually synthesized, and which carries an attributable `CalibrationID`;
   `DefaultFitControllerConfig()` declares none, so nothing is calibrated out of the box. Uncalibrated lanes
-  stay natural-only: the escalated pass can still rewrite or regroup, but it never requests a rate its
-  runtime cannot honor, and an unresolved overrun stays `REVIEW`. A declared calibration is also only an
+  stay natural-only: the escalated pass can still spend the remedies its lineage has left (one measured
+  rewrite, one bounded same-speaker group), but it never requests a rate its runtime cannot honor, and an
+  unresolved overrun stays `REVIEW`. A declared calibration is also only an
   operator attestation - a fixed-rate lane still fails closed on any non-1.0 request, and the attempt is not
   recorded as speed-adjusted.
 

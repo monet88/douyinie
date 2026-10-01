@@ -128,7 +128,7 @@ The operator queue is exception-only. Passing, auto-resolved, and manually overr
 - Validate the decoded waveform/sample extent against that playback end and against neighboring localized clip placement; metadata duration alone is not acceptance proof.
 - Contract enforcement across audition/benchmark/review: In accordance with #153, contextual audition, benchmark evaluation, review inspection, and production synthesis share the exact same playback contract and require run-scoped lineage proof (`RunID`).
 - An overlong candidate must not reach the final mixer.
-- Resolve overrun through the approved adaptation loop: rewrite/resynthesize/rate/mild stretch/local regroup within the same speaker turn.
+- Resolve overrun through the approved adaptation loop: rewrite/resynthesize/rate/mild stretch/local regroup within the same speaker turn. A bounded same-speaker group is chosen before it is synthesized, is granted at most once per lineage, and never replenishes a spent native-speed or rewrite allowance.
 - Never fix one overrun by shifting later source speech.
 - Preserve perceptible inter-turn breathing room; fitting arithmetic alone is not sufficient quality evidence.
 

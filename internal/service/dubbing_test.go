@@ -4680,6 +4680,151 @@ func TestDubbingService_Issue154_AcceptedRewriteCarriesIntoSpeakerEscalation(t *
 	}
 }
 
+// Issue #155 review finding: the FitController's own DURATION_OVERRUN verdict, not a
+// measured-vs-slot millisecond comparison, decides whether a fixed-rate speaker's timing
+// failure is unresolved. A grouped candidate can fill its accepted playback window in floored
+// milliseconds while its resampled frames do not fit it, so such a group must still escalate
+// the whole speaker once, and a frame-exact failure the fallback did not clear must not be
+// reported Resolved.
+func TestDubbingService_Issue155_FrameExactGroupOverrunEscalatesWholeSpeaker(t *testing.T) {
+	dubSvc, db, casStore, reg, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	assetID := uuid.NewString()
+	runID := uuid.NewString()
+	setupAssetJobRunAudioRole(t, db, casStore, assetID, runID, "vi")
+
+	// The fit proves the accepted playback window against the rate the mixer resamples to.
+	// 2005ms at 44100Hz spans 88420.5 frames, so a candidate whose floored probe fills the
+	// window exactly still places one frame past it: the refusal is frame-exact, not
+	// millisecond, and the recorded measurement does not exceed the slot it was measured
+	// against.
+	const (
+		groupEndMs  = 2005
+		candidateMs = groupEndMs
+	)
+	if err := db.SavePreflightReport(context.Background(), domain.PreflightReport{
+		ID: "preflight-" + assetID, AssetID: assetID, DurationSec: 10, DurationMs: 10000,
+		AudioChannels: 1, AudioSampleRate: 44100, ContainerValid: true, FingerprintMatch: true,
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("save preflight report: %v", err)
+	}
+
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: "vi",
+		Segments: []domain.DubScriptSegment{
+			// Two words only: the fixed-rate lane has no rewrite remedy, so the lone trigger's
+			// overrun must be answered by the bounded same-speaker group.
+			{Index: 0, SpeakerID: "SPEAKER_00", StartMs: 0, EndMs: 1000, SlotDurationMs: 1000,
+				SourceText: "第一句", MeaningText: "Vế một", SpokenText: "Vế một", SourceGapAfterMs: 100},
+			{Index: 1, SpeakerID: "SPEAKER_00", StartMs: 1100, EndMs: groupEndMs, SlotDurationMs: groupEndMs - 1100,
+				SourceText: "第二句", MeaningText: "Vế hai", SpokenText: "Vế hai", SourceGapAfterMs: 100},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	pinDubbingScriptLineage(t, db, casStore, &dubScript, runID)
+	scriptBytes, _ := json.Marshal(dubScript)
+	scriptCAS, _ := casStore.Put(bytes.NewReader(scriptBytes))
+
+	// The unattended VI default lane is the fixed-rate lane the group is measured on.
+	assign, err := dubSvc.AssignVoices(context.Background(), domain.VoiceAssignmentInput{
+		RunID:             runID,
+		AssetID:           assetID,
+		TargetLanguage:    "vi",
+		CustomAssignments: map[string]domain.VoiceProfile{"SPEAKER_00": provider.DefaultPresetVoices("vi")[0]},
+	})
+	if err != nil {
+		t.Fatalf("AssignVoices: %v", err)
+	}
+	fixedProvider, ok := reg.Get("fake_zerotts_tts_vi")
+	if !ok {
+		t.Fatal("the unattended VI fixed-rate lane must be registered")
+	}
+	fixedFake, ok := fixedProvider.(*provider.FakeTTSProvider)
+	if !ok {
+		t.Fatalf("unexpected provider type %T for the fixed-rate lane", fixedProvider)
+	}
+	// The trigger and its group are both measured as segment 0, so one duration serves both:
+	// each probe fills the window it was measured against while its frames do not.
+	fixedFake.CustomDurations = map[int]int64{0: candidateMs}
+
+	// The duration-controlled fallback lane the escalation targets, registered before the run
+	// so the escalation is policy/license eligible. It reproduces the same frame-exact refusal.
+	fallbackFake := provider.NewFakeTTSProvider("fake_cosyvoice3_tts", candidateMs)
+	fallbackFake.CustomDurations = map[int]int64{0: candidateMs}
+	if err := reg.Register(fallbackFake); err != nil {
+		t.Fatalf("register fallback lane: %v", err)
+	}
+	if err := governance.NewLicenseService(db).RegisterManifest(context.Background(), domain.LicenseManifestEntry{
+		DependencyName: "fake_cosyvoice3_tts",
+		Version:        "1.0.0",
+		SHA256:         "sha256_mock_fake_cosyvoice3_tts",
+		SourceRepo:     "github.com/monet88/douyinie/models/fake_cosyvoice3_tts",
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Standard",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("register fallback lane manifest: %v", err)
+	}
+
+	variant, err := dubSvc.SynthesizeAndFit(context.Background(), domain.DubbingJobInput{
+		RunID:               runID,
+		AssetID:             assetID,
+		TargetLanguage:      "vi",
+		DubScriptVariantCAS: scriptCAS.SHA256,
+		VoiceAssignmentCAS:  assign.CASHash,
+	})
+	if err != nil {
+		t.Fatalf("SynthesizeAndFit: %v", err)
+	}
+
+	// The group's refusal is frame-exact only: the measurement the review records fits the
+	// slot, so only the FitController's own verdict marks it an unresolved timing failure.
+	if len(variant.ReviewSegments) != 1 {
+		t.Fatalf("expected the whole group in review, got %+v", variant.ReviewSegments)
+	}
+	review := variant.ReviewSegments[0]
+	if review.FitDecision != domain.FitActionReview || review.ReviewReason != "DURATION_OVERRUN" {
+		t.Fatalf("expected the fit's own DURATION_OVERRUN verdict, got %+v", review)
+	}
+	if review.MeasuredDurationMs > review.SlotDurationMs {
+		t.Fatalf("fixture must fail on frame placement alone, the measurement overran the slot: %+v", review)
+	}
+	if len(review.SpeechBlockIndices) != 2 || review.SpeechBlockIndices[0] != 0 || review.SpeechBlockIndices[1] != 1 {
+		t.Fatalf("the refused group must stay whole in review, got %v", review.SpeechBlockIndices)
+	}
+
+	// The frame-exact overrun still escalates the whole speaker once onto the fallback lane,
+	// and that lane's own frame-exact refusal keeps the outcome unresolved.
+	if len(variant.Escalations) != 1 {
+		t.Fatalf("a frame-exact group overrun must escalate the whole speaker once, got %+v", variant.Escalations)
+	}
+	esc := variant.Escalations[0]
+	if esc.SpeakerID != "SPEAKER_00" || esc.Reason != domain.VoiceEscalationReasonFixedRateOverrun ||
+		esc.ToProviderID != provider.CosyVoiceProviderID ||
+		len(esc.TriggerSegmentIndices) != 1 || esc.TriggerSegmentIndices[0] != 0 {
+		t.Fatalf("unexpected escalation evidence: %+v", esc)
+	}
+	if esc.Resolved {
+		t.Fatalf("the fallback did not clear the frame-exact overrun, so it must stay unresolved: %+v", esc)
+	}
+	if fallbackFake.Invocations != 1 {
+		t.Fatalf("the escalated pass must replay the chosen group exactly once, got %d invocations", fallbackFake.Invocations)
+	}
+	if variant.OverallStatus != "REVIEW_REQUIRED" || len(variant.Segments) != 0 {
+		t.Fatalf("expected an unresolved REVIEW, got status=%s selected=%d", variant.OverallStatus, len(variant.Segments))
+	}
+}
+
 // Issue #154 AC7: accepting a rewrite returns the candidate to natural playback, so the next
 // synthesis of the rewritten text runs at speed 1.0 and neither the selected segment nor the
 // fit evidence carries the CalibrationID of the native-speed retry spent before the rewrite.
