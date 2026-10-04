@@ -573,6 +573,26 @@
                     </div>
                     <dl class="detail-list three" id="inspect-meta"></dl>
 
+                    <!-- Issue #156: review-only tempo alternative, audible but never auto-selected -->
+                    <div id="inspect-tempo" class="tempo-panel hidden">
+                      <div class="tempo-head">
+                        <strong>Phương án tempo</strong>
+                        <span class="status-pill muted" id="inspect-tempo-selectable">—</span>
+                      </div>
+                      <p class="tempo-note" id="inspect-tempo-note"></p>
+                      <dl class="detail-list three" id="inspect-tempo-meta"></dl>
+                      <div class="tempo-audio">
+                        <label class="tempo-audio-row">
+                          <span>Natural (waveform giữ nguyên)</span>
+                          <audio class="hidden" id="inspect-tempo-natural" controls preload="none"></audio>
+                        </label>
+                        <label class="tempo-audio-row">
+                          <span>Tempo alternative (chưa được chọn)</span>
+                          <audio class="hidden" id="inspect-tempo-transformed" controls preload="none"></audio>
+                        </label>
+                      </div>
+                    </div>
+
                     <div class="editor-tabs" role="tablist" aria-label="Loại sửa">
                       <button type="button" class="editor-tab is-active" data-editor-tab="accept">Accept</button>
                       <button type="button" class="editor-tab" data-editor-tab="text">Sửa text</button>

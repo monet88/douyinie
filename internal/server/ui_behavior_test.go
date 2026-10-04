@@ -28,6 +28,30 @@ func TestOperatorUIFollowedCreatorSurface(t *testing.T) {
 	}
 }
 
+// TestOperatorUITempoAuditionSurface pins the markup the Issue #156 audition panel needs in the
+// real page: the behavior harness stubs the DOM, so only this check catches a panel, player or
+// status node that was dropped from index.html.
+func TestOperatorUITempoAuditionSurface(t *testing.T) {
+	index, err := operatorUIFS.ReadFile("ui/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := operatorUIFS.ReadFile("ui/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{`id="inspect-tempo"`, `id="inspect-tempo-selectable"`, `id="inspect-tempo-meta"`, `id="inspect-tempo-natural"`, `id="inspect-tempo-transformed"`} {
+		if !strings.Contains(string(index), marker) {
+			t.Fatalf("tempo audition UI missing %q", marker)
+		}
+	}
+	for _, marker := range []string{"/dub-media/", "tempo_candidate", "playback_duration_ms"} {
+		if !strings.Contains(string(app), marker) {
+			t.Fatalf("tempo audition UI behavior missing %q", marker)
+		}
+	}
+}
+
 // TestOperatorUIAppBehavior pins the Operator UI behaviors that string markers
 // cannot: internal/server/ui/app.js is executed in a Node vm with a stubbed DOM
 // and driven through its real event listeners. It fails if selection stops

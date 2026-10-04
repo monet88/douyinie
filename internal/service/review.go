@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/storage"
 )
@@ -1754,6 +1756,170 @@ func (s *ReviewService) runBoundArtifactCAS(ctx context.Context, runID, stage st
 	return casHash, nil
 }
 
+// Run-scoped dubbing media playback (Issue #156). The transport resolves nothing itself: it
+// parses the request, calls OpenRunDubMedia and maps these sentinel classes to status codes.
+var (
+	// ErrDubMediaInvalidHash reports a requested media hash that is not a sha256 digest.
+	ErrDubMediaInvalidHash = errors.New("invalid audio hash: must be a 64-character hex sha256")
+	// ErrDubMediaRunNotFound reports an unknown run, or a run whose job no longer exists.
+	ErrDubMediaRunNotFound = errors.New("run not found")
+	// ErrDubMediaVariantAbsent reports a run that owns no dubbing variant at all.
+	ErrDubMediaVariantAbsent = errors.New("dub segments variant not found for run")
+	// ErrDubMediaNotOwned reports a variant or hash bound to another asset, language or run.
+	ErrDubMediaNotOwned = errors.New("dubbing media not owned by this run")
+	// ErrDubMediaTooLarge reports an owned artifact past the playback size bound.
+	ErrDubMediaTooLarge = errors.New("audio artifact exceeds playback size limit")
+	// ErrDubMediaObjectMissing reports an owned hash whose CAS object is absent.
+	ErrDubMediaObjectMissing = errors.New("audio media artifact not found in store")
+)
+
+// DubMediaSource is one resolved, run-owned audio artifact ready to stream.
+type DubMediaSource struct {
+	Reader io.ReadCloser
+	Size   int64
+}
+
+// OpenRunDubMedia resolves one bounded audio artifact (natural or transformed) for inspector
+// audition. It is strictly run-scoped and hash-owned: the hash must appear in this run's
+// current DubSegmentsVariant - as a natural waveform on Segments/ReviewSegments or as an
+// atempo alternative on ReviewSegments - so arbitrary paths, cross-run hashes and foreign
+// hashes are refused. Playback reads CAS only and performs no provider, TTS or transform call.
+func (s *ReviewService) OpenRunDubMedia(ctx context.Context, runID, rawHash string) (*DubMediaSource, error) {
+	if s == nil || s.db == nil || s.cas == nil {
+		return nil, errors.New("database and CAS store required for dubbing playback")
+	}
+	hash := strings.ToLower(strings.TrimSpace(rawHash))
+	if _, hexErr := hex.DecodeString(hash); hexErr != nil || len(hash) != 64 {
+		return nil, fmt.Errorf("%w: %q", ErrDubMediaInvalidHash, rawHash)
+	}
+	run, err := s.db.GetRun(ctx, runID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("%w: %s", ErrDubMediaRunNotFound, runID)
+		}
+		return nil, fmt.Errorf("load run %s: %w", runID, err)
+	}
+	job, err := s.db.GetJob(ctx, run.JobID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("%w: job %s", ErrDubMediaRunNotFound, run.JobID)
+		}
+		return nil, fmt.Errorf("load job %s: %w", run.JobID, err)
+	}
+	idx, err := s.runScopedDubbingVariantIndex(ctx, runID, job.SourceAssetID, job.TargetLanguage)
+	if err != nil {
+		return nil, err
+	}
+	if idx == nil {
+		return nil, fmt.Errorf("%w: run %s", ErrDubMediaVariantAbsent, runID)
+	}
+	variant, err := s.loadRunDubbingVariant(idx, job.SourceAssetID, job.TargetLanguage)
+	if err != nil {
+		return nil, err
+	}
+	if !dubVariantOwnsAudioHash(variant, hash) {
+		return nil, fmt.Errorf("%w: audio hash is not owned by this run's dubbing variant", ErrDubMediaNotOwned)
+	}
+	// Playback enforces the tempo transform's own output ceiling - the largest artifact a run can
+	// commit and select, so nothing selectable is unplayable - against the committed object size,
+	// so an oversized or hostile artifact is refused before any of its bytes are read.
+	size, err := s.cas.Size(hash)
+	if err != nil {
+		if errors.Is(err, cas.ErrObjectNotFound) {
+			return nil, fmt.Errorf("%w: %s", ErrDubMediaObjectMissing, hash)
+		}
+		return nil, fmt.Errorf("stat audio media %s: %w", hash, err)
+	}
+	if size > media.DefaultAtempoMaxOutputBytes {
+		return nil, fmt.Errorf("%w: %d bytes", ErrDubMediaTooLarge, size)
+	}
+	reader, err := s.cas.Get(hash)
+	if err != nil {
+		if errors.Is(err, cas.ErrObjectNotFound) {
+			return nil, fmt.Errorf("%w: %s", ErrDubMediaObjectMissing, hash)
+		}
+		return nil, fmt.Errorf("open audio media %s: %w", hash, err)
+	}
+	return &DubMediaSource{Reader: reader, Size: size}, nil
+}
+
+// dubVariantOwnsAudioHash reports whether hash is one of the variant's committed audio
+// references: a selected segment waveform, a review segment's retained natural waveform, or
+// either side of its tempo candidate.
+func dubVariantOwnsAudioHash(variant *domain.DubSegmentsVariant, hash string) bool {
+	if variant == nil || hash == "" {
+		return false
+	}
+	if slices.ContainsFunc(variant.Segments, func(seg domain.DubSegment) bool {
+		return strings.EqualFold(seg.AudioSHA256, hash)
+	}) {
+		return true
+	}
+	return slices.ContainsFunc(variant.ReviewSegments, func(rev domain.DubSegmentReview) bool {
+		if strings.EqualFold(rev.AudioSHA256, hash) {
+			return true
+		}
+		tc := rev.TempoCandidate
+		return tc != nil && (strings.EqualFold(tc.NaturalAudioSHA256, hash) ||
+			strings.EqualFold(tc.TransformedAudioSHA256, hash))
+	})
+}
+
+// runScopedDubbingVariantIndex resolves the DubSegmentsVariant index bound to runID, preferring
+// the run's own index row and falling back to the variant its dub_synthesize stage execution
+// recorded, still pinned to this asset and language. (nil, nil) means the run owns no dubbing
+// variant at all; a row bound to another asset or language is ErrDubMediaNotOwned.
+//
+// The index row is fetched by run_id, so its RunID is the requested run and is the claim the
+// decoded variant must satisfy. The fallback instead synthesizes an index from the requested
+// run's own dub_synthesize stage artifact, with no RunID claim: a replay run legitimately
+// consumes an artifact whose immutable body an older run produced (see runBoundArtifactCAS), so
+// the stage execution - not a re-derived run claim - is the authoritative run binding. The
+// asset/language binding still applies to both paths.
+func (s *ReviewService) runScopedDubbingVariantIndex(ctx context.Context, runID, assetID, targetLang string) (*storage.DubSegmentsVariantIndex, error) {
+	idx, err := s.db.GetDubSegmentsVariantIndexByRun(ctx, runID)
+	if errors.Is(err, storage.ErrNotFound) {
+		casHash, boundErr := s.runBoundArtifactCAS(ctx, runID, "dub_synthesize")
+		if boundErr != nil {
+			return nil, boundErr
+		}
+		if casHash == "" {
+			return nil, nil
+		}
+		idx, err = &storage.DubSegmentsVariantIndex{AssetID: assetID, TargetLanguage: targetLang, CASHash: casHash}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query dub segments variant index: %w", err)
+	}
+	if idx.AssetID != assetID || !strings.EqualFold(idx.TargetLanguage, targetLang) {
+		return nil, fmt.Errorf("%w: dub segments variant run binding mismatch for run %s", ErrDubMediaNotOwned, runID)
+	}
+	return idx, nil
+}
+
+// loadRunDubbingVariant reads and decodes one indexed variant, verifying it still belongs to
+// this asset and language - and to idx's run when the index row claims one - before any of its
+// audio hashes are trusted.
+func (s *ReviewService) loadRunDubbingVariant(idx *storage.DubSegmentsVariantIndex, assetID, targetLang string) (*domain.DubSegmentsVariant, error) {
+	if idx.CASHash == "" {
+		return nil, errors.New("dub segments variant index has empty CAS hash")
+	}
+	rc, err := s.cas.Get(idx.CASHash)
+	if err != nil {
+		return nil, fmt.Errorf("load dub segments variant from CAS (%s): %w", idx.CASHash, err)
+	}
+	defer rc.Close()
+	var variant domain.DubSegmentsVariant
+	if err := json.NewDecoder(rc).Decode(&variant); err != nil {
+		return nil, fmt.Errorf("decode dub segments variant (%s): %w", idx.CASHash, err)
+	}
+	if variant.AssetID != assetID || !strings.EqualFold(variant.TargetLanguage, targetLang) ||
+		(idx.RunID != "" && variant.RunID != idx.RunID) {
+		return nil, fmt.Errorf("%w: dub segments variant ownership mismatch for asset %q target %q", ErrDubMediaNotOwned, assetID, targetLang)
+	}
+	return &variant, nil
+}
+
 func (s *ReviewService) ProjectAllReviewItems(ctx context.Context, assetID, targetLang string) ([]domain.ReviewItem, error) {
 	return s.projectAllReviewItems(ctx, assetID, targetLang, "")
 }
@@ -2001,42 +2167,20 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 	var hasDubSegments bool
 	var dubSegIdx *storage.DubSegmentsVariantIndex
 	if runID != "" {
-		dubSegIdx, err = s.db.GetDubSegmentsVariantIndexByRun(ctx, runID)
-		if errors.Is(err, storage.ErrNotFound) {
-			casHash, boundErr := s.runBoundArtifactCAS(ctx, runID, "dub_synthesize")
-			if boundErr != nil {
-				return nil, boundErr
-			}
-			if casHash != "" {
-				dubSegIdx = &storage.DubSegmentsVariantIndex{AssetID: assetID, RunID: runID, TargetLanguage: targetLang, CASHash: casHash}
-				err = nil
-			}
-		}
-		if err == nil && (dubSegIdx.AssetID != assetID || !strings.EqualFold(dubSegIdx.TargetLanguage, targetLang)) {
-			return nil, fmt.Errorf("dub segments variant run binding mismatch for run %s", runID)
+		dubSegIdx, err = s.runScopedDubbingVariantIndex(ctx, runID, assetID, targetLang)
+		if err != nil {
+			return nil, err
 		}
 	} else {
 		dubSegIdx, err = s.db.GetDubSegmentsVariantIndex(ctx, assetID, targetLang)
-	}
-	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return nil, fmt.Errorf("query dub segments variant index: %w", err)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return nil, fmt.Errorf("query dub segments variant index: %w", err)
+		}
 	}
 	if dubSegIdx != nil {
-		if dubSegIdx.CASHash == "" {
-			return nil, fmt.Errorf("dub segments variant index has empty CAS hash")
-		}
-		rc, err := s.cas.Get(dubSegIdx.CASHash)
+		dsVar, err := s.loadRunDubbingVariant(dubSegIdx, assetID, targetLang)
 		if err != nil {
-			return nil, fmt.Errorf("load dub segments variant from CAS (%s): %w", dubSegIdx.CASHash, err)
-		}
-		var dsVar domain.DubSegmentsVariant
-		if err := json.NewDecoder(rc).Decode(&dsVar); err != nil {
-			rc.Close()
-			return nil, fmt.Errorf("decode dub segments variant (%s): %w", dubSegIdx.CASHash, err)
-		}
-		rc.Close()
-		if dsVar.AssetID != assetID || !strings.EqualFold(dsVar.TargetLanguage, targetLang) {
-			return nil, fmt.Errorf("dub segments variant ownership mismatch for asset %q target %q", assetID, targetLang)
+			return nil, err
 		}
 		hasDubSegments = true
 		createdAt := dsVar.CreatedAt
@@ -2048,6 +2192,28 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 			reason := rev.ReviewReason
 			if reason == "" {
 				reason = "tts_unresolvable_overrun"
+			}
+			details := map[string]any{
+				"measured_duration_ms": rev.MeasuredDurationMs,
+				"slot_duration_ms":     rev.SlotDurationMs,
+				"fit_decision":         string(rev.FitDecision),
+				"attempt_count":        rev.AttemptCount,
+				"natural_audio_sha256": rev.AudioSHA256,
+			}
+			if tc := rev.TempoCandidate; tc != nil {
+				details["tempo_candidate"] = map[string]any{
+					"factor":                   tc.Factor,
+					"natural_audio_sha256":     tc.NaturalAudioSHA256,
+					"transformed_audio_sha256": tc.TransformedAudioSHA256,
+					"natural_duration_ms":      tc.NaturalDurationMs,
+					"transformed_duration_ms":  tc.TransformedDurationMs,
+					"playback_duration_ms":     tc.PlaybackDurationMs,
+					"selectable":               tc.Selectable,
+					"reason":                   tc.Reason,
+					"tool_id":                  tc.ToolID,
+					"filter":                   tc.Filter,
+					"policy_version":           tc.PolicyVersion,
+				}
 			}
 			items = append(items, domain.ReviewItem{
 				ID:             fmt.Sprintf("rev-dubseg-rev-%s-%d", dubSegIdx.CASHash, rev.Index),
@@ -2063,14 +2229,9 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 				EndMs:          rev.EndMs,
 				Severity:       "blocker",
 				Reason:         reason,
-				Details: map[string]any{
-					"measured_duration_ms": rev.MeasuredDurationMs,
-					"slot_duration_ms":     rev.SlotDurationMs,
-					"fit_decision":         string(rev.FitDecision),
-					"attempt_count":        rev.AttemptCount,
-				},
-				Status:    domain.ReviewItemStatusPending,
-				CreatedAt: createdAt,
+				Details:        details,
+				Status:         domain.ReviewItemStatusPending,
+				CreatedAt:      createdAt,
 			})
 		}
 		// Segments that flagged RequiresReview

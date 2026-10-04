@@ -951,12 +951,11 @@ func (s *BundleService) collectReachableCASHashes(manifest *domain.JobBundleMani
 				return nil, err
 			}
 		}
-		for _, att := range runData.ProviderAttempts {
-			if err := addIfCAS(att.InputHash); err != nil {
-				return nil, err
-			}
-		}
-
+		// Issue #156 acceptance invariant: ProviderAttempt.InputHash is a request/provenance digest
+		// (TTS text+voice+speed, translation input, discovery query), not a CAS artifact reference.
+		// Treating it as a CAS requirement breaks export of real runs whose attempts record non-CAS
+		// request digests. Media inputs (source asset, preflight normalized audio) are traversed
+		// explicitly; excluding attempt digests from reachable CAS objects is required for bundle closure.
 		if ta := runData.TranscriptArtifact; ta != nil {
 			if err := addIfCAS(ta.CASHash); err != nil {
 				return nil, err
@@ -989,6 +988,15 @@ func (s *BundleService) collectReachableCASHashes(manifest *domain.JobBundleMani
 			for _, rev := range dsv.ReviewSegments {
 				if err := addIfCAS(rev.AudioSHA256); err != nil {
 					return nil, err
+				}
+				if tc := rev.TempoCandidate; tc != nil {
+					// Required CAS objects, exactly as collectManifestReferencedHashes treats them.
+					if err := addIfCAS(tc.NaturalAudioSHA256); err != nil {
+						return nil, err
+					}
+					if err := addIfCAS(tc.TransformedAudioSHA256); err != nil {
+						return nil, err
+					}
 				}
 			}
 		}
@@ -1063,9 +1071,8 @@ func (s *BundleService) collectManifestReferencedHashes(manifest *domain.JobBund
 		for _, se := range runData.StageExecutions {
 			addHash(se.ArtifactSHA256)
 		}
-		for _, att := range runData.ProviderAttempts {
-			addHash(att.InputHash)
-		}
+		// Issue #156: ProviderAttempt.InputHash is a request/provenance digest, not an artifact the
+		// bundle archive ships; it is deliberately excluded from manifest referenced CAS hashes.
 		if ta := runData.TranscriptArtifact; ta != nil {
 			addHash(ta.CASHash)
 		}
@@ -1085,6 +1092,10 @@ func (s *BundleService) collectManifestReferencedHashes(manifest *domain.JobBund
 			}
 			for _, rev := range dsv.ReviewSegments {
 				addHash(rev.AudioSHA256)
+				if tc := rev.TempoCandidate; tc != nil {
+					addHash(tc.NaturalAudioSHA256)
+					addHash(tc.TransformedAudioSHA256)
+				}
 			}
 		}
 		if dma := runData.DubMixArtifact; dma != nil {

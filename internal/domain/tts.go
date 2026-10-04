@@ -50,7 +50,11 @@ const (
 	// chosen group per lineage per logical attempt, with canonical membership/anchors and
 	// no iterative growth, so a pre-#155 variant that grew through repeated regroup
 	// synthesis must not be replayed for a #155 request.
-	DubSegmentsSchemaVersion = 5
+	// Version 6 adds the review-only FFmpeg tempo candidate (#156): an unresolved overrun
+	// may carry one atempo alternative derived from its own retained waveform, with a
+	// distinct transformed hash, factor and re-probed durations. A pre-#156 variant has no
+	// such evidence and must not be replayed as if the tempo slice had run for it.
+	DubSegmentsSchemaVersion = 6
 )
 
 // VoiceProfile represents a preset or cloned voice configuration.
@@ -260,6 +264,71 @@ type DubSegment struct {
 	CalibrationID      string       `json:"calibration_id,omitempty"`
 }
 
+// DubTempoCandidate is the review-only FFmpeg atempo alternative generated for one
+// unresolved duration overrun once every natural remedy is exhausted (Issue #156). It is
+// derived from the review unit's own retained waveform and is never selected: it exists so
+// the operator can audition the transform and so the run keeps honest duration evidence.
+type DubTempoCandidate struct {
+	// NaturalAudioSHA256 is the intact retained waveform this alternative was derived from:
+	// the same hash the review unit already carries as its natural candidate.
+	NaturalAudioSHA256 string `json:"natural_audio_sha256"`
+	// TransformedAudioSHA256 is the FFmpeg atempo output committed to CAS. Empty when no
+	// transform was generated (ineligible factor, missing/unreadable source, or failure).
+	// It is the only handle to the transformed artifact: playback resolves it by hash, and
+	// no machine-local CAS path is persisted or published for it (Issue #156).
+	TransformedAudioSHA256 string `json:"transformed_audio_sha256,omitempty"`
+	// Factor is the required tempo factor computed from the retained waveform's exact frame
+	// geometry over the accepted playback window, both in the mixer's output sample rate.
+	Factor float64 `json:"factor"`
+	// NaturalDurationMs and TransformedDurationMs are measured millisecond evidence. They are
+	// never the eligibility or fit gate: a floored millisecond probe can fit a window the
+	// waveform still overruns in frames.
+	NaturalDurationMs     int64 `json:"natural_duration_ms"`
+	TransformedDurationMs int64 `json:"transformed_duration_ms,omitempty"`
+	// PlaybackDurationMs is the accepted playback window (DubPlaybackEndMs - StartMs) the
+	// factor is measured against. It is deliberately not the immutable source slot duration.
+	PlaybackDurationMs int64 `json:"playback_duration_ms"`
+	// Selectable reports whether the re-probed transformed output actually fits the accepted
+	// playback window. It is honest fit evidence only: the candidate stays unselected and
+	// REVIEW_REQUIRED at every factor, and this flag never creates a quality PASS.
+	Selectable bool `json:"selectable"`
+	// Reason is the deterministic outcome (TempoReason*).
+	Reason string `json:"reason"`
+	// ToolID identifies the transform tool, e.g. "ffmpeg-atempo".
+	ToolID string `json:"tool_id"`
+	// Filter is the exact single filter applied, e.g. "atempo=1.250000".
+	Filter string `json:"filter,omitempty"`
+	// PolicyVersion is the fit policy identity that judged eligibility.
+	PolicyVersion string `json:"policy_version,omitempty"`
+}
+
+// The review-only tempo outcomes. None of them selects the candidate: they exist so the
+// operator and the bundle see why an overrun has or has not a DSP alternative.
+const (
+	// TempoToolID identifies the only transform tool the tempo slice may use.
+	TempoToolID = "ffmpeg-atempo"
+	// TempoReasonFits: the transformed output fits the accepted playback window.
+	TempoReasonFits = "TEMPO_CANDIDATE_WITHIN_WINDOW"
+	// TempoReasonOverrun: the transformed output still overruns the window (no crop/retry).
+	TempoReasonOverrun = "TEMPO_CANDIDATE_STILL_OVERRUN"
+	// TempoReasonFactorOutOfRange: factor <= 1 or factor > 1.25, so no DSP is generated.
+	TempoReasonFactorOutOfRange = "TEMPO_FACTOR_OUT_OF_RANGE"
+	// TempoReasonSourceInvalid: no intact, readable natural waveform to transform.
+	TempoReasonSourceInvalid = "TEMPO_SOURCE_UNAVAILABLE"
+	// TempoReasonToolUnavailable: ffmpeg (or its binary) is not available.
+	TempoReasonToolUnavailable = "TEMPO_TOOL_UNAVAILABLE"
+	// TempoReasonTransformFailed: the FFmpeg transform failed.
+	TempoReasonTransformFailed = "TEMPO_TRANSFORM_FAILED"
+	// TempoReasonOutputTooLarge: the transform produced more bytes than the bound allows.
+	TempoReasonOutputTooLarge = "TEMPO_OUTPUT_TOO_LARGE"
+	// TempoReasonOutputInvalid: the transform output could not be probed as valid audio.
+	TempoReasonOutputInvalid = "TEMPO_OUTPUT_INVALID"
+	// TempoReasonCancelled: the transform was cancelled or timed out before any candidate
+	// existed. It is honest review evidence, not a pass failure: the retained natural
+	// waveform stays playable and no transformed artifact is committed.
+	TempoReasonCancelled = "TEMPO_CANCELLED"
+)
+
 // DubSegmentReview records an unselected candidate or segment flagged for operator review.
 type DubSegmentReview struct {
 	Index              int          `json:"index"`
@@ -280,6 +349,10 @@ type DubSegmentReview struct {
 	DubPlaybackEndMs   int64        `json:"dub_playback_end_ms"`
 	EffectiveReserveMs int64        `json:"effective_reserve_ms"`
 	CalibrationID      string       `json:"calibration_id,omitempty"`
+	// TempoCandidate is the review-only DSP alternative (Issue #156). Nil when the unit never
+	// had an intact natural waveform to transform (invalid timing, missing replacement) or
+	// when the remedy sequence had not been exhausted for it.
+	TempoCandidate *DubTempoCandidate `json:"tempo_candidate,omitempty"`
 }
 
 // VoiceEscalationReasonFixedRateOverrun is the deterministic reason recorded when a

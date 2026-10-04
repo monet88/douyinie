@@ -1571,6 +1571,7 @@ func (s *Server) routes() {
 	// TTS Synthesis & Fit Controller (T14: Measured-duration DubSegmentsVariant)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/dub-synthesize", s.handleRunDubSynthesize)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/dub-segments", s.handleGetDubSegments)
+	s.mux.HandleFunc("GET /api/v1/runs/{id}/dub-media/{hash}", s.handleGetRunDubMedia)
 	// Audio Stem Separation & Deterministic Mix (T15)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/separate-stems", s.handleRunSeparateStems)
 	s.mux.HandleFunc("GET /api/v1/assets/{id}/audio-stems", s.handleGetAudioStems)
@@ -3201,6 +3202,51 @@ func (s *Server) handleGetDubSegments(w http.ResponseWriter, r *http.Request) {
 	variant.CASHash = idx.CASHash
 	variant.ProvenanceHash = idx.ProvenanceHash
 	writeJSON(w, http.StatusOK, map[string]any{"dub_segments_variant": variant})
+}
+
+// handleGetRunDubMedia serves one bounded audio artifact (natural or transformed) for
+// audition in the inspector (Issue #156). The handler stays transport-only: it parses the
+// request, calls the run-scoped resolver and maps its sentinel classes to status codes.
+// Resolution, ownership (run/asset/language), hash ownership and the playback bound are
+// ReviewService policy shared with the review projection.
+func (s *Server) handleGetRunDubMedia(w http.ResponseWriter, r *http.Request) {
+	if s.reviewSvc == nil {
+		writeError(w, http.StatusInternalServerError, "review service required")
+		return
+	}
+	source, err := s.reviewSvc.OpenRunDubMedia(r.Context(), r.PathValue("id"), r.PathValue("hash"))
+	if err != nil {
+		s.writeDubMediaError(w, r.PathValue("id"), err)
+		return
+	}
+	defer source.Reader.Close()
+
+	w.Header().Set("Content-Type", "audio/wav")
+	w.Header().Set("Content-Length", strconv.FormatInt(source.Size, 10))
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, io.LimitReader(source.Reader, source.Size))
+}
+
+// writeDubMediaError maps the resolver's sentinel playback classes to transport statuses.
+// Unclassified resolution failures are logged server-side and answered with a fixed message:
+// they can wrap *os.PathError values that embed absolute CAS paths, and this endpoint never
+// exposes filesystem paths to the client (Issue #156).
+func (s *Server) writeDubMediaError(w http.ResponseWriter, runID string, err error) {
+	switch {
+	case errors.Is(err, service.ErrDubMediaInvalidHash):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, service.ErrDubMediaNotOwned):
+		writeError(w, http.StatusForbidden, err.Error())
+	case errors.Is(err, service.ErrDubMediaTooLarge):
+		writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+	case errors.Is(err, service.ErrDubMediaRunNotFound),
+		errors.Is(err, service.ErrDubMediaVariantAbsent),
+		errors.Is(err, service.ErrDubMediaObjectMissing):
+		writeError(w, http.StatusNotFound, err.Error())
+	default:
+		log.Printf("[dub-media] run %s resolution failed: %v", runID, err)
+		writeError(w, http.StatusInternalServerError, "dub media resolution failed")
+	}
 }
 
 func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
