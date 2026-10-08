@@ -70,14 +70,31 @@ func (s *Store) ResolvePath(hash string) (string, error) {
 	return filepath.Join(s.casDir, cleanHash[0:2], cleanHash[2:4], cleanHash), nil
 }
 
-// Exists checks if an object with the given SHA-256 is present in the CAS.
+// Exists checks if an object with the given SHA-256 is present in the CAS. Presence is exactly
+// what Size resolves: a malformed hash, a missing path and a directory are all "not an object".
 func (s *Store) Exists(hash string) bool {
+	_, err := s.Size(hash)
+	return err == nil
+}
+
+// Size returns the committed byte size of an object without reading it, so a caller can bound
+// or advertise a response before streaming the body.
+func (s *Store) Size(hash string) (int64, error) {
 	p, err := s.ResolvePath(hash)
 	if err != nil {
-		return false
+		return 0, err
 	}
 	info, err := os.Stat(p)
-	return err == nil && !info.IsDir()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, ErrObjectNotFound
+		}
+		return 0, err
+	}
+	if info.IsDir() {
+		return 0, ErrObjectNotFound
+	}
+	return info.Size(), nil
 }
 
 // Put writes stream content into CAS using atomic same-volume staging and rename.

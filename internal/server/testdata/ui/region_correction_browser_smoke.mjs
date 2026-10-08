@@ -12,13 +12,17 @@
 // Usage: node region_correction_browser_smoke.mjs <operator-ui-url>
 // Exit codes: 0 = pass, 1 = failure, 3 = no Chromium-family browser available (caller skips).
 
-import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { rmSync } from "node:fs";
 
-const SKIP_EXIT_CODE = 3;
-const FLOW_TIMEOUT_MS = 20000;
+import {
+  SKIP_EXIT_CODE,
+  sleep,
+  findBrowser,
+  CDP,
+  launchBrowser,
+  createChecklist,
+  attachPage,
+} from "./cdp_client.mjs";
 
 const uiUrl = process.argv[2];
 if (!uiUrl) {
@@ -26,144 +30,9 @@ if (!uiUrl) {
   process.exit(1);
 }
 
-function findBrowser() {
-  const candidates = [
-    process.env.DOUYINIE_CHROME_BIN,
-    "C:/Program Files/Google/Chrome/Application/chrome.exe",
-    "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
-    "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
-    "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
-    "/usr/bin/google-chrome",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    if (candidate.includes("/") || candidate.includes("\\")) {
-      if (existsSync(candidate)) return candidate;
-      continue;
-    }
-    const probe = spawnSync(candidate, ["--version"], { encoding: "utf8" });
-    if (probe.status === 0) return candidate;
-  }
-  return null;
-}
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-class CDP {
-  constructor(socket) {
-    this.socket = socket;
-    this.nextId = 1;
-    this.pending = new Map();
-    this.listeners = new Map();
-    socket.addEventListener("message", (event) => this.#onMessage(event.data));
-    socket.addEventListener("close", () => {
-      for (const { reject } of this.pending.values()) reject(new Error("CDP connection closed"));
-      this.pending.clear();
-    });
-  }
-
-  static async connect(url) {
-    const socket = new WebSocket(url);
-    await new Promise((resolve, reject) => {
-      socket.addEventListener("open", resolve, { once: true });
-      socket.addEventListener("error", () => reject(new Error(`cannot connect to ${url}`)), { once: true });
-    });
-    return new CDP(socket);
-  }
-
-  #onMessage(raw) {
-    const message = JSON.parse(typeof raw === "string" ? raw : raw.toString());
-    if (message.id && this.pending.has(message.id)) {
-      const { resolve, reject } = this.pending.get(message.id);
-      this.pending.delete(message.id);
-      if (message.error) reject(new Error(`${message.error.message}${message.error.data ? `: ${message.error.data}` : ""}`));
-      else resolve(message.result);
-      return;
-    }
-    if (message.method) {
-      for (const listener of this.listeners.get(message.method) || []) {
-        listener(message.params, message.sessionId);
-      }
-    }
-  }
-
-  on(method, listener) {
-    if (!this.listeners.has(method)) this.listeners.set(method, []);
-    this.listeners.get(method).push(listener);
-  }
-
-  send(method, params = {}, sessionId) {
-    const id = this.nextId++;
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      const payload = { id, method, params };
-      if (sessionId) payload.sessionId = sessionId;
-      this.socket.send(JSON.stringify(payload));
-    });
-  }
-
-  close() {
-    this.socket.close();
-  }
-}
-
-async function launchBrowser(browserPath) {
-  const profileDir = mkdtempSync(join(tmpdir(), "douyinie-browser-smoke-"));
-  const child = spawn(
-    browserPath,
-    [
-      "--headless=new",
-      "--remote-debugging-port=0",
-      `--user-data-dir=${profileDir}`,
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-extensions",
-      "--disable-background-networking",
-      "--disable-features=Translate,MediaRouter",
-      "--autoplay-policy=no-user-gesture-required",
-      "--hide-scrollbars",
-      "--window-size=1440,1000",
-      "about:blank",
-    ],
-    { stdio: ["ignore", "pipe", "pipe"] },
-  );
-
-  let endpoint = "";
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => {
-    const match = /DevTools listening on (ws:\/\/\S+)/.exec(chunk);
-    if (match && !endpoint) endpoint = match[1];
-  });
-
-  const deadline = Date.now() + 20000;
-  while (!endpoint && Date.now() < deadline && child.exitCode === null) {
-    await sleep(50);
-  }
-  if (!endpoint) {
-    child.kill();
-    throw new Error("the browser never reported a DevTools endpoint");
-  }
-  return { child, endpoint, profileDir };
-}
-
-const failures = [];
-const checks = [];
+const { check, failures, checks } = createChecklist();
 const expectedAbsentArtifacts = [];
 const consoleErrors = [];
-
-function check(label, condition, detail = "") {
-  if (condition) {
-    checks.push(label);
-    console.log(`ok   ${label}`);
-    return true;
-  }
-  failures.push(`${label}${detail ? ` (${detail})` : ""}`);
-  console.log(`FAIL ${label}${detail ? ` — ${detail}` : ""}`);
-  return false;
-}
 
 const browserPath = findBrowser();
 if (!browserPath) {
@@ -180,47 +49,10 @@ let cdp = null;
 
 try {
   cdp = await CDP.connect(endpoint);
-  const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
-  const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
-  const session = (method, params = {}) => cdp.send(method, params, sessionId);
-
-  // The console is the acceptance criterion's other half: a flow that "works" while the
-  // client throws is not a clean flow.
-  cdp.on("Runtime.exceptionThrown", (params, sid) => {
-    if (sid !== sessionId) return;
-    const details = params.exceptionDetails || {};
-    consoleErrors.push(`exception: ${details.exception?.description || details.text}`);
+  const { session, evaluate, waitFor, rectOf, textOf, valueOf, mouse, clickElement } = await attachPage(cdp, {
+    consoleErrors,
+    expectedAbsentArtifacts,
   });
-  cdp.on("Runtime.consoleAPICalled", (params, sid) => {
-    if (sid !== sessionId || params.type !== "error") return;
-    consoleErrors.push(`console.error: ${params.args.map((arg) => arg.value ?? arg.description ?? "").join(" ")}`);
-  });
-  cdp.on("Log.entryAdded", (params, sid) => {
-    if (sid !== sessionId) return;
-    const entry = params.entry || {};
-    if (entry.level !== "error") return;
-    // 404 is the UI's documented "artifact not written yet" protocol (an optional panel it
-    // renders as empty); Chrome still reports the fetch in the network log. Everything else
-    // — and every JS error — is a real failure.
-    if (entry.source === "network" && /404/.test(entry.text)) {
-      expectedAbsentArtifacts.push(entry.text);
-      return;
-    }
-    consoleErrors.push(`log(${entry.source}): ${entry.text}`);
-  });
-
-  await session("Page.enable");
-  await session("Runtime.enable");
-  await session("Log.enable");
-
-  async function evaluate(expression, { awaitPromise = false } = {}) {
-    const result = await session("Runtime.evaluate", { expression, returnByValue: true, awaitPromise });
-    if (result.exceptionDetails) {
-      const details = result.exceptionDetails;
-      throw new Error(`page evaluation failed: ${details.exception?.description || details.text}\n${expression}`);
-    }
-    return result.result?.value;
-  }
 
   pageDiagnostics = async () => {
     const lines = [`page url: ${await evaluate("window.location.href").catch(() => "?")}`];
@@ -242,37 +74,6 @@ try {
     lines.push(`console errors: ${consoleErrors.length ? consoleErrors.join(" | ") : "none"}`);
     return lines;
   };
-
-  async function waitFor(label, probe, timeoutMs = FLOW_TIMEOUT_MS) {
-    const deadline = Date.now() + timeoutMs;
-    let last = null;
-    while (Date.now() < deadline) {
-      last = await probe();
-      if (last) return last;
-      await sleep(100);
-    }
-    throw new Error(`timed out waiting for ${label} (last probe value: ${JSON.stringify(last)})`);
-  }
-
-  const rectOf = (selector) =>
-    evaluate(`(() => {
-      const el = document.querySelector(${JSON.stringify(selector)});
-      if (!el) return null;
-      const r = el.getBoundingClientRect();
-      return { x: r.x, y: r.y, width: r.width, height: r.height };
-    })()`);
-
-  const textOf = (selector) =>
-    evaluate(`(() => {
-      const el = document.querySelector(${JSON.stringify(selector)});
-      return el ? el.textContent : null;
-    })()`);
-
-  const valueOf = (selector) =>
-    evaluate(`(() => {
-      const el = document.querySelector(${JSON.stringify(selector)});
-      return el ? el.value : null;
-    })()`);
 
   const previewArtifactParam = () =>
     evaluate(`(() => {
@@ -303,20 +104,6 @@ try {
       { awaitPromise: true },
     );
 
-  async function mouse(type, x, y, extra = {}) {
-    await session("Input.dispatchMouseEvent", {
-      type,
-      x,
-      y,
-      button: "left",
-      buttons: type === "mouseReleased" ? 0 : 1,
-      clickCount: 1,
-      ...extra,
-    });
-  }
-
-  // Trusted pointer gestures: pressed → several moves → released, exactly what a drag on the
-  // box emits. The app listens for pointer events, which mouse input synthesizes in Blink.
   async function drag(rect, dx, dy) {
     const x = rect.x + rect.width / 2;
     const y = rect.y + rect.height / 2;
@@ -328,25 +115,6 @@ try {
     }
     await mouse("mouseReleased", x + dx, y + dy);
     await sleep(50);
-  }
-
-  async function clickElement(selector) {
-    // A real operator scrolls the target into view; without this a control below the fold
-    // has viewport coordinates outside the browser window and the synthesized click hits
-    // nothing.
-    await evaluate(`(() => {
-      const el = document.querySelector(${JSON.stringify(selector)});
-      if (el) el.scrollIntoView({ block: "center", inline: "nearest" });
-    })()`);
-    await sleep(120);
-    const rect = await rectOf(selector);
-    if (!rect || rect.width === 0 || rect.height === 0) throw new Error(`${selector} is not visible`);
-    const x = rect.x + rect.width / 2;
-    const y = rect.y + rect.height / 2;
-    await mouse("mouseMoved", x, y, { buttons: 0 });
-    await mouse("mousePressed", x, y);
-    await mouse("mouseReleased", x, y);
-    return rect;
   }
 
   await session("Page.navigate", { url: uiUrl });

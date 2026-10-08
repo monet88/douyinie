@@ -36,6 +36,15 @@ type DubbingService struct {
 	// TTSInvoke executes one TTS provider synthesis attempt. When nil,
 	// router-backed invocation is used.
 	TTSInvoke TTSInvokeFunc
+
+	// AtempoTransform overrides media.ApplyAtempoWAV for controllable transform testing.
+	AtempoTransform func(ctx context.Context, req media.AtempoRequest) ([]byte, error)
+
+	// beforeRunRowClaim, when set, runs once immediately before a pass attempts to claim the
+	// run's dub-variant row. It is a test-only seam (see export_test.go): it lands a concurrent
+	// operator reassignment inside the publish/escalation window deterministically, which is the
+	// interleaving the claim statement's own ownership guard exists to refuse.
+	beforeRunRowClaim func()
 }
 
 // lineageRecoveryState tracks per-source-lineage consumption of native-speed, measured-
@@ -1257,6 +1266,55 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 	}
 
 	recoveryState := newLineageRecoveryState()
+
+	// commit publishes a pass: CAS derives its identity from the variant's own canonical
+	// bytes, and the run-scoped index moves to that artifact while the pass still belongs to the
+	// run's current voice assignment. A variant that already carries its committed identity came
+	// from the idempotent synthesis cache, so it is the artifact a previous call published and is
+	// returned untouched.
+	publish := func(variant *domain.DubSegmentsVariant) (*domain.DubSegmentsVariant, error) {
+		if variant.CASHash != "" {
+			return variant, nil
+		}
+		commitCtx, cancelCommit := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancelCommit()
+		if err := s.commitDubSegmentsVariant(commitCtx, variant); err != nil {
+			return nil, err
+		}
+		return variant, nil
+	}
+
+	// Issue #156: the pass that ends the configured remedy sequence derives the review-only
+	// atempo alternative for each unresolved unit before those bytes become the published
+	// artifact. Committing is cancellation-independent because cancellation is recorded as
+	// TEMPO_CANCELLED evidence - a bookkeeping write the operator must be able to read - while
+	// run control still stops the run through the caller's own cancellation check.
+	finalize := func(variant *domain.DubSegmentsVariant) (*domain.DubSegmentsVariant, error) {
+		// A committed variant came from the idempotent synthesis cache, so it already carries the
+		// work this call would redo - with two exceptions, both re-derived from the cached pass's
+		// own retained waveform without re-running TTS. One is evidence a transient transform
+		// failure recorded about the run that was interrupted, which is not a verdict on the
+		// pass. The other is a pass published before an escalation a later attempt could not
+		// repeat (the fallback lane is no longer route-eligible, or the escalation was refused):
+		// it is not final, so an eligible unresolved overrun it still carries must gain its
+		// tempo evidence here instead of being returned as the run's canonical artifact.
+		if variant.CASHash != "" {
+			if !resetRetryableTempoEvidence(variant) && tempoEvidenceComplete(variant) {
+				return variant, nil
+			}
+			variant.CASHash = ""
+		}
+		s.attachTempoCandidates(ctx, variant)
+		published, err := publish(variant)
+		if err != nil {
+			return nil, err
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return published, ctxErr
+		}
+		return published, nil
+	}
+
 	pass, err := s.synthesizeSegmentsPass(ctx, in, dubScript, dubScriptCAS, voiceAssign, voiceAssignCAS, nil, nil, recoveryState)
 	if err != nil {
 		return nil, err
@@ -1268,20 +1326,60 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 	// fallback lane (CosyVoice3). The escalation supersedes that speaker's frozen
 	// assignment and regenerates only its descendants; whatever is still unresolved
 	// after the escalated regeneration projects REVIEW instead of hopping again.
-	if plan := s.planSpeakerEscalation(ctx, in, voiceAssign, pass); plan != nil {
-		superseding, err := s.applySpeakerEscalation(ctx, in, voiceAssign, plan)
-		if err != nil {
-			return nil, err
-		}
-		if superseding == nil {
-			// The run moved on to a newer assignment that is not this escalation, so
-			// the unresolved overrun above stays REVIEW instead of reverting it.
-			return pass, nil
-		}
-		return s.synthesizeSegmentsPass(ctx, in, dubScript, dubScriptCAS, superseding, superseding.CASHash, pass, plan.evidence, recoveryState)
+	plan := s.planSpeakerEscalation(ctx, in, voiceAssign, pass)
+	if plan == nil {
+		// Issue #156: no escalation applies, so this pass already exhausted the natural
+		// remedies and each unresolved unit may carry exactly one atempo candidate.
+		return finalize(pass)
 	}
-
-	return pass, nil
+	// The pre-escalation pass is published before the escalation that supersedes it - and
+	// before any work that can fail - so a retried synthesis reads it from the idempotent
+	// cache instead of re-running TTS for it, and a failed escalation cannot lose a pass that
+	// already completed. Its remedy sequence is not exhausted, so it carries no atempo
+	// candidate; only the final pass does.
+	//
+	// A pass that already belongs to a superseded assignment is committed without claiming the
+	// run's dub-variant row (#156): the row keeps resolving to the current assignment's pass, the
+	// one that carries this issue's tempo evidence, instead of being taken over by superseded
+	// audio. The ownership test is the claim statement itself, so a reassignment that lands while
+	// this pass is being published - after the request decided to escalate and before the
+	// escalation decision below - refuses the claim rather than being missed by a stale pre-check.
+	//
+	// ponytail: the superseded artifact is in CAS but not in the index, so the row-based idempotent
+	// cache no longer short-circuits a repeat of that stale call. Repeating superseded work is rare
+	// and cheap next to canonicalizing superseded audio; index it under a non-canonical key if that
+	// retry ever shows up in cost data.
+	if _, err := publish(pass); err != nil {
+		return nil, err
+	}
+	superseding, err := s.applySpeakerEscalation(ctx, in, voiceAssign, plan)
+	if err != nil {
+		return nil, err
+	}
+	if superseding == nil {
+		// The run moved on to a newer assignment that is not this escalation, so the completed
+		// pass stays committed and readable, is returned as REVIEW evidence, and never claimed the
+		// run's dub-variant row - that row keeps resolving to the current assignment's own pass.
+		// Nothing here touches the operator's newer assignment (#155: a newer assignment is never
+		// reverted, so no escalation is minted from this stale base).
+		//
+		// Issue #156 derives no atempo candidate on this path on purpose. A candidate can only be
+		// attached to this pass, and attaching it would publish superseded-assignment audio as the
+		// run's canonical media and graft cross-assignment tempo evidence onto it. The pass whose
+		// remedy sequence ends with tempo evidence is the run's current assignment's pass, and that
+		// assignment's own request synthesizes it (ReassignVoice and the inspector corrections mint
+		// the superseding assignment and synthesize it in the same request; a call whose base IS the
+		// current assignment can never reach this branch). The unresolved overrun therefore stays
+		// REVIEW here and gains its evidence there, from its own retained waveform.
+		return pass, nil
+	}
+	escalated, err := s.synthesizeSegmentsPass(ctx, in, dubScript, dubScriptCAS, superseding, superseding.CASHash, pass, plan.evidence, recoveryState)
+	if err != nil {
+		return nil, err
+	}
+	// Issue #156: the escalated regeneration is the end of the configured remedy
+	// sequence, so only this final pass may derive review-only atempo candidates.
+	return finalize(escalated)
 }
 
 // CanReuseVariant proves that a persisted dub artifact belongs to the exact
@@ -2456,35 +2554,153 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 		CreatedAt:             time.Now().UTC(),
 	}
 
-	// 7. Commit to CAS and SQLite
-	if s.cas != nil && s.db != nil {
-		data, err := json.Marshal(variant)
-		if err != nil {
-			return nil, fmt.Errorf("marshal dub segments variant: %w", err)
-		}
-		casObj, err := s.cas.Put(bytes.NewReader(data))
-		if err != nil {
-			return nil, fmt.Errorf("put dub segments variant in CAS: %w", err)
-		}
-		variant.CASHash = casObj.SHA256
+	// Invariant: Do not publish the pass inside synthesizeSegmentsPass before the final recovery/escalation
+	// decision is made. Build the pass first; the caller publishes or attaches review-only tempo candidates
+	// exactly once when the configured recovery sequence has concluded.
+	return variant, nil
+}
 
-		idx := storage.DubSegmentsVariantIndex{
-			ID:             variant.ID,
-			AssetID:        variant.AssetID,
-			RunID:          variant.RunID,
-			JobID:          variant.JobID,
-			TargetLanguage: variant.TargetLanguage,
-			CASHash:        variant.CASHash,
-			ProvenanceHash: variant.ProvenanceHash,
-			OverallStatus:  variant.OverallStatus,
-			CreatedAt:      variant.CreatedAt,
-		}
-		if err := s.db.SaveDubSegmentsVariantIndex(ctx, idx); err != nil {
-			return nil, fmt.Errorf("save dub segments variant index: %w", err)
-		}
+// commitDubSegmentsVariant marshals a dub segments variant into CAS and points the run-scoped
+// index at it while the variant's own voice assignment is still the run's current one. It is
+// idempotent for the same bytes because CAS is content-addressed, so a variant re-committed after
+// later evidence is attached supersedes the index entry in place. A pass that belongs to a
+// superseded assignment is committed without the index row (#156): it stays readable by hash and
+// is returned as evidence, but the row - what the inspector, the review projection and playback
+// resolve - keeps pointing at the current assignment's own pass.
+//
+// The ownership test is the row write itself, not a decision taken earlier in the request: the
+// claim statement refuses to claim while an assignment other than the variant's own is in force,
+// so a reassignment landing between this request's earlier decisions and this write cannot slip
+// a superseded pass into the row the way a pre-check-then-write pair lets it.
+func (s *DubbingService) commitDubSegmentsVariant(ctx context.Context, variant *domain.DubSegmentsVariant) error {
+	if variant == nil || s.cas == nil || s.db == nil {
+		return nil
+	}
+	// The published bytes are canonical: an artifact never embeds an identity - its own or a
+	// predecessor's - that CAS is about to derive from those very bytes, so re-publishing the
+	// same content always yields the same hash.
+	variant.CASHash = ""
+	data, err := json.Marshal(variant)
+	if err != nil {
+		return fmt.Errorf("marshal dub segments variant: %w", err)
+	}
+	casObj, err := s.cas.Put(bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("put dub segments variant in CAS: %w", err)
+	}
+	variant.CASHash = casObj.SHA256
+	if s.beforeRunRowClaim != nil {
+		s.beforeRunRowClaim()
 	}
 
-	return variant, nil
+	idx := storage.DubSegmentsVariantIndex{
+		ID:             variant.ID,
+		AssetID:        variant.AssetID,
+		RunID:          variant.RunID,
+		JobID:          variant.JobID,
+		TargetLanguage: variant.TargetLanguage,
+		CASHash:        variant.CASHash,
+		ProvenanceHash: variant.ProvenanceHash,
+		OverallStatus:  variant.OverallStatus,
+		CreatedAt:      variant.CreatedAt,
+	}
+	if _, err := s.db.ClaimDubSegmentsVariantIndexForAssignment(ctx, idx, variant.VoiceAssignmentCAS); err != nil {
+		return fmt.Errorf("save dub segments variant index: %w", err)
+	}
+	return nil
+}
+
+// tempoEvidenceRetryable reports whether a recorded tempo outcome is evidence about the run
+// that produced it rather than the transform's own answer to the waveform. A cancelled or
+// unavailable transform says nothing about the candidate, so a resumed call re-derives it; every
+// other outcome - fits, residual overrun, factor out of range, missing source, failed, oversized
+// or invalid output - is the deterministic result of the transform and stays committed.
+func tempoEvidenceRetryable(reason string) bool {
+	return reason == domain.TempoReasonCancelled || reason == domain.TempoReasonToolUnavailable
+}
+
+// resetRetryableTempoEvidence clears the transient tempo evidence of a variant read back from the
+// idempotent synthesis cache so the candidate can be derived again, and drops the committed
+// identity so the republished pass becomes the run's one canonical final artifact. Non-transient
+// candidates, and every other field of the cached pass, are left exactly as committed. It reports
+// whether anything was reset, so an unchanged pass keeps its committed identity untouched.
+func resetRetryableTempoEvidence(variant *domain.DubSegmentsVariant) bool {
+	reset := false
+	for i := range variant.ReviewSegments {
+		candidate := variant.ReviewSegments[i].TempoCandidate
+		if candidate == nil || !tempoEvidenceRetryable(candidate.Reason) {
+			continue
+		}
+		variant.ReviewSegments[i].TempoCandidate = nil
+		reset = true
+	}
+	if reset {
+		variant.CASHash = ""
+	}
+	return reset
+}
+
+// tempoEvidenceComplete reports whether every review unit attachTempoCandidates would derive a
+// candidate for already carries tempo evidence. A committed pass that still has such a unit was
+// published before the derivation ran - the pre-escalation pass an escalation later superseded
+// but a retried call could not repeat - so the cached fast path must not treat it as final.
+func tempoEvidenceComplete(variant *domain.DubSegmentsVariant) bool {
+	for i := range variant.ReviewSegments {
+		rev := &variant.ReviewSegments[i]
+		if rev.TempoCandidate != nil || rev.AudioSHA256 == "" || rev.MeasuredDurationMs <= 0 {
+			continue
+		}
+		if !unresolvedTimingFailure(*rev) || rev.DubPlaybackEndMs <= rev.StartMs {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// attachTempoCandidates derives the review-only FFmpeg atempo alternative for every unresolved
+// duration overrun of a FINAL synthesis pass and attaches it to the variant in place; the
+// caller publishes the variant exactly once afterwards (Issue #156). It must never run before
+// the natural/native/rewrite/regroup remedies and the whole-speaker escalation have been spent:
+// a pass that is about to escalate is superseded, so deriving a candidate from its waveform
+// would commit DSP the escalated pass immediately discards. The factor is the unit's own
+// retained frame geometry over its accepted playback window, and the candidate stays unselected
+// and REVIEW_REQUIRED at every factor.
+//
+// Only a unit whose review verdict is the fit controller's unresolved DURATION_OVERRUN derives
+// a candidate: a unit flagged for invalid timing, a QA refusal or a missing replacement never
+// had its duration remedy sequence run, so handing it DSP evidence would misreport an unrelated
+// refusal as an exhausted tempo remedy.
+func (s *DubbingService) attachTempoCandidates(ctx context.Context, variant *domain.DubSegmentsVariant) {
+	if variant == nil {
+		return
+	}
+	// The mixer's output rate is one property of the asset, not of the unit, so it is resolved
+	// once for the whole variant — resolving it reads the background stem out of CAS, and doing
+	// that per overrun would read full-length audio again for every unresolved unit. It is
+	// resolved on the first unit that actually derives a candidate, since a variant with none
+	// needs no rate at all.
+	outRateResolved := false
+	outRate := 0
+	for i := range variant.ReviewSegments {
+		rev := &variant.ReviewSegments[i]
+		if rev.TempoCandidate != nil || rev.AudioSHA256 == "" || rev.MeasuredDurationMs <= 0 {
+			continue
+		}
+		if !unresolvedTimingFailure(*rev) {
+			continue
+		}
+		// The accepted playback window is what the unit must fit, so it is the divisor; a
+		// non-positive window has no duration to fit and derives no candidate.
+		if rev.DubPlaybackEndMs <= rev.StartMs {
+			continue
+		}
+		if !outRateResolved {
+			outRate = s.outputSampleRateForAsset(ctx, variant.AssetID)
+			outRateResolved = true
+		}
+		rev.TempoCandidate = s.tempoCandidateForReview(ctx, variant.FitPolicyID, outRate, rev)
+	}
 }
 
 // outputSampleRateForAsset resolves the rate the mixer resamples every candidate to: the
@@ -2558,6 +2774,139 @@ func measuredOverrunAboveAllowanceMs(probedMs, startMs, playbackEndMs, measuredF
 		return 0
 	}
 	return (excessFrames*1000 + int64(outputSampleRate) - 1) / int64(outputSampleRate)
+}
+
+// tempoCandidateForReview derives the review-only FFmpeg atempo alternative for one unresolved
+// duration overrun (Issue #156). It runs only for an overrun whose own retained waveform is
+// still intact: the factor is the waveform's exact frame extent resampled to the mixer's output
+// rate over the accepted playback window — the same arithmetic the fit controller and the mixer
+// gate with — and a transform is generated only when 1 < factor <= 1.25.
+//
+// outRate is the caller-resolved mixer output rate for the asset; 0 means "unknown" and keeps
+// the comparison in the source's own time base.
+//
+// Floored whole-millisecond probes are recorded as measured evidence but are never the
+// eligibility or fit gate: a probe that fits a window while the resampled waveform still
+// overruns it by a frame is a real overrun, and treating it as a fit would both suppress a
+// genuine candidate and misreport a transformed candidate as selectable.
+//
+// Every other outcome is recorded as evidence with no DSP artifact. The candidate is never
+// selected and never turns REVIEW_REQUIRED into a PASS; a cancelled or timed-out transform is
+// recorded as TEMPO_CANCELLED evidence with nothing committed for the transform, so the
+// operator can read why the alternative is missing instead of losing the pass, and a failed
+// transform still commits nothing.
+func (s *DubbingService) tempoCandidateForReview(ctx context.Context, fitPolicyID string, outRate int, rev *domain.DubSegmentReview) *domain.DubTempoCandidate {
+	base := domain.DubTempoCandidate{
+		NaturalAudioSHA256: rev.AudioSHA256,
+		NaturalDurationMs:  rev.MeasuredDurationMs,
+		PlaybackDurationMs: rev.DubPlaybackEndMs - rev.StartMs,
+		Reason:             domain.TempoReasonSourceInvalid,
+		ToolID:             domain.TempoToolID,
+		PolicyVersion:      fitPolicyID,
+	}
+	if rev.AudioSHA256 == "" || rev.DubPlaybackEndMs <= rev.StartMs || s.cas == nil {
+		return &base
+	}
+	// The retained waveform must still be intact: a missing or corrupt natural parent is
+	// evidence, not a transform input. No factor-range verdict is recorded before the factor
+	// exists — the source itself is what is unavailable, and the factor is only derivable from
+	// that source.
+	if err := s.cas.VerifyIntegrity(rev.AudioSHA256); err != nil {
+		return &base
+	}
+	rc, err := s.cas.Get(rev.AudioSHA256)
+	if err != nil {
+		return &base
+	}
+	source, readErr := io.ReadAll(rc)
+	_ = rc.Close()
+	if readErr != nil {
+		return &base
+	}
+	frames, rate, err := media.WAVFrameGeometry(source)
+	if err != nil || frames <= 0 || rate <= 0 {
+		return &base
+	}
+	// The mixer resamples every candidate to the asset's output rate, so both the retained
+	// waveform and the accepted window are measured in that rate. Without one, the comparison
+	// stays frame-exact in the source's own time base — either way it never falls back to a
+	// floored millisecond probe.
+	if outRate <= 0 {
+		outRate = rate
+	}
+	sourceFrames := media.ResampledPCM16Frames(frames, rate, outRate)
+	windowFrames := media.PlaybackWindowFrames(rev.StartMs, rev.DubPlaybackEndMs, outRate)
+	if sourceFrames <= 0 || windowFrames <= 0 {
+		return &base
+	}
+	factor := float64(sourceFrames) / float64(windowFrames)
+	base.Factor = factor
+	// Above 1.25 (or at/below 1, which no unresolved overrun produces) no DSP candidate exists.
+	if !(factor > 1) || factor > media.AtempoMaxFactor {
+		base.Reason = domain.TempoReasonFactorOutOfRange
+		return &base
+	}
+
+	transformFn := media.ApplyAtempoWAV
+	if s.AtempoTransform != nil {
+		transformFn = s.AtempoTransform
+	}
+	transformed, err := transformFn(ctx, media.AtempoRequest{SourceWAV: source, Factor: factor})
+	if err != nil {
+		// A cancelled or timed-out transform is evidence, not a pass failure: run control still
+		// stops the run through its own cancellation check, and the operator reads why no
+		// alternative exists instead of losing the pass.
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			base.Reason = domain.TempoReasonCancelled
+			return &base
+		}
+		base.Reason = tempoReasonForError(err)
+		return &base
+	}
+	transformedMs, probeErr := media.ProbeWAVBytes(transformed)
+	transformedFrames, transformedRate, geomErr := media.WAVFrameGeometry(transformed)
+	if probeErr != nil || transformedMs <= 0 || geomErr != nil || transformedFrames <= 0 || transformedRate <= 0 {
+		base.Reason = domain.TempoReasonOutputInvalid
+		return &base
+	}
+	obj, err := s.cas.Put(bytes.NewReader(transformed))
+	if err != nil {
+		base.Reason = domain.TempoReasonTransformFailed
+		return &base
+	}
+	base.TransformedAudioSHA256 = obj.SHA256
+	base.TransformedDurationMs = transformedMs
+	base.Filter = media.AtempoFilterString(factor)
+	// Residual overrun is honest evidence: the transform is never cropped or retried to force
+	// the duration, and an overlong output is marked unselectable rather than discarded. The
+	// verdict is the frame-exact comparison the mixer enforces, not the floored probe: the
+	// transformed waveform is re-measured by frame geometry in the same output rate.
+	transformedFramesOut := media.ResampledPCM16Frames(transformedFrames, transformedRate, outRate)
+	base.Selectable = transformedFramesOut > 0 && transformedFramesOut <= windowFrames
+	if base.Selectable {
+		base.Reason = domain.TempoReasonFits
+	} else {
+		base.Reason = domain.TempoReasonOverrun
+	}
+	return &base
+}
+
+// tempoReasonForError maps a bounded-transform failure onto its deterministic review reason. A
+// cancelled or timed-out transform never reaches here: the caller classifies it as
+// TEMPO_CANCELLED before calling, so this mapping starts at the failures below that.
+func tempoReasonForError(err error) string {
+	switch {
+	case errors.Is(err, media.ErrAtempoSourceInvalid):
+		return domain.TempoReasonSourceInvalid
+	case errors.Is(err, media.ErrAtempoUnavailable):
+		return domain.TempoReasonToolUnavailable
+	case errors.Is(err, media.ErrAtempoOutputTooLarge):
+		return domain.TempoReasonOutputTooLarge
+	case errors.Is(err, media.ErrAtempoOutputInvalid):
+		return domain.TempoReasonOutputInvalid
+	default:
+		return domain.TempoReasonTransformFailed
+	}
 }
 
 // unresolvedTimingFailure reports whether a review unit carries the FitController's own

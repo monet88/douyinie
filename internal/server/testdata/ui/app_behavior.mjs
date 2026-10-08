@@ -168,6 +168,12 @@ function createHarness() {
     regionRole: register("#region-role"),
     regionText: register("#region-text"),
     inspectTitle: register("#inspect-title"),
+    inspectTempo: register("#inspect-tempo", { classes: ["hidden"] }),
+    inspectTempoMeta: register("#inspect-tempo-meta"),
+    inspectTempoSelectable: register("#inspect-tempo-selectable"),
+    inspectTempoNote: register("#inspect-tempo-note"),
+    inspectTempoNatural: register("#inspect-tempo-natural", { tag: "audio", classes: ["hidden"] }),
+    inspectTempoTransformed: register("#inspect-tempo-transformed", { tag: "audio", classes: ["hidden"] }),
     textForm: register("#text-form", { dataset: { editorPanel: "text" }, classes: ["hidden"] }),
     acceptForm: register("#accept-form", { dataset: { editorPanel: "accept" } }),
     voiceForm: register("#voice-form", { dataset: { editorPanel: "voice" }, classes: ["hidden"] }),
@@ -1381,6 +1387,125 @@ test("Media Library prefers local thumbnail URL over provider cover fallback", a
     source.includes("(thumbnailURL ? '<img src=\"' + esc(thumbnailURL)"),
     "Media Library image rendering must use the resolved thumbnail URL"
   );
+});
+
+// Issue #156: the exception drawer must surface the review-only tempo alternative as evidence
+// and let the operator hear both the retained natural waveform and the eligible transform
+// through the run-scoped media endpoint, without either being selected.
+const tempoCandidateItem = `
+state.selectedRunId = "run-1";
+state.selectedRun = { id: "run-1", job_id: "job-1", status: "running" };
+state.selectedJob = { id: "job-1", source_asset_id: "asset-1", target_language: "vi" };
+state.reviewItems = [
+  {
+    id: "rev-tempo-1",
+    run_id: "run-1",
+    type: "TTS_OVERRUN",
+    stage: "dub_synthesize",
+    severity: "blocker",
+    status: "pending",
+    reason: "DURATION_OVERRUN",
+    item_index: 0,
+    start_ms: 0,
+    end_ms: 1000,
+    details: {
+      natural_audio_sha256: "nat-hash",
+      tempo_candidate: {
+        factor: 1.2,
+        natural_audio_sha256: "nat-hash",
+        transformed_audio_sha256: "trans-hash",
+        natural_duration_ms: 1200,
+        transformed_duration_ms: 1000,
+        playback_duration_ms: 1000,
+        selectable: true,
+        reason: "TEMPO_CANDIDATE_WITHIN_WINDOW",
+        tool_id: "ffmpeg-atempo",
+        filter: "atempo=1.200000",
+        policy_version: "playback-window-v2"
+      }
+    }
+  },
+  {
+    id: "rev-plain-1",
+    run_id: "run-1",
+    type: "low_confidence",
+    stage: "translation",
+    severity: "warning",
+    status: "pending",
+    reason: "low_meaning_confidence",
+    item_index: 0,
+    details: {}
+  }
+];
+state.selectedReviewItem = state.reviewItems[0];
+renderInspector();
+`;
+
+test("tempo candidate evidence is shown and auditioned through the run-scoped endpoint", async () => {
+  const h = createHarness();
+  await h.ready();
+  h.evalIn(tempoCandidateItem);
+
+  assert.equal(h.els.inspectTempo.classList.contains("hidden"), false, "a tempo candidate must open the audition panel");
+  const meta = h.els.inspectTempoMeta.innerHTML;
+  assert.ok(meta.includes("1.2000"), `the panel must show the factor, got ${meta}`);
+  assert.ok(meta.includes("1200 ms"), "the panel must show the natural duration");
+  assert.ok(meta.includes("1000 ms"), "the panel must show the transformed and playback durations");
+  assert.ok(meta.includes("TEMPO_CANDIDATE_WITHIN_WINDOW"), "the panel must show the deterministic reason");
+  assert.ok(meta.includes("ffmpeg-atempo"), "the panel must name the tool that produced the candidate");
+  assert.equal(h.els.inspectTempoSelectable.textContent, "trong cửa sổ phát", "the panel must state selectability");
+  assert.equal(
+    h.els.inspectTempoNatural.src,
+    "/api/v1/runs/run-1/dub-media/nat-hash",
+    "the natural audition must use the run-scoped media endpoint"
+  );
+  assert.equal(
+    h.els.inspectTempoTransformed.src,
+    "/api/v1/runs/run-1/dub-media/trans-hash",
+    "the tempo audition must use the run-scoped media endpoint"
+  );
+  assert.equal(h.els.inspectTempoNatural.classList.contains("hidden"), false, "an owned natural waveform must be playable");
+  assert.equal(h.els.inspectTempoTransformed.classList.contains("hidden"), false, "a produced alternative must be playable");
+});
+
+test("a candidate without a transform stays visible as evidence and audible only for the natural waveform", async () => {
+  const h = createHarness();
+  await h.ready();
+  h.evalIn(tempoCandidateItem);
+  h.evalIn(`
+    state.reviewItems[0].details.tempo_candidate = {
+      factor: 1.3,
+      natural_audio_sha256: "nat-hash",
+      transformed_audio_sha256: "",
+      natural_duration_ms: 1300,
+      playback_duration_ms: 1000,
+      selectable: false,
+      reason: "TEMPO_CANCELLED",
+      tool_id: "ffmpeg-atempo"
+    };
+    renderInspector();
+  `);
+
+  assert.equal(h.els.inspectTempo.classList.contains("hidden"), false, "cancellation evidence must stay visible");
+  assert.ok(h.els.inspectTempoMeta.innerHTML.includes("TEMPO_CANCELLED"), "the panel must show the cancelled reason");
+  assert.equal(h.els.inspectTempoSelectable.textContent, "không chọn được", "a cancelled candidate must not read as selectable");
+  assert.equal(h.els.inspectTempoNatural.src, "/api/v1/runs/run-1/dub-media/nat-hash", "the natural waveform stays playable");
+  assert.equal(h.els.inspectTempoTransformed.classList.contains("hidden"), true, "no transformed artifact means no second player");
+  assert.equal(h.els.inspectTempoTransformed.src, "", "the second player must not keep a stale source");
+});
+
+test("selecting an exception without a candidate clears the audition panel and its sources", async () => {
+  const h = createHarness();
+  await h.ready();
+  h.evalIn(tempoCandidateItem);
+  assert.equal(h.els.inspectTempo.classList.contains("hidden"), false, "precondition: the panel is open");
+
+  h.evalIn("state.selectedReviewItem = state.reviewItems[1]; renderInspector();");
+
+  assert.equal(h.els.inspectTempo.classList.contains("hidden"), true, "an exception without a tempo candidate must hide the panel");
+  assert.equal(h.els.inspectTempoMeta.innerHTML, "", "the evidence rows must be cleared");
+  assert.equal(h.els.inspectTempoNatural.src, "", "the natural player must not keep a stale source");
+  assert.equal(h.els.inspectTempoTransformed.src, "", "the tempo player must not keep a stale source");
 });
 
 let failed = 0;

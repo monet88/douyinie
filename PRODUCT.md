@@ -25,7 +25,7 @@ Unlike generic auto-subtitlers or blunt voice-over tools that wipe background au
 ## Operating Context
 
 - **Hardware & Runtime**: Local Windows 11 workstation with NVIDIA GPU (e.g. RTX 2060 SUPER), running a Go RuntimeHost orchestrator and specialized Python 3.10/3.11 StageWorkers (ASR, Forced Aligner, CAM++ Diarizer, ZeroTTS/CosyVoice, Demucs/UVR, PaddleOCR, YAMNet).
-- **Interface**: Local browser-based Operator Web Workspace (`http://127.0.0.1:8080/ui/`) featuring Job Queue, Stage-by-Stage Workflow Stepper, Review Workspace with interactive video player, Text Region Inspector, Voice Audition, and Final Render Gate.
+- **Interface**: Local browser-based Operator Web Workspace (`http://127.0.0.1:8080/ui/`) featuring Job Queue, Stage-by-Stage Workflow Stepper, Review Workspace with interactive video player, Text Region Inspector, Voice Audition, review-only Tempo Audition, and Final Render Gate.
 - **Execution Model**: Single active processing slot per machine; unattended by default, stopping at `review_required` only when exceptions are flagged.
 
 ## Capabilities and Constraints

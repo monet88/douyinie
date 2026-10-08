@@ -652,7 +652,9 @@ func TestReviewService_CorruptCAS_ReturnsError(t *testing.T) {
 // A replay run consumes the dub stage's artifact without owning a dub_segments_variants row of its own, so
 // a run-scoped projection found nothing and the blocker never reached the operator: the run shipped with the
 // source dialogue stripped and no voice, and the queue showed only the unrelated OCR items (live evidence,
-// run 959e8dab). The projection must read the variant through the run's own stage execution.
+// run 959e8dab). The projection must read the variant through the run's own stage execution: the immutable
+// body was produced by the origin run, but the replay run's stage binding is what makes that artifact this
+// run's to project.
 func TestReviewService_ReplayRunProjectsDubOverrunFromStageArtifact(t *testing.T) {
 	svc, db, casStore, assetID := setupReviewTestHarness(t)
 	ctx := context.Background()
@@ -722,6 +724,45 @@ func TestReviewService_ReplayRunProjectsDubOverrunFromStageArtifact(t *testing.T
 	}
 	if items[0].StartMs != 0 || items[0].EndMs != 12400 {
 		t.Errorf("item must carry the segment slot it names, got %d-%d", items[0].StartMs, items[0].EndMs)
+	}
+}
+
+// A real dub_segments_variants row fetched by run_id carries that run as its claim, so a body that
+// decodes to another run's variant - same asset and language - is refused rather than projected:
+// a foreign run's variant and audio hashes never reach this run's review queue or playback
+// (Issue #156).
+func TestReviewService_ForeignRunVariantRowIsRefused(t *testing.T) {
+	svc, db, casStore, assetID := setupReviewTestHarness(t)
+	ctx := context.Background()
+	const foreignRun, claimedRun = "run-dub-origin", "run-dub-claimant"
+	now := time.Now().UTC()
+
+	job := domain.LocalizationJob{ID: "job-dub-claim", SourceAssetID: assetID, TargetLanguage: "vi", Status: "running", CreatedAt: now}
+	if err := db.CreateJob(ctx, job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{ID: claimedRun, JobID: job.ID, Status: "running", ConfigSnapshotJSON: "{}", CreatedAt: now}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	blob, _ := json.Marshal(domain.DubSegmentsVariant{
+		ID: "dub-seg-foreign", AssetID: assetID, RunID: foreignRun, TargetLanguage: "vi",
+		ProvenanceHash: "prov-dub-foreign", OverallStatus: "REVIEW_REQUIRED", CreatedAt: now,
+	})
+	obj, err := casStore.Put(bytes.NewReader(blob))
+	if err != nil {
+		t.Fatalf("put variant: %v", err)
+	}
+	// Keyed by run_id, the row claims claimedRun while its body names foreignRun.
+	if err := db.SaveDubSegmentsVariantIndex(ctx, storage.DubSegmentsVariantIndex{
+		ID: "dub-seg-foreign", AssetID: assetID, RunID: claimedRun, TargetLanguage: "vi",
+		CASHash: obj.SHA256, ProvenanceHash: "prov-dub-foreign", OverallStatus: "REVIEW_REQUIRED", CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("save dub segments index: %v", err)
+	}
+
+	if _, err := svc.ProjectReviewItemsForRun(ctx, assetID, "vi", claimedRun); !errors.Is(err, service.ErrDubMediaNotOwned) {
+		t.Fatalf("expected ErrDubMediaNotOwned for a row whose body claims another run, got %v", err)
 	}
 }
 

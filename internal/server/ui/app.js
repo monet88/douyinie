@@ -1779,10 +1779,81 @@ function clearInspectorEditor() {
   state.selectedReviewItem = null;
   state.selectedSegmentIndex = null;
   state.selectedRegionId = null;
+  renderTempoCandidate(null);
   const emptyBox = $("#inspector-empty");
   const editorBox = $("#inspector-editor");
   if (emptyBox) emptyBox.classList.remove("hidden");
   if (editorBox) editorBox.classList.add("hidden");
+}
+
+// Issue #156: the review-only atempo alternative is auditioned through the run-scoped media
+// endpoint. Only hashes the run's own dubbing variant owns resolve there, so the operator hears
+// the retained natural waveform and one eligible alternative without either being selected.
+function tempoMediaURL(runId, hash) {
+  if (!runId || !hash) return "";
+  return `/api/v1/runs/${encodeURIComponent(runId)}/dub-media/${encodeURIComponent(hash)}`;
+}
+
+function bindTempoAudio(node, url) {
+  if (!node) return;
+  if (!url) {
+    node.removeAttribute("src");
+    node.classList.add("hidden");
+    return;
+  }
+  node.src = url;
+  node.classList.remove("hidden");
+}
+
+function renderTempoCandidate(item) {
+  const panel = $("#inspect-tempo");
+  if (!panel) return;
+
+  const meta = $("#inspect-tempo-meta");
+  const selectable = $("#inspect-tempo-selectable");
+  const note = $("#inspect-tempo-note");
+  const raw = item?.details?.tempo_candidate;
+  const candidate = raw && typeof raw === "object" ? raw : null;
+
+  if (!candidate) {
+    panel.classList.add("hidden");
+    if (meta) meta.innerHTML = "";
+    if (note) note.textContent = "";
+    bindTempoAudio($("#inspect-tempo-natural"), "");
+    bindTempoAudio($("#inspect-tempo-transformed"), "");
+    return;
+  }
+
+  const runId = item.run_id || state.selectedRunId || "";
+  const naturalHash = candidate.natural_audio_sha256 || item.details?.natural_audio_sha256 || "";
+
+  panel.classList.remove("hidden");
+  if (selectable) {
+    selectable.className = `status-pill ${candidate.selectable ? "pass" : "warning"}`;
+    selectable.textContent = candidate.selectable ? "trong cửa sổ phát" : "không chọn được";
+  }
+  if (note) {
+    note.textContent = candidate.selectable
+      ? "Bản tempo nằm trong cửa sổ phát đã chấp nhận nhưng chưa được chọn; việc phê duyệt thuộc ticket kế tiếp."
+      : "Chưa có bản tempo dùng được (xem lý do bên dưới); bản ghi gốc vẫn giữ nguyên.";
+  }
+  if (meta) {
+    const rows = [
+      ["Factor", candidate.factor != null ? Number(candidate.factor).toFixed(4) : "—"],
+      ["Natural", candidate.natural_duration_ms != null ? `${candidate.natural_duration_ms} ms` : "—"],
+      ["Tempo", candidate.transformed_duration_ms ? `${candidate.transformed_duration_ms} ms` : "—"],
+      ["Cửa sổ phát", candidate.playback_duration_ms != null ? `${candidate.playback_duration_ms} ms` : "—"],
+      ["Lý do", candidate.reason || "—"],
+      ["Tool", candidate.tool_id || "—"],
+      ["Filter", candidate.filter || "—"],
+      ["Policy", candidate.policy_version || "—"],
+    ];
+    meta.innerHTML = rows
+      .map(([label, value]) => `<div><dt>${esc(label)}</dt><dd title="${esc(value)}">${esc(value)}</dd></div>`)
+      .join("");
+  }
+  bindTempoAudio($("#inspect-tempo-natural"), tempoMediaURL(runId, naturalHash));
+  bindTempoAudio($("#inspect-tempo-transformed"), tempoMediaURL(runId, candidate.transformed_audio_sha256 || ""));
 }
 
 function renderInspectorEditor() {
@@ -1834,6 +1905,8 @@ function renderInspectorEditor() {
       if (regInput) regInput.value = item.region_id;
     }
   }
+
+  renderTempoCandidate(item);
 
   if (state.selectedJob?.target_language) {
     const voiceLang = $("#voice-language");
