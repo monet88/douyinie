@@ -570,7 +570,7 @@ func (s *ReviewService) AcceptReviewedCandidate(ctx context.Context, in AcceptRe
 	}
 
 	// 5. Translation/dubbing contract, voice lineage and governing playback policy.
-	lineage, err := s.selectionLineage(ctx, runID, in.AssetID, targetLang, variant)
+	lineage, err := s.resolveSelectionLineage(ctx, runID, in.AssetID, targetLang, variant)
 	if err != nil {
 		return nil, err
 	}
@@ -600,21 +600,8 @@ func (s *ReviewService) AcceptReviewedCandidate(ctx context.Context, in AcceptRe
 	// 7. Build the successor variant and its acceptance evidence.
 	overrideID := uuid.NewString()
 	acceptedAt := time.Now().UTC()
-	evidence := domain.AcceptedReviewCandidate{
-		ReviewItemID:        itemID,
-		ReviewOverrideID:    overrideID,
-		ReviewSegmentIndex:  rev.Index,
-		SpeakerID:           rev.SpeakerID,
-		NaturalAudioSHA256:  selected.naturalHash,
-		SelectedAudioSHA256: selected.hash,
-		Transformed:         selected.transformed,
-		TempoFactor:         selected.tempoFactor,
-		TempoFilter:         selected.tempoFilter,
-		TempoToolID:         selected.tempoToolID,
-		QualityWaiver:       selected.qualityWaiver,
-		AcceptedAt:          acceptedAt,
-	}
-	successor, err := promoteReviewUnit(variant, rev, selected, playbackEnd, reserve, evidence)
+	evidence := acceptanceEvidence(itemID, overrideID, rev, selected, acceptedAt)
+	successor, err := promoteReviewUnit(variant, rev, selected, playbackEnd, reserve, evidence, lineage.eligible)
 	if err != nil {
 		return nil, err
 	}
@@ -688,10 +675,10 @@ func (s *ReviewService) AcceptReviewedCandidate(ctx context.Context, in AcceptRe
 	return result, nil
 }
 
-// selectionLineage resolves and validates the pinned contract, policy and canonical source
+// resolveSelectionLineage resolves and validates the pinned contract, policy and canonical source
 // lineage the acceptance must be proven against. Every mismatch is a refusal: an acceptance may
 // never stamp a changed text/voice/contract lineage as previously reviewed.
-func (s *ReviewService) selectionLineage(ctx context.Context, runID, assetID, targetLang string, variant *domain.DubSegmentsVariant) (*selectionLineage, error) {
+func (s *ReviewService) resolveSelectionLineage(ctx context.Context, runID, assetID, targetLang string, variant *domain.DubSegmentsVariant) (*selectionLineage, error) {
 	if variant.SchemaVersion != domain.DubSegmentsSchemaVersion {
 		return nil, fmt.Errorf("%w: dubbing artifact uses stale schema %d", ErrReviewedCandidateStale, variant.SchemaVersion)
 	}
@@ -895,6 +882,7 @@ func promoteReviewUnit(
 	selected *selectedWaveform,
 	playbackEndMs, reserveMs int64,
 	evidence domain.AcceptedReviewCandidate,
+	eligible map[int]domain.SpeechBlock,
 ) (*domain.DubSegmentsVariant, error) {
 	if variant == nil {
 		return nil, errors.New("dubbing artifact is required to promote a reviewed candidate")
@@ -982,15 +970,17 @@ func promoteReviewUnit(
 	})
 
 	next.AcceptedCandidates = append(slices.Clone(variant.AcceptedCandidates), evidence)
-	next.OverallStatus = dubVariantStatus(&next)
+	next.OverallStatus = dubVariantStatus(&next, eligible)
 	next.CASHash = ""
 	return &next, nil
 }
 
 // dubVariantStatus recomputes a variant's overall status from its own units: it is PASS only when
-// every unit is a selected, accepted segment and no review unit remains. It never invents PASS.
-func dubVariantStatus(variant *domain.DubSegmentsVariant) string {
-	if variant == nil || len(variant.Segments) == 0 {
+// every dub-eligible canonical block is covered by exactly one accepted segment and no review unit
+// remains. PASS is what authorizes the delivery rebuild, so the full coverage contract the mixer
+// will enforce is proven here rather than discovered inside the mix. It never invents PASS.
+func dubVariantStatus(variant *domain.DubSegmentsVariant, eligible map[int]domain.SpeechBlock) string {
+	if variant == nil || len(variant.Segments) == 0 || len(eligible) == 0 {
 		return "REVIEW_REQUIRED"
 	}
 	if len(variant.ReviewSegments) > 0 {
@@ -998,6 +988,22 @@ func dubVariantStatus(variant *domain.DubSegmentsVariant) string {
 	}
 	for _, seg := range variant.Segments {
 		if seg.RequiresReview || seg.FitDecision != domain.FitActionAccept {
+			return "REVIEW_REQUIRED"
+		}
+	}
+	covered := make(map[int]int, len(eligible))
+	for _, seg := range variant.Segments {
+		for _, member := range seg.SpeechBlockIndices {
+			if _, ok := eligible[member]; !ok {
+				// A foreign member is neither covered nor coverable: it is not a canonical
+				// dub-eligible block of this run's pinned source.
+				return "REVIEW_REQUIRED"
+			}
+			covered[member]++
+		}
+	}
+	for member := range eligible {
+		if covered[member] != 1 {
 			return "REVIEW_REQUIRED"
 		}
 	}
@@ -1041,11 +1047,20 @@ func coverageCount(variant *domain.DubSegmentsVariant, index int) int {
 	return count
 }
 
+// dubReviewItemPrefix opens every dubbing review item identity.
+const dubReviewItemPrefix = "rev-dubseg-rev-"
+
+// dubReviewItemID is the one construction of a dubbing review item identity: the artifact CAS hash
+// it was projected from and the fit unit index it names. The projection and the parser share it, so
+// a change to the shape cannot leave one side minting an identity the other cannot read.
+func dubReviewItemID(variantCAS string, index int) string {
+	return fmt.Sprintf("%s%s-%d", dubReviewItemPrefix, variantCAS, index)
+}
+
 // parseDubReviewItemID parses the identity a dubbing review item carries: the artifact CAS hash it
 // was projected from and the fit unit index it names.
 func parseDubReviewItemID(itemID string) (variantCAS string, index int, ok bool) {
-	const prefix = "rev-dubseg-rev-"
-	rest, ok := strings.CutPrefix(itemID, prefix)
+	rest, ok := strings.CutPrefix(itemID, dubReviewItemPrefix)
 	if !ok {
 		return "", 0, false
 	}
@@ -1210,9 +1225,15 @@ func (s *ReviewService) rebuildSelectionDelivery(
 	}
 
 	if handoff.Action == "auto_render_started" {
+		// The acceptance resolves the park that held the run, so the paused entry is the one this
+		// gate admits; the terminal transition and its rollback are the shared ones, and the state
+		// is reported only once the run really reached it.
+		if err := CompleteDeliveredRun(ctx, s.db, successor.RunID, true); err != nil {
+			return err
+		}
 		result.RunCompleted = true
 		result.Message = "accepted candidate, rebuilt the run's delivery, and completed the run: " + handoff.Message
-		return s.completeRunAfterAutoHandoff(ctx, job.ID, successor.RunID)
+		return nil
 	}
 	// Review posture renders nothing: the delivery is rebuilt and the run stays paused on the
 	// operator's explicit final-render start, so the result must not report it as released.
@@ -1277,25 +1298,77 @@ func (s *ReviewService) recordHandoffStage(ctx context.Context, runID string, po
 	return s.recordCorrectionStage(ctx, runID, stageName, obj.SHA256)
 }
 
-// completeRunAfterAutoHandoff finishes the run and its job after an automatic final render, the
-// same terminal transition the run pipeline performs in Auto posture. The job write comes first so
-// a failed queue transition rolls it back instead of leaving a completed job behind a live run.
-func (s *ReviewService) completeRunAfterAutoHandoff(ctx context.Context, jobID, runID string) error {
+// ErrRunCompletionTransition marks a failed write of the terminal run/job transition. Only that
+// case is the pipeline's to recover (it marks the run failed); a refusal to complete, and a failed
+// queue lookup, are different outcomes and are surfaced as they are.
+var ErrRunCompletionTransition = errors.New("run completion transition failed")
+
+// CompleteDeliveredRun finishes a run and its job at the end of a delivery that actually exists,
+// under the run's own queue gate. It is the one terminal transition both callers use - the pipeline
+// completes the running run whose handoff stage just succeeded, and an accepted reviewed-candidate
+// rebuild completes the run that was parked for the operator's decision - so the two cannot drift
+// on the gate, the job/queue order or the rollback, and a cancelled, interrupted, already-finished
+// or never-started run can never be promoted to a finished one.
+//
+// allowParked is the gate's one deliberate delta: the pipeline only ever completes a running run,
+// while an acceptance resolves the park that held it and therefore also completes a paused one.
+//
+// The job write comes before the queue transition so a failed write leaves the run unfinished with
+// the error surfaced, and a failed queue transition rolls the job back, instead of leaving a
+// completed job behind a live run.
+func CompleteDeliveredRun(ctx context.Context, db *storage.DB, runID string, allowParked bool) error {
+	if db == nil || strings.TrimSpace(runID) == "" {
+		return errors.New("database and run id are required to complete a run")
+	}
+	entry, err := db.GetQueueEntryByRunID(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("check queue status before completion for run %s: %w", runID, err)
+	}
+	switch entry.Status {
+	case domain.RunStatusRunning:
+	case domain.RunStatusPaused:
+		if !allowParked {
+			return nil
+		}
+	case domain.RunStatusCancelled, domain.RunStatusInterrupted:
+		return nil
+	default:
+		return fmt.Errorf("unexpected queue status %s before completion for run %s", entry.Status, runID)
+	}
+
+	jobID := strings.TrimSpace(entry.JobID)
+	if jobID == "" {
+		if run, err := db.GetRun(ctx, runID); err == nil && run != nil {
+			jobID = strings.TrimSpace(run.JobID)
+		}
+	}
+	// The job's status follows the work the run actually finished, not the queue transition. In
+	// Review posture the handoff stage is a readiness gate that stops at 'start_final_render' and
+	// renders nothing, so the job must stay open until the operator's explicit render succeeds. The
+	// posture is re-read here rather than assumed from the caller.
 	var priorJobStatus string
-	if job, err := s.db.GetJob(ctx, jobID); err == nil && job != nil {
-		priorJobStatus = job.Status
-	}
-	if err := s.db.UpdateJobStatus(ctx, jobID, "completed"); err != nil {
-		return fmt.Errorf("complete job %s after accepted selection: %w", jobID, err)
-	}
-	if err := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusCompleted, domain.RunStatusCompleted); err != nil {
-		if priorJobStatus != "" {
-			if rollbackErr := s.db.UpdateJobStatus(ctx, jobID, priorJobStatus); rollbackErr != nil {
-				return fmt.Errorf("complete run %s after accepted selection: %w (rolling job %s back to %s also failed: %v)",
-					runID, err, jobID, priorJobStatus, rollbackErr)
+	if jobID != "" {
+		posture, err := ResolveRunPosture(ctx, db, runID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("resolve posture before completing job %s of run %s: %w", jobID, runID, err)
+		}
+		if posture != domain.ReviewPostureReview {
+			if job, err := db.GetJob(ctx, jobID); err == nil && job != nil {
+				priorJobStatus = job.Status
+			}
+			if err := db.UpdateJobStatus(ctx, jobID, "completed"); err != nil {
+				return fmt.Errorf("complete job %s of run %s: %w", jobID, runID, err)
 			}
 		}
-		return fmt.Errorf("complete run %s after accepted selection: %w", runID, err)
+	}
+	if err := db.UpdateQueueStatus(ctx, runID, domain.RunStatusCompleted, domain.RunStatusCompleted); err != nil {
+		if jobID != "" && priorJobStatus != "" {
+			if rollbackErr := db.UpdateJobStatus(ctx, jobID, priorJobStatus); rollbackErr != nil {
+				return fmt.Errorf("%w: %v (rolling job %s back to %s also failed: %v)",
+					ErrRunCompletionTransition, err, jobID, priorJobStatus, rollbackErr)
+			}
+		}
+		return fmt.Errorf("%w: %v", ErrRunCompletionTransition, err)
 	}
 	return nil
 }
@@ -1408,7 +1481,8 @@ func (s *ReviewService) reportReplayedAcceptance(
 	// rebuild that failed after the successor was published leaves an approved decision with no
 	// media, so the retry re-drives the rebuild through the same stages instead of reporting a
 	// delivery the run does not actually serve.
-	if !s.deliveryBuiltFrom(ctx, runID, variant) {
+	handoff, built := s.deliveryBuiltFrom(ctx, runID, variant)
+	if !built {
 		job, err := s.db.GetJob(ctx, jobID)
 		if err != nil {
 			return nil, fmt.Errorf("load job %s to re-drive the replayed acceptance's rebuild: %w", jobID, err)
@@ -1439,14 +1513,30 @@ func (s *ReviewService) reportReplayedAcceptance(
 		}
 		*stage.into = casHash
 	}
-	handoff, err := s.recordedFinalRenderHandoff(ctx, runID)
-	if err != nil {
-		return nil, err
-	}
-	if handoff != nil {
-		result.FinalRenderCAS = handoff.FinalRenderCAS
-		result.HandoffAction = handoff.Action
-		result.HandoffMessage = handoff.Message
+	// The recorded decision states what the run reached, so the replay reports that and not a
+	// re-derivation: an Auto handoff released the run (and finishes a terminal write that never
+	// landed), while a Review handoff left it paused on the operator's explicit render. Both states
+	// are reported only from what the queue actually holds.
+	result.FinalRenderCAS = handoff.FinalRenderCAS
+	result.HandoffAction = handoff.Action
+	result.HandoffMessage = handoff.Message
+	if handoff.Action == "auto_render_started" {
+		entry, err := s.db.GetQueueEntryByRunID(ctx, runID)
+		if err != nil {
+			return nil, fmt.Errorf("read run %s queue entry for the replayed acceptance: %w", runID, err)
+		}
+		if entry.Status != domain.RunStatusCompleted {
+			if err := CompleteDeliveredRun(ctx, s.db, runID, true); err != nil {
+				return nil, err
+			}
+			if entry, err = s.db.GetQueueEntryByRunID(ctx, runID); err != nil {
+				return nil, fmt.Errorf("read run %s queue entry after completion: %w", runID, err)
+			}
+		}
+		result.RunCompleted = entry.Status == domain.RunStatusCompleted
+		result.RunPaused = !result.RunCompleted
+	} else {
+		result.RunPaused = true
 	}
 	result.Message = fmt.Sprintf("review item %s was already accepted with waveform %s; nothing was re-selected or rebuilt",
 		existing.ReviewItemID, existing.SelectedAudioSHA256)
@@ -1482,33 +1572,39 @@ func (s *ReviewService) recordedFinalRenderHandoff(ctx context.Context, runID st
 }
 
 // deliveryBuiltFrom reports whether the delivery the run serves was actually produced from this
-// variant: the published mix must name it as its source, and the plan and preview the rebuild writes
-// must still be present. It is what tells a finished replay apart from one whose rebuild failed, so
-// a retry rebuilds instead of reporting media the run never produced.
-func (s *ReviewService) deliveryBuiltFrom(ctx context.Context, runID string, variant *domain.DubSegmentsVariant) bool {
+// variant, and returns the terminal handoff it recorded. The published mix must name the variant as
+// its source, the plan and preview the rebuild writes must still be present, and the final-render
+// decision must be recorded. That last condition is what tells a finished delivery apart from one
+// whose final render failed after the mix and preview were pinned: without it a retry would report
+// media the run never produced.
+func (s *ReviewService) deliveryBuiltFrom(ctx context.Context, runID string, variant *domain.DubSegmentsVariant) (*domain.FinalRenderHandoffResult, bool) {
 	mixIdx, err := s.db.GetDubMixArtifactIndexByRun(ctx, runID)
 	if err != nil || mixIdx == nil || mixIdx.CASHash == "" {
-		return false
+		return nil, false
 	}
 	rc, err := s.cas.Get(mixIdx.CASHash)
 	if err != nil {
-		return false
+		return nil, false
 	}
 	defer rc.Close()
 	var mix domain.DubMixArtifact
 	if err := json.NewDecoder(rc).Decode(&mix); err != nil {
-		return false
+		return nil, false
 	}
 	if mix.DubSegmentsCAS != variant.CASHash {
-		return false
+		return nil, false
 	}
 	for _, stage := range []string{"render_plan", "render_preview"} {
 		casHash, err := s.db.GetStageArtifactHash(ctx, runID, stage)
 		if err != nil || casHash == "" {
-			return false
+			return nil, false
 		}
 	}
-	return true
+	handoff, err := s.recordedFinalRenderHandoff(ctx, runID)
+	if err != nil || handoff == nil {
+		return nil, false
+	}
+	return handoff, true
 }
 
 // ensureAcceptanceAudit writes the acceptance audit row when a retried request finds the successor
@@ -1556,7 +1652,33 @@ func (s *ReviewService) ensureAcceptanceAudit(
 	return nil
 }
 
-// selectedWaveformFromEvidence reconstructs the audit sentence of a recorded acceptance.
+// acceptanceEvidence is the one construction of an acceptance's persisted lineage from the waveform
+// the operator selected. Paired with selectedWaveformFromEvidence below, the artifact and the audit
+// sentence can never describe different bytes, because neither side lists the lineage fields again.
+func acceptanceEvidence(
+	itemID, overrideID string,
+	rev domain.DubSegmentReview,
+	selected *selectedWaveform,
+	acceptedAt time.Time,
+) domain.AcceptedReviewCandidate {
+	return domain.AcceptedReviewCandidate{
+		ReviewItemID:        itemID,
+		ReviewOverrideID:    overrideID,
+		ReviewSegmentIndex:  rev.Index,
+		SpeakerID:           rev.SpeakerID,
+		NaturalAudioSHA256:  selected.naturalHash,
+		SelectedAudioSHA256: selected.hash,
+		Transformed:         selected.transformed,
+		TempoFactor:         selected.tempoFactor,
+		TempoFilter:         selected.tempoFilter,
+		TempoToolID:         selected.tempoToolID,
+		QualityWaiver:       selected.qualityWaiver,
+		AcceptedAt:          acceptedAt,
+	}
+}
+
+// selectedWaveformFromEvidence rebuilds the selected waveform of a recorded acceptance, so a
+// replayed request can restate its audit sentence from the evidence alone.
 func selectedWaveformFromEvidence(evidence domain.AcceptedReviewCandidate) *selectedWaveform {
 	return &selectedWaveform{
 		hash:        evidence.SelectedAudioSHA256,
@@ -3508,7 +3630,7 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 				}
 			}
 			items = append(items, domain.ReviewItem{
-				ID:             fmt.Sprintf("rev-dubseg-rev-%s-%d", dubSegIdx.CASHash, rev.Index),
+				ID:             dubReviewItemID(dubSegIdx.CASHash, rev.Index),
 				RunID:          dsVar.RunID,
 				AssetID:        assetID,
 				JobID:          dsVar.JobID,

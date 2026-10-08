@@ -245,12 +245,14 @@ Traps:
   candidate's measured factor falls within `(1, 1.25]` and the FFmpeg `atempo` transform actually
   succeeds - one eligible transformed alternative served by `GET /api/v1/runs/<run>/dub-media/<hash>`.
   An out-of-range factor, an unavailable `ffmpeg`, or a failed or cancelled transform leaves the panel
-  showing the natural waveform and the recorded reason instead of a playable alternative. That panel
-  does not resolve the item by itself: the item stays `pending` and nothing reaches the mix or a final
-  render until the operator explicitly accepts that exact reviewed candidate
-  (`POST /api/v1/runs/<run>/review/accept-candidate` with the item id, `candidate: "transformed"` and an
-  explicit `manual_override` quality waiver, or `candidate: "natural"` for a retained waveform that
-  itself fits). The acceptance releases only the accepted waveform into a successor dubbing artifact,
+  showing the natural waveform and the recorded reason instead of a playable alternative. The panel
+  resolves the item only through the operator's own acceptance: `Chấp nhận bản tempo` (or
+  `Chấp nhận waveform natural` for a retained waveform that itself fits), after typing the audit
+  reason and ticking the `manual_override` quality waiver the transformed waveform requires. It sends
+  `POST /api/v1/runs/<run>/review/accept-candidate` with the item id and `candidate: "transformed"`
+  (or `candidate: "natural"`).
+  Until that click the item stays `pending` and nothing reaches the mix or a final render. The
+  acceptance releases only the accepted waveform into a successor dubbing artifact,
   keeps the run paused while any other unit is unresolved, and rebuilds mix, render plan and preview
   once the last required group is accepted - see `CONTEXT.md` §4.3. It replaces nothing above: the
   rewrite and escalation ways out remain the only ones that avoid releasing a transformed waveform.

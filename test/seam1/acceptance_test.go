@@ -132,6 +132,18 @@ func setupAutoRunHarness(t *testing.T) *testHarness {
 	return setupHarnessWithOptions(t, harnessOptions{autoRunExecutor: true})
 }
 
+// parkRunForReview puts a run into the state the drained pipeline leaves it in when a mandatory
+// replacement is missing: paused, with the review decision owed to the operator. Fixtures that
+// synthesize a dubbing pass directly never drain the run, so without this an acceptance would act
+// on a never-started (queued) run - a state an operator can never review from, and one the
+// terminal completion gate refuses.
+func parkRunForReview(t *testing.T, h *testHarness, runID string) {
+	t.Helper()
+	if err := h.db.UpdateQueueStatus(context.Background(), runID, domain.RunStatusPaused, domain.RunStatusPaused); err != nil {
+		t.Fatalf("park run %s for review: %v", runID, err)
+	}
+}
+
 // newRuntimeHost constructs a Seam-1 RuntimeHost server over the given open DB and
 // CAS store, returning the server plus its registry and router. It is used both for
 // the initial harness and to reconstruct a fresh RuntimeHost over reopened persisted

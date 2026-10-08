@@ -435,52 +435,24 @@ func (s *Server) completeRunSafely(ctx context.Context, runID string) error {
 	defer s.activeRunMu.Unlock()
 
 	lookupCtx := context.WithoutCancel(ctx)
-	entry, err := s.db.GetQueueEntryByRunID(lookupCtx, runID)
-	if err != nil {
-		return fmt.Errorf("check queue status before completion for run %s: %w", runID, err)
-	}
-	switch entry.Status {
-	case domain.RunStatusRunning:
-		// The job's status follows the work the run actually finished, not the queue transition.
-		// In Review posture the handoff stage is a readiness gate that stops at 'start_final_render'
-		// and renders nothing, so the job must stay open until the operator's explicit render succeeds
-		// (handleRenderFinal finishes it through completeJobAfterExplicitFinalRender).
-		// In Auto posture, final render was executed automatically during the handoff, so the job is
-		// completed here.
-		//
-		// The job write comes before the queue transition so a failed write leaves the run unfinished
-		// with the error surfaced, instead of a run that reports completion while its job is left behind.
-		// If the subsequent queue transition fails, we roll back the job status to prevent divergence.
-		var priorJobStatus string
-		if entry.JobID != "" {
-			posture, err := service.ResolveRunPosture(lookupCtx, s.db, runID)
-			if err != nil && !errors.Is(err, storage.ErrNotFound) {
-				return fmt.Errorf("resolve posture before completing job %s of run %s: %w", entry.JobID, runID, err)
-			}
-			if posture != domain.ReviewPostureReview {
-				if job, err := s.db.GetJob(lookupCtx, entry.JobID); err == nil && job != nil {
-					priorJobStatus = job.Status
-				}
-				if err := s.db.UpdateJobStatus(lookupCtx, entry.JobID, "completed"); err != nil {
-					return fmt.Errorf("complete job %s of run %s: %w", entry.JobID, runID, err)
-				}
-			}
-		}
-		if err := s.db.UpdateQueueStatus(lookupCtx, runID, domain.RunStatusCompleted, domain.RunStatusCompleted); err != nil {
-			if entry.JobID != "" && priorJobStatus != "" {
-				_ = s.db.UpdateJobStatus(lookupCtx, entry.JobID, priorJobStatus)
-			}
-			if failErr := s.failRun(lookupCtx, runID, "run_completion", fmt.Sprintf("failed to mark run completed: %v", err)); failErr != nil {
-				return fmt.Errorf("complete run failed: %v (failRun error: %w)", err, failErr)
-			}
-			return fmt.Errorf("complete run failed: %w", err)
-		}
+	// The terminal transition is service.CompleteDeliveredRun, the same one an accepted
+	// reviewed-candidate rebuild uses, so the pipeline and the acceptance cannot drift on the queue
+	// gate, the job/queue order or the rollback. The pipeline only ever completes a running run, so
+	// it passes the running-only gate.
+	err := service.CompleteDeliveredRun(lookupCtx, s.db, runID, false)
+	if err == nil {
 		return nil
-	case domain.RunStatusPaused, domain.RunStatusCancelled, domain.RunStatusInterrupted:
-		return nil
-	default:
-		return fmt.Errorf("unexpected queue status %s before completion for run %s", entry.Status, runID)
 	}
+	// Only a failed transition write is this caller's to recover - it marks the run failed so the
+	// divergence is visible instead of a run that reports completion while its job is left behind.
+	// A refusal to complete, and a failed queue lookup, are surfaced as they are.
+	if !errors.Is(err, service.ErrRunCompletionTransition) {
+		return err
+	}
+	if failErr := s.failRun(lookupCtx, runID, "run_completion", fmt.Sprintf("failed to mark run completed: %v", err)); failErr != nil {
+		return fmt.Errorf("complete run failed: %v (failRun error: %w)", err, failErr)
+	}
+	return fmt.Errorf("complete run failed: %w", err)
 }
 
 // completeJobAfterExplicitFinalRender finishes the job a completed run left open for the operator's
@@ -5448,6 +5420,16 @@ func (s *Server) writeAcceptReviewedCandidate(w http.ResponseWriter, r *http.Req
 			writeError(w, http.StatusConflict, err.Error())
 		case errors.Is(err, service.ErrReviewedCandidateNotSelectable),
 			errors.Is(err, service.ErrReviewedCandidateUnavailable):
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+		// A hard media/timing gate raised by the rebuild itself - the mixer refusing the accepted
+		// waveform's placement or coverage, a soundtrack the pinned stems cannot satisfy, a pinned
+		// role plan the mix requires - is the same class of refusal as the selection-time gate and
+		// keeps its documented status: the successor and its audit row stay as evidence, and the
+		// operator sees the gate that refused instead of an opaque server fault.
+		case errors.Is(err, domain.ErrMixerOverrunRefused),
+			errors.Is(err, domain.ErrSoundtrackPreservationFailed),
+			errors.Is(err, domain.ErrAudioRolePlanRequired),
+			errors.Is(err, domain.ErrRunPinnedAudioRolePlanMissing):
 			writeError(w, http.StatusUnprocessableEntity, err.Error())
 		case errors.Is(err, service.ErrReviewedCandidateWaiverRequired),
 			errors.Is(err, service.ErrReviewedCandidateInvalid):

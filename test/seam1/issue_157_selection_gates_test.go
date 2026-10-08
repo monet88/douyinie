@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -58,6 +59,15 @@ func issue157Run(t *testing.T, h *testHarness, runID string) domain.Localization
 // selectable candidate. sameVoice drives the whole run through a single voice (issue #93/#155).
 func issue157ParkedFixture(t *testing.T, h *testHarness, sameVoice bool) (jobID, assetID, runID string, items []domain.ReviewItem) {
 	t.Helper()
+	return issue157ParkedFixtureWithMedia(t, h, 6.0, sameVoice)
+}
+
+// issue157ParkedFixtureWithMedia is the same two-turn parked lineage over a caller-chosen source
+// media duration. A media shorter than the pinned source timeline is the state in which the
+// acceptance's own window gate holds but the mixer's placement gate must refuse, which is the hard
+// media refusal the route's status mapping is asserted against.
+func issue157ParkedFixtureWithMedia(t *testing.T, h *testHarness, mediaSeconds float64, sameVoice bool) (jobID, assetID, runID string, items []domain.ReviewItem) {
+	t.Helper()
 	turns := []issue155Turn{
 		{speaker: "SPEAKER_00", startMs: 0, endMs: 1000, source: "你好", spoken: "Xin chao ban"},
 		{speaker: "SPEAKER_01", startMs: 1150, endMs: 2150, source: "再见", spoken: "Tam biet ban"},
@@ -66,7 +76,7 @@ func issue157ParkedFixture(t *testing.T, h *testHarness, sameVoice bool) (jobID,
 		{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue},
 		{StartMs: 1150, EndMs: 2150, Role: domain.AudioRoleNarrationDialogue},
 	}
-	jobID, runID = createJobAndRunWithDuration(t, h, 6.0)
+	jobID, runID = createJobAndRunWithDuration(t, h, mediaSeconds)
 	assetID = getJobViaAPI(t, h, jobID).SourceAssetID
 
 	scriptCAS, _ := issue155PinLineage(t, h, jobID, assetID, runID, roles, turns)
@@ -103,6 +113,9 @@ func issue157ParkedFixture(t *testing.T, h *testHarness, sameVoice bool) (jobID,
 		t.Fatalf("expected two unresolved review units and no selection, got status=%s selected=%v reviewed=%v",
 			variant.OverallStatus, selected, reviewed)
 	}
+	// The run parks on the unresolved units exactly as the drained pipeline leaves it, so every
+	// acceptance below resolves a paused run rather than a never-started one.
+	parkRunForReview(t, h, runID)
 	items = issue157ReviewItems(t, h, runID)
 	if len(items) != 2 {
 		t.Fatalf("expected two pending review items, got %+v", items)
@@ -695,6 +708,7 @@ func TestSeam1_Issue157_GroupedUnitAcceptanceKeepsCanonicalMembership(t *testing
 		t.Fatalf("expected the bounded regroup to cover both canonical members, got %v", unit.SpeechBlockIndices)
 	}
 
+	parkRunForReview(t, h, runID)
 	items := issue157ReviewItems(t, h, runID)
 	if len(items) != 1 {
 		t.Fatalf("expected one pending review item for the grouped unit, got %+v", items)
@@ -762,22 +776,18 @@ func issue157CreateRunInPosture(t *testing.T, h *testHarness, jobID string, post
 	return result.Run.ID
 }
 
-// TestSeam1_Issue157_ReviewPostureKeepsExplicitFinalRenderStart proves a complete acceptance under
-// Review posture rebuilds the delivery and stops at the operator's explicit final render: no final
-// render is executed or pinned, and the result reports the run as still paused.
-func TestSeam1_Issue157_ReviewPostureKeepsExplicitFinalRenderStart(t *testing.T) {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		t.Skip("ffmpeg is required on test host to rebuild a preview render")
-	}
-	h := setupHarness(t)
+// issue157ReviewPostureFixture pins one overrunning dialogue turn in a run submitted in Review
+// posture, so an acceptance rebuilds the delivery and stops at the operator's explicit final render.
+func issue157ReviewPostureFixture(t *testing.T, h *testHarness) (jobID, assetID, runID string, items []domain.ReviewItem) {
+	t.Helper()
 	turns := []issue155Turn{
 		{speaker: "SPEAKER_00", startMs: 0, endMs: 1000, source: "你好", spoken: "Xin chao ban"},
 	}
 	roles := []domain.AudioSegment{{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue}}
 
-	jobID, _ := createJobAndRunWithDuration(t, h, 4.0)
-	assetID := getJobViaAPI(t, h, jobID).SourceAssetID
-	runID := issue157CreateRunInPosture(t, h, jobID, domain.ReviewPostureReview)
+	jobID, _ = createJobAndRunWithDuration(t, h, 4.0)
+	assetID = getJobViaAPI(t, h, jobID).SourceAssetID
+	runID = issue157CreateRunInPosture(t, h, jobID, domain.ReviewPostureReview)
 
 	scriptCAS, _ := issue155PinLineage(t, h, jobID, assetID, runID, roles, turns)
 	lane := defaultVITTSFake(t, h)
@@ -796,11 +806,23 @@ func TestSeam1_Issue157_ReviewPostureKeepsExplicitFinalRenderStart(t *testing.T)
 	if resp.StatusCode != http.StatusCreated || variant == nil || variant.OverallStatus != "REVIEW_REQUIRED" {
 		t.Fatalf("expected the review-posture run to park on one unresolved unit, got %v", variant)
 	}
-
-	items := issue157ReviewItems(t, h, runID)
+	parkRunForReview(t, h, runID)
+	items = issue157ReviewItems(t, h, runID)
 	if len(items) != 1 {
 		t.Fatalf("expected one pending review unit, got %+v", items)
 	}
+	return jobID, assetID, runID, items
+}
+
+// TestSeam1_Issue157_ReviewPostureKeepsExplicitFinalRenderStart proves a complete acceptance under
+// Review posture rebuilds the delivery and stops at the operator's explicit final render: no final
+// render is executed or pinned, and the result reports the run as still paused.
+func TestSeam1_Issue157_ReviewPostureKeepsExplicitFinalRenderStart(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is required on test host to rebuild a preview render")
+	}
+	h := setupHarness(t)
+	_, _, runID, items := issue157ReviewPostureFixture(t, h)
 	status, result, refusal := issue157Accept(t, h, runID, issue157Selection(items[0].ID))
 	if status != http.StatusOK || result == nil {
 		t.Fatalf("expected the acceptance to succeed, got %d (%s)", status, refusal)
@@ -823,6 +845,22 @@ func TestSeam1_Issue157_ReviewPostureKeepsExplicitFinalRenderStart(t *testing.T)
 	}
 	if run := issue157Run(t, h, runID); run.Status == domain.RunStatusCompleted {
 		t.Fatalf("review posture must not complete the run before the explicit render, got %s", run.Status)
+	}
+
+	// A repeated identical acceptance is the same report: the delivery exists, so the replay states
+	// the state the run actually reached and never releases the final render the operator still owes.
+	replayStatus, replayed, replayRefusal := issue157Accept(t, h, runID, issue157Selection(items[0].ID))
+	if replayStatus != http.StatusOK || replayed == nil || !replayed.Idempotent {
+		t.Fatalf("expected an idempotent replay, got %d (%s)", replayStatus, replayRefusal)
+	}
+	if replayed.HandoffAction != "start_final_render" || !replayed.RunPaused || replayed.RunCompleted {
+		t.Fatalf("a review-posture replay must report the paused state it left, got %+v", replayed)
+	}
+	if replayed.FinalRenderCAS != "" {
+		t.Fatalf("a review-posture replay must not report a final render, got %s", replayed.FinalRenderCAS)
+	}
+	if replayed.PreviewRenderCAS != result.PreviewRenderCAS || replayed.DubMixCAS != result.DubMixCAS {
+		t.Fatalf("the replay must read back the rebuilt delivery: %+v vs %+v", replayed, result)
 	}
 }
 
@@ -888,5 +926,350 @@ func TestSeam1_Issue157_ConcurrentSelectionsCannotMintTwoDecisions(t *testing.T)
 	pending := issue157ReviewItems(t, h, runID)
 	if len(pending) != 1 || pending[0].ItemIndex != items[1].ItemIndex {
 		t.Fatalf("only the accepted unit may leave the queue, got %+v", pending)
+	}
+}
+
+// issue157ReadMix decodes the run's current dub mix artifact.
+func issue157ReadMix(t *testing.T, h *testHarness, runID string) *domain.DubMixArtifact {
+	t.Helper()
+	idx, err := h.db.GetDubMixArtifactIndexByRun(context.Background(), runID)
+	if err != nil || idx == nil {
+		t.Fatalf("read run %s dub mix index: %v", runID, err)
+	}
+	rc, err := h.casStore.Get(idx.CASHash)
+	if err != nil {
+		t.Fatalf("read run %s dub mix from CAS (%s): %v", runID, idx.CASHash, err)
+	}
+	defer rc.Close()
+	var mix domain.DubMixArtifact
+	if err := json.NewDecoder(rc).Decode(&mix); err != nil {
+		t.Fatalf("decode run %s dub mix: %v", runID, err)
+	}
+	return &mix
+}
+
+// issue157HasWindow reports whether a preservation plan carries the exact interval.
+func issue157HasWindow(windows []domain.PreservationWindow, startMs, endMs int64) bool {
+	for _, w := range windows {
+		if w.StartMs == startMs && w.EndMs == endMs {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSeam1_Issue157_AutoPostureAcceptanceRendersFinalAndCompletesRun proves the auto-posture end of
+// the slice: the last required acceptance rebuilds the delivery, executes and pins the final render,
+// and only then completes the run and its job; the repeated identical acceptance reports that state
+// as the idempotent replay it is.
+func TestSeam1_Issue157_AutoPostureAcceptanceRendersFinalAndCompletesRun(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is required to render the final delivery")
+	}
+	h := setupHarness(t)
+	ctx := context.Background()
+	jobID, assetID, runID, items := issue157ParkedFixture(t, h, false)
+
+	firstStatus, first, firstRefusal := issue157Accept(t, h, runID, issue157Selection(items[0].ID))
+	if firstStatus != http.StatusOK || first == nil || first.CoverageComplete {
+		t.Fatalf("expected the first group to be accepted without a rebuild, got %d (%s)", firstStatus, firstRefusal)
+	}
+	pending := issue157ReviewItems(t, h, runID)
+	if len(pending) != 1 {
+		t.Fatalf("expected one group still pending, got %+v", pending)
+	}
+
+	status, last, refusal := issue157Accept(t, h, runID, issue157Selection(pending[0].ID))
+	if status != http.StatusOK || last == nil {
+		t.Fatalf("expected the last acceptance to succeed, got %d (%s)", status, refusal)
+	}
+	if !last.CoverageComplete || !last.RunCompleted || last.RunPaused {
+		t.Fatalf("expected a completed auto run, got %+v", last)
+	}
+	if last.HandoffAction != "auto_render_started" || last.FinalRenderCAS == "" {
+		t.Fatalf("expected an executed auto final render, got action=%q cas=%q", last.HandoffAction, last.FinalRenderCAS)
+	}
+	if stage := issue157StageArtifact(t, h, runID, "render_final"); stage == "" {
+		t.Fatal("expected the render_final stage to record the executed handoff")
+	}
+	finalIdx, err := h.db.GetLatestRenderArtifactIndex(ctx, assetID, "vi", domain.RenderKindFinal)
+	if err != nil || finalIdx == nil || finalIdx.CASHash != last.FinalRenderCAS {
+		t.Fatalf("expected the executed final render to be the run's current one, got %+v (%v)", finalIdx, err)
+	}
+	if run := issue157Run(t, h, runID); run.Status != domain.RunStatusCompleted {
+		t.Fatalf("expected the accepted run to complete, got %s", run.Status)
+	}
+	if job := getJobViaAPI(t, h, jobID); job.Status != "completed" {
+		t.Fatalf("expected the accepted run's job to complete, got %s", job.Status)
+	}
+
+	// The replay reports the delivery it reached and finishes nothing twice.
+	replayStatus, replayed, replayRefusal := issue157Accept(t, h, runID, issue157Selection(pending[0].ID))
+	if replayStatus != http.StatusOK || replayed == nil || !replayed.Idempotent {
+		t.Fatalf("expected an idempotent replay, got %d (%s)", replayStatus, replayRefusal)
+	}
+	if !replayed.RunCompleted || replayed.RunPaused {
+		t.Fatalf("a completed auto delivery must replay as completed, got paused=%v completed=%v",
+			replayed.RunPaused, replayed.RunCompleted)
+	}
+	if replayed.HandoffAction != "auto_render_started" || replayed.FinalRenderCAS != last.FinalRenderCAS {
+		t.Fatalf("the replay must report the executed final render, got action=%q cas=%q", replayed.HandoffAction, replayed.FinalRenderCAS)
+	}
+	if got := issue157OverrideCount(t, h, runID); got != 2 {
+		t.Fatalf("the replay must not append audit rows, got %d", got)
+	}
+}
+
+// TestSeam1_Issue157_DeliveredRunCompletionRespectsTheQueueGate proves the shared terminal transition
+// refuses to finish a run whose queue entry is not the state that decision resolves, so neither the
+// pipeline nor an acceptance can promote a cancelled, finished or never-started run to a completed
+// one - the gate the acceptance path previously lacked.
+func TestSeam1_Issue157_DeliveredRunCompletionRespectsTheQueueGate(t *testing.T) {
+	h := setupHarness(t)
+	ctx := context.Background()
+
+	// A never-started run is not a delivery the acceptance may finish.
+	_, queuedRun := createJobAndRun(t, h)
+	if err := service.CompleteDeliveredRun(ctx, h.db, queuedRun, true); err == nil {
+		t.Fatal("expected a queued run to be refused as a completion target")
+	}
+	if run := issue157Run(t, h, queuedRun); run.Status == domain.RunStatusCompleted {
+		t.Fatalf("a queued run must not be completed, got %s", run.Status)
+	}
+
+	// A cancelled run keeps its history and is never promoted.
+	_, cancelRun := createJobAndRun(t, h)
+	if err := h.queueSvc.Cancel(ctx, cancelRun); err != nil {
+		t.Fatalf("cancel run: %v", err)
+	}
+	if err := service.CompleteDeliveredRun(ctx, h.db, cancelRun, true); err != nil {
+		t.Fatalf("a cancelled run is a no-op for completion, got %v", err)
+	}
+	if run := issue157Run(t, h, cancelRun); run.Status != domain.RunStatusCancelled {
+		t.Fatalf("a cancelled run must stay cancelled, got %s", run.Status)
+	}
+
+	// A paused run is completed only by the caller that resolves the park.
+	parkedJob, parkedRun := createJobAndRun(t, h)
+	parkRunForReview(t, h, parkedRun)
+	if err := service.CompleteDeliveredRun(ctx, h.db, parkedRun, false); err != nil {
+		t.Fatalf("the running-only gate is a no-op for a paused run, got %v", err)
+	}
+	if run := issue157Run(t, h, parkedRun); run.Status != domain.RunStatusPaused {
+		t.Fatalf("the running-only gate must leave a paused run paused, got %s", run.Status)
+	}
+	if err := service.CompleteDeliveredRun(ctx, h.db, parkedRun, true); err != nil {
+		t.Fatalf("complete the parked run: %v", err)
+	}
+	if run := issue157Run(t, h, parkedRun); run.Status != domain.RunStatusCompleted {
+		t.Fatalf("expected the parked run to complete, got %s", run.Status)
+	}
+	if job := getJobViaAPI(t, h, parkedJob); job.Status != "completed" {
+		t.Fatalf("expected the parked run's job to complete, got %s", job.Status)
+	}
+
+	// An already-finished run is refused instead of being re-completed or marked failed.
+	if err := service.CompleteDeliveredRun(ctx, h.db, parkedRun, true); err == nil {
+		t.Fatal("expected a second completion of a finished run to be refused")
+	}
+	if run := issue157Run(t, h, parkedRun); run.Status != domain.RunStatusCompleted {
+		t.Fatalf("a refused re-completion must leave the run completed, got %s", run.Status)
+	}
+}
+
+// TestSeam1_Issue157_RebuildMediaGateIsUnprocessableEntity proves a hard media gate raised by the
+// rebuild itself keeps the refusal class the contract documents: the accepted decision stays as
+// evidence, and the operator sees 422 - the same class as the selection-time gates - rather than an
+// opaque server fault. The fixture's source media is shorter than the pinned source timeline, so the
+// accepted window fits its own arithmetic while the mixer refuses to place the waveform past the
+// end of the media it must mix into.
+func TestSeam1_Issue157_RebuildMediaGateIsUnprocessableEntity(t *testing.T) {
+	h := setupHarness(t)
+	_, _, runID, items := issue157ParkedFixtureWithMedia(t, h, 1.2, false)
+
+	status, first, firstRefusal := issue157Accept(t, h, runID, issue157Selection(items[0].ID))
+	if status != http.StatusOK || first == nil || first.CoverageComplete {
+		t.Fatalf("expected the first group to be accepted without a rebuild, got %d (%s)", status, firstRefusal)
+	}
+	pending := issue157ReviewItems(t, h, runID)
+	if len(pending) != 1 {
+		t.Fatalf("expected one group still pending, got %+v", pending)
+	}
+
+	status, result, refusal := issue157Accept(t, h, runID, issue157Selection(pending[0].ID))
+	if status != http.StatusUnprocessableEntity || result != nil {
+		t.Fatalf("expected the rebuild's media gate to be 422, got %d (%s)", status, refusal)
+	}
+	if !strings.Contains(refusal, "audio mixer refused") {
+		t.Fatalf("expected the refusal to be the mixer's own gate, got %q", refusal)
+	}
+
+	// The decision is evidence: the successor with both acceptances stays the run's dubbing artifact,
+	// no mix is reported as accepted, and the run is not released.
+	successor := issue157RunVariant(t, h, runID)
+	if successor.OverallStatus != "PASS" || len(successor.AcceptedCandidates) != 2 {
+		t.Fatalf("expected the accepted decision to survive the refused rebuild, got status=%s evidence=%d",
+			successor.OverallStatus, len(successor.AcceptedCandidates))
+	}
+	if got := issue157OverrideCount(t, h, runID); got != 2 {
+		t.Fatalf("expected both acceptances to stay audited, got %d rows", got)
+	}
+	mixIdx, err := h.db.GetDubMixArtifactIndexByRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("read the refused mix index: %v", err)
+	}
+	if mixIdx.OverallStatus == "PASS" {
+		t.Fatalf("a refused rebuild must not publish an accepted mix, got %+v", mixIdx)
+	}
+	if run := issue157Run(t, h, runID); run.Status == domain.RunStatusCompleted {
+		t.Fatalf("a refused rebuild must not complete the run, got %s", run.Status)
+	}
+}
+
+// TestSeam1_Issue157_NoDubSingingPreservationSurvivesAcceptedRebuild proves the accepted rebuild keeps
+// the canonical ownership of a source that also carries singing: the singing block is never a dub
+// member nor a required replacement, and the rebuilt mix preserves the singing window while it
+// suppresses only the dialogue the accepted waveform replaces.
+func TestSeam1_Issue157_NoDubSingingPreservationSurvivesAcceptedRebuild(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is required to rebuild the mix")
+	}
+	h := setupHarness(t)
+
+	turns := []issue155Turn{
+		{speaker: "SPEAKER_00", startMs: 0, endMs: 1000, source: "你好", spoken: "Xin chao ban"},
+		// A singing stretch the ASR transcribed as speech: never dub-eligible, so it must stay a
+		// preserved source window instead of becoming a required replacement.
+		{speaker: "SPEAKER_00", startMs: 1150, endMs: 2150, source: "啦", scriptAbsent: true},
+	}
+	roles := []domain.AudioSegment{
+		{StartMs: 0, EndMs: 1000, Role: domain.AudioRoleNarrationDialogue},
+		{StartMs: 1150, EndMs: 2150, Role: domain.AudioRoleSingingMusicVocal},
+		{StartMs: 0, EndMs: 3000, Role: domain.AudioRoleInstrumentalBgm},
+	}
+	jobID, runID := createJobAndRunWithDuration(t, h, 6.0)
+	assetID := getJobViaAPI(t, h, jobID).SourceAssetID
+	scriptCAS, _ := issue155PinLineage(t, h, jobID, assetID, runID, roles, turns)
+	lane := defaultVITTSFake(t, h)
+	lane.DurationMs = 1200
+
+	respAssign, assign := runAssignVoices(t, h, assetID, map[string]any{"run_id": runID, "target_language": "vi"})
+	if respAssign.StatusCode != http.StatusCreated || assign == nil {
+		t.Fatalf("voice assignment failed: %d", respAssign.StatusCode)
+	}
+	resp, variant := runDubSynthesize(t, h, assetID, map[string]any{
+		"run_id":                 runID,
+		"target_language":        "vi",
+		"dub_script_variant_cas": scriptCAS,
+		"voice_assignment_cas":   assign.CASHash,
+	})
+	if resp.StatusCode != http.StatusCreated || variant == nil {
+		t.Fatalf("dub-synthesize failed: %d", resp.StatusCode)
+	}
+	if variant.OverallStatus != "REVIEW_REQUIRED" || len(variant.ReviewSegments) != 1 || len(variant.Segments) != 0 {
+		t.Fatalf("expected one unresolved dialogue unit and no selection, got status=%s review=%d selected=%d",
+			variant.OverallStatus, len(variant.ReviewSegments), len(variant.Segments))
+	}
+	if got := variant.ReviewSegments[0].SpeechBlockIndices; !slices.Equal(got, []int{0}) {
+		t.Fatalf("the singing block must not be a required replacement, got members %v", got)
+	}
+	parkRunForReview(t, h, runID)
+
+	items := issue157ReviewItems(t, h, runID)
+	if len(items) != 1 {
+		t.Fatalf("expected one pending dialogue unit, got %+v", items)
+	}
+	status, result, refusal := issue157Accept(t, h, runID, issue157Selection(items[0].ID))
+	if status != http.StatusOK || result == nil || !result.CoverageComplete {
+		t.Fatalf("expected the dialogue unit to be accepted with complete coverage, got %d (%s)", status, refusal)
+	}
+
+	successor := issue157RunVariant(t, h, runID)
+	if successor.OverallStatus != "PASS" || len(successor.Segments) != 1 || len(successor.ReviewSegments) != 0 {
+		t.Fatalf("expected one accepted segment and no unresolved unit, got status=%s selected=%d review=%d",
+			successor.OverallStatus, len(successor.Segments), len(successor.ReviewSegments))
+	}
+	for _, seg := range successor.Segments {
+		if !slices.Equal(seg.SpeechBlockIndices, []int{0}) {
+			t.Fatalf("the accepted segment must cover only the dialogue block, got %v", seg.SpeechBlockIndices)
+		}
+	}
+
+	mix := issue157ReadMix(t, h, runID)
+	if !mix.PreservationPlan.PreserveSinging {
+		t.Fatal("the rebuilt mix must preserve singing")
+	}
+	if !issue157HasWindow(mix.PreservationPlan.SingingWindows, 1150, 2150) {
+		t.Fatalf("the singing window must stay preserved untouched, got %+v", mix.PreservationPlan.SingingWindows)
+	}
+	if !issue157HasWindow(mix.PreservationPlan.SpeechWindows, 0, 1000) {
+		t.Fatalf("suppression must follow the accepted dialogue block, got %+v", mix.PreservationPlan.SpeechWindows)
+	}
+	for _, w := range mix.PreservationPlan.SpeechWindows {
+		if w.StartMs < 2150 && w.EndMs > 1150 {
+			t.Fatalf("the singing window must never be suppressed as dialogue, got %+v", w)
+		}
+	}
+}
+
+// TestSeam1_Issue157_InjectedCASFailureLeavesNoApprovalAndRetryCompletes proves an injected CAS
+// failure at the acceptance's own commit point cannot leave an approval that releases media: no
+// successor, no audit row and no mix exist, and the operator's retry of the same exact selection
+// completes the acceptance once the store works again.
+func TestSeam1_Issue157_InjectedCASFailureLeavesNoApprovalAndRetryCompletes(t *testing.T) {
+	h := setupHarness(t)
+	ctx := context.Background()
+	_, _, runID, items := issue157ParkedFixture(t, h, true)
+	base := issue157RunVariant(t, h, runID)
+
+	// The CAS staging directory is what every write needs: withdrawing it fails the acceptance's own
+	// commit without touching a single object a reader resolves.
+	staging := filepath.Join(h.dir, "cas", "tmp")
+	if err := os.Rename(staging, staging+".away"); err != nil {
+		t.Fatalf("withdraw the CAS staging directory: %v", err)
+	}
+	restored := false
+	restore := func() {
+		if !restored {
+			_ = os.Rename(staging+".away", staging)
+			restored = true
+		}
+	}
+	t.Cleanup(restore)
+
+	status, result, refusal := issue157Accept(t, h, runID, issue157Selection(items[0].ID))
+	if status == http.StatusOK || result != nil {
+		t.Fatalf("expected the injected CAS failure to surface, got %d (%s)", status, refusal)
+	}
+	restore()
+
+	if now := issue157RunVariant(t, h, runID); now.CASHash != base.CASHash {
+		t.Fatalf("a failed acceptance must not move the run's dubbing artifact: %s -> %s", base.CASHash, now.CASHash)
+	}
+	if got := issue157OverrideCount(t, h, runID); got != 0 {
+		t.Fatalf("a failed acceptance must not write audit rows, got %d", got)
+	}
+	if _, err := h.db.GetDubMixArtifactIndexByRun(ctx, runID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("a failed acceptance must not publish a mix, got %v", err)
+	}
+	if pending := issue157ReviewItems(t, h, runID); len(pending) != 2 {
+		t.Fatalf("a failed acceptance must leave the review queue untouched, got %+v", pending)
+	}
+
+	// The retry of the same exact selection completes it against the artifact it was derived from.
+	retryStatus, retried, retryRefusal := issue157Accept(t, h, runID, issue157Selection(items[0].ID))
+	if retryStatus != http.StatusOK || retried == nil {
+		t.Fatalf("expected the retry to complete the acceptance, got %d (%s)", retryStatus, retryRefusal)
+	}
+	if retried.CoverageComplete || !retried.RunPaused || retried.RemainingReviewCount != 1 {
+		t.Fatalf("expected the retry to accept one of two units and stay paused, got %+v", retried)
+	}
+	after := issue157RunVariant(t, h, runID)
+	if after.CASHash != retried.DubSegmentsVariantCAS || len(after.AcceptedCandidates) != 1 {
+		t.Fatalf("expected the retry's successor to carry one acceptance, got cas=%s evidence=%d",
+			after.CASHash, len(after.AcceptedCandidates))
+	}
+	if got := issue157OverrideCount(t, h, runID); got != 1 {
+		t.Fatalf("the retry must record exactly one audit row, got %d", got)
 	}
 }
