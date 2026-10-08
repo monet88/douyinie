@@ -916,6 +916,15 @@ func (s *BundleService) collectReachableCASHashes(manifest *domain.JobBundleMani
 		return nil
 	}
 
+	// Helper to add an object whose presence in CAS is optional. A request/provenance digest
+	// that resolves to a real object is shipped; one that does not is manifest data only.
+	addIfPresent := func(h string) {
+		clean := strings.ToLower(strings.TrimSpace(h))
+		if len(clean) == 64 && s.cas.Exists(clean) {
+			hashes[clean] = true
+		}
+	}
+
 	// 1. Source asset & preflight
 	if err := addIfCAS(manifest.SourceAsset.SHA256); err != nil {
 		return nil, err
@@ -951,11 +960,16 @@ func (s *BundleService) collectReachableCASHashes(manifest *domain.JobBundleMani
 				return nil, err
 			}
 		}
-		// Issue #156 acceptance invariant: ProviderAttempt.InputHash is a request/provenance digest
-		// (TTS text+voice+speed, translation input, discovery query), not a CAS artifact reference.
-		// Treating it as a CAS requirement breaks export of real runs whose attempts record non-CAS
-		// request digests. Media inputs (source asset, preflight normalized audio) are traversed
-		// explicitly; excluding attempt digests from reachable CAS objects is required for bundle closure.
+		// Issue #156: ProviderAttempt.InputHash has mixed semantics. An attempt that recorded the
+		// media object it read names a real CAS artifact the bundle must ship (an ASR attempt holds
+		// the source media hash); a TTS/translation/discovery attempt records a derived request
+		// digest that never became an artifact. Ship and require it exactly when it resolves in CAS,
+		// so a provenance-only digest neither fails closure nor invents bytes, while a CAS-backed
+		// one is still shipped. Media inputs (source asset, preflight normalized audio) are
+		// traversed explicitly above.
+		for _, att := range runData.ProviderAttempts {
+			addIfPresent(att.InputHash)
+		}
 		if ta := runData.TranscriptArtifact; ta != nil {
 			if err := addIfCAS(ta.CASHash); err != nil {
 				return nil, err
@@ -1048,6 +1062,11 @@ func (s *BundleService) collectReachableCASHashes(manifest *domain.JobBundleMani
 
 func (s *BundleService) collectManifestReferencedHashes(manifest *domain.JobBundleManifest) map[string]bool {
 	hashes := make(map[string]bool)
+	// Hashes the archive actually ships, i.e. the declared bundle artifacts.
+	shippedHashes := make(map[string]bool, len(manifest.Artifacts))
+	for _, art := range manifest.Artifacts {
+		shippedHashes[strings.ToLower(strings.TrimSpace(art.SHA256))] = true
+	}
 	addHash := func(h string) {
 		clean := strings.ToLower(strings.TrimSpace(h))
 		if len(clean) == 64 {
@@ -1071,8 +1090,16 @@ func (s *BundleService) collectManifestReferencedHashes(manifest *domain.JobBund
 		for _, se := range runData.StageExecutions {
 			addHash(se.ArtifactSHA256)
 		}
-		// Issue #156: ProviderAttempt.InputHash is a request/provenance digest, not an artifact the
-		// bundle archive ships; it is deliberately excluded from manifest referenced CAS hashes.
+		// Issue #156: ProviderAttempt.InputHash is required from the archive only when the archive
+		// actually ships it. A CAS-backed attempt digest (an ASR attempt records the media object it
+		// read) was shipped by export, so the bundle must declare it; a provenance-only request
+		// digest is preserved in manifest provider_attempts and must not fail validation, exactly as
+		// export's reachable traversal decided when it built manifest.Artifacts.
+		for _, att := range runData.ProviderAttempts {
+			if shippedHashes[strings.ToLower(strings.TrimSpace(att.InputHash))] {
+				addHash(att.InputHash)
+			}
+		}
 		if ta := runData.TranscriptArtifact; ta != nil {
 			addHash(ta.CASHash)
 		}

@@ -296,7 +296,7 @@ type DubTempoCandidate struct {
 	Reason string `json:"reason"`
 	// ToolID identifies the transform tool, e.g. "ffmpeg-atempo".
 	ToolID string `json:"tool_id"`
-	// Filter is the exact single filter applied, e.g. "atempo=1.250000".
+	// Filter is the exact single filter applied, e.g. "atempo=1.25".
 	Filter string `json:"filter,omitempty"`
 	// PolicyVersion is the fit policy identity that judged eligibility.
 	PolicyVersion string `json:"policy_version,omitempty"`

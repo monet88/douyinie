@@ -26,16 +26,19 @@ func TestWriteDubMediaError_NeverEchoesFilesystemPaths(t *testing.T) {
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 for an unclassified resolution failure, got %d", rec.Code)
 	}
+	// Capture the body before decoding it: decoding drains the recorder, so asserting on it
+	// afterwards would be checking an empty string rather than the response.
+	body := rec.Body.String()
 	var payload struct {
 		Error string `json:"error"`
 	}
-	if decErr := json.NewDecoder(rec.Body).Decode(&payload); decErr != nil {
+	if decErr := json.NewDecoder(strings.NewReader(body)).Decode(&payload); decErr != nil {
 		t.Fatalf("decode refusal body: %v", decErr)
 	}
 	if payload.Error != "dub media resolution failed" {
 		t.Fatalf("expected the fixed refusal message, got %q", payload.Error)
 	}
-	if strings.Contains(rec.Body.String(), casPath) || strings.Contains(rec.Body.String(), "douyinie-data") {
-		t.Fatalf("refusal body leaked a filesystem path: %s", rec.Body.String())
+	if strings.Contains(body, casPath) || strings.Contains(body, "douyinie-data") {
+		t.Fatalf("refusal body leaked a filesystem path: %s", body)
 	}
 }

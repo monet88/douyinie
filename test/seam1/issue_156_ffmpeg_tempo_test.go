@@ -90,8 +90,10 @@ func TestSeam1_Issue156_DeterministicExhaustionRealFFmpegCandidate(t *testing.T)
 	if tc.ToolID != domain.TempoToolID {
 		t.Fatalf("expected tool %s, got %s", domain.TempoToolID, tc.ToolID)
 	}
-	if tc.Filter != "atempo=1.200000" {
-		t.Fatalf("expected filter atempo=1.200000, got %s", tc.Filter)
+	// The recorded lineage must be exactly the filter the transform ran: AtempoFilterString's own
+	// serialization of the recorded factor, not a hard-coded spelling that can drift from it.
+	if want := media.AtempoFilterString(tc.Factor); tc.Filter != want {
+		t.Fatalf("expected filter %q, got %q", want, tc.Filter)
 	}
 	// Transformed duration ~1000ms <= 1000ms -> Selectable = true, Reason = TEMPO_CANDIDATE_WITHIN_WINDOW
 	if !tc.Selectable || tc.Reason != domain.TempoReasonFits {

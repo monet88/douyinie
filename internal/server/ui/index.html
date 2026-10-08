@@ -582,14 +582,26 @@
                       <p class="tempo-note" id="inspect-tempo-note"></p>
                       <dl class="detail-list three" id="inspect-tempo-meta"></dl>
                       <div class="tempo-audio">
-                        <label class="tempo-audio-row">
+                        <div class="tempo-audio-row">
                           <span>Natural (waveform giữ nguyên)</span>
-                          <audio class="hidden" id="inspect-tempo-natural" controls preload="none"></audio>
-                        </label>
-                        <label class="tempo-audio-row">
+                          <audio
+                            class="hidden"
+                            id="inspect-tempo-natural"
+                            controls
+                            preload="none"
+                            aria-label="Waveform natural giữ nguyên"
+                          ></audio>
+                        </div>
+                        <div class="tempo-audio-row">
                           <span>Tempo alternative (chưa được chọn)</span>
-                          <audio class="hidden" id="inspect-tempo-transformed" controls preload="none"></audio>
-                        </label>
+                          <audio
+                            class="hidden"
+                            id="inspect-tempo-transformed"
+                            controls
+                            preload="none"
+                            aria-label="Phương án tempo thay thế chưa được chọn"
+                          ></audio>
+                        </div>
                       </div>
                     </div>
 

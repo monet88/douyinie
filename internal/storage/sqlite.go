@@ -3547,7 +3547,59 @@ func (s *DB) SaveDubSegmentsVariantIndex(ctx context.Context, idx DubSegmentsVar
 			cas_hash = excluded.cas_hash,
 			overall_status = excluded.overall_status
 	`
-	_, err := s.db.ExecContext(ctx, query,
+	_, err := s.db.ExecContext(ctx, query, dubSegmentsVariantIndexArgs(idx)...)
+	if err != nil {
+		return fmt.Errorf("save dub_segments_variant index: %w", err)
+	}
+	return nil
+}
+
+// ClaimDubSegmentsVariantIndexForAssignment records the index row for a CAS-stored
+// DubSegmentsVariant only while no voice assignment other than assignmentCAS is in force for the
+// run, and reports whether the row was claimed (§156). The ownership test and the row write are
+// one statement, so a reassignment that lands between any earlier decision and this write cannot
+// be missed: it refuses the write instead of letting a superseded pass take over the row the
+// inspector, the review projection and playback resolve.
+func (s *DB) ClaimDubSegmentsVariantIndexForAssignment(ctx context.Context, idx DubSegmentsVariantIndex, assignmentCAS string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// INSERT ... SELECT ... WHERE NOT EXISTS: a run with no assignment row has nothing newer to
+	// protect, so the claim proceeds; a run whose assignment is the variant's own proceeds too.
+	query := `
+		INSERT INTO dub_segments_variants (
+			id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+			overall_status, created_at
+		)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE NOT EXISTS (
+			SELECT 1 FROM voice_assignments
+			WHERE asset_id = ? AND run_id = ? AND target_language = ? AND cas_hash <> ?
+		)
+		ON CONFLICT(provenance_hash) DO UPDATE SET
+			cas_hash = excluded.cas_hash,
+			overall_status = excluded.overall_status
+	`
+	res, err := s.db.ExecContext(ctx, query, append(dubSegmentsVariantIndexArgs(idx),
+		idx.AssetID, idx.RunID, idx.TargetLanguage, assignmentCAS)...)
+	if err != nil {
+		return false, fmt.Errorf("claim dub_segments_variant index: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("claim dub_segments_variant index: %w", err)
+	}
+	return affected > 0, nil
+}
+
+// dubSegmentsVariantIndexArgs binds one dub-variant index row in the column order both writes
+// above spell, so a column added to one cannot silently be missing from the other.
+func dubSegmentsVariantIndexArgs(idx DubSegmentsVariantIndex) []any {
+	createdAt := idx.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	return []any{
 		idx.ID,
 		idx.AssetID,
 		idx.RunID,
@@ -3556,17 +3608,8 @@ func (s *DB) SaveDubSegmentsVariantIndex(ctx context.Context, idx DubSegmentsVar
 		idx.CASHash,
 		idx.ProvenanceHash,
 		idx.OverallStatus,
-		func() string {
-			if idx.CreatedAt.IsZero() {
-				return time.Now().UTC().Format(time.RFC3339Nano)
-			}
-			return idx.CreatedAt.Format(time.RFC3339Nano)
-		}(),
-	)
-	if err != nil {
-		return fmt.Errorf("save dub_segments_variant index: %w", err)
+		createdAt.Format(time.RFC3339Nano),
 	}
-	return nil
 }
 
 // GetDubSegmentsVariantIndex retrieves the latest index row for an asset and target language.

@@ -471,22 +471,22 @@ func TestDubbingService_Issue156_MidSubprocessCancellationProvesIntegrity(t *tes
 	// Override transform to use the controllable helper and cancel context only after helper started
 	dubSvc.AtempoTransform = func(callCtx context.Context, req media.AtempoRequest) ([]byte, error) {
 		req.FFmpegPath = helperBin
-		done := make(chan struct{})
 		go func() {
-			// Wait for helper to write marker (proving it really started)
+			// Wait for the helper to write its marker (proving it really started), then cancel
+			// its context. The bounded wait must cancel on the timeout path too: a helper that
+			// never signalled would otherwise leave the transform blocked and hang the suite.
 			deadline := time.Now().Add(5 * time.Second)
 			for {
 				if _, err := os.Stat(markerFile); err == nil {
 					break
 				}
 				if time.Now().After(deadline) {
-					return
+					break
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
-			// Cancel while helper subprocess is actively running
+			// Cancel while the helper subprocess is actively running.
 			cancel()
-			close(done)
 		}()
 		return media.ApplyAtempoWAV(callCtx, req)
 	}
@@ -943,6 +943,550 @@ func TestDubbingService_Issue156_PreEscalationPassPublishedBeforeEscalationFailu
 	if len(published.Escalations) != 0 {
 		t.Fatalf("the published pass must predate the escalation, got %+v", published.Escalations)
 	}
+}
+
+const (
+	movedOnRaceAssetID = "asset-moved-on-assignment"
+	movedOnRaceRunID   = "run-moved-on-assignment"
+	movedOnRaceLang    = "vi"
+	movedOnRaceSlotMs  = int64(1000)
+	movedOnRaceLaneMs  = int64(1200) // 1.20 of the slot: an eligible atempo overrun
+)
+
+// seedMovedOnAssignmentRace seeds the concurrent-reassignment race this slice must survive. The
+// fixed-rate assignment A is the base an in-flight call synthesizes under, with its escalation
+// available so that call reaches the escalation decision; the operator assignment B - a general
+// lane that is neither A's lane nor the escalation target, so B's own pass is final - becomes the
+// run's current assignment when mintReassign is called. The tempo transform is stubbed and
+// counted, so a case can prove exactly how many transforms ran.
+func seedMovedOnAssignmentRace(t *testing.T) (
+	dubSvc *service.DubbingService,
+	db *storage.DB,
+	casStore *cas.Store,
+	scriptCAS string,
+	assignA *domain.VoiceAssignment,
+	mintReassign func() *domain.VoiceAssignment,
+	transformCalls func() int,
+) {
+	t.Helper()
+	dubSvc, db, casStore, reg, _ := setupDubbingTestHarness(t)
+	t.Cleanup(func() { _ = db.Close() })
+	ctx := context.Background()
+
+	setupAssetJobRunAudioRole(t, db, casStore, movedOnRaceAssetID, movedOnRaceRunID, movedOnRaceLang)
+
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        movedOnRaceAssetID,
+		RunID:          movedOnRaceRunID,
+		SourceLanguage: "zh",
+		TargetLanguage: movedOnRaceLang,
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SpeakerID:      "SPEAKER_00",
+				StartMs:        0,
+				EndMs:          movedOnRaceSlotMs,
+				SlotDurationMs: movedOnRaceSlotMs,
+				SourceText:     "你好",
+				MeaningText:    "Alo",
+				SpokenText:     "Alo",
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	pinDubbingScriptLineage(t, db, casStore, &dubScript, movedOnRaceRunID)
+	scriptBytes, _ := json.Marshal(dubScript)
+	scriptObj, _ := casStore.Put(bytes.NewReader(scriptBytes))
+
+	// The duration-controlled fallback lane A's escalation targets: registered and licensed before
+	// the run, so A's call plans an escalation instead of finalizing its own pass.
+	fallbackFake := provider.NewFakeTTSProvider("fake_cosyvoice3_tts", movedOnRaceLaneMs)
+	if err := reg.Register(fallbackFake); err != nil {
+		t.Fatalf("register fallback lane: %v", err)
+	}
+	if err := governance.NewLicenseService(db).RegisterManifest(ctx, domain.LicenseManifestEntry{
+		DependencyName: "fake_cosyvoice3_tts",
+		Version:        "1.0.0",
+		SHA256:         "sha256_mock_fake_cosyvoice3_tts",
+		SourceRepo:     "github.com/monet88/douyinie/models/fake_cosyvoice3_tts",
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Standard",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("register fallback lane manifest: %v", err)
+	}
+
+	for _, laneID := range []string{"fake_zerotts_tts_vi", "fake_vieneu_tts_vi"} {
+		lane, ok := reg.Get(laneID)
+		if !ok {
+			t.Fatalf("lane %s must be registered", laneID)
+		}
+		lane.(*provider.FakeTTSProvider).DurationMs = movedOnRaceLaneMs
+	}
+
+	assignA, err := dubSvc.AssignVoices(ctx, domain.VoiceAssignmentInput{
+		RunID:             movedOnRaceRunID,
+		AssetID:           movedOnRaceAssetID,
+		TargetLanguage:    movedOnRaceLang,
+		CustomAssignments: map[string]domain.VoiceProfile{"SPEAKER_00": provider.DefaultPresetVoices("vi")[0]},
+	})
+	if err != nil {
+		t.Fatalf("AssignVoices: %v", err)
+	}
+
+	// The operator's reassignment, minted exactly as the inspector's reassignment path mints it.
+	// It is callable rather than pre-applied so a case chooses when it lands: before the in-flight
+	// call, or inside that call's publish window.
+	mintReassign = func() *domain.VoiceAssignment {
+		t.Helper()
+		assignB, err := dubSvc.ReassignVoice(ctx, domain.VoiceAssignmentInput{
+			RunID:          movedOnRaceRunID,
+			AssetID:        movedOnRaceAssetID,
+			TargetLanguage: movedOnRaceLang,
+			CustomAssignments: map[string]domain.VoiceProfile{
+				"SPEAKER_00": {ID: "vieneu_vi_alt", ProviderID: "fake_vieneu_tts_vi", VoiceID: "vieneu_vi_alt", Language: movedOnRaceLang},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ReassignVoice: %v", err)
+		}
+		if assignB.CASHash == assignA.CASHash {
+			t.Fatal("precondition: the reassignment must mint a distinct current assignment")
+		}
+		return assignB
+	}
+
+	calls := 0
+	dubSvc.AtempoTransform = func(callCtx context.Context, req media.AtempoRequest) ([]byte, error) {
+		calls++
+		return media.GeneratePCM16WAV(16000, 1, movedOnRaceSlotMs), nil
+	}
+	return dubSvc, db, casStore, scriptObj.SHA256, assignA, mintReassign, func() int { return calls }
+}
+
+// TestDubbingService_Issue156_MovedOnRunDerivesEvidenceOnItsOwnAssignmentPass pins the
+// concurrent-reassignment contract for this slice. When an operator reassignment lands while a
+// request is in flight, the pass that request synthesized belongs to the superseded assignment:
+// it stays committed and readable, is returned as REVIEW evidence, gains NO tempo candidate
+// (attaching one would republish superseded-assignment audio as the run's canonical media), and
+// the operator's newer assignment is never reverted. The audition evidence belongs to the current
+// assignment's own pass, synthesized by its own request from its own retained waveform, so a run
+// that ends exhausted under the current assignment always has its candidate.
+func TestDubbingService_Issue156_MovedOnRunDerivesEvidenceOnItsOwnAssignmentPass(t *testing.T) {
+	dubSvc, db, casStore, scriptCAS, assignA, mintReassign, transformCalls := seedMovedOnAssignmentRace(t)
+	ctx := context.Background()
+	assignB := mintReassign()
+
+	stale, err := dubSvc.SynthesizeAndFit(ctx, domain.DubbingJobInput{
+		RunID:               movedOnRaceRunID,
+		AssetID:             movedOnRaceAssetID,
+		TargetLanguage:      movedOnRaceLang,
+		DubScriptVariantCAS: scriptCAS,
+		VoiceAssignmentCAS:  assignA.CASHash,
+	})
+	if err != nil {
+		t.Fatalf("the superseded-base synthesis must complete: %v", err)
+	}
+	if stale.OverallStatus != "REVIEW_REQUIRED" || len(stale.Segments) != 0 {
+		t.Fatalf("the superseded pass must stay unresolved and unselected, got status=%s segments=%d", stale.OverallStatus, len(stale.Segments))
+	}
+	if len(stale.ReviewSegments) != 1 || stale.ReviewSegments[0].TempoCandidate != nil {
+		t.Fatalf("the superseded pass must carry no tempo candidate, got %+v", stale.ReviewSegments)
+	}
+	if len(stale.Escalations) != 0 {
+		t.Fatalf("the superseded pass must not record an escalation, got %+v", stale.Escalations)
+	}
+	if stale.CASHash == "" || !casStore.Exists(stale.CASHash) {
+		t.Fatalf("the completed pass must stay committed and readable, got %q", stale.CASHash)
+	}
+	if got := transformCalls(); got != 0 {
+		t.Fatalf("no DSP may run for a superseded pass, got %d transform call(s)", got)
+	}
+	if idx, err := db.GetVoiceAssignmentIndexByRun(ctx, movedOnRaceAssetID, movedOnRaceRunID, movedOnRaceLang); err != nil || idx == nil || idx.CASHash != assignB.CASHash {
+		t.Fatalf("the newer assignment must stay in force, got idx=%v err=%v", idx, err)
+	}
+	// Nothing had published a pass for the run yet. The superseded pass does not claim the run's
+	// dub-variant row, so the run resolves to no artifact until the current assignment's own pass
+	// publishes - rather than resolving to superseded-assignment audio (#156).
+	if idx, err := db.GetDubSegmentsVariantIndexByRun(ctx, movedOnRaceRunID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("a superseded pass must not claim the run's row, got idx=%v err=%v", idx, err)
+	}
+
+	// The current assignment's own request synthesizes its own pass, which derives its own
+	// candidate from its own retained waveform.
+	final, err := dubSvc.SynthesizeAndFit(ctx, domain.DubbingJobInput{
+		RunID:               movedOnRaceRunID,
+		AssetID:             movedOnRaceAssetID,
+		TargetLanguage:      movedOnRaceLang,
+		DubScriptVariantCAS: scriptCAS,
+		VoiceAssignmentCAS:  assignB.CASHash,
+	})
+	if err != nil {
+		t.Fatalf("the current assignment's synthesis failed: %v", err)
+	}
+	if final.VoiceAssignmentCAS != assignB.CASHash {
+		t.Fatalf("the final pass must belong to the current assignment, got %s", final.VoiceAssignmentCAS)
+	}
+	if len(final.ReviewSegments) != 1 || final.ReviewSegments[0].TempoCandidate == nil {
+		t.Fatalf("the current assignment's pass must derive its own candidate, got %+v", final.ReviewSegments)
+	}
+	tc := final.ReviewSegments[0].TempoCandidate
+	if !tc.Selectable || tc.Reason != domain.TempoReasonFits || tc.TransformedAudioSHA256 == "" {
+		t.Fatalf("expected a selectable in-window candidate, got %+v", tc)
+	}
+	if tc.NaturalDurationMs != movedOnRaceLaneMs {
+		t.Fatalf("the candidate must come from the current pass's own waveform (%dms), got %dms", movedOnRaceLaneMs, tc.NaturalDurationMs)
+	}
+	if got := transformCalls(); got != 1 {
+		t.Fatalf("exactly one transform belongs to the current pass, got %d", got)
+	}
+	if final.OverallStatus != "REVIEW_REQUIRED" || len(final.Segments) != 0 {
+		t.Fatalf("the candidate must stay unselected and REVIEW_REQUIRED, got status=%s segments=%d", final.OverallStatus, len(final.Segments))
+	}
+
+	// The run's published artifact is the pass that carries the evidence; the superseded artifact
+	// stays readable history without one.
+	idx, err := db.GetDubSegmentsVariantIndexByRun(ctx, movedOnRaceRunID)
+	if err != nil || idx == nil || idx.CASHash != final.CASHash {
+		t.Fatalf("the run's published artifact must be the current assignment's pass, got idx=%v err=%v", idx, err)
+	}
+	published := loadCasVariant(t, casStore, idx.CASHash)
+	if len(published.ReviewSegments) != 1 || published.ReviewSegments[0].TempoCandidate == nil {
+		t.Fatalf("the published artifact must carry the derived candidate, got %+v", published.ReviewSegments)
+	}
+	if superseded := loadCasVariant(t, casStore, stale.CASHash); superseded.ReviewSegments[0].TempoCandidate != nil {
+		t.Fatal("the superseded artifact must stay without a tempo candidate")
+	}
+}
+
+// TestDubbingService_Issue156_SupersededPublishNeverClaimsTheRunVariantRow pins the other ordering
+// of the same race: the current assignment's pass is published first, and the in-flight call for the
+// superseded assignment completes afterwards. That pass is still committed history, but it must not
+// take the run's canonical dub-variant row - the row the inspector, the review projection and
+// playback all resolve - because then the run would resolve to superseded-assignment audio and the
+// current assignment's tempo evidence would be unreachable.
+func TestDubbingService_Issue156_SupersededPublishNeverClaimsTheRunVariantRow(t *testing.T) {
+	dubSvc, db, casStore, scriptCAS, assignA, mintReassign, transformCalls := seedMovedOnAssignmentRace(t)
+	ctx := context.Background()
+	assignB := mintReassign()
+
+	current, err := dubSvc.SynthesizeAndFit(ctx, domain.DubbingJobInput{
+		RunID:               movedOnRaceRunID,
+		AssetID:             movedOnRaceAssetID,
+		TargetLanguage:      movedOnRaceLang,
+		DubScriptVariantCAS: scriptCAS,
+		VoiceAssignmentCAS:  assignB.CASHash,
+	})
+	if err != nil {
+		t.Fatalf("the current assignment's synthesis failed: %v", err)
+	}
+	if len(current.ReviewSegments) != 1 || current.ReviewSegments[0].TempoCandidate == nil {
+		t.Fatalf("precondition: the current assignment's pass must carry its own candidate, got %+v", current.ReviewSegments)
+	}
+	if idx, err := db.GetDubSegmentsVariantIndexByRun(ctx, movedOnRaceRunID); err != nil || idx == nil || idx.CASHash != current.CASHash {
+		t.Fatalf("precondition: the current pass must own the run's row, got idx=%v err=%v", idx, err)
+	}
+
+	// The in-flight call for the superseded assignment now completes: it publishes its own pass and
+	// finds that the run has moved on to the assignment the operator chose later.
+	stale, err := dubSvc.SynthesizeAndFit(ctx, domain.DubbingJobInput{
+		RunID:               movedOnRaceRunID,
+		AssetID:             movedOnRaceAssetID,
+		TargetLanguage:      movedOnRaceLang,
+		DubScriptVariantCAS: scriptCAS,
+		VoiceAssignmentCAS:  assignA.CASHash,
+	})
+	if err != nil {
+		t.Fatalf("the superseded-base synthesis must complete: %v", err)
+	}
+	if stale.CASHash == "" || stale.CASHash == current.CASHash || !casStore.Exists(stale.CASHash) {
+		t.Fatalf("the superseded pass must stay committed as its own artifact, got %q", stale.CASHash)
+	}
+	if len(stale.ReviewSegments) != 1 || stale.ReviewSegments[0].TempoCandidate != nil {
+		t.Fatalf("the superseded pass must carry no tempo candidate, got %+v", stale.ReviewSegments)
+	}
+	if got := transformCalls(); got != 1 {
+		t.Fatalf("only the current assignment's pass may transform, got %d transform call(s)", got)
+	}
+	if idx, err := db.GetDubSegmentsVariantIndexByRun(ctx, movedOnRaceRunID); err != nil || idx == nil || idx.CASHash != current.CASHash {
+		t.Fatalf("a superseded publish must hand the run's row back, got idx=%v err=%v", idx, err)
+	}
+	published := loadCasVariant(t, casStore, current.CASHash)
+	if len(published.ReviewSegments) != 1 || published.ReviewSegments[0].TempoCandidate == nil {
+		t.Fatalf("the run's row must resolve to the pass that carries the evidence, got %+v", published.ReviewSegments)
+	}
+	if superseded := loadCasVariant(t, casStore, stale.CASHash); superseded.ReviewSegments[0].TempoCandidate != nil {
+		t.Fatal("the superseded artifact must stay without a tempo candidate")
+	}
+}
+
+// TestDubbingService_Issue156_ReassignmentInsidePublishWindowRefusesStaleRowClaim forces the one
+// interleaving a decision taken earlier in the request cannot cover: the reassignment lands after
+// the pre-escalation pass has been synthesized and at the moment it tries to claim the run's
+// dub-variant row, so the escalation decision the request makes afterwards is the first thing to
+// observe it. The stale pass must still be committed and CAS-readable - it is the artifact this
+// call returns as REVIEW evidence - but it must never own the run's dub-variant row, and it must
+// gain no tempo candidate. The row belongs to the current assignment's own pass, synthesized by
+// its own request, which carries its own tempo evidence.
+func TestDubbingService_Issue156_ReassignmentInsidePublishWindowRefusesStaleRowClaim(t *testing.T) {
+	dubSvc, db, casStore, scriptCAS, assignA, mintReassign, transformCalls := seedMovedOnAssignmentRace(t)
+	ctx := context.Background()
+
+	// The reassignment fires exactly once, at the stale pass's row claim: the pass is synthesized
+	// and about to be published, and the escalation decision has not run yet.
+	var assignB *domain.VoiceAssignment
+	dubSvc.SetBeforeRunRowClaimForTest(func() {
+		if assignB == nil {
+			assignB = mintReassign()
+		}
+	})
+
+	stale, err := dubSvc.SynthesizeAndFit(ctx, domain.DubbingJobInput{
+		RunID:               movedOnRaceRunID,
+		AssetID:             movedOnRaceAssetID,
+		TargetLanguage:      movedOnRaceLang,
+		DubScriptVariantCAS: scriptCAS,
+		VoiceAssignmentCAS:  assignA.CASHash,
+	})
+	if err != nil {
+		t.Fatalf("the superseded-base synthesis must complete: %v", err)
+	}
+	if assignB == nil {
+		t.Fatal("precondition: the reassignment must have landed inside the publish window")
+	}
+	dubSvc.SetBeforeRunRowClaimForTest(nil)
+
+	if stale.OverallStatus != "REVIEW_REQUIRED" || len(stale.Segments) != 0 {
+		t.Fatalf("the superseded pass must stay unresolved and unselected, got status=%s segments=%d", stale.OverallStatus, len(stale.Segments))
+	}
+	if len(stale.ReviewSegments) != 1 || stale.ReviewSegments[0].TempoCandidate != nil {
+		t.Fatalf("the superseded pass must carry no tempo candidate, got %+v", stale.ReviewSegments)
+	}
+	if len(stale.Escalations) != 0 {
+		t.Fatalf("the superseded pass must not record an escalation, got %+v", stale.Escalations)
+	}
+	if stale.CASHash == "" || !casStore.Exists(stale.CASHash) {
+		t.Fatalf("the superseded pass must stay committed and readable, got %q", stale.CASHash)
+	}
+	if got := transformCalls(); got != 0 {
+		t.Fatalf("no DSP may run for a superseded pass, got %d transform call(s)", got)
+	}
+	if idx, err := db.GetVoiceAssignmentIndexByRun(ctx, movedOnRaceAssetID, movedOnRaceRunID, movedOnRaceLang); err != nil || idx == nil || idx.CASHash != assignB.CASHash {
+		t.Fatalf("the reassignment that landed mid-publish must stay in force, got idx=%v err=%v", idx, err)
+	}
+	// The claim that raced the reassignment is refused by the claim statement itself.
+	if idx, err := db.GetDubSegmentsVariantIndexByRun(ctx, movedOnRaceRunID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("a pass superseded mid-publish must not claim the run's row, got idx=%v err=%v", idx, err)
+	}
+
+	// The current assignment's own request synthesizes the pass that owns the row, and derives its
+	// own candidate from its own retained waveform.
+	final, err := dubSvc.SynthesizeAndFit(ctx, domain.DubbingJobInput{
+		RunID:               movedOnRaceRunID,
+		AssetID:             movedOnRaceAssetID,
+		TargetLanguage:      movedOnRaceLang,
+		DubScriptVariantCAS: scriptCAS,
+		VoiceAssignmentCAS:  assignB.CASHash,
+	})
+	if err != nil {
+		t.Fatalf("the current assignment's synthesis failed: %v", err)
+	}
+	if final.VoiceAssignmentCAS != assignB.CASHash {
+		t.Fatalf("the final pass must belong to the current assignment, got %s", final.VoiceAssignmentCAS)
+	}
+	if len(final.ReviewSegments) != 1 || final.ReviewSegments[0].TempoCandidate == nil {
+		t.Fatalf("the current assignment's pass must derive its own candidate, got %+v", final.ReviewSegments)
+	}
+	tc := final.ReviewSegments[0].TempoCandidate
+	if !tc.Selectable || tc.Reason != domain.TempoReasonFits || tc.TransformedAudioSHA256 == "" {
+		t.Fatalf("expected a selectable in-window candidate, got %+v", tc)
+	}
+	if tc.NaturalDurationMs != movedOnRaceLaneMs {
+		t.Fatalf("the candidate must come from the current pass's own waveform (%dms), got %dms", movedOnRaceLaneMs, tc.NaturalDurationMs)
+	}
+	if got := transformCalls(); got != 1 {
+		t.Fatalf("exactly one transform belongs to the current pass, got %d", got)
+	}
+	if idx, err := db.GetDubSegmentsVariantIndexByRun(ctx, movedOnRaceRunID); err != nil || idx == nil || idx.CASHash != final.CASHash {
+		t.Fatalf("the current assignment's pass must own the run's row, got idx=%v err=%v", idx, err)
+	}
+	if superseded := loadCasVariant(t, casStore, stale.CASHash); superseded.ReviewSegments[0].TempoCandidate != nil {
+		t.Fatal("the stale artifact must stay readable and without a tempo candidate")
+	}
+}
+
+// TestDubbingService_Issue156_CachedPreEscalationPassStillDerivesTempoEvidence proves the cached
+// fast path is taken only when the pass is really final. A run whose escalation cannot be
+// repeated on a later call reads the pre-escalation pass from the idempotent cache; that pass was
+// published before any tempo derivation, so the eligible unresolved overrun it still carries must
+// gain its candidate from the cached retained waveform and the pass must be republished - all
+// without a second TTS invocation.
+func TestDubbingService_Issue156_CachedPreEscalationPassStillDerivesTempoEvidence(t *testing.T) {
+	dubSvc, db, casStore, reg, _ := setupDubbingTestHarness(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	const (
+		assetID    = "asset-escalation-cached-evidence"
+		runID      = "run-escalation-cached-evidence"
+		targetLang = "vi"
+		slotMs     = int64(1000)
+		laneMs     = int64(1200) // 1.20 of the slot: an eligible atempo overrun
+	)
+	setupAssetJobRunAudioRole(t, db, casStore, assetID, runID, targetLang)
+
+	dubScript := domain.DubScriptVariant{
+		ID:             uuid.NewString(),
+		SchemaVersion:  domain.DubScriptSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		SourceLanguage: "zh",
+		TargetLanguage: targetLang,
+		Segments: []domain.DubScriptSegment{
+			{
+				Index:          0,
+				SpeakerID:      "SPEAKER_00",
+				StartMs:        0,
+				EndMs:          slotMs,
+				SlotDurationMs: slotMs,
+				SourceText:     "你好",
+				MeaningText:    "Alo",
+				SpokenText:     "Alo",
+			},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+	pinDubbingScriptLineage(t, db, casStore, &dubScript, runID)
+	scriptBytes, _ := json.Marshal(dubScript)
+	scriptCAS, _ := casStore.Put(bytes.NewReader(scriptBytes))
+
+	assign, err := dubSvc.AssignVoices(ctx, domain.VoiceAssignmentInput{
+		RunID:             runID,
+		AssetID:           assetID,
+		TargetLanguage:    targetLang,
+		CustomAssignments: map[string]domain.VoiceProfile{"SPEAKER_00": provider.DefaultPresetVoices("vi")[0]},
+	})
+	if err != nil {
+		t.Fatalf("AssignVoices: %v", err)
+	}
+
+	fixedProvider, ok := reg.Get("fake_zerotts_tts_vi")
+	if !ok {
+		t.Fatal("fixed-rate lane must be registered")
+	}
+	fixedFake := fixedProvider.(*provider.FakeTTSProvider)
+	fixedFake.DurationMs = laneMs
+
+	// The duration-controlled fallback lane the escalation targets, registered and licensed
+	// before the run so the first call plans the escalation.
+	fallbackFake := provider.NewFakeTTSProvider("fake_cosyvoice3_tts", laneMs)
+	if err := reg.Register(fallbackFake); err != nil {
+		t.Fatalf("register fallback lane: %v", err)
+	}
+	if err := governance.NewLicenseService(db).RegisterManifest(ctx, domain.LicenseManifestEntry{
+		DependencyName: "fake_cosyvoice3_tts",
+		Version:        "1.0.0",
+		SHA256:         "sha256_mock_fake_cosyvoice3_tts",
+		SourceRepo:     "github.com/monet88/douyinie/models/fake_cosyvoice3_tts",
+		CodeLicense:    "Apache-2.0",
+		ModelLicense:   "Apache-2.0",
+		DataLicense:    "OpenData",
+		ServiceTerms:   "Standard",
+		Verified:       true,
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("register fallback lane manifest: %v", err)
+	}
+
+	// Inject a failure into the escalation's own persistence step (the superseding
+	// VoiceAssignment write) so the completed pre-escalation pass is published and the call
+	// surfaces an error, leaving the run on its original assignment.
+	abort := "injected escalation persistence failure"
+	_ = db.QueryRow(ctx, `CREATE TRIGGER issue156_cached_evidence_fail_insert BEFORE INSERT ON voice_assignments
+		BEGIN SELECT RAISE(ABORT, '`+abort+`'); END`).Scan(new(any))
+	_ = db.QueryRow(ctx, `CREATE TRIGGER issue156_cached_evidence_fail_update BEFORE UPDATE ON voice_assignments
+		BEGIN SELECT RAISE(ABORT, '`+abort+`'); END`).Scan(new(any))
+
+	input := domain.DubbingJobInput{
+		RunID:               runID,
+		AssetID:             assetID,
+		TargetLanguage:      targetLang,
+		DubScriptVariantCAS: scriptCAS.SHA256,
+		VoiceAssignmentCAS:  assign.CASHash,
+	}
+	if _, err := dubSvc.SynthesizeAndFit(ctx, input); err == nil {
+		t.Fatal("expected the injected escalation persistence failure to surface")
+	}
+	firstIdx, err := db.GetDubSegmentsVariantIndex(ctx, assetID, targetLang)
+	if err != nil || firstIdx == nil {
+		t.Fatalf("the pre-escalation pass must be published: idx=%v err=%v", firstIdx, err)
+	}
+	// Precondition: the published pass predates the derivation, so it carries no candidate.
+	firstPass := loadCasVariant(t, casStore, firstIdx.CASHash)
+	if len(firstPass.ReviewSegments) != 1 || firstPass.ReviewSegments[0].TempoCandidate != nil {
+		t.Fatalf("precondition: the pre-escalation pass must carry no tempo candidate, got %+v", firstPass.ReviewSegments)
+	}
+	invocationsAfterFirst := fixedFake.Invocations
+
+	// The fallback lane is no longer route-eligible, so the retry cannot repeat the escalation
+	// and finalizes the cached pre-escalation pass instead.
+	reg.SetRequireSnapshots(true)
+	dubSvc.AtempoTransform = func(callCtx context.Context, req media.AtempoRequest) ([]byte, error) {
+		return media.GeneratePCM16WAV(16000, 1, slotMs), nil
+	}
+
+	retried, err := dubSvc.SynthesizeAndFit(ctx, input)
+	if err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if fixedFake.Invocations != invocationsAfterFirst {
+		t.Fatalf("the retry must not re-run TTS: %d -> %d invocations", invocationsAfterFirst, fixedFake.Invocations)
+	}
+	if retried == nil || len(retried.ReviewSegments) != 1 || retried.ReviewSegments[0].TempoCandidate == nil {
+		t.Fatalf("expected the cached pass republished with tempo evidence, got %+v", retried)
+	}
+	tc := retried.ReviewSegments[0].TempoCandidate
+	if tc.TransformedAudioSHA256 == "" || tc.Reason != domain.TempoReasonFits || !tc.Selectable {
+		t.Fatalf("expected a selectable in-window candidate derived from the cached waveform, got %+v", tc)
+	}
+	if tc.NaturalDurationMs != laneMs {
+		t.Fatalf("the candidate must be derived from the cached pass waveform (%dms), got %dms", laneMs, tc.NaturalDurationMs)
+	}
+	secondIdx, err := db.GetDubSegmentsVariantIndex(ctx, assetID, targetLang)
+	if err != nil || secondIdx == nil {
+		t.Fatalf("expected the republished final artifact: idx=%v err=%v", secondIdx, err)
+	}
+	if secondIdx.CASHash == firstIdx.CASHash {
+		t.Fatal("the retry must republish the pass that gained tempo evidence")
+	}
+	if !casStore.Exists(firstIdx.CASHash) {
+		t.Fatalf("the pre-escalation artifact must stay readable history: %s", firstIdx.CASHash)
+	}
+	published := loadCasVariant(t, casStore, secondIdx.CASHash)
+	if len(published.ReviewSegments) != 1 || published.ReviewSegments[0].TempoCandidate == nil ||
+		published.ReviewSegments[0].TempoCandidate.TransformedAudioSHA256 != tc.TransformedAudioSHA256 {
+		t.Fatalf("the published final artifact must carry the derived candidate, got %+v", published.ReviewSegments)
+	}
+}
+
+// loadCasVariant reads and decodes one committed DubSegmentsVariant by its CAS hash.
+func loadCasVariant(t *testing.T, casStore *cas.Store, casHash string) *domain.DubSegmentsVariant {
+	t.Helper()
+	rc, err := casStore.Get(casHash)
+	if err != nil {
+		t.Fatalf("load variant %s: %v", casHash, err)
+	}
+	defer rc.Close()
+	var variant domain.DubSegmentsVariant
+	if err := json.NewDecoder(rc).Decode(&variant); err != nil {
+		t.Fatalf("decode variant %s: %v", casHash, err)
+	}
+	return &variant
 }
 
 // TestDubbingService_Issue156_ResumeRetriesOnlyTransientTempoEvidence pins the resume clause of

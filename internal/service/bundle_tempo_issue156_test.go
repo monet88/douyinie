@@ -189,13 +189,25 @@ func TestBundleService_Issue156_MissingNaturalParentFailsClosure(t *testing.T) {
 		ConfigSnapshotJSON: `{"profile": "hybrid"}`,
 		CreatedAt:          now,
 	}
-	_ = dbA.CreateRun(ctx, run)
+	if err := dbA.CreateRun(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	// The retained waveform exists, so the only absent parent is the candidate's own natural
+	// parent: this isolates the tempo-candidate closure from the segment's retained audio.
+	natObj, err := casA.Put(bytes.NewReader(media.GeneratePCM16WAV(16000, 1, 1200)))
+	if err != nil {
+		t.Fatalf("put retained natural audio: %v", err)
+	}
 
 	// Declare a natural parent hash that does NOT exist in CAS
 	missingNaturalSHA := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 	transWAV := media.GeneratePCM16WAV(16000, 1, 1000)
-	transObj, _ := casA.Put(bytes.NewReader(transWAV))
+	transObj, err := casA.Put(bytes.NewReader(transWAV))
+	if err != nil {
+		t.Fatalf("put transformed audio: %v", err)
+	}
 
 	dsv := domain.DubSegmentsVariant{
 		ID:             uuid.NewString(),
@@ -214,7 +226,7 @@ func TestBundleService_Issue156_MissingNaturalParentFailsClosure(t *testing.T) {
 				StartMs:            0,
 				EndMs:              1000,
 				SlotDurationMs:     1000,
-				AudioSHA256:        missingNaturalSHA, // missing natural parent!
+				AudioSHA256:        natObj.SHA256,
 				MeasuredDurationMs: 1200,
 				FitDecision:        domain.FitActionReview,
 				ReviewReason:       "DURATION_OVERRUN",
@@ -234,9 +246,12 @@ func TestBundleService_Issue156_MissingNaturalParentFailsClosure(t *testing.T) {
 	}
 
 	dsvBytes, _ := json.Marshal(dsv)
-	dsvObj, _ := casA.Put(bytes.NewReader(dsvBytes))
+	dsvObj, err := casA.Put(bytes.NewReader(dsvBytes))
+	if err != nil {
+		t.Fatalf("put dsv: %v", err)
+	}
 	dsv.CASHash = dsvObj.SHA256
-	_ = dbA.SaveDubSegmentsVariantIndex(ctx, storage.DubSegmentsVariantIndex{
+	if err := dbA.SaveDubSegmentsVariantIndex(ctx, storage.DubSegmentsVariantIndex{
 		ID:             dsv.ID,
 		AssetID:        assetID,
 		RunID:          runID,
@@ -246,10 +261,12 @@ func TestBundleService_Issue156_MissingNaturalParentFailsClosure(t *testing.T) {
 		ProvenanceHash: "prov-missing-parent",
 		OverallStatus:  "REVIEW_REQUIRED",
 		CreatedAt:      now,
-	})
+	}); err != nil {
+		t.Fatalf("save dsv index: %v", err)
+	}
 
 	var zipBuf bytes.Buffer
-	_, err := bundleSvcA.ExportBundle(ctx, jobID, &zipBuf)
+	_, err = bundleSvcA.ExportBundle(ctx, jobID, &zipBuf)
 	if err == nil || !errors.Is(err, domain.ErrJobBundleArtifactMissing) {
 		t.Fatalf("expected ErrJobBundleArtifactMissing for missing natural parent, got: %v", err)
 	}
@@ -342,6 +359,85 @@ func TestBundleService_Issue156_ProviderAttemptDigestIsNotClosureRequired(t *tes
 	}
 }
 
+// TestBundleService_Issue156_ProviderAttemptInputHashShipsWhenItIsCASBacked pins the other half
+// of the mixed-semantics contract: an attempt whose InputHash names a real CAS object (an ASR
+// attempt records the media object it read) must be shipped and referenced, so a bundle never
+// drops an artifact its own manifest provenance points at, and import verifies it like any other
+// shipped artifact.
+func TestBundleService_Issue156_ProviderAttemptInputHashShipsWhenItIsCASBacked(t *testing.T) {
+	ctx := context.Background()
+	dbA, casA, licA, bundleSvcA := setupBundleTestEnv(t)
+	defer dbA.Close()
+
+	jobID, _ := seedTestJob(t, dbA, casA, licA)
+
+	runID := uuid.NewString()
+	now := time.Now().UTC()
+	if err := dbA.CreateRun(ctx, domain.LocalizationRun{
+		ID:                 runID,
+		JobID:              jobID,
+		Status:             "completed",
+		ConfigSnapshotJSON: `{}`,
+		CreatedAt:          now,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	// An object no other manifest reference reaches, so only the attempt can ship it.
+	mediaObj, err := casA.Put(bytes.NewReader(media.GeneratePCM16WAV(16000, 1, 1200)))
+	if err != nil {
+		t.Fatalf("put attempt input media: %v", err)
+	}
+
+	if err := dbA.RecordProviderAttempt(ctx, domain.ProviderAttempt{
+		ID:            uuid.NewString(),
+		RunID:         runID,
+		Stage:         "asr",
+		ProviderID:    "fake_qwen3_asr",
+		ModelName:     "qwen3-asr",
+		ModelVersion:  "1.7b",
+		InputHash:     mediaObj.SHA256,
+		AttemptNumber: 1,
+		Status:        "succeeded",
+		CreatedAt:     now,
+	}); err != nil {
+		t.Fatalf("record attempt: %v", err)
+	}
+
+	var zipBuf bytes.Buffer
+	manifest, err := bundleSvcA.ExportBundle(ctx, jobID, &zipBuf)
+	if err != nil {
+		t.Fatalf("ExportBundle must ship a CAS-backed attempt input hash: %v", err)
+	}
+
+	shipped := false
+	for _, art := range manifest.Artifacts {
+		if art.SHA256 == mediaObj.SHA256 {
+			shipped = true
+		}
+	}
+	if !shipped {
+		t.Fatalf("CAS-backed attempt input hash %s must be shipped as a bundle artifact", mediaObj.SHA256)
+	}
+
+	dbB, casB, _, bundleSvcB := setupBundleTestEnv(t)
+	defer dbB.Close()
+	zipBytes := zipBuf.Bytes()
+	if _, err := bundleSvcB.ImportBundle(ctx, bytes.NewReader(zipBytes), int64(len(zipBytes)), service.ImportOptions{}); err != nil {
+		t.Fatalf("ImportBundle of a CAS-backed attempt input hash failed: %v", err)
+	}
+	if !casB.Exists(mediaObj.SHA256) {
+		t.Fatalf("the imported CAS must hold the shipped attempt input object %s", mediaObj.SHA256)
+	}
+	importedAttempts, err := dbB.ListProviderAttempts(ctx, runID, "asr")
+	if err != nil {
+		t.Fatalf("list imported provider attempts: %v", err)
+	}
+	if len(importedAttempts) != 1 || importedAttempts[0].InputHash != mediaObj.SHA256 {
+		t.Fatalf("expected 1 imported attempt with input hash %s, got %+v", mediaObj.SHA256, importedAttempts)
+	}
+}
+
 // TestBundleService_Issue156_DistinctNaturalParentIsShipped proves the closure ships every
 // waveform the review candidate references: the retained natural waveform, the candidate's own
 // natural parent (distinct when the retained waveform came from a rewrite or regroup), and the
@@ -365,9 +461,18 @@ func TestBundleService_Issue156_DistinctNaturalParentIsShipped(t *testing.T) {
 		t.Fatalf("create run: %v", err)
 	}
 
-	retainedObj, _ := casA.Put(bytes.NewReader(media.GeneratePCM16WAV(16000, 1, 1200)))
-	parentObj, _ := casA.Put(bytes.NewReader(media.GeneratePCM16WAV(16000, 1, 1150)))
-	transObj, _ := casA.Put(bytes.NewReader(media.GeneratePCM16WAV(16000, 1, 1000)))
+	retainedObj, err := casA.Put(bytes.NewReader(media.GeneratePCM16WAV(16000, 1, 1200)))
+	if err != nil {
+		t.Fatalf("put retained natural waveform: %v", err)
+	}
+	parentObj, err := casA.Put(bytes.NewReader(media.GeneratePCM16WAV(16000, 1, 1150)))
+	if err != nil {
+		t.Fatalf("put candidate natural parent: %v", err)
+	}
+	transObj, err := casA.Put(bytes.NewReader(media.GeneratePCM16WAV(16000, 1, 1000)))
+	if err != nil {
+		t.Fatalf("put transformed alternative: %v", err)
+	}
 
 	dsv := domain.DubSegmentsVariant{
 		ID:             uuid.NewString(),
@@ -461,16 +566,21 @@ func TestBundleService_Issue156_MissingTransformedAudioFailsClosure(t *testing.T
 
 	runID := uuid.NewString()
 	now := time.Now().UTC()
-	_ = dbA.CreateRun(ctx, domain.LocalizationRun{
+	if err := dbA.CreateRun(ctx, domain.LocalizationRun{
 		ID:                 runID,
 		JobID:              jobID,
 		Status:             "completed",
 		ConfigSnapshotJSON: `{}`,
 		CreatedAt:          now,
-	})
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
 
 	natWAV := media.GeneratePCM16WAV(16000, 1, 1200)
-	natObj, _ := casA.Put(bytes.NewReader(natWAV))
+	natObj, err := casA.Put(bytes.NewReader(natWAV))
+	if err != nil {
+		t.Fatalf("put natural audio: %v", err)
+	}
 
 	missingTransSHA := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 
@@ -509,8 +619,11 @@ func TestBundleService_Issue156_MissingTransformedAudioFailsClosure(t *testing.T
 	}
 
 	dsvBytes, _ := json.Marshal(dsv)
-	dsvObj, _ := casA.Put(bytes.NewReader(dsvBytes))
-	_ = dbA.SaveDubSegmentsVariantIndex(ctx, storage.DubSegmentsVariantIndex{
+	dsvObj, err := casA.Put(bytes.NewReader(dsvBytes))
+	if err != nil {
+		t.Fatalf("put dsv: %v", err)
+	}
+	if err := dbA.SaveDubSegmentsVariantIndex(ctx, storage.DubSegmentsVariantIndex{
 		ID:             dsv.ID,
 		AssetID:        assetID,
 		RunID:          runID,
@@ -520,10 +633,12 @@ func TestBundleService_Issue156_MissingTransformedAudioFailsClosure(t *testing.T
 		ProvenanceHash: "prov-missing-transformed",
 		OverallStatus:  "REVIEW_REQUIRED",
 		CreatedAt:      now,
-	})
+	}); err != nil {
+		t.Fatalf("save dsv index: %v", err)
+	}
 
 	var zipBuf bytes.Buffer
-	_, err := bundleSvcA.ExportBundle(ctx, jobID, &zipBuf)
+	_, err = bundleSvcA.ExportBundle(ctx, jobID, &zipBuf)
 	if err == nil || !errors.Is(err, domain.ErrJobBundleArtifactMissing) {
 		t.Fatalf("expected ErrJobBundleArtifactMissing for missing transformed audio, got: %v", err)
 	}
@@ -540,23 +655,27 @@ func TestBundleService_Issue156_MissingStageExecutionArtifactFailsClosure(t *tes
 
 	runID := uuid.NewString()
 	now := time.Now().UTC()
-	_ = dbA.CreateRun(ctx, domain.LocalizationRun{
+	if err := dbA.CreateRun(ctx, domain.LocalizationRun{
 		ID:                 runID,
 		JobID:              jobID,
 		Status:             "completed",
 		ConfigSnapshotJSON: `{}`,
 		CreatedAt:          now,
-	})
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
 
 	missingStageArtifactSHA := "9999999999999999999999999999999999999999999999999999999999999999"
-	_ = dbA.CreateStageExecution(ctx, domain.StageExecution{
+	if err := dbA.CreateStageExecution(ctx, domain.StageExecution{
 		ID:             uuid.NewString(),
 		RunID:          runID,
 		Stage:          "dub_synthesize",
 		Status:         "succeeded",
 		ArtifactSHA256: missingStageArtifactSHA, // missing stage execution artifact!
 		CreatedAt:      now,
-	})
+	}); err != nil {
+		t.Fatalf("create stage execution: %v", err)
+	}
 
 	var zipBuf bytes.Buffer
 	_, err := bundleSvcA.ExportBundle(ctx, jobID, &zipBuf)

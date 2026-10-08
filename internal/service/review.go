@@ -16,7 +16,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
-	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/storage"
 )
@@ -1756,6 +1755,14 @@ func (s *ReviewService) runBoundArtifactCAS(ctx context.Context, runID, stage st
 	return casHash, nil
 }
 
+// MaxDubMediaPlaybackBytes bounds one artifact served by the run-scoped dubbing media endpoint.
+// It is review/transport policy for this endpoint, so it owns its own literal rather than
+// aliasing the transform's output bound: the two currently agree (both 64 MiB) because the
+// inspector must be able to audition every audio artifact a run can commit for a review-only
+// candidate, but either ceiling may move independently - a tighter playback bound, a larger
+// transform cap - and neither move should silently redefine the other.
+const MaxDubMediaPlaybackBytes int64 = 64 << 20
+
 // Run-scoped dubbing media playback (Issue #156). The transport resolves nothing itself: it
 // parses the request, calls OpenRunDubMedia and maps these sentinel classes to status codes.
 var (
@@ -1817,12 +1824,14 @@ func (s *ReviewService) OpenRunDubMedia(ctx context.Context, runID, rawHash stri
 	if err != nil {
 		return nil, err
 	}
+	if err := s.verifyVariantVoiceLineage(ctx, runID, job.SourceAssetID, job.TargetLanguage, variant); err != nil {
+		return nil, err
+	}
 	if !dubVariantOwnsAudioHash(variant, hash) {
 		return nil, fmt.Errorf("%w: audio hash is not owned by this run's dubbing variant", ErrDubMediaNotOwned)
 	}
-	// Playback enforces the tempo transform's own output ceiling - the largest artifact a run can
-	// commit and select, so nothing selectable is unplayable - against the committed object size,
-	// so an oversized or hostile artifact is refused before any of its bytes are read.
+	// Playback enforces its own named ceiling (MaxDubMediaPlaybackBytes) against the committed
+	// object size, so an oversized or hostile artifact is refused before any of its bytes are read.
 	size, err := s.cas.Size(hash)
 	if err != nil {
 		if errors.Is(err, cas.ErrObjectNotFound) {
@@ -1830,7 +1839,7 @@ func (s *ReviewService) OpenRunDubMedia(ctx context.Context, runID, rawHash stri
 		}
 		return nil, fmt.Errorf("stat audio media %s: %w", hash, err)
 	}
-	if size > media.DefaultAtempoMaxOutputBytes {
+	if size > MaxDubMediaPlaybackBytes {
 		return nil, fmt.Errorf("%w: %d bytes", ErrDubMediaTooLarge, size)
 	}
 	reader, err := s.cas.Get(hash)
@@ -1918,6 +1927,45 @@ func (s *ReviewService) loadRunDubbingVariant(idx *storage.DubSegmentsVariantInd
 		return nil, fmt.Errorf("%w: dub segments variant ownership mismatch for asset %q target %q", ErrDubMediaNotOwned, assetID, targetLang)
 	}
 	return &variant, nil
+}
+
+// verifyVariantVoiceLineage refuses a variant the run itself produced under a voice assignment
+// that is no longer the one in force for the run (#156). The dub-variant row and the run's
+// dub_synthesize stage artifact both survive a reassignment: the row keeps the last pass it
+// claimed, and executeRun records the superseded pass a refused claim returned, so without this
+// check the inspector would play and project a superseded assignment's audio and tempo evidence
+// after ReassignVoice made another assignment current.
+//
+// Only a variant that names the requested run is judged, because its voice assignment is the
+// run's own lineage. A cross-run replay binds another run's artifact through the stage execution
+// and carries that run's assignment, which is the replay run's authority, not a contradiction;
+// a run with no assignment row at all has no lineage to contradict. Everything else fails
+// closed, including a variant of this run that records no assignment while the run does have one:
+// missing lineage evidence is refused rather than read as an all-clear.
+func (s *ReviewService) verifyVariantVoiceLineage(ctx context.Context, runID, assetID, targetLang string, variant *domain.DubSegmentsVariant) error {
+	if variant == nil || runID == "" || variant.RunID != runID {
+		return nil
+	}
+	current, err := s.db.GetVoiceAssignmentIndexByRun(ctx, assetID, runID, strings.ToLower(strings.TrimSpace(targetLang)))
+	if errors.Is(err, storage.ErrNotFound) && targetLang != strings.ToLower(strings.TrimSpace(targetLang)) {
+		// The voice-assignment row can be written from differently cased client input than the job
+		// row this lookup is keyed on, so a case-sensitive miss would read as "no assignment in
+		// force" and silently exempt the very variant this guard exists to refuse.
+		current, err = s.db.GetVoiceAssignmentIndexByRun(ctx, assetID, runID, targetLang)
+	}
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("load current voice assignment for run %s: %w", runID, err)
+	}
+	if current == nil || current.CASHash == "" {
+		return nil
+	}
+	if current.CASHash != variant.VoiceAssignmentCAS {
+		return fmt.Errorf("%w: dub segments variant was not produced under the voice assignment in force for run %s", ErrDubMediaNotOwned, runID)
+	}
+	return nil
 }
 
 func (s *ReviewService) ProjectAllReviewItems(ctx context.Context, assetID, targetLang string) ([]domain.ReviewItem, error) {
@@ -2180,6 +2228,9 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 	if dubSegIdx != nil {
 		dsVar, err := s.loadRunDubbingVariant(dubSegIdx, assetID, targetLang)
 		if err != nil {
+			return nil, err
+		}
+		if err := s.verifyVariantVoiceLineage(ctx, runID, assetID, targetLang, dsVar); err != nil {
 			return nil, err
 		}
 		hasDubSegments = true

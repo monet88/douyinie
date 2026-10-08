@@ -4931,6 +4931,12 @@ func (s *Server) handleGetRunReviewItems(w http.ResponseWriter, r *http.Request)
 		items, err = s.reviewSvc.ProjectReviewItemsForRun(r.Context(), job.SourceAssetID, job.TargetLanguage, runID)
 	}
 	if err != nil {
+		// A variant whose voice-assignment lineage is superseded is an expected, classified
+		// refusal - the same class GET /dub-media answers with 403 - not an internal fault.
+		if errors.Is(err, service.ErrDubMediaNotOwned) {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -4966,6 +4972,12 @@ func (s *Server) handleReviewOverride(w http.ResponseWriter, r *http.Request) {
 	in.AssetID = assetID
 	override, err := s.reviewSvc.RecordManualOverride(r.Context(), in)
 	if err != nil {
+		// A variant whose voice-assignment lineage is superseded is refused for the same reason
+		// GET /dub-media refuses its audio (403), not because the override request was malformed.
+		if errors.Is(err, service.ErrDubMediaNotOwned) {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -5014,6 +5026,12 @@ func (s *Server) handleRunReviewOverride(w http.ResponseWriter, r *http.Request)
 
 	override, err := s.reviewSvc.RecordManualOverride(r.Context(), in)
 	if err != nil {
+		// A variant whose voice-assignment lineage is superseded is refused for the same reason
+		// GET /dub-media refuses its audio (403), not because the override request was malformed.
+		if errors.Is(err, service.ErrDubMediaNotOwned) {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -5048,6 +5066,12 @@ func (s *Server) handleReviewItemDirectOverride(w http.ResponseWriter, r *http.R
 	}
 	override, err := s.reviewSvc.RecordManualOverride(r.Context(), in)
 	if err != nil {
+		// A variant whose voice-assignment lineage is superseded is refused for the same reason
+		// GET /dub-media refuses its audio (403), not because the override request was malformed.
+		if errors.Is(err, service.ErrDubMediaNotOwned) {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -5348,6 +5372,13 @@ func (s *Server) handleFinalRenderHandoff(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
+		// A run whose dubbing variant belongs to a superseded voice assignment is a classified
+		// refusal (the same class GET /dub-media answers with 403): the superseded pass must not
+		// hand off to a final render, and it is not an internal fault.
+		if errors.Is(err, service.ErrDubMediaNotOwned) {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -5401,6 +5432,13 @@ func (s *Server) handleRunFinalRenderHandoff(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) || errors.Is(err, domain.ErrAssetNotFound) {
 			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		// A run whose dubbing variant belongs to a superseded voice assignment is a classified
+		// refusal (the same class GET /dub-media answers with 403): the superseded pass must not
+		// hand off to a final render, and it is not an internal fault.
+		if errors.Is(err, service.ErrDubMediaNotOwned) {
+			writeError(w, http.StatusForbidden, err.Error())
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())

@@ -39,6 +39,12 @@ type DubbingService struct {
 
 	// AtempoTransform overrides media.ApplyAtempoWAV for controllable transform testing.
 	AtempoTransform func(ctx context.Context, req media.AtempoRequest) ([]byte, error)
+
+	// beforeRunRowClaim, when set, runs once immediately before a pass attempts to claim the
+	// run's dub-variant row. It is a test-only seam (see export_test.go): it lands a concurrent
+	// operator reassignment inside the publish/escalation window deterministically, which is the
+	// interleaving the claim statement's own ownership guard exists to refuse.
+	beforeRunRowClaim func()
 }
 
 // lineageRecoveryState tracks per-source-lineage consumption of native-speed, measured-
@@ -1262,9 +1268,10 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 	recoveryState := newLineageRecoveryState()
 
 	// commit publishes a pass: CAS derives its identity from the variant's own canonical
-	// bytes, and the run-scoped index moves to that artifact. A variant that already carries
-	// its committed identity came from the idempotent synthesis cache, so it is the artifact a
-	// previous call published and is returned untouched.
+	// bytes, and the run-scoped index moves to that artifact while the pass still belongs to the
+	// run's current voice assignment. A variant that already carries its committed identity came
+	// from the idempotent synthesis cache, so it is the artifact a previous call published and is
+	// returned untouched.
 	publish := func(variant *domain.DubSegmentsVariant) (*domain.DubSegmentsVariant, error) {
 		if variant.CASHash != "" {
 			return variant, nil
@@ -1284,12 +1291,18 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 	// run control still stops the run through the caller's own cancellation check.
 	finalize := func(variant *domain.DubSegmentsVariant) (*domain.DubSegmentsVariant, error) {
 		// A committed variant came from the idempotent synthesis cache, so it already carries the
-		// work this call would redo - except for evidence a transient transform failure recorded
-		// about the run that was interrupted, which is not a verdict on the pass. Dropping only
-		// that evidence re-derives the alternative from the cached pass without re-running TTS,
-		// and republishing it as the run's one canonical final artifact.
-		if variant.CASHash != "" && !resetRetryableTempoEvidence(variant) {
-			return variant, nil
+		// work this call would redo - with two exceptions, both re-derived from the cached pass's
+		// own retained waveform without re-running TTS. One is evidence a transient transform
+		// failure recorded about the run that was interrupted, which is not a verdict on the
+		// pass. The other is a pass published before an escalation a later attempt could not
+		// repeat (the fallback lane is no longer route-eligible, or the escalation was refused):
+		// it is not final, so an eligible unresolved overrun it still carries must gain its
+		// tempo evidence here instead of being returned as the run's canonical artifact.
+		if variant.CASHash != "" {
+			if !resetRetryableTempoEvidence(variant) && tempoEvidenceComplete(variant) {
+				return variant, nil
+			}
+			variant.CASHash = ""
 		}
 		s.attachTempoCandidates(ctx, variant)
 		published, err := publish(variant)
@@ -1324,6 +1337,18 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 	// cache instead of re-running TTS for it, and a failed escalation cannot lose a pass that
 	// already completed. Its remedy sequence is not exhausted, so it carries no atempo
 	// candidate; only the final pass does.
+	//
+	// A pass that already belongs to a superseded assignment is committed without claiming the
+	// run's dub-variant row (#156): the row keeps resolving to the current assignment's pass, the
+	// one that carries this issue's tempo evidence, instead of being taken over by superseded
+	// audio. The ownership test is the claim statement itself, so a reassignment that lands while
+	// this pass is being published - after the request decided to escalate and before the
+	// escalation decision below - refuses the claim rather than being missed by a stale pre-check.
+	//
+	// ponytail: the superseded artifact is in CAS but not in the index, so the row-based idempotent
+	// cache no longer short-circuits a repeat of that stale call. Repeating superseded work is rare
+	// and cheap next to canonicalizing superseded audio; index it under a non-canonical key if that
+	// retry ever shows up in cost data.
 	if _, err := publish(pass); err != nil {
 		return nil, err
 	}
@@ -1332,9 +1357,20 @@ func (s *DubbingService) SynthesizeAndFit(ctx context.Context, in domain.Dubbing
 		return nil, err
 	}
 	if superseding == nil {
-		// The run moved on to a newer assignment that is not this escalation, so the
-		// unresolved overrun above stays REVIEW instead of reverting it, and that unit's
-		// remedy sequence was never exhausted - it derives no atempo candidate here.
+		// The run moved on to a newer assignment that is not this escalation, so the completed
+		// pass stays committed and readable, is returned as REVIEW evidence, and never claimed the
+		// run's dub-variant row - that row keeps resolving to the current assignment's own pass.
+		// Nothing here touches the operator's newer assignment (#155: a newer assignment is never
+		// reverted, so no escalation is minted from this stale base).
+		//
+		// Issue #156 derives no atempo candidate on this path on purpose. A candidate can only be
+		// attached to this pass, and attaching it would publish superseded-assignment audio as the
+		// run's canonical media and graft cross-assignment tempo evidence onto it. The pass whose
+		// remedy sequence ends with tempo evidence is the run's current assignment's pass, and that
+		// assignment's own request synthesizes it (ReassignVoice and the inspector corrections mint
+		// the superseding assignment and synthesize it in the same request; a call whose base IS the
+		// current assignment can never reach this branch). The unresolved overrun therefore stays
+		// REVIEW here and gains its evidence there, from its own retained waveform.
 		return pass, nil
 	}
 	escalated, err := s.synthesizeSegmentsPass(ctx, in, dubScript, dubScriptCAS, superseding, superseding.CASHash, pass, plan.evidence, recoveryState)
@@ -2525,8 +2561,17 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 }
 
 // commitDubSegmentsVariant marshals a dub segments variant into CAS and points the run-scoped
-// index at it. It is idempotent for the same bytes because CAS is content-addressed, so a
-// variant re-committed after later evidence is attached supersedes the index entry in place.
+// index at it while the variant's own voice assignment is still the run's current one. It is
+// idempotent for the same bytes because CAS is content-addressed, so a variant re-committed after
+// later evidence is attached supersedes the index entry in place. A pass that belongs to a
+// superseded assignment is committed without the index row (#156): it stays readable by hash and
+// is returned as evidence, but the row - what the inspector, the review projection and playback
+// resolve - keeps pointing at the current assignment's own pass.
+//
+// The ownership test is the row write itself, not a decision taken earlier in the request: the
+// claim statement refuses to claim while an assignment other than the variant's own is in force,
+// so a reassignment landing between this request's earlier decisions and this write cannot slip
+// a superseded pass into the row the way a pre-check-then-write pair lets it.
 func (s *DubbingService) commitDubSegmentsVariant(ctx context.Context, variant *domain.DubSegmentsVariant) error {
 	if variant == nil || s.cas == nil || s.db == nil {
 		return nil
@@ -2544,6 +2589,9 @@ func (s *DubbingService) commitDubSegmentsVariant(ctx context.Context, variant *
 		return fmt.Errorf("put dub segments variant in CAS: %w", err)
 	}
 	variant.CASHash = casObj.SHA256
+	if s.beforeRunRowClaim != nil {
+		s.beforeRunRowClaim()
+	}
 
 	idx := storage.DubSegmentsVariantIndex{
 		ID:             variant.ID,
@@ -2556,7 +2604,7 @@ func (s *DubbingService) commitDubSegmentsVariant(ctx context.Context, variant *
 		OverallStatus:  variant.OverallStatus,
 		CreatedAt:      variant.CreatedAt,
 	}
-	if err := s.db.SaveDubSegmentsVariantIndex(ctx, idx); err != nil {
+	if _, err := s.db.ClaimDubSegmentsVariantIndexForAssignment(ctx, idx, variant.VoiceAssignmentCAS); err != nil {
 		return fmt.Errorf("save dub segments variant index: %w", err)
 	}
 	return nil
@@ -2590,6 +2638,24 @@ func resetRetryableTempoEvidence(variant *domain.DubSegmentsVariant) bool {
 		variant.CASHash = ""
 	}
 	return reset
+}
+
+// tempoEvidenceComplete reports whether every review unit attachTempoCandidates would derive a
+// candidate for already carries tempo evidence. A committed pass that still has such a unit was
+// published before the derivation ran - the pre-escalation pass an escalation later superseded
+// but a retried call could not repeat - so the cached fast path must not treat it as final.
+func tempoEvidenceComplete(variant *domain.DubSegmentsVariant) bool {
+	for i := range variant.ReviewSegments {
+		rev := &variant.ReviewSegments[i]
+		if rev.TempoCandidate != nil || rev.AudioSHA256 == "" || rev.MeasuredDurationMs <= 0 {
+			continue
+		}
+		if !unresolvedTimingFailure(*rev) || rev.DubPlaybackEndMs <= rev.StartMs {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // attachTempoCandidates derives the review-only FFmpeg atempo alternative for every unresolved

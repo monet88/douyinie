@@ -40,6 +40,28 @@ export function findBrowser() {
   return null;
 }
 
+// The Operator UI reads these artifacts speculatively (app.js loadSelectedRun): a 404 means "not
+// written yet" and must never fail a smoke. Every other network 404 is a real failure and stays a
+// console error, so a genuinely broken endpoint cannot hide behind this protocol.
+const OPTIONAL_ARTIFACT_PATHS = [
+  /^\/api\/v1\/assets\/[^/]+\/transcript$/,
+  /^\/api\/v1\/assets\/[^/]+\/translation-variant$/,
+  /^\/api\/v1\/assets\/[^/]+\/voice-assignment$/,
+  /^\/api\/v1\/assets\/[^/]+\/text-region-plan$/,
+  /^\/api\/v1\/assets\/[^/]+\/render\/(preview|final)$/,
+];
+
+function isOptionalArtifactURL(rawURL) {
+  if (!rawURL) return false;
+  let pathname = rawURL;
+  try {
+    pathname = new URL(rawURL).pathname;
+  } catch {
+    // A relative URL keeps its raw value; the patterns still match its path.
+  }
+  return OPTIONAL_ARTIFACT_PATHS.some((pattern) => pattern.test(pathname));
+}
+
 export class CDP {
   constructor(socket) {
     this.socket = socket;
@@ -86,10 +108,27 @@ export class CDP {
   send(method, params = {}, sessionId) {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      // Every pending command is bounded: a response that never arrives must fail the flow, not
+      // hang the smoke until the harness kills it. The timer is cleared on every settle path -
+      // resolve, reject and socket close - so it can never fire after the promise is settled.
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`CDP ${method} timed out after ${FLOW_TIMEOUT_MS}ms`));
+      }, FLOW_TIMEOUT_MS);
+      const settle = (fn) => (value) => {
+        clearTimeout(timer);
+        fn(value);
+      };
+      this.pending.set(id, { resolve: settle(resolve), reject: settle(reject) });
       const payload = { id, method, params };
       if (sessionId) payload.sessionId = sessionId;
-      this.socket.send(JSON.stringify(payload));
+      try {
+        this.socket.send(JSON.stringify(payload));
+      } catch (error) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        reject(error);
+      }
     });
   }
 
@@ -154,8 +193,9 @@ export function createChecklist() {
 }
 
 // attachPage exposes the page session every flow drives: evaluation, polling waits, trusted
-// clicks and the console-error accounting (404 counts as the UI's documented "artifact not
-// written yet" protocol, never as a failure).
+// clicks and the console-error accounting. Only a 404 from one of the UI's documented optional
+// artifact reads counts as that read's "not written yet" protocol; every other network error,
+// including an unrelated 404, stays a console error.
 export async function attachPage(cdp, { consoleErrors = [], expectedAbsentArtifacts = [] } = {}) {
   const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
   const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
@@ -173,8 +213,8 @@ export async function attachPage(cdp, { consoleErrors = [], expectedAbsentArtifa
     if (sid !== sessionId) return;
     const entry = params.entry || {};
     if (entry.level !== "error") return;
-    if (entry.source === "network" && /404/.test(entry.text)) {
-      expectedAbsentArtifacts.push(entry.text);
+    if (entry.source === "network" && /404/.test(entry.text) && isOptionalArtifactURL(entry.url)) {
+      expectedAbsentArtifacts.push(entry.url || entry.text);
       return;
     }
     consoleErrors.push(`log(${entry.source}): ${entry.text}`);

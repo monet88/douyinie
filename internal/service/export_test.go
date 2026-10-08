@@ -171,3 +171,10 @@ func PinAudioRolePlanForTest(ctx context.Context, db *storage.DB, casStore *cas.
 	}
 	return plan.CASHash
 }
+
+// SetBeforeRunRowClaimForTest installs a hook that runs immediately before a pass attempts to
+// claim the run's dub-variant row, so a test can land a concurrent operator reassignment inside
+// the publish/escalation window deterministically. Pass nil to remove it.
+func (s *DubbingService) SetBeforeRunRowClaimForTest(fn func()) {
+	s.beforeRunRowClaim = fn
+}

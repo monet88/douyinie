@@ -552,6 +552,246 @@ func TestRunScopedDubbingVariant_EnforcesRequestedRunOwnership(t *testing.T) {
 	}
 }
 
+// putTempoUnitVariant commits one dubbing variant that records voiceAssignCAS as the assignment
+// it was synthesized under, and returns the variant's CAS hash plus the hash of the retained
+// waveform the variant owns, so a caller can either index it or bind it to a stage execution.
+func putTempoUnitVariant(t *testing.T, casStore *cas.Store, assetID, jobID, runID, targetLang, voiceAssignCAS string) (variantCAS, audioSHA string) {
+	t.Helper()
+	audio, err := casStore.Put(bytes.NewReader(media.GeneratePCM16WAV(16000, 1, 1200)))
+	if err != nil {
+		t.Fatalf("put retained waveform: %v", err)
+	}
+	variant := domain.DubSegmentsVariant{
+		ID:                 uuid.NewString(),
+		SchemaVersion:      domain.DubSegmentsSchemaVersion,
+		AssetID:            assetID,
+		RunID:              runID,
+		JobID:              jobID,
+		TargetLanguage:     targetLang,
+		FitPolicyID:        "playback-window-v2",
+		OverallStatus:      "REVIEW_REQUIRED",
+		VoiceAssignmentCAS: voiceAssignCAS,
+		ReviewSegments: []domain.DubSegmentReview{{
+			Index:              0,
+			SpeakerID:          "SPEAKER_00",
+			StartMs:            0,
+			EndMs:              1000,
+			SlotDurationMs:     1000,
+			AudioSHA256:        audio.SHA256,
+			MeasuredDurationMs: 1200,
+			FitDecision:        domain.FitActionReview,
+			ReviewReason:       "DURATION_OVERRUN",
+			AttemptCount:       1,
+			DubPlaybackEndMs:   1000,
+		}},
+		CreatedAt: time.Now().UTC(),
+	}
+	data, err := json.Marshal(variant)
+	if err != nil {
+		t.Fatalf("marshal variant: %v", err)
+	}
+	obj, err := casStore.Put(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("put variant: %v", err)
+	}
+	return obj.SHA256, audio.SHA256
+}
+
+// saveTempoUnitVoiceAssignment records the voice assignment in force for a run.
+func saveTempoUnitVoiceAssignment(t *testing.T, db *storage.DB, assetID, jobID, runID, targetLang, casHash string) {
+	t.Helper()
+	if err := db.SaveVoiceAssignmentIndex(context.Background(), storage.VoiceAssignmentIndex{
+		ID:              "va-" + runID,
+		AssetID:         assetID,
+		RunID:           runID,
+		JobID:           jobID,
+		TargetLanguage:  targetLang,
+		CASHash:         casHash,
+		ProvenanceHash:  "prov-va-" + runID,
+		AssignmentsJSON: "{}",
+		CreatedAt:       time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("save voice assignment %s: %v", casHash, err)
+	}
+}
+
+// indexTempoUnitVariant binds a committed variant as the run's dub-variant row.
+func indexTempoUnitVariant(t *testing.T, db *storage.DB, assetID, jobID, runID, targetLang, variantCAS string) {
+	t.Helper()
+	if err := db.SaveDubSegmentsVariantIndex(context.Background(), storage.DubSegmentsVariantIndex{
+		ID:             uuid.NewString(),
+		AssetID:        assetID,
+		RunID:          runID,
+		JobID:          jobID,
+		TargetLanguage: targetLang,
+		CASHash:        variantCAS,
+		ProvenanceHash: "prov-indexed-" + variantCAS[:12],
+		OverallStatus:  "REVIEW_REQUIRED",
+		CreatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("save variant index: %v", err)
+	}
+}
+
+// TestRunScopedDubbingVariant_RefusesSupersededAssignmentEvidence covers the two ways a pass
+// synthesized under a superseded voice assignment can still resolve for the run (Issue #156):
+// the run's own dub-variant row can hold that pass when a reassignment lands after it was
+// claimed, and - when the pass never claimed the row - the run's dub_synthesize stage execution
+// binds it instead, which is exactly what executeRun records after a refused claim. Both
+// surfaces must fail closed: playback refuses the audio and the review projection does not
+// surface the superseded assignment's evidence. A pass that belongs to the assignment in force,
+// a cross-run replay binding, and a stage-only lineage with no assignment row stay permitted.
+func TestRunScopedDubbingVariant_RefusesSupersededAssignmentEvidence(t *testing.T) {
+	const (
+		assetID = "asset-stale-assign"
+		jobID   = "job-stale-assign"
+		runID   = "run-stale-assign"
+		lang    = "vi"
+	)
+	ctx := context.Background()
+
+	t.Run("indexed row holding a superseded assignment is refused", func(t *testing.T) {
+		_, db, casStore := newTempoUnitHarness(t)
+		seedTempoUnitLineage(t, db, assetID, jobID, runID)
+		saveTempoUnitVoiceAssignment(t, db, assetID, jobID, runID, lang, "assign-current")
+		variantCAS, audioSHA := putTempoUnitVariant(t, casStore, assetID, jobID, runID, lang, "assign-superseded")
+		indexTempoUnitVariant(t, db, assetID, jobID, runID, lang, variantCAS)
+		svc := &ReviewService{db: db, cas: casStore}
+
+		if _, err := svc.OpenRunDubMedia(ctx, runID, audioSHA); !errors.Is(err, ErrDubMediaNotOwned) {
+			t.Fatalf("playback must refuse a superseded assignment's audio, got err=%v", err)
+		}
+		if _, err := svc.ProjectReviewItemsForRun(ctx, assetID, lang, runID); !errors.Is(err, ErrDubMediaNotOwned) {
+			t.Fatalf("the pending projection must not surface a superseded assignment's evidence, got err=%v", err)
+		}
+		if _, err := svc.ProjectAllReviewItemsForRun(ctx, assetID, lang, runID); !errors.Is(err, ErrDubMediaNotOwned) {
+			t.Fatalf("the audit projection must not surface a superseded assignment's evidence, got err=%v", err)
+		}
+	})
+
+	t.Run("stage-bound superseded assignment without a row is refused", func(t *testing.T) {
+		_, db, casStore := newTempoUnitHarness(t)
+		seedTempoUnitLineage(t, db, assetID, jobID, runID)
+		saveTempoUnitVoiceAssignment(t, db, assetID, jobID, runID, lang, "assign-current")
+		variantCAS, audioSHA := putTempoUnitVariant(t, casStore, assetID, jobID, runID, lang, "assign-superseded")
+		// The superseded pass never claimed the run's row: the run's own stage execution is the
+		// only binding left.
+		if err := db.CreateStageExecution(ctx, domain.StageExecution{
+			ID:             uuid.NewString(),
+			RunID:          runID,
+			Stage:          "dub_synthesize",
+			Status:         domain.StageStatusSucceeded,
+			ArtifactSHA256: variantCAS,
+			CreatedAt:      time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("bind stale stage artifact: %v", err)
+		}
+		svc := &ReviewService{db: db, cas: casStore}
+
+		if _, err := svc.OpenRunDubMedia(ctx, runID, audioSHA); !errors.Is(err, ErrDubMediaNotOwned) {
+			t.Fatalf("playback must refuse a superseded stage-bound assignment's audio, got err=%v", err)
+		}
+		if _, err := svc.ProjectAllReviewItemsForRun(ctx, assetID, lang, runID); !errors.Is(err, ErrDubMediaNotOwned) {
+			t.Fatalf("the projection must not surface the stage-bound superseded evidence, got err=%v", err)
+		}
+	})
+
+	t.Run("a differently cased target language does not exempt a stale variant", func(t *testing.T) {
+		_, db, casStore := newTempoUnitHarness(t)
+		seedTempoUnitLineage(t, db, assetID, jobID, runID)
+		// The stored assignment row and the lookup key can carry different casing: a job row is
+		// written from client input, and the guard must still recognize the assignment in force
+		// instead of reading the case-sensitive miss as "no assignment to contradict".
+		saveTempoUnitVoiceAssignment(t, db, assetID, jobID, runID, "vi", "assign-current")
+		_ = casStore
+		svc := &ReviewService{db: db, cas: casStore}
+		stale := &domain.DubSegmentsVariant{
+			ID:                 uuid.NewString(),
+			AssetID:            assetID,
+			RunID:              runID,
+			TargetLanguage:     "VI",
+			VoiceAssignmentCAS: "assign-superseded",
+		}
+		if err := svc.verifyVariantVoiceLineage(ctx, runID, assetID, "VI", stale); !errors.Is(err, ErrDubMediaNotOwned) {
+			t.Fatalf("an upper-cased lookup must still refuse a superseded assignment, got err=%v", err)
+		}
+		if err := svc.verifyVariantVoiceLineage(ctx, runID, assetID, "vi", stale); !errors.Is(err, ErrDubMediaNotOwned) {
+			t.Fatalf("the lower-cased lookup must refuse too, got err=%v", err)
+		}
+	})
+
+	t.Run("current assignment, cross-run replay and stage-only lineage stay permitted", func(t *testing.T) {
+		_, db, casStore := newTempoUnitHarness(t)
+		seedTempoUnitLineage(t, db, assetID, jobID, runID)
+		saveTempoUnitVoiceAssignment(t, db, assetID, jobID, runID, lang, "assign-current")
+		svc := &ReviewService{db: db, cas: casStore}
+		// Playback hands back an open CAS reader; close it so the case leaves no file handle
+		// behind (a leaked handle makes the Windows temp-dir cleanup of this test fail).
+		openAudio := func(run, hash string) error {
+			source, err := svc.OpenRunDubMedia(ctx, run, hash)
+			if err != nil {
+				return err
+			}
+			return source.Reader.Close()
+		}
+
+		// The pass belongs to the assignment in force: nothing to refuse.
+		currentCAS, currentAudio := putTempoUnitVariant(t, casStore, assetID, jobID, runID, lang, "assign-current")
+		indexTempoUnitVariant(t, db, assetID, jobID, runID, lang, currentCAS)
+		if err := openAudio(runID, currentAudio); err != nil {
+			t.Fatalf("the current assignment's audio must stay playable, got %v", err)
+		}
+		if _, err := svc.ProjectAllReviewItemsForRun(ctx, assetID, lang, runID); err != nil {
+			t.Fatalf("the current assignment's projection must resolve, got %v", err)
+		}
+
+		// A replay run consumes an artifact another run produced under its own assignment; the
+		// stage binding is the run's authority, so the assignment check must not apply.
+		const replayRunID = "run-replay-consumer"
+		if _, err := db.CreateRunEnqueued(ctx, domain.LocalizationRun{
+			ID: replayRunID, JobID: jobID, Status: "running", ConfigSnapshotJSON: "{}", CreatedAt: time.Now().UTC(),
+		}, jobID); err != nil {
+			t.Fatalf("create replay run: %v", err)
+		}
+		replayCAS, replayAudio := putTempoUnitVariant(t, casStore, assetID, jobID, "run-replay-producer", lang, "assign-producer")
+		if err := db.CreateStageExecution(ctx, domain.StageExecution{
+			ID:             uuid.NewString(),
+			RunID:          replayRunID,
+			Stage:          "dub_synthesize",
+			Status:         domain.StageStatusSucceeded,
+			ArtifactSHA256: replayCAS,
+			CreatedAt:      time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("bind replay stage artifact: %v", err)
+		}
+		if err := openAudio(replayRunID, replayAudio); err != nil {
+			t.Fatalf("a run-bound replay of another run's artifact must stay playable, got %v", err)
+		}
+
+		// A stage-only lineage with no assignment row at all has no assignment to contradict.
+		const bareRunID = "run-bare-stage-only"
+		if _, err := db.CreateRunEnqueued(ctx, domain.LocalizationRun{
+			ID: bareRunID, JobID: jobID, Status: "running", ConfigSnapshotJSON: "{}", CreatedAt: time.Now().UTC(),
+		}, jobID); err != nil {
+			t.Fatalf("create bare run: %v", err)
+		}
+		bareCAS, bareAudio := putTempoUnitVariant(t, casStore, assetID, jobID, bareRunID, lang, "assign-never-recorded")
+		if err := db.CreateStageExecution(ctx, domain.StageExecution{
+			ID:             uuid.NewString(),
+			RunID:          bareRunID,
+			Stage:          "dub_synthesize",
+			Status:         domain.StageStatusSucceeded,
+			ArtifactSHA256: bareCAS,
+			CreatedAt:      time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("bind bare stage artifact: %v", err)
+		}
+		if err := openAudio(bareRunID, bareAudio); err != nil {
+			t.Fatalf("a stage-only lineage with no assignment row must stay playable, got %v", err)
+		}
+	})
+}
+
 // TestResetRetryableTempoEvidence_TransientOnly pins which tempo outcomes a resumed pass may
 // re-derive. A cancelled or unavailable transform is evidence about the run, not an answer about
 // the waveform, so only those two are dropped; every deterministic verdict the transform itself

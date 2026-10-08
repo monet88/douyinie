@@ -254,7 +254,10 @@ func TestServer_Issue156_RunReviewItemsAndDubMediaPlayback(t *testing.T) {
 
 	// 6. Test override cannot create implicit selection
 	t.Run("override cannot select or approve candidate", func(t *testing.T) {
-		body := `{"review_item_id": "rev-dubseg-rev-` + dsvObj.SHA256 + `-0", "action": "override"}`
+		// A reason is required for the audit trail and is validated before the review item is
+		// resolved, so supplying one is what makes this reach the hard timing blocker below
+		// instead of an unrelated "reason is required" refusal.
+		body := `{"review_item_id": "rev-dubseg-rev-` + dsvObj.SHA256 + `-0", "action": "override", "reason": "attempted operator override of a hard timing blocker"}`
 		req := httptest.NewRequest("POST", "/api/v1/runs/"+runID+"/review/override", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
@@ -265,6 +268,9 @@ func TestServer_Issue156_RunReviewItemsAndDubMediaPlayback(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("expected 400 Bad Request refusal for TTS overrun, got status %d body=%s", rec.Code, rec.Body.String())
 		}
+		if !strings.Contains(rec.Body.String(), "hard timing blocker") {
+			t.Fatalf("expected the refusal to be the hard timing blocker, got body=%s", rec.Body.String())
+		}
 	})
 
 	// 7. Test an owned artifact past the accepted artifact ceiling returns 413 Request Entity Too Large
@@ -272,7 +278,7 @@ func TestServer_Issue156_RunReviewItemsAndDubMediaPlayback(t *testing.T) {
 		// Create a synthetic oversized variant where one owned segment references an object past
 		// the playback bound. We do not allocate that many bytes: CAS Put takes an io.Reader, so
 		// an io.LimitReader on a zero reader works.
-		oversizedBytes := media.DefaultAtempoMaxOutputBytes + 1024
+		oversizedBytes := service.MaxDubMediaPlaybackBytes + 1024
 		oversizedObj, err := casStore.Put(io.LimitReader(zeroReader{}, oversizedBytes))
 		if err != nil {
 			t.Fatalf("put oversized object in CAS: %v", err)
@@ -531,7 +537,7 @@ func TestServer_Issue156_RunReviewItemsAndDubMediaPlayback(t *testing.T) {
 	// 10. Test an owned artifact at exactly the playback bound is still served: the bound is a
 	// strict ceiling, so the largest legitimate waveform must not be refused.
 	t.Run("serves an owned artifact at exactly the playback bound", func(t *testing.T) {
-		boundObj, err := casStore.Put(io.LimitReader(zeroReader{}, media.DefaultAtempoMaxOutputBytes))
+		boundObj, err := casStore.Put(io.LimitReader(zeroReader{}, service.MaxDubMediaPlaybackBytes))
 		if err != nil {
 			t.Fatalf("put bound-sized object in CAS: %v", err)
 		}
@@ -585,11 +591,11 @@ func TestServer_Issue156_RunReviewItemsAndDubMediaPlayback(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("expected 200 at exactly the playback bound, got %d body=%s", rec.Code, rec.Body.String())
 		}
-		if got := rec.Header().Get("Content-Length"); got != strconv.FormatInt(media.DefaultAtempoMaxOutputBytes, 10) {
-			t.Fatalf("expected Content-Length %d, got %q", media.DefaultAtempoMaxOutputBytes, got)
+		if got := rec.Header().Get("Content-Length"); got != strconv.FormatInt(service.MaxDubMediaPlaybackBytes, 10) {
+			t.Fatalf("expected Content-Length %d, got %q", service.MaxDubMediaPlaybackBytes, got)
 		}
-		if int64(rec.Body.Len()) != media.DefaultAtempoMaxOutputBytes {
-			t.Fatalf("expected %d streamed bytes, got %d", media.DefaultAtempoMaxOutputBytes, rec.Body.Len())
+		if int64(rec.Body.Len()) != service.MaxDubMediaPlaybackBytes {
+			t.Fatalf("expected %d streamed bytes, got %d", service.MaxDubMediaPlaybackBytes, rec.Body.Len())
 		}
 	})
 
@@ -662,6 +668,226 @@ func TestServer_Issue156_RunReviewItemsAndDubMediaPlayback(t *testing.T) {
 		srv.Handler().ServeHTTP(bareRec, bareReq)
 		if bareRec.Code != http.StatusNotFound {
 			t.Fatalf("expected 404 for a run without a dubbing variant, got %d body=%s", bareRec.Code, bareRec.Body.String())
+		}
+	})
+
+	// 13. A run's own variant recorded under a superseded voice assignment must not be served:
+	// the reassignment is the run's current voice lineage, so the stale pass is refused even
+	// though the run's dub-variant row still resolves to it (Issue #156 stale-artifact ownership),
+	// and the exception queue must not surface its evidence either.
+	t.Run("refuses audio from a superseded voice assignment", func(t *testing.T) {
+		staleAudioObj, err := casStore.Put(bytes.NewReader(media.GeneratePCM16WAV(16000, 1, 1200)))
+		if err != nil {
+			t.Fatalf("put stale retained waveform: %v", err)
+		}
+		if err := db.SaveVoiceAssignmentIndex(ctx, storage.VoiceAssignmentIndex{
+			ID:              "va-current-" + runID,
+			AssetID:         assetID,
+			RunID:           runID,
+			JobID:           jobID,
+			TargetLanguage:  targetLang,
+			CASHash:         "assign-current",
+			ProvenanceHash:  "prov-va-current-server",
+			AssignmentsJSON: "{}",
+			CreatedAt:       now,
+		}); err != nil {
+			t.Fatalf("save current voice assignment: %v", err)
+		}
+
+		staleDSV := dsv
+		staleDSV.ID = uuid.NewString()
+		staleDSV.VoiceAssignmentCAS = "assign-superseded"
+		staleDSV.ReviewSegments = append([]domain.DubSegmentReview(nil), dsv.ReviewSegments...)
+		staleDSV.ReviewSegments[0].AudioSHA256 = staleAudioObj.SHA256
+		staleDSV.CreatedAt = now.Add(time.Minute)
+		staleData, err := json.Marshal(staleDSV)
+		if err != nil {
+			t.Fatalf("marshal stale variant: %v", err)
+		}
+		staleObj, err := casStore.Put(bytes.NewReader(staleData))
+		if err != nil {
+			t.Fatalf("put stale variant: %v", err)
+		}
+		// The superseded pass still holds the run's row - it was claimed before the reassignment -
+		// and it is the newer row, so run-scoped resolution reads it.
+		if err := db.SaveDubSegmentsVariantIndex(ctx, storage.DubSegmentsVariantIndex{
+			ID:             staleDSV.ID,
+			AssetID:        assetID,
+			RunID:          runID,
+			JobID:          jobID,
+			TargetLanguage: targetLang,
+			CASHash:        staleObj.SHA256,
+			ProvenanceHash: "prov-stale-assignment",
+			OverallStatus:  "REVIEW_REQUIRED",
+			CreatedAt:      now.Add(time.Minute),
+		}); err != nil {
+			t.Fatalf("save stale variant index: %v", err)
+		}
+
+		req := httptest.NewRequest("GET", "/api/v1/runs/"+runID+"/dub-media/"+staleAudioObj.SHA256, nil)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for audio from a superseded voice assignment, got %d body=%s", rec.Code, rec.Body.String())
+		}
+
+		itemsReq := httptest.NewRequest("GET", "/api/v1/runs/"+runID+"/review-items", nil)
+		itemsRec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(itemsRec, itemsReq)
+		if itemsRec.Code != http.StatusForbidden {
+			t.Fatalf("the exception queue must refuse a superseded assignment's evidence with 403, got %d body=%s", itemsRec.Code, itemsRec.Body.String())
+		}
+	})
+
+	// 14. A pass that never claimed the run's row survives only in the run's dub_synthesize stage
+	// execution - which is what executeRun records for the pass a refused claim returned after a
+	// reassignment landed mid-flight. With another assignment in force that stage binding must be
+	// refused rather than served as the run's media.
+	t.Run("refuses a stale stage-bound variant when the run owns no row", func(t *testing.T) {
+		boundRunID := "run-stage-bound-stale"
+		if _, err := db.CreateRunEnqueued(ctx, domain.LocalizationRun{
+			ID:                 boundRunID,
+			JobID:              jobID,
+			Status:             "running",
+			ConfigSnapshotJSON: "{}",
+			CreatedAt:          now,
+		}, jobID); err != nil {
+			t.Fatalf("create stage-bound run: %v", err)
+		}
+		if err := db.SaveVoiceAssignmentIndex(ctx, storage.VoiceAssignmentIndex{
+			ID:              "va-current-" + boundRunID,
+			AssetID:         assetID,
+			RunID:           boundRunID,
+			JobID:           jobID,
+			TargetLanguage:  targetLang,
+			CASHash:         "assign-current-bound",
+			ProvenanceHash:  "prov-va-bound",
+			AssignmentsJSON: "{}",
+			CreatedAt:       now,
+		}); err != nil {
+			t.Fatalf("save stage-bound current assignment: %v", err)
+		}
+
+		boundAudioObj, err := casStore.Put(bytes.NewReader(media.GeneratePCM16WAV(16000, 1, 1100)))
+		if err != nil {
+			t.Fatalf("put stage-bound waveform: %v", err)
+		}
+		boundDSV := dsv
+		boundDSV.ID = uuid.NewString()
+		boundDSV.RunID = boundRunID
+		boundDSV.VoiceAssignmentCAS = "assign-superseded-bound"
+		boundDSV.ReviewSegments = append([]domain.DubSegmentReview(nil), dsv.ReviewSegments...)
+		boundDSV.ReviewSegments[0].AudioSHA256 = boundAudioObj.SHA256
+		boundData, err := json.Marshal(boundDSV)
+		if err != nil {
+			t.Fatalf("marshal stage-bound variant: %v", err)
+		}
+		boundObj, err := casStore.Put(bytes.NewReader(boundData))
+		if err != nil {
+			t.Fatalf("put stage-bound variant: %v", err)
+		}
+		if err := db.CreateStageExecution(ctx, domain.StageExecution{
+			ID:             uuid.NewString(),
+			RunID:          boundRunID,
+			Stage:          "dub_synthesize",
+			Status:         domain.StageStatusSucceeded,
+			ArtifactSHA256: boundObj.SHA256,
+			CreatedAt:      now,
+		}); err != nil {
+			t.Fatalf("bind stage artifact: %v", err)
+		}
+
+		req := httptest.NewRequest("GET", "/api/v1/runs/"+boundRunID+"/dub-media/"+boundAudioObj.SHA256, nil)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for a stale stage-bound variant, got %d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
+	// 15. Every entry point that projects a run's review items must classify the stale
+	// voice-assignment refusal as 403 (not 400 for a malformed request, not 500 for a server
+	// fault), so a superseded pass can be neither overridden nor handed off to a final render.
+	t.Run("classifies a stale voice assignment as 403 on override and handoff", func(t *testing.T) {
+		guardRunID := "run-stale-guard"
+		if _, err := db.CreateRunEnqueued(ctx, domain.LocalizationRun{
+			ID:                 guardRunID,
+			JobID:              jobID,
+			Status:             "running",
+			ConfigSnapshotJSON: "{}",
+			CreatedAt:          now,
+		}, jobID); err != nil {
+			t.Fatalf("create guarded run: %v", err)
+		}
+		if err := db.SaveVoiceAssignmentIndex(ctx, storage.VoiceAssignmentIndex{
+			ID:              "va-current-" + guardRunID,
+			AssetID:         assetID,
+			RunID:           guardRunID,
+			JobID:           jobID,
+			TargetLanguage:  targetLang,
+			CASHash:         "assign-current-guard",
+			ProvenanceHash:  "prov-va-guard",
+			AssignmentsJSON: "{}",
+			CreatedAt:       now,
+		}); err != nil {
+			t.Fatalf("save guarded current assignment: %v", err)
+		}
+		guardAudioObj, err := casStore.Put(bytes.NewReader(media.GeneratePCM16WAV(16000, 1, 1300)))
+		if err != nil {
+			t.Fatalf("put guarded waveform: %v", err)
+		}
+		guardDSV := dsv
+		guardDSV.ID = uuid.NewString()
+		guardDSV.RunID = guardRunID
+		guardDSV.VoiceAssignmentCAS = "assign-superseded-guard"
+		guardDSV.ReviewSegments = append([]domain.DubSegmentReview(nil), dsv.ReviewSegments...)
+		guardDSV.ReviewSegments[0].AudioSHA256 = guardAudioObj.SHA256
+		guardData, err := json.Marshal(guardDSV)
+		if err != nil {
+			t.Fatalf("marshal guarded variant: %v", err)
+		}
+		guardObj, err := casStore.Put(bytes.NewReader(guardData))
+		if err != nil {
+			t.Fatalf("put guarded variant: %v", err)
+		}
+		if err := db.SaveDubSegmentsVariantIndex(ctx, storage.DubSegmentsVariantIndex{
+			ID:             guardDSV.ID,
+			AssetID:        assetID,
+			RunID:          guardRunID,
+			JobID:          jobID,
+			TargetLanguage: targetLang,
+			CASHash:        guardObj.SHA256,
+			ProvenanceHash: "prov-stale-guard",
+			OverallStatus:  "REVIEW_REQUIRED",
+			CreatedAt:      now,
+		}); err != nil {
+			t.Fatalf("save guarded variant index: %v", err)
+		}
+
+		overrideBody := `{"review_item_id": "rev-x", "action": "override", "reason": "operator attempt"}`
+		runOverrideBody := `{"run_id": "` + guardRunID + `", "review_item_id": "rev-x", "action": "override", "reason": "operator attempt"}`
+		directOverrideBody := `{"run_id": "` + guardRunID + `", "asset_id": "` + assetID + `", "action": "override", "reason": "operator attempt"}`
+		guardCases := []struct {
+			name string
+			path string
+			body string
+		}{
+			{"run-scoped override", "/api/v1/runs/" + guardRunID + "/review/override", overrideBody},
+			{"asset-scoped override", "/api/v1/assets/" + assetID + "/review/override", runOverrideBody},
+			{"direct item override", "/api/v1/review-items/rev-x/override", directOverrideBody},
+			{"run-scoped handoff", "/api/v1/runs/" + guardRunID + "/render/handoff", `{}`},
+			{"asset-scoped handoff", "/api/v1/assets/" + assetID + "/render/handoff?run_id=" + guardRunID, `{}`},
+		}
+		for _, tc := range guardCases {
+			t.Run(tc.name, func(t *testing.T) {
+				req := httptest.NewRequest("POST", tc.path, strings.NewReader(tc.body))
+				req.Header.Set("Content-Type", "application/json")
+				rec := httptest.NewRecorder()
+				srv.Handler().ServeHTTP(rec, req)
+				if rec.Code != http.StatusForbidden {
+					t.Fatalf("expected 403 for a superseded voice assignment, got %d body=%s", rec.Code, rec.Body.String())
+				}
+			})
 		}
 	})
 }

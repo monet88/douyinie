@@ -45,6 +45,31 @@ func TestAtempoFilterArgs_OnlyOneFilterWithFiniteNumericArg(t *testing.T) {
 	}
 }
 
+// A valid factor barely above 1 must not serialize to the no-op "atempo=1.000000": the emitted
+// filter has to name a speed-up, and the lineage a caller records has to be exactly that filter.
+func TestAtempoFilterString_BoundaryAboveOneStaysASpeedUp(t *testing.T) {
+	for _, factor := range []float64{1.0000001, 1.0000004, 1.000001, 1.0001} {
+		filter := media.AtempoFilterString(factor)
+		args, err := media.AtempoFilterArgs(factor)
+		if err != nil {
+			t.Fatalf("factor %v must be in range: %v", factor, err)
+		}
+		if args[2] != filter {
+			t.Fatalf("lineage %q is not the emitted filter %q", filter, args[2])
+		}
+		value, err := strconv.ParseFloat(strings.TrimPrefix(filter, "atempo="), 64)
+		if err != nil {
+			t.Fatalf("emitted filter %q is not a parseable factor: %v", filter, err)
+		}
+		if value <= 1 {
+			t.Fatalf("factor %v serialized to the no-op %q", factor, filter)
+		}
+		if value != factor {
+			t.Fatalf("factor %v serialized to %q, which parses back as %v", factor, filter, value)
+		}
+	}
+}
+
 func TestApplyAtempoWAV_RealFFmpegTransform(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not installed on test host")

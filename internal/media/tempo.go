@@ -54,9 +54,12 @@ type AtempoRequest struct {
 }
 
 // AtempoFilterString formats the single atempo filter token for a factor. It is the one place
-// the token is spelled, so the lineage a caller records is the exact filter that ran.
+// the token is spelled, so the lineage a caller records is the exact filter that ran. The
+// shortest round-tripping decimal is used instead of a fixed six-decimal format: a valid factor
+// barely above 1 (e.g. 1.0000004) would otherwise round to the no-op "atempo=1.000000" and both
+// the emitted filter and its recorded lineage would claim a transform that never sped anything up.
 func AtempoFilterString(factor float64) string {
-	return fmt.Sprintf("atempo=%.6f", factor)
+	return "atempo=" + strconv.FormatFloat(factor, 'f', -1, 64)
 }
 
 // AtempoFilterArgs returns the exact ffmpeg argument tail of the single atempo transform.

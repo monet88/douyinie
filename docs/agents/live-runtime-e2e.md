@@ -240,11 +240,14 @@ Traps:
   `measured_duration_ms` / `slot_duration_ms`. Two ways out, both operator-visible: shorten the wording
   (`Sửa text` → `POST /api/v1/runs/<run>/inspector/correct-text` with `new_target_text` +
   `spoken_text_override`) or give the run a lane that can compress (below). When the natural remedy
-  sequence is already exhausted, the same item also carries audition evidence in the Inspector's
-  `Phương án tempo` panel (`#inspect-tempo`): the retained natural waveform played against one eligible
-  FFmpeg `atempo` alternative served by `GET /api/v1/runs/<run>/dub-media/<hash>`. That panel does not
-  resolve the item - the alternative stays unselected, the item stays `pending`, and nothing reaches the
-  mix or a final render - so it is evidence for the two ways out above, not a third decision.
+  sequence is already exhausted, the same item may also carry audition evidence in the Inspector's
+  `Phương án tempo` panel (`#inspect-tempo`): the retained natural waveform, and - only when the
+  candidate's measured factor falls within `(1, 1.25]` and the FFmpeg `atempo` transform actually
+  succeeds - one eligible transformed alternative served by `GET /api/v1/runs/<run>/dub-media/<hash>`.
+  An out-of-range factor, an unavailable `ffmpeg`, or a failed or cancelled transform leaves the panel
+  showing the natural waveform and the recorded reason instead of a playable alternative. That panel
+  does not resolve the item - the alternative stays unselected, the item stays `pending`, and nothing
+  reaches the mix or a final render - so it is evidence for the two ways out above, not a third decision.
 - **Why the automatic fit lane may never engage.** The VI default lane (ZeroTTS) and the VieNeu
   compatibility lane are fixed-rate: they reject any speed other than 1.0, so overrun can only go through
   rewrite/regroup and then the whole-speaker escalation to the duration-controlled lane (`cosyvoice3_tts`,

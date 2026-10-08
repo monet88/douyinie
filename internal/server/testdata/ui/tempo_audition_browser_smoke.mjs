@@ -78,10 +78,16 @@ try {
   await session("Page.navigate", { url: uiUrl });
   await waitFor("the operator UI shell to boot", async () => await evaluate(`!!document.querySelector("[data-view-target=jobs]")`));
 
-  // 1. Select the run the way an operator does: open the queue and pick it.
+  // 1. Select the run under test the way an operator does: open the queue and click the entry
+  // whose data-select-run equals the supplied run id. Clicking the first entry would audition
+  // whichever run happens to be at the top instead of the one this smoke provisioned.
+  const runSelector = `[data-select-run="${runID.replace(/["\\]/g, "\\$&")}"]`;
   await clickElement('[data-view-target="jobs"]');
-  await waitFor("the queue to list the run", async () => (await evaluate(`document.querySelectorAll("[data-select-run]").length`)) > 0);
-  await clickElement("[data-select-run]");
+  await waitFor(
+    "the queue to list the run under test",
+    async () => await evaluate(`!!document.querySelector(${JSON.stringify(runSelector)})`),
+  );
+  await clickElement(runSelector);
   await clickElement('[data-view-target="inspector"]');
   await sleep(200);
 
