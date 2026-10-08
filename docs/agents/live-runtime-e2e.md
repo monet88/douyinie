@@ -246,8 +246,14 @@ Traps:
   succeeds - one eligible transformed alternative served by `GET /api/v1/runs/<run>/dub-media/<hash>`.
   An out-of-range factor, an unavailable `ffmpeg`, or a failed or cancelled transform leaves the panel
   showing the natural waveform and the recorded reason instead of a playable alternative. That panel
-  does not resolve the item - the alternative stays unselected, the item stays `pending`, and nothing
-  reaches the mix or a final render - so it is evidence for the two ways out above, not a third decision.
+  does not resolve the item by itself: the item stays `pending` and nothing reaches the mix or a final
+  render until the operator explicitly accepts that exact reviewed candidate
+  (`POST /api/v1/runs/<run>/review/accept-candidate` with the item id, `candidate: "transformed"` and an
+  explicit `manual_override` quality waiver, or `candidate: "natural"` for a retained waveform that
+  itself fits). The acceptance releases only the accepted waveform into a successor dubbing artifact,
+  keeps the run paused while any other unit is unresolved, and rebuilds mix, render plan and preview
+  once the last required group is accepted - see `CONTEXT.md` §4.3. It replaces nothing above: the
+  rewrite and escalation ways out remain the only ones that avoid releasing a transformed waveform.
 - **Why the automatic fit lane may never engage.** The VI default lane (ZeroTTS) and the VieNeu
   compatibility lane are fixed-rate: they reject any speed other than 1.0, so overrun can only go through
   rewrite/regroup and then the whole-speaker escalation to the duration-controlled lane (`cosyvoice3_tts`,

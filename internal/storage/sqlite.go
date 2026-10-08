@@ -3554,6 +3554,15 @@ func (s *DB) SaveDubSegmentsVariantIndex(ctx context.Context, idx DubSegmentsVar
 	return nil
 }
 
+// voiceAssignmentGuardSQL is the ownership guard both variant claim paths write as part of their own
+// statement: a variant row is claimable only while no voice assignment other than the variant's own
+// is in force for the run (Issues #155, #156, #157). It is one fragment so the supersede rule cannot
+// drift between the paths that enforce it.
+const voiceAssignmentGuardSQL = `NOT EXISTS (
+			SELECT 1 FROM voice_assignments
+			WHERE asset_id = ? AND run_id = ? AND target_language = ? AND cas_hash <> ?
+		)`
+
 // ClaimDubSegmentsVariantIndexForAssignment records the index row for a CAS-stored
 // DubSegmentsVariant only while no voice assignment other than assignmentCAS is in force for the
 // run, and reports whether the row was claimed (§156). The ownership test and the row write are
@@ -3572,10 +3581,7 @@ func (s *DB) ClaimDubSegmentsVariantIndexForAssignment(ctx context.Context, idx 
 			overall_status, created_at
 		)
 		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
-		WHERE NOT EXISTS (
-			SELECT 1 FROM voice_assignments
-			WHERE asset_id = ? AND run_id = ? AND target_language = ? AND cas_hash <> ?
-		)
+		WHERE ` + voiceAssignmentGuardSQL + `
 		ON CONFLICT(provenance_hash) DO UPDATE SET
 			cas_hash = excluded.cas_hash,
 			overall_status = excluded.overall_status
@@ -3588,6 +3594,62 @@ func (s *DB) ClaimDubSegmentsVariantIndexForAssignment(ctx context.Context, idx 
 	affected, err := res.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("claim dub_segments_variant index: %w", err)
+	}
+	return affected > 0, nil
+}
+
+// ClaimDubSegmentsVariantIndexFromBase records the index row for a successor DubSegmentsVariant
+// and reports whether it was claimed, but only while the row still names the exact base variant
+// the successor was derived from (§157). An acceptance rebuilds one successor from the base the
+// operator saw; two operators accepting different review units concurrently must not both win
+// with the second silently discarding the first's promotion, and an acceptance built from a
+// variant that a later synthesis or reassignment already superseded must not take over the row
+// the inspector, the review projection and playback resolve.
+//
+// The base test and the row write are one statement, so a concurrent acceptance that already
+// claimed the row - moving it to its own successor bytes - refuses this write. A provenance row
+// that does not exist yet is claimable: a replay run can resolve its variant through its own
+// dub_synthesize stage artifact without owning an index row.
+//
+// The voice-assignment guard of ClaimDubSegmentsVariantIndexForAssignment still applies, so a
+// superseded-assignment successor can never claim the row either.
+func (s *DB) ClaimDubSegmentsVariantIndexFromBase(ctx context.Context, idx DubSegmentsVariantIndex, assignmentCAS, baseCAS string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if strings.TrimSpace(baseCAS) == "" {
+		return false, errors.New("base dub segments variant cas hash is required to claim a successor")
+	}
+
+	query := `
+		INSERT INTO dub_segments_variants (
+			id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+			overall_status, created_at
+		)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE ` + voiceAssignmentGuardSQL + `
+		AND (
+			NOT EXISTS (
+				SELECT 1 FROM dub_segments_variants WHERE provenance_hash = ?
+			)
+			OR EXISTS (
+				SELECT 1 FROM dub_segments_variants
+				WHERE provenance_hash = ? AND cas_hash = ?
+			)
+		)
+		ON CONFLICT(provenance_hash) DO UPDATE SET
+			cas_hash = excluded.cas_hash,
+			overall_status = excluded.overall_status
+	`
+	res, err := s.db.ExecContext(ctx, query, append(dubSegmentsVariantIndexArgs(idx),
+		idx.AssetID, idx.RunID, idx.TargetLanguage, assignmentCAS,
+		idx.ProvenanceHash, idx.ProvenanceHash, strings.ToLower(strings.TrimSpace(baseCAS)))...)
+	if err != nil {
+		return false, fmt.Errorf("claim successor dub_segments_variant index: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("claim successor dub_segments_variant index: %w", err)
 	}
 	return affected > 0, nil
 }
@@ -6122,18 +6184,20 @@ func (s *DB) UpsertDubSegmentsVariantIndex(ctx context.Context, idx DubSegmentsV
 	defer s.mu.Unlock()
 
 	query := `
-		INSERT INTO dub_segments_variants (id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO dub_segments_variants (id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash, overall_status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			asset_id = excluded.asset_id,
 			run_id = excluded.run_id,
+			job_id = excluded.job_id,
 			target_language = excluded.target_language,
 			cas_hash = excluded.cas_hash,
 			provenance_hash = excluded.provenance_hash,
+			overall_status = excluded.overall_status,
 			created_at = excluded.created_at
 	`
 	_, err := s.db.ExecContext(ctx, query,
-		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+		idx.ID, idx.AssetID, idx.RunID, idx.JobID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.OverallStatus, idx.CreatedAt.Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert dub segments variant index: %w", err)
@@ -6147,17 +6211,19 @@ func (s *DB) UpsertAudioStemsArtifactIndex(ctx context.Context, idx AudioStemsAr
 	defer s.mu.Unlock()
 
 	query := `
-		INSERT INTO audio_stems_artifacts (id, asset_id, provider_id, cas_hash, provenance_hash, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO audio_stems_artifacts (id, asset_id, provider_id, model_name, model_version, cas_hash, provenance_hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			asset_id = excluded.asset_id,
 			provider_id = excluded.provider_id,
+			model_name = excluded.model_name,
+			model_version = excluded.model_version,
 			cas_hash = excluded.cas_hash,
 			provenance_hash = excluded.provenance_hash,
 			created_at = excluded.created_at
 	`
 	_, err := s.db.ExecContext(ctx, query,
-		idx.ID, idx.AssetID, idx.ProviderID, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+		idx.ID, idx.AssetID, idx.ProviderID, idx.ModelName, idx.ModelVersion, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert audio stems artifact index: %w", err)

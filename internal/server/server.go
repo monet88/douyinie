@@ -430,34 +430,6 @@ func (s *Server) shouldContinueRun(ctx context.Context, runID string) (bool, err
 	}
 }
 
-func (s *Server) resolveRunPosture(ctx context.Context, runID string) (domain.ReviewPosture, error) {
-	run, err := s.db.GetRun(ctx, runID)
-	if err != nil {
-		return "", fmt.Errorf("failed to get run %s: %w", runID, err)
-	}
-	if run == nil || strings.TrimSpace(run.ConfigSnapshotJSON) == "" {
-		return domain.ReviewPostureAuto, nil
-	}
-	var cfg struct {
-		Posture       domain.ReviewPosture `json:"posture"`
-		ReviewPosture domain.ReviewPosture `json:"review_posture"`
-	}
-	if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
-		return "", fmt.Errorf("malformed run config snapshot JSON: %w", err)
-	}
-	p := cfg.Posture
-	if p == "" {
-		p = cfg.ReviewPosture
-	}
-	if p != "" {
-		if p != domain.ReviewPostureAuto && p != domain.ReviewPostureReview {
-			return "", fmt.Errorf("invalid run posture: %q", p)
-		}
-		return p, nil
-	}
-	return domain.ReviewPostureAuto, nil
-}
-
 func (s *Server) completeRunSafely(ctx context.Context, runID string) error {
 	s.activeRunMu.Lock()
 	defer s.activeRunMu.Unlock()
@@ -481,7 +453,7 @@ func (s *Server) completeRunSafely(ctx context.Context, runID string) error {
 		// If the subsequent queue transition fails, we roll back the job status to prevent divergence.
 		var priorJobStatus string
 		if entry.JobID != "" {
-			posture, err := s.resolveRunPosture(lookupCtx, runID)
+			posture, err := service.ResolveRunPosture(lookupCtx, s.db, runID)
 			if err != nil && !errors.Is(err, storage.ErrNotFound) {
 				return fmt.Errorf("resolve posture before completing job %s of run %s: %w", entry.JobID, runID, err)
 			}
@@ -650,7 +622,7 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 	}
 
 	// Validate run config snapshot and posture fail-closed
-	posture, err := s.resolveRunPosture(ctx, runID)
+	posture, err := service.ResolveRunPosture(ctx, s.db, runID)
 	if err != nil {
 		return s.failRun(ctx, runID, "run_config", err.Error())
 	}
@@ -1620,6 +1592,10 @@ func (s *Server) routes() {
 	// Final Render Handoff (T20: Auto queue-zero vs Review explicit action)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/render/handoff", s.handleFinalRenderHandoff)
 	s.mux.HandleFunc("POST /api/v1/runs/{id}/render/handoff", s.handleRunFinalRenderHandoff)
+
+	// Exact reviewed-candidate selection (Issue #157: accept one reviewed candidate, then rebuild)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/review/accept-candidate", s.handleAcceptReviewedCandidate)
+	s.mux.HandleFunc("POST /api/v1/runs/{id}/review/accept-candidate", s.handleRunAcceptReviewedCandidate)
 
 	// Multimodal Quality Results (T19)
 	s.mux.HandleFunc("POST /api/v1/quality-results", s.handleCreateQualityResult)
@@ -5386,6 +5362,103 @@ func (s *Server) handleFinalRenderHandoff(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{
 		"handoff": result,
 	})
+}
+
+// handleAcceptReviewedCandidate is the asset-scoped entry point of the exact reviewed-candidate
+// selection (#157). It requires an explicit run_id: a selection is always an exact run-scoped act
+// and never falls back to another run's dubbing artifact.
+func (s *Server) handleAcceptReviewedCandidate(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if s.reviewSvc == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+
+	var in service.AcceptReviewedCandidateInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(in.RunID) == "" {
+		writeError(w, http.StatusBadRequest, "run_id is required for reviewed-candidate selection")
+		return
+	}
+
+	in.AssetID = assetID
+	s.writeAcceptReviewedCandidate(w, r, in)
+}
+
+// handleRunAcceptReviewedCandidate is the run-scoped entry point. The run owns the asset, language
+// and job the selection is bound to, so the caller cannot name a different one.
+func (s *Server) handleRunAcceptReviewedCandidate(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+	if s.reviewSvc == nil || s.db == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+
+	run, err := s.db.GetRun(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	job, err := s.db.GetJob(r.Context(), run.JobID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var in service.AcceptReviewedCandidateInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	in.RunID = runID
+	// The run owns its job, asset and language. A body that omits them is filled from the run; a
+	// body that names a different one is left as sent so the selection is refused as a wrong
+	// binding instead of silently using the run's own values.
+	if in.JobID == "" {
+		in.JobID = job.ID
+	}
+	if in.AssetID == "" {
+		in.AssetID = job.SourceAssetID
+	}
+	if in.TargetLanguage == "" {
+		in.TargetLanguage = job.TargetLanguage
+	}
+	s.writeAcceptReviewedCandidate(w, r, in)
+}
+
+// writeAcceptReviewedCandidate maps the selection service's refusal classes to status codes. They
+// stay distinct on purpose: an operator must be able to tell a stale decision from a hard media
+// gate from a missing quality waiver.
+func (s *Server) writeAcceptReviewedCandidate(w http.ResponseWriter, r *http.Request, in service.AcceptReviewedCandidateInput) {
+	result, err := s.reviewSvc.AcceptReviewedCandidate(r.Context(), in)
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrNotFound), errors.Is(err, domain.ErrAssetNotFound):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, service.ErrReviewedCandidateStale),
+			errors.Is(err, service.ErrReviewedCandidateNotPending),
+			errors.Is(err, service.ErrReviewedCandidateConflict):
+			writeError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, service.ErrReviewedCandidateNotSelectable),
+			errors.Is(err, service.ErrReviewedCandidateUnavailable):
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+		case errors.Is(err, service.ErrReviewedCandidateWaiverRequired),
+			errors.Is(err, service.ErrReviewedCandidateInvalid):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"result": result})
 }
 
 func (s *Server) handleRunFinalRenderHandoff(w http.ResponseWriter, r *http.Request) {
