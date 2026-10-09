@@ -66,6 +66,17 @@ func TestDubVariantStatusRequiresExactEligibleCoverage(t *testing.T) {
 			want:     "REVIEW_REQUIRED",
 		},
 		{
+			name: "an accepted segment still flagged for review never passes",
+			variant: &domain.DubSegmentsVariant{
+				Segments: []domain.DubSegment{
+					accepted(0, 0),
+					{Index: 1, SpeechBlockIndices: []int{1}, FitDecision: domain.FitActionAccept, RequiresReview: true},
+				},
+			},
+			eligible: eligible,
+			want:     "REVIEW_REQUIRED",
+		},
+		{
 			name:     "an eligible block no segment covers never passes",
 			variant:  &domain.DubSegmentsVariant{Segments: []domain.DubSegment{accepted(0, 0)}},
 			eligible: eligible,

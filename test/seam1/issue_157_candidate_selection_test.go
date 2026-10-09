@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -123,6 +124,10 @@ func issue157StageArtifact(t *testing.T, h *testHarness, runID, stage string) st
 // tempo candidate, the operator accepts that exact candidate, and the accepted selection survives
 // a restart and a bundle replay onto a host with a different CAS root.
 func TestSeam1_Issue157_JoinedPipelineSelectionThroughRenderAndPortableReplay(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is required to build the tempo candidate and render the rebuilt preview")
+	}
+
 	h := setupAutoRunHarness(t)
 	configureDialogueTranslationGateway(t, h)
 

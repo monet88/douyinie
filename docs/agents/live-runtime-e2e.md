@@ -255,7 +255,8 @@ Traps:
   acceptance releases only the accepted waveform into a successor dubbing artifact,
   keeps the run paused while any other unit is unresolved, and rebuilds mix, render plan and preview
   once the last required group is accepted - see `CONTEXT.md` §4.3. It replaces nothing above: the
-  rewrite and escalation ways out remain the only ones that avoid releasing a transformed waveform.
+  rewrite and escalation ways out remain alternatives to accepting either auditioned waveform, and
+  only accepting `candidate: "transformed"` releases a transformed waveform.
 - **Why the automatic fit lane may never engage.** The VI default lane (ZeroTTS) and the VieNeu
   compatibility lane are fixed-rate: they reject any speed other than 1.0, so overrun can only go through
   rewrite/regroup and then the whole-speaker escalation to the duration-controlled lane (`cosyvoice3_tts`,

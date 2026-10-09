@@ -394,9 +394,11 @@ type AcceptReviewedCandidateResult struct {
 	RemainingReviewCount int  `json:"remaining_review_count"`
 	CoverageComplete     bool `json:"coverage_complete"`
 	Idempotent           bool `json:"idempotent"`
-	// RunPaused reports that the run is still paused: coverage is incomplete, so no partial mix was
-	// ever produced, or the run is in Review posture awaiting the operator's explicit final render.
-	// It is false only once an automatic final render released the run.
+	// RunPaused reports that the run is paused: coverage is incomplete, so no partial mix was ever
+	// produced, or the run is in Review posture awaiting the operator's explicit final render. It is
+	// false once an automatic final render released the run, and also false for a run that was
+	// cancelled or interrupted - such a run is neither finished nor waiting on the operator, and
+	// offering it as a resumable pause would misreport the state the operator left it in.
 	RunPaused bool `json:"run_paused"`
 	// RunCompleted reports that the run and its job were finished (auto posture, gates passed).
 	RunCompleted bool `json:"run_completed"`
@@ -1140,6 +1142,12 @@ func (s *ReviewService) rebuildSelectionDelivery(
 	// the superseded media must not stay servable as current while the accepted media is only partly
 	// published. The CAS blobs are immutable and stay; the index rows and stage pins are what make an
 	// artifact the one a reader resolves.
+	// A cancellation that lands while this rebuild runs does not change that: cancelling owns the
+	// run's lifecycle status and forbids a new acceptance into it, but nothing in the product
+	// withdraws media a run has already produced (the pipeline's own renders survive a cancel the
+	// same way), and what this rebuild publishes belongs to the delivery the operator accepted. The
+	// superseded rows are taken back either way, so a cancellation can never leave the replaced
+	// media servable.
 	if err := s.withdrawRunRenderArtifacts(ctx, successor.RunID, targetLang); err != nil {
 		return err
 	}
@@ -1226,10 +1234,22 @@ func (s *ReviewService) rebuildSelectionDelivery(
 
 	if handoff.Action == "auto_render_started" {
 		// The acceptance resolves the park that held the run, so the paused entry is the one this
-		// gate admits; the terminal transition and its rollback are the shared ones, and the state
-		// is reported only once the run really reached it.
+		// gate admits; the terminal transition and its rollback are the shared ones.
 		if err := CompleteDeliveredRun(ctx, s.db, successor.RunID, true); err != nil {
 			return err
+		}
+		// The transition refuses a run that a cancellation or a recovery already took out of the
+		// active state, so the run's state is reported from what it really reached instead of being
+		// assumed: the rebuilt delivery is delivered either way, but a run that stopped on its own
+		// terms is never reported as completed by this acceptance.
+		entry, err := s.db.GetQueueEntryByRunID(ctx, successor.RunID)
+		if err != nil {
+			return fmt.Errorf("read run %s state after the accepted rebuild: %w", successor.RunID, err)
+		}
+		if entry.Status != domain.RunStatusCompleted {
+			result.Message = fmt.Sprintf("accepted candidate and rebuilt the run's delivery; the run is %s: %s",
+				entry.Status, handoff.Message)
+			return nil
 		}
 		result.RunCompleted = true
 		result.Message = "accepted candidate, rebuilt the run's delivery, and completed the run: " + handoff.Message
@@ -1361,14 +1381,32 @@ func CompleteDeliveredRun(ctx context.Context, db *storage.DB, runID string, all
 			}
 		}
 	}
-	if err := db.UpdateQueueStatus(ctx, runID, domain.RunStatusCompleted, domain.RunStatusCompleted); err != nil {
-		if jobID != "" && priorJobStatus != "" {
-			if rollbackErr := db.UpdateJobStatus(ctx, jobID, priorJobStatus); rollbackErr != nil {
-				return fmt.Errorf("%w: %v (rolling job %s back to %s also failed: %v)",
-					ErrRunCompletionTransition, err, jobID, priorJobStatus, rollbackErr)
-			}
+	rollbackCompletedJob := func() error {
+		if jobID == "" || priorJobStatus == "" {
+			return nil // the posture kept the job open: there is nothing to undo
+		}
+		return db.UpdateJobStatus(ctx, jobID, priorJobStatus)
+	}
+
+	// The gate above only reads the status; this write is what it guards. The transition applies
+	// only while the run is still active, so a cancellation or recovery that lands in between
+	// refuses the completion instead of being overwritten by it.
+	applied, err := db.CompleteQueueEntryIfActive(ctx, runID, allowParked)
+	if err != nil {
+		if rollbackErr := rollbackCompletedJob(); rollbackErr != nil {
+			return fmt.Errorf("%w: %v (rolling job %s back to %s also failed: %v)",
+				ErrRunCompletionTransition, err, jobID, priorJobStatus, rollbackErr)
 		}
 		return fmt.Errorf("%w: %v", ErrRunCompletionTransition, err)
+	}
+	if !applied {
+		// The run left the active state under this completion: its own terminal status stands, so
+		// the job write is undone and the delivery is not reported as finished. This is a refusal,
+		// not a failure - the caller must not mark the run failed over another caller's decision.
+		if rollbackErr := rollbackCompletedJob(); rollbackErr != nil {
+			return fmt.Errorf("refuse completing run %s (no longer active): rolling job %s back to %s failed: %w",
+				runID, jobID, priorJobStatus, rollbackErr)
+		}
 	}
 	return nil
 }
@@ -1469,8 +1507,17 @@ func (s *ReviewService) reportReplayedAcceptance(
 		Idempotent:            true,
 		Status:                domain.ReviewItemStatusAutoResolved,
 	}
+	// The queue entry is the authority for the run's own state: it may have finished, been paused,
+	// cancelled or interrupted since the original acceptance, and the replay reports that instead of
+	// assuming the acceptance's own outcome still stands. A cancelled or interrupted run is neither
+	// finished nor waiting on the operator, so it is never reported as a resumable pause.
+	entry, err := s.db.GetQueueEntryByRunID(ctx, runID)
+	if err != nil {
+		return nil, fmt.Errorf("read run %s queue entry for the replayed acceptance: %w", runID, err)
+	}
+	result.RunCompleted = entry.Status == domain.RunStatusCompleted
+	result.RunPaused = entry.Status == domain.RunStatusPaused
 	if !result.CoverageComplete {
-		result.RunPaused = true
 		result.Status = domain.ReviewItemStatusManualOverride
 		result.Message = fmt.Sprintf("review item %s was already accepted with waveform %s; %d review unit(s) remain unresolved and no partial mix was produced",
 			existing.ReviewItemID, existing.SelectedAudioSHA256, len(variant.ReviewSegments))
@@ -1514,29 +1561,24 @@ func (s *ReviewService) reportReplayedAcceptance(
 		*stage.into = casHash
 	}
 	// The recorded decision states what the run reached, so the replay reports that and not a
-	// re-derivation: an Auto handoff released the run (and finishes a terminal write that never
-	// landed), while a Review handoff left it paused on the operator's explicit render. Both states
-	// are reported only from what the queue actually holds.
+	// re-derivation: an Auto handoff released the run, while a Review handoff left it paused on the
+	// operator's explicit render.
 	result.FinalRenderCAS = handoff.FinalRenderCAS
 	result.HandoffAction = handoff.Action
 	result.HandoffMessage = handoff.Message
-	if handoff.Action == "auto_render_started" {
-		entry, err := s.db.GetQueueEntryByRunID(ctx, runID)
-		if err != nil {
-			return nil, fmt.Errorf("read run %s queue entry for the replayed acceptance: %w", runID, err)
+	// An Auto handoff released the run, so the only thing the replay may still do is finish a terminal
+	// write that never landed. That write is attempted only from the statuses a completion admits: a
+	// run that is still queued (re-drained) or already cancelled/interrupted is reported as it is
+	// rather than forced through a transition of its own, and the guard is what admits the write.
+	if handoff.Action == "auto_render_started" && (entry.Status == domain.RunStatusRunning || entry.Status == domain.RunStatusPaused) {
+		if err := CompleteDeliveredRun(ctx, s.db, runID, true); err != nil {
+			return nil, err
 		}
-		if entry.Status != domain.RunStatusCompleted {
-			if err := CompleteDeliveredRun(ctx, s.db, runID, true); err != nil {
-				return nil, err
-			}
-			if entry, err = s.db.GetQueueEntryByRunID(ctx, runID); err != nil {
-				return nil, fmt.Errorf("read run %s queue entry after completion: %w", runID, err)
-			}
+		if entry, err = s.db.GetQueueEntryByRunID(ctx, runID); err != nil {
+			return nil, fmt.Errorf("read run %s queue entry after completion: %w", runID, err)
 		}
 		result.RunCompleted = entry.Status == domain.RunStatusCompleted
-		result.RunPaused = !result.RunCompleted
-	} else {
-		result.RunPaused = true
+		result.RunPaused = entry.Status == domain.RunStatusPaused
 	}
 	result.Message = fmt.Sprintf("review item %s was already accepted with waveform %s; nothing was re-selected or rebuilt",
 		existing.ReviewItemID, existing.SelectedAudioSHA256)

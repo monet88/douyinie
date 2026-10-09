@@ -3,6 +3,7 @@ package seam1_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1074,6 +1075,168 @@ func TestSeam1_Issue157_DeliveredRunCompletionRespectsTheQueueGate(t *testing.T)
 	}
 	if run := issue157Run(t, h, parkedRun); run.Status != domain.RunStatusCompleted {
 		t.Fatalf("a refused re-completion must leave the run completed, got %s", run.Status)
+	}
+
+	// A queue entry that still claims an active run while the run row itself has already stopped is
+	// refused by the guarded write, and the job write that preceded it is undone with it: the
+	// transition decides one run state, not two.
+	divergentJob, divergentRun := createJobAndRun(t, h)
+	if err := h.queueSvc.MarkRunning(ctx, divergentRun); err != nil {
+		t.Fatalf("mark the divergent run running: %v", err)
+	}
+	priorJobStatus := getJobViaAPI(t, h, divergentJob).Status
+	rawDB, err := sql.Open("sqlite", filepath.Join(h.dir, "douyinie_test.db")+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer rawDB.Close()
+	if _, err := rawDB.ExecContext(ctx, `UPDATE localization_runs SET status = 'cancelled' WHERE id = ?`, divergentRun); err != nil {
+		t.Fatalf("stop the run row only: %v", err)
+	}
+	if err := service.CompleteDeliveredRun(ctx, h.db, divergentRun, true); err != nil {
+		t.Fatalf("a run row that stopped on its own terms is a refusal, not a failure, got %v", err)
+	}
+	entry, err := h.db.GetQueueEntryByRunID(ctx, divergentRun)
+	if err != nil {
+		t.Fatalf("read the divergent queue entry: %v", err)
+	}
+	if entry.Status != domain.RunStatusRunning {
+		t.Fatalf("the guarded write must not complete a run whose own row stopped, got %s", entry.Status)
+	}
+	if job := getJobViaAPI(t, h, divergentJob); job.Status != priorJobStatus {
+		t.Fatalf("the refused transition must undo the job write: %s -> %s", priorJobStatus, job.Status)
+	}
+}
+
+// TestSeam1_Issue157_CancelledRunIsNeverReportedAsCompleted proves the acceptance reports only the
+// state the run really reached: a cancellation that lands while the accepted delivery is being
+// rebuilt owns the run's terminal status, so the decision is recorded and the rebuilt delivery is
+// delivered without the acceptance claiming a completion it did not perform.
+func TestSeam1_Issue157_CancelledRunIsNeverReportedAsCompleted(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is required to rebuild the accepted delivery")
+	}
+	h := setupHarness(t)
+	ctx := context.Background()
+	_, _, runID, items := issue157ParkedFixture(t, h, false)
+
+	firstStatus, first, firstRefusal := issue157Accept(t, h, runID, issue157Selection(items[0].ID))
+	if firstStatus != http.StatusOK || first == nil || first.CoverageComplete {
+		t.Fatalf("expected the first group to be accepted without a rebuild, got %d (%s)", firstStatus, firstRefusal)
+	}
+	pending := issue157ReviewItems(t, h, runID)
+	if len(pending) != 1 {
+		t.Fatalf("expected one group still pending, got %+v", pending)
+	}
+
+	// The cancellation lands at the stage row the handoff records once the delivery is fully rebuilt
+	// and immediately before the terminal transition, so the run's own terminal status is not the
+	// acceptance's to overwrite: the decision is committed, the rebuild has finished, and the run
+	// stays cancelled instead of being reported as completed.
+	rawDB, err := sql.Open("sqlite", filepath.Join(h.dir, "douyinie_test.db")+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer rawDB.Close()
+	if _, err := rawDB.ExecContext(ctx, `CREATE TRIGGER cancel_during_rebuild AFTER INSERT ON stage_executions
+		WHEN NEW.stage = 'render_final' AND NEW.status = 'succeeded'
+		BEGIN
+			UPDATE queue_entries SET status = 'cancelled', position = NULL WHERE run_id = NEW.run_id;
+			UPDATE localization_runs SET status = 'cancelled' WHERE id = NEW.run_id;
+		END;`); err != nil {
+		t.Fatalf("create cancel trigger: %v", err)
+	}
+
+	status, last, refusal := issue157Accept(t, h, runID, issue157Selection(pending[0].ID))
+	if status != http.StatusOK || last == nil {
+		t.Fatalf("expected the accepted decision to be recorded, got %d (%s)", status, refusal)
+	}
+	if last.FinalRenderCAS == "" {
+		t.Fatalf("expected the accepted delivery to be rebuilt, got %+v", last)
+	}
+	if last.RunCompleted {
+		t.Fatalf("a run cancelled during the rebuild must not be reported as completed: %+v", last)
+	}
+	if strings.Contains(last.Message, "completed the run") {
+		t.Fatalf("the report must not claim a completion the run never reached, got %q", last.Message)
+	}
+	if !strings.Contains(last.Message, domain.RunStatusCancelled) {
+		t.Fatalf("the report must name the state the run really reached, got %q", last.Message)
+	}
+	if run := issue157Run(t, h, runID); run.Status != domain.RunStatusCancelled {
+		t.Fatalf("the run's own terminal status must stand, got %s", run.Status)
+	}
+	if pending := issue157ReviewItems(t, h, runID); len(pending) != 0 {
+		t.Fatalf("the accepted decision must still be recorded, pending=%+v", pending)
+	}
+
+	// A repeated selection is refused by the run's own state before any replay can report it, and the
+	// refusal names the state the run reached: the operator is never told a cancelled run is paused or
+	// resumable, and nothing re-drives the delivery that was abandoned.
+	status, replay, replayRefusal := issue157Accept(t, h, runID, issue157Selection(items[0].ID))
+	if status != http.StatusConflict || replay != nil {
+		t.Fatalf("expected the cancelled run to refuse a repeated selection, got %d (%+v)", status, replay)
+	}
+	if !strings.Contains(replayRefusal, domain.RunStatusCancelled) {
+		t.Fatalf("the refusal must name the state the run reached, got %q", replayRefusal)
+	}
+	if run := issue157Run(t, h, runID); run.Status != domain.RunStatusCancelled {
+		t.Fatalf("the refusal must not re-drive a cancelled run, got %s", run.Status)
+	}
+}
+
+// TestSeam1_Issue157_CancelledReplayNeverReportsAPause proves a replay reports the run state the
+// queue holds at the moment it answers, not the state the acceptance left behind. The operator's
+// cancellation lands after this request was admitted - so the request runs to its report - and the
+// report must name neither a completion nor a pause: reporting a pause would offer the operator a
+// resume of the run they just abandoned.
+func TestSeam1_Issue157_CancelledReplayNeverReportsAPause(t *testing.T) {
+	h := setupHarness(t)
+	ctx := context.Background()
+	_, _, runID, items := issue157ParkedFixture(t, h, false)
+
+	// The first group's acceptance is recorded without a delivery, so no partial mix exists and the
+	// run stays parked on the remaining review unit.
+	status, first, refusal := issue157Accept(t, h, runID, issue157Selection(items[0].ID))
+	if status != http.StatusOK || first == nil || first.CoverageComplete {
+		t.Fatalf("expected the first group to be accepted without a rebuild, got %d (%s)", status, refusal)
+	}
+
+	// The retry the replay exists for: the successor carries the decision while its audit row was
+	// never written. Writing that row is the replay's only write, and the cancellation arrives with
+	// it - after the request read the run, before the report reads it again.
+	rawDB, err := sql.Open("sqlite", filepath.Join(h.dir, "douyinie_test.db")+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer rawDB.Close()
+	if _, err := rawDB.ExecContext(ctx, `DELETE FROM review_overrides WHERE run_id = ?`, runID); err != nil {
+		t.Fatalf("drop the recorded audit row: %v", err)
+	}
+	if _, err := rawDB.ExecContext(ctx, fmt.Sprintf(`CREATE TRIGGER cancel_during_replay AFTER INSERT ON review_overrides
+		WHEN NEW.run_id = '%s'
+		BEGIN
+			UPDATE queue_entries SET status = 'cancelled', position = NULL WHERE run_id = NEW.run_id;
+			UPDATE localization_runs SET status = 'cancelled' WHERE id = NEW.run_id;
+		END;`, runID)); err != nil {
+		t.Fatalf("create cancel trigger: %v", err)
+	}
+
+	status, replay, replayRefusal := issue157Accept(t, h, runID, issue157Selection(items[0].ID))
+	if status != http.StatusOK || replay == nil || !replay.Idempotent {
+		t.Fatalf("expected the replay to answer from the recorded decision, got %d (%s)", status, replayRefusal)
+	}
+	if replay.RunCompleted {
+		t.Fatalf("a cancelled run is not completed: %+v", replay)
+	}
+	if replay.RunPaused {
+		t.Fatalf("a cancelled run must never be reported as paused: %+v", replay)
+	}
+	if run := issue157Run(t, h, runID); run.Status != domain.RunStatusCancelled {
+		t.Fatalf("the replay must leave the state the cancellation set, got %s", run.Status)
+	}
+	if pending := issue157ReviewItems(t, h, runID); len(pending) != 1 {
+		t.Fatalf("the replay must not resolve the remaining review unit, pending=%+v", pending)
 	}
 }
 

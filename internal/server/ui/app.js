@@ -1915,6 +1915,12 @@ async function submitTempoAcceptance(candidate, button) {
     return;
   }
 
+  // Both choices are locked while the request is in flight: the run resolves one decision, so a
+  // click on the opposite waveform during the POST could only be refused by the host after the
+  // first acceptance already landed.
+  for (const control of [$("#inspect-tempo-accept-transformed"), $("#inspect-tempo-accept-natural")]) {
+    if (control) control.disabled = true;
+  }
   setBusy(button, true, "Đang chấp nhận…");
   if (status) status.textContent = "";
   try {
@@ -1931,8 +1937,14 @@ async function submitTempoAcceptance(candidate, button) {
     const message = body?.result?.message || "";
     toast("Đã chấp nhận candidate", message || `Đã chấp nhận waveform ${candidate}.`, "success");
     if (status) status.textContent = message;
-    state.handoff = null;
-    state.selectedReviewItem = null;
+    // The operator may have opened another exception while this acceptance was in flight: only the
+    // selection this request belongs to may be cleared, so a new one is never dropped. The rebuilt
+    // delivery is the run's, though, so this run's handoff is stale either way.
+    const sameRun = (state.selectedReviewItem?.run_id || state.selectedRunId || "") === runId;
+    if (sameRun) {
+      state.handoff = null;
+      if (state.selectedReviewItem?.id === item.id) state.selectedReviewItem = null;
+    }
     await loadReviewItems();
     renderInspector();
   } catch (error) {
@@ -1942,8 +1954,8 @@ async function submitTempoAcceptance(candidate, button) {
     showError(error);
   } finally {
     setBusy(button, false);
-    // Re-render so the transformed button's disabled state (owned by the candidate's own gate,
-    // not by setBusy) is restored after a refusal left the item selected.
+    // Re-render so each button's disabled state (owned by the candidate's own gate, not by setBusy)
+    // replaces the in-flight lock once the request settled.
     renderTempoCandidate(state.selectedReviewItem);
   }
 }
