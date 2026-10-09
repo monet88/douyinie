@@ -1017,37 +1017,80 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		}
 
 		// 2e. TTS / Dub Synthesis (T14)
+		// A run keeps two records of this stage: the artifact its stage row pins, which the reuse below
+		// reads, and the index row an acceptance moves to the successor it released. The acceptance
+		// commits the claim first and records the stage artifact after it, so a failure in between
+		// leaves the stage row naming the variant the accepted candidate replaced. The index row is the
+		// run's dubbing artifact everywhere else - the acceptance admission and the portable bundle
+		// export both resolve the run through it - so the accepted claim is tried first and a resumed
+		// run continues on the operator's selection instead of re-parking on superseded media. Every
+		// candidate is validated exactly like the pinned artifact, so a claim that no longer matches the
+		// run's contracts falls back to the pin, or to a fresh synthesis, rather than releasing audio
+		// the run's current lineage does not own.
+		dubbingInput := domain.DubbingJobInput{
+			RunID: runID, AssetID: assetID, JobID: jobID, TargetLanguage: targetLang,
+			DubScriptVariantCAS: dubScriptVariant.CASHash, VoiceAssignmentCAS: voiceAssignment.CASHash,
+			TranscriptArtifactCAS: transcriptArtifact.CASHash,
+		}
+		acceptedCAS := ""
+		if s.reviewSvc != nil {
+			casHash, err := s.reviewSvc.AcceptedDubbingArtifact(ctx, runID, assetID, targetLang)
+			if err != nil {
+				return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("resolve the run's accepted dubbing artifact: %v", err))
+			}
+			acceptedCAS = casHash
+		}
+		pinCAS := ""
 		if reusable, casHash := isStageReusable("dub_synthesize"); reusable {
-			if s.casStore != nil && s.dubbingSvc != nil {
-				rc, err := s.casStore.Get(casHash)
-				if err == nil {
-					var dv domain.DubSegmentsVariant
-					if err := json.NewDecoder(rc).Decode(&dv); err == nil && s.dubbingSvc.CanReuseVariant(ctx, domain.DubbingJobInput{
-						RunID: runID, AssetID: assetID, JobID: jobID, TargetLanguage: targetLang,
-						DubScriptVariantCAS: dubScriptVariant.CASHash, VoiceAssignmentCAS: voiceAssignment.CASHash,
-						TranscriptArtifactCAS: transcriptArtifact.CASHash,
-					}, &dv) {
-						dv.CASHash = casHash
-						dubSegmentsCAS = casHash
-						if dv.OverallStatus == "REVIEW_REQUIRED" {
-							if err := s.db.UpdateJobStatus(ctx, jobID, "review_required"); err != nil {
-								rc.Close()
-								return fmt.Errorf("mark job %s review_required: %w", jobID, err)
-							}
-							if err := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusPaused, domain.RunStatusPaused); err != nil {
-								rc.Close()
-								return fmt.Errorf("pause run %s for dubbing timing review: %w", runID, err)
-							}
-							rc.Close()
-							return nil
-						}
-					}
-					rc.Close()
+			pinCAS = casHash
+		}
+		dubCandidates := make([]string, 0, 2)
+		if acceptedCAS != "" {
+			dubCandidates = append(dubCandidates, acceptedCAS)
+		}
+		if pinCAS != "" && pinCAS != acceptedCAS {
+			dubCandidates = append(dubCandidates, pinCAS)
+		}
+		for _, casHash := range dubCandidates {
+			if s.casStore == nil || s.dubbingSvc == nil {
+				break
+			}
+			rc, err := s.casStore.Get(casHash)
+			if err != nil {
+				continue
+			}
+			var dv domain.DubSegmentsVariant
+			decodeErr := json.NewDecoder(rc).Decode(&dv)
+			reusable := decodeErr == nil && s.dubbingSvc.CanReuseVariant(ctx, dubbingInput, &dv)
+			rc.Close()
+			if !reusable {
+				continue
+			}
+			dv.CASHash = casHash
+			dubSegmentsCAS = casHash
+			if casHash == acceptedCAS && casHash != pinCAS {
+				// The run delivers the accepted successor while its stage row still names the artifact the
+				// accepted candidate replaced. Recording the artifact this run reuses converges the run's
+				// recorded lineage to what its mix is built from, so a replay does not read the superseded
+				// variant as the successful stage. Failing here fails the run: publishing media whose
+				// recorded lineage contradicts it is what the issue forbids.
+				if err := s.reviewSvc.RecordAcceptedDubbingArtifact(ctx, runID, casHash); err != nil {
+					return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("record the accepted dubbing artifact: %v", err))
 				}
 			}
-			if dubSegmentsCAS == "" {
-				canReuse = false
+			if dv.OverallStatus == "REVIEW_REQUIRED" {
+				if err := s.db.UpdateJobStatus(ctx, jobID, "review_required"); err != nil {
+					return fmt.Errorf("mark job %s review_required: %w", jobID, err)
+				}
+				if err := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusPaused, domain.RunStatusPaused); err != nil {
+					return fmt.Errorf("pause run %s for dubbing timing review: %w", runID, err)
+				}
+				return nil
 			}
+			break
+		}
+		if len(dubCandidates) > 0 && dubSegmentsCAS == "" {
+			canReuse = false
 		}
 		if dubSegmentsCAS == "" {
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
@@ -1059,15 +1102,7 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 				return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("failed to record stage start: %v", err))
 			}
 
-			dubSegmentsVariant, ttsErr := s.dubbingSvc.SynthesizeAndFit(ctx, domain.DubbingJobInput{
-				RunID:                 runID,
-				AssetID:               assetID,
-				JobID:                 jobID,
-				TargetLanguage:        targetLang,
-				DubScriptVariantCAS:   dubScriptVariant.CASHash,
-				VoiceAssignmentCAS:    voiceAssignment.CASHash,
-				TranscriptArtifactCAS: transcriptArtifact.CASHash,
-			})
+			dubSegmentsVariant, ttsErr := s.dubbingSvc.SynthesizeAndFit(ctx, dubbingInput)
 			if ttsErr != nil {
 				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 					return err
@@ -1100,6 +1135,26 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 	}
 
 	// 2. AudioMix (T15) - separation / passthrough
+	// The mix is a record of the dubbing artifact it was mixed from, and the stage row below is what
+	// the reuse reads. An acceptance that moved the run's dubbing artifact to its accepted successor
+	// withdraws and rebuilds the delivery, so a run resumed in the middle of that rebuild records the
+	// variant the accepted candidate replaced: that delivery is withdrawn here and rebuilt from the
+	// artifact the run now holds instead of publishing superseded media (#157).
+	//
+	// The withdrawal is durable, but this execution already read the run's stage rows for its own reuse
+	// decisions, so an invalidated delivery must also stop being reusable for the rest of this pass -
+	// without that, the mix below would still be skipped on the superseded row the reconcile just
+	// invalidated. Everything derived from the mix is recomputed with it, which is the run's existing
+	// semantics for any stage this pass had to rebuild.
+	if s.reviewSvc != nil {
+		invalidated, err := s.reviewSvc.ReconcileDeliveryLineage(ctx, runID, assetID, targetLang, dubSegmentsCAS)
+		if err != nil {
+			return s.failRun(ctx, runID, "audio_mix", fmt.Sprintf("reconcile the run's delivery lineage: %v", err))
+		}
+		if invalidated {
+			canReuse = false
+		}
+	}
 	if reusable, _ := isStageReusable("audio_mix"); reusable {
 		// Reused audio_mix
 	} else {

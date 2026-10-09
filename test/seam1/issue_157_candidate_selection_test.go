@@ -299,6 +299,33 @@ func TestSeam1_Issue157_JoinedPipelineSelectionThroughRenderAndPortableReplay(t 
 		resp.Body.Close()
 	}
 
+	// The accepted delivery must publish a final render too, and the run's own final endpoint must
+	// resolve exactly the artifact the acceptance reported: a regression that stops the final render
+	// from being produced or indexed would pass on the preview alone.
+	if accepted.FinalRenderCAS == "" {
+		t.Fatalf("expected the accepted candidate to publish a final render, got %+v", accepted)
+	}
+	respFinal, err := http.Get(fmt.Sprintf("%s/api/v1/assets/%s/render/final?run_id=%s&target_language=vi", h.server.URL, assetID, runID))
+	if err != nil {
+		t.Fatalf("final render request: %v", err)
+	}
+	defer respFinal.Body.Close()
+	if respFinal.StatusCode != http.StatusOK {
+		t.Fatalf("expected the run's final render to resolve, got %d", respFinal.StatusCode)
+	}
+	var finalBody struct {
+		FinalRender struct {
+			CASHash string `json:"cas_hash"`
+		} `json:"final_render"`
+	}
+	if err := json.NewDecoder(respFinal.Body).Decode(&finalBody); err != nil {
+		t.Fatalf("decode final render: %v", err)
+	}
+	if finalBody.FinalRender.CASHash != accepted.FinalRenderCAS {
+		t.Fatalf("the final endpoint must resolve the artifact the acceptance reported: %s != %s",
+			finalBody.FinalRender.CASHash, accepted.FinalRenderCAS)
+	}
+
 	// Restart: a fresh RuntimeHost over the same persisted state still serves the accepted media
 	// and no longer queues the resolved item.
 	h2 := issue157RestartHost(t, h)
@@ -389,19 +416,34 @@ func issue157OverrideCount(t *testing.T, h *testHarness, runID string) int {
 // process restart without losing persisted state.
 func issue157RestartHost(t *testing.T, h *testHarness) *testHarness {
 	t.Helper()
-	srv, _, _ := newRuntimeHostWithOptions(t, h.db, h.casStore, h.queueSvc, h.scheduler, harnessOptions{})
+	return issue157RestartHostWithOptions(t, h, harnessOptions{})
+}
+
+// issue157RestartAutoRunHost restarts a RuntimeHost the way a production host comes back: over the
+// same persisted state, with the queue executor enabled, so a run the operator resumes is actually
+// driven to its next state instead of waiting on an executor that never returns.
+func issue157RestartAutoRunHost(t *testing.T, h *testHarness) *testHarness {
+	t.Helper()
+	return issue157RestartHostWithOptions(t, h, harnessOptions{autoRunExecutor: true})
+}
+
+func issue157RestartHostWithOptions(t *testing.T, h *testHarness, opts harnessOptions) *testHarness {
+	t.Helper()
+	srv, registry, router := newRuntimeHostWithOptions(t, h.db, h.casStore, h.queueSvc, h.scheduler, opts)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() {
 		_ = srv.Shutdown(context.Background())
 		ts.Close()
 	})
 	return &testHarness{
-		server:     ts,
-		srv:        srv,
-		db:         h.db,
+		server: ts,
+		srv:    srv,
+		db:     h.db,
+		// The restarted host resolves providers through its own registry and router: a test that has
+		// to configure provider lanes for the runs this host resumes configures these.
 		casStore:   h.casStore,
-		registry:   h.registry,
-		router:     h.router,
+		registry:   registry,
+		router:     router,
 		queueSvc:   h.queueSvc,
 		scheduler:  h.scheduler,
 		dubbingSvc: h.dubbingSvc,

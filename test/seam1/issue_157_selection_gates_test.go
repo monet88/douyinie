@@ -637,6 +637,121 @@ func TestSeam1_Issue157_InterruptedDeliveryRebuildIsResumedByRetry(t *testing.T)
 	}
 }
 
+// issue157ResumeStages names the stages a resumed dubbing run records attempts under, in pipeline
+// order. A resume must not buy again any stage that had already succeeded.
+var issue157ResumeStages = []string{
+	"audio_role_plan", "speech_understand", "translation", "dub_script", "voice_assignment",
+	"dub_synthesize", "audio_mix", "text_detection", "visual_text_localize", "render_plan",
+	"render_preview", "render_final",
+}
+
+// issue157StageArtifacts records the artifact every pipeline stage of the run currently publishes, so
+// a resume can be judged against the state it started from: a stage that already published an artifact
+// must still publish the same one afterwards.
+func issue157StageArtifacts(t *testing.T, h *testHarness, runID string) map[string]string {
+	t.Helper()
+	artifacts := make(map[string]string, len(issue157ResumeStages))
+	for _, stage := range issue157ResumeStages {
+		artifacts[stage] = issue157StageArtifact(t, h, runID, stage)
+	}
+	return artifacts
+}
+
+// issue157MixFromSegments asks the runtime host to mix the given dubbing artifact, exactly as the
+// run's own mix stage does, and returns the CAS of the artifact the host published.
+func issue157MixFromSegments(t *testing.T, h *testHarness, assetID, runID, segmentsCAS string) string {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"run_id":           runID,
+		"target_language":  "vi",
+		"dub_segments_cas": segmentsCAS,
+		"preserve_singing": true,
+	})
+	if err != nil {
+		t.Fatalf("encode audio mix request: %v", err)
+	}
+	resp, err := http.Post(fmt.Sprintf("%s/api/v1/assets/%s/audio-mix", h.server.URL, assetID), "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("request audio mix: %v", err)
+	}
+	defer resp.Body.Close()
+	var body struct {
+		DubMix *domain.DubMixArtifact `json:"dub_mix"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode audio mix response (status %d): %v", resp.StatusCode, err)
+	}
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("audio mix returned %d: %+v", resp.StatusCode, body)
+	}
+	if body.DubMix == nil || body.DubMix.CASHash == "" {
+		t.Fatalf("audio mix published no artifact: %+v", body)
+	}
+	return body.DubMix.CASHash
+}
+
+// issue157PinStalePlan stores the render plan artifact a delivery held before the operator replaced
+// the dubbing artifact it was frozen from - a plan pinning the given mix - and returns its CAS.
+func issue157PinStalePlan(t *testing.T, h *testHarness, assetID, runID, mixCAS string) string {
+	t.Helper()
+	blob, err := json.Marshal(domain.RenderPlan{
+		ID:             "rp-replaced-" + runID,
+		SchemaVersion:  domain.RenderPlanSchemaVersion,
+		AssetID:        assetID,
+		RunID:          runID,
+		TargetLanguage: domain.TargetLanguageVI,
+		DubMixCASHash:  mixCAS,
+		CreatedAt:      time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("encode render plan fixture: %v", err)
+	}
+	obj, err := h.casStore.Put(bytes.NewReader(blob))
+	if err != nil {
+		t.Fatalf("store render plan fixture: %v", err)
+	}
+	return obj.SHA256
+}
+
+// issue157PinStage records a succeeded stage execution naming an artifact: the row a pipeline pass,
+// or a reviewer correction, leaves behind for a delivery it published.
+func issue157PinStage(t *testing.T, h *testHarness, runID, stage, casHash string) {
+	t.Helper()
+	now := time.Now().UTC()
+	if err := h.db.CreateStageExecution(context.Background(), domain.StageExecution{
+		ID:             "se-" + stage + "-" + runID,
+		RunID:          runID,
+		Stage:          stage,
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: casHash,
+		StartedAt:      &now,
+		CompletedAt:    &now,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("record the %s delivery pin: %v", stage, err)
+	}
+}
+
+// issue157ReadPlan decodes the render plan artifact the run currently holds.
+func issue157ReadPlan(t *testing.T, h *testHarness, runID string) *domain.RenderPlan {
+	t.Helper()
+	idx, err := h.db.GetRenderPlanIndexByRun(context.Background(), runID)
+	if err != nil || idx == nil {
+		t.Fatalf("read run %s render plan index: %v (%+v)", runID, err, idx)
+	}
+	rc, err := h.casStore.Get(idx.CASHash)
+	if err != nil {
+		t.Fatalf("read render plan %s: %v", idx.CASHash, err)
+	}
+	defer rc.Close()
+	var plan domain.RenderPlan
+	if err := json.NewDecoder(rc).Decode(&plan); err != nil {
+		t.Fatalf("decode render plan %s: %v", idx.CASHash, err)
+	}
+	return &plan
+}
+
 // issue157QualityResultCount counts the run's recorded QA results.
 func issue157QualityResultCount(t *testing.T, h *testHarness, runID string) int {
 	t.Helper()
@@ -647,18 +762,16 @@ func issue157QualityResultCount(t *testing.T, h *testHarness, runID string) int 
 	return len(rows)
 }
 
-// issue157ProviderAttempts counts the run's recorded provider attempts across every stage.
+// issue157ProviderAttempts counts every provider attempt the run recorded, whichever stage it ran
+// under: asking for a hand-listed set of stages would let an attempt that an acceptance added under
+// another valid stage - audio_role_plan, for one - pass unnoticed.
 func issue157ProviderAttempts(t *testing.T, h *testHarness, runID string) int {
 	t.Helper()
-	total := 0
-	for _, stage := range []string{"translation", "dub_synthesize", "text_region_detect", "render"} {
-		rows, err := h.db.ListProviderAttempts(context.Background(), runID, stage)
-		if err != nil {
-			t.Fatalf("read provider attempts for run %s stage %s: %v", runID, stage, err)
-		}
-		total += len(rows)
+	rows, err := h.db.ListProviderAttempts(context.Background(), runID, "")
+	if err != nil {
+		t.Fatalf("read provider attempts for run %s: %v", runID, err)
 	}
-	return total
+	return len(rows)
 }
 
 // TestSeam1_Issue157_GroupedUnitAcceptanceKeepsCanonicalMembership proves an acceptance of a unit
@@ -1182,6 +1295,372 @@ func TestSeam1_Issue157_CancelledRunIsNeverReportedAsCompleted(t *testing.T) {
 	}
 	if run := issue157Run(t, h, runID); run.Status != domain.RunStatusCancelled {
 		t.Fatalf("the refusal must not re-drive a cancelled run, got %s", run.Status)
+	}
+}
+
+// TestSeam1_Issue157_RetryRepairsTheAcceptedDubbingStagePin proves a retry converges the state a
+// failed first acceptance leaves behind. The successor is claimed (the run's index row is the
+// accepted variant) and the audit row is written before the run's dub_synthesize stage artifact is
+// recorded, so a failure in that last write leaves the stage row naming the pre-acceptance variant -
+// the artifact a resumed run reuses. The retry re-records the pin, so a resume continues from the
+// operator's selection instead of reusing the variant the selection replaced.
+func TestSeam1_Issue157_RetryRepairsTheAcceptedDubbingStagePin(t *testing.T) {
+	h := setupHarness(t)
+	ctx := context.Background()
+	_, _, runID, items := issue157ParkedFixture(t, h, false)
+
+	// The pipeline's own pin is what a resumed run would reuse until the acceptance's retry repairs it.
+	preAcceptance := issue157RunVariant(t, h, runID)
+	now := time.Now().UTC()
+	if err := h.db.CreateStageExecution(ctx, domain.StageExecution{
+		ID:             "se-dub-pin-" + runID,
+		RunID:          runID,
+		Stage:          "dub_synthesize",
+		Status:         domain.StageStatusSucceeded,
+		ArtifactSHA256: preAcceptance.CASHash,
+		StartedAt:      &now,
+		CompletedAt:    &now,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("record the pre-acceptance dubbing pin: %v", err)
+	}
+	stalePin := issue157StageArtifact(t, h, runID, "dub_synthesize")
+	if stalePin != preAcceptance.CASHash {
+		t.Fatalf("the run must pin the artifact its synthesis produced, got %s want %s", stalePin, preAcceptance.CASHash)
+	}
+
+	// The acceptance's stage write fails after the successor claim and the audit row: exactly the
+	// interrupted state the retry has to converge.
+	rawDB, err := sql.Open("sqlite", filepath.Join(h.dir, "douyinie_test.db")+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer rawDB.Close()
+	if _, err := rawDB.ExecContext(ctx, `CREATE TRIGGER fail_dubbing_pin BEFORE INSERT ON stage_executions
+		WHEN NEW.stage = 'dub_synthesize' AND NEW.status = 'succeeded'
+		BEGIN
+			SELECT RAISE(ABORT, 'dubbing stage write failed');
+		END;`); err != nil {
+		t.Fatalf("create failing stage trigger: %v", err)
+	}
+
+	status, _, refusal := issue157Accept(t, h, runID, issue157Selection(items[0].ID))
+	if status == http.StatusOK {
+		t.Fatalf("expected the failed stage write to surface, got %d (%s)", status, refusal)
+	}
+	claimed := issue157RunVariant(t, h, runID)
+	if claimed.CASHash == stalePin {
+		t.Fatalf("the successor must be claimed before the pin is recorded, still %s", claimed.CASHash)
+	}
+	if got := issue157StageArtifact(t, h, runID, "dub_synthesize"); got != stalePin {
+		t.Fatalf("the failed write must leave the pre-acceptance pin in place, got %s want %s", got, stalePin)
+	}
+
+	// The operator retries the same selection once the fault is gone.
+	if _, err := rawDB.ExecContext(ctx, `DROP TRIGGER fail_dubbing_pin`); err != nil {
+		t.Fatalf("drop failing stage trigger: %v", err)
+	}
+	retryStatus, retried, retryRefusal := issue157Accept(t, h, runID, issue157Selection(items[0].ID))
+	if retryStatus != http.StatusOK || retried == nil || !retried.Idempotent {
+		t.Fatalf("expected the retry to replay the recorded decision, got %d (%s)", retryStatus, retryRefusal)
+	}
+	if got := issue157StageArtifact(t, h, runID, "dub_synthesize"); got != claimed.CASHash {
+		t.Fatalf("the retry must record the accepted successor as the run's dubbing pin: %s != %s", got, claimed.CASHash)
+	}
+	if count := issue157OverrideCount(t, h, runID); count != 1 {
+		t.Fatalf("the retry must not append another audit row, got %d", count)
+	}
+	if variant := issue157RunVariant(t, h, runID); variant.CASHash != claimed.CASHash {
+		t.Fatalf("the retry must not mint another decision: %s != %s", variant.CASHash, claimed.CASHash)
+	}
+	// The repair is a stage record for the accepted artifact: it must not release the run the
+	// unresolved unit still holds paused, or report it as anything else.
+	if !retried.RunPaused {
+		t.Fatalf("the remaining review unit must keep the run paused, got %+v", retried)
+	}
+	if run := issue157Run(t, h, runID); run.Status != domain.RunStatusPaused {
+		t.Fatalf("the retry must leave the run paused, got %s", run.Status)
+	}
+}
+
+// TestSeam1_Issue157_ResumedRunHonorsTheAcceptedDubbingArtifact proves a resume converges the state a
+// failed acceptance leaves behind without the operator re-accepting. The production pipeline parks the
+// run on one unresolved candidate; the acceptance claims its successor and writes the audit row, then
+// fails before recording the run's dub_synthesize stage artifact - so the stage row still names the
+// variant the accepted candidate replaced, and a resume whose dubbing stage reads that row would
+// re-park the run on it. The run must continue on the accepted successor instead and deliver media
+// mixed from it.
+func TestSeam1_Issue157_ResumedRunHonorsTheAcceptedDubbingArtifact(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is required to resume the accepted delivery")
+	}
+	h := setupAutoRunHarness(t)
+	configureDialogueTranslationGateway(t, h)
+	ctx := context.Background()
+
+	// One 300ms dialogue slot whose fixed-rate candidate needs a review-only transform: the pipeline
+	// parks the run on exactly one unresolved unit, with every earlier stage pinned by itself.
+	lane := defaultVITTSFake(t, h)
+	lane.DurationMs = 330
+
+	assetID := ingestSyntheticAssetWithFrequency(t, h.server.URL, h.dir, "issue157_resume.mp4", 2.0, 2500)
+	jobID := createJob(t, h.server.URL, assetID, domain.TargetLanguageVI)
+	runID := enqueueRun(t, h.server.URL, jobID)
+
+	parked := pollRunStatus(t, h.server.URL, runID, domain.RunStatusPaused, 30*time.Second)
+	if parked.Status != domain.RunStatusPaused {
+		t.Fatalf("expected the run to park on its unresolved candidate, got %q; stages: %+v; items: %+v",
+			parked.Status, getRunStages(t, h.server.URL, runID), issue157ReviewItems(t, h, runID))
+	}
+	items := issue157ReviewItems(t, h, runID)
+	if len(items) != 1 {
+		t.Fatalf("expected exactly one pending review item, got %+v", items)
+	}
+	// The pipeline's own pin is the variant its synthesis produced: the artifact a resumed run reuses
+	// while the accepted successor is only claimed in the run's index row.
+	preAcceptance := issue157RunVariant(t, h, runID)
+	pinned := issue157StageArtifact(t, h, runID, "dub_synthesize")
+	if pinned == "" || pinned != preAcceptance.CASHash {
+		t.Fatalf("expected the parked run to pin the variant it synthesized: pin=%s variant=%s", pinned, preAcceptance.CASHash)
+	}
+
+	// The acceptance claims its successor and writes the audit row, then fails recording the run's
+	// dub_synthesize stage artifact: the interrupted state a resume has to converge.
+	rawDB, err := sql.Open("sqlite", filepath.Join(h.dir, "douyinie_test.db")+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer rawDB.Close()
+	if _, err := rawDB.ExecContext(ctx, `CREATE TRIGGER fail_dubbing_pin BEFORE INSERT ON stage_executions
+		WHEN NEW.stage = 'dub_synthesize' AND NEW.status = 'succeeded'
+		BEGIN
+			SELECT RAISE(ABORT, 'dubbing stage write failed');
+		END;`); err != nil {
+		t.Fatalf("create failing stage trigger: %v", err)
+	}
+	status, _, refusal := issue157Accept(t, h, runID, issue157Selection(items[0].ID))
+	if status == http.StatusOK {
+		t.Fatalf("expected the failed stage write to surface, got %d (%s)", status, refusal)
+	}
+	if _, err := rawDB.ExecContext(ctx, `DROP TRIGGER fail_dubbing_pin`); err != nil {
+		t.Fatalf("drop failing stage trigger: %v", err)
+	}
+	claimed := issue157RunVariant(t, h, runID)
+	if claimed.CASHash == pinned {
+		t.Fatalf("the accepted successor must be claimed before the stage write fails, still %s (refusal: %s)", claimed.CASHash, refusal)
+	}
+	if claimed.OverallStatus != "PASS" || len(claimed.AcceptedCandidates) != 1 {
+		t.Fatalf("expected the claimed successor to carry the decision and complete coverage, got status=%s evidence=%d",
+			claimed.OverallStatus, len(claimed.AcceptedCandidates))
+	}
+	if got := issue157StageArtifact(t, h, runID, "dub_synthesize"); got != pinned {
+		t.Fatalf("the failed write must leave the pipeline's pin in place, got %s want %s", got, pinned)
+	}
+	if mixIdx, err := h.db.GetDubMixArtifactIndexByRun(ctx, runID); err == nil && mixIdx != nil {
+		t.Fatalf("an interrupted acceptance must not publish a mix, got %s", mixIdx.CASHash)
+	}
+	stagesBeforeResume := issue157StageArtifacts(t, h, runID)
+
+	// The operator restarts the host and resumes the run: no repeated acceptance, no new decision.
+	h2 := issue157RestartAutoRunHost(t, h)
+	configureDialogueTranslationGateway(t, h2)
+	resumeResp, err := http.Post(fmt.Sprintf("%s/api/v1/runs/%s/resume", h2.server.URL, runID), "application/json", nil)
+	if err != nil {
+		t.Fatalf("resume request: %v", err)
+	}
+	resumeResp.Body.Close()
+	if resumeResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for resume, got %d", resumeResp.StatusCode)
+	}
+	run := pollRunStatus(t, h2.server.URL, runID, domain.RunStatusCompleted, 30*time.Second)
+	if run.Status != domain.RunStatusCompleted {
+		t.Fatalf("the resumed run must complete on the accepted successor instead of re-parking on the variant it replaced, got %s", run.Status)
+	}
+
+	// The delivery the resumed run published was mixed from the accepted successor: media built from
+	// the variant the accepted candidate replaced is never served as the run's current delivery.
+	mix := issue157ReadMix(t, h2, runID)
+	if !strings.EqualFold(mix.DubSegmentsCAS, claimed.CASHash) {
+		t.Fatalf("the resumed run's mix must be mixed from the accepted successor %s, got %s", claimed.CASHash, mix.DubSegmentsCAS)
+	}
+	// The resume converged the run's recorded lineage to the artifact its mix was built from: the
+	// stage row now names the accepted successor instead of the variant the accepted candidate
+	// replaced, so a replay never reads a superseded variant as the successful stage.
+	if got := issue157StageArtifact(t, h2, runID, "dub_synthesize"); got != claimed.CASHash {
+		t.Fatalf("the resumed run's dubbing stage artifact must be the accepted successor %s, got %s", claimed.CASHash, got)
+	}
+	// Reuse, not re-synthesis: every stage that had already published an artifact before the resume
+	// still publishes that artifact afterwards. A resumed run reuses the work it already has, and the
+	// dubbing stage is the one that converges - to the accepted successor, not to another synthesis.
+	// The mix below is the delivery-level proof: it is mixed from the accepted successor, which only a
+	// reuse of that artifact can produce.
+	for _, stage := range issue157ResumeStages {
+		published := stagesBeforeResume[stage]
+		if published == "" || stage == "dub_synthesize" {
+			continue
+		}
+		if got := issue157StageArtifact(t, h2, runID, stage); got != published {
+			t.Fatalf("the resume must reuse the %s stage it already had: artifact %s -> %s", stage, published, got)
+		}
+	}
+	if resp, err := http.Get(fmt.Sprintf("%s/api/v1/assets/%s/render/preview?run_id=%s&target_language=vi", h2.server.URL, assetID, runID)); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected the resumed run to serve its rebuilt preview: status=%v err=%v", statusOf(resp), err)
+	} else {
+		resp.Body.Close()
+	}
+	if items := issue157ReviewItems(t, h2, runID); len(items) != 0 {
+		t.Fatalf("the accepted selection must stay resolved through the resume, got %+v", items)
+	}
+	if variant := issue157RunVariant(t, h2, runID); variant.CASHash != claimed.CASHash {
+		t.Fatalf("the resume must not mint another decision: %s != %s", variant.CASHash, claimed.CASHash)
+	}
+	if got := issue157OverrideCount(t, h2, runID); got != 1 {
+		t.Fatalf("the resume must not append audit rows, got %d", got)
+	}
+}
+
+// TestSeam1_Issue157_ResumeWithdrawsADeliveryPinnedToTheReplacedCandidate proves a resume withdraws
+// and rebuilds a delivery the run published for a dubbing artifact the operator replaced.
+//
+// The pipeline parks the run on one unresolved unit, and a delivery is published for the variant its
+// own synthesis produced: a real mix of that variant, the plan that pinned that mix, and the preview
+// the delivery advertised. The acceptance then dies recording the run's dub_synthesize stage artifact -
+// so those rows still name the mix, plan and preview of the artifact the accepted candidate replaced.
+// A resume that trusted them would serve media the operator never selected: it must withdraw them and
+// rebuild the delivery from the accepted successor, the artifact the run's own index row claims.
+func TestSeam1_Issue157_ResumeWithdrawsADeliveryPinnedToTheReplacedCandidate(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is required to rebuild the accepted delivery")
+	}
+	h := setupAutoRunHarness(t)
+	configureDialogueTranslationGateway(t, h)
+	ctx := context.Background()
+
+	// One 300ms dialogue slot whose fixed-rate candidate needs a review-only transform: the pipeline
+	// parks the run on exactly one unresolved unit, with every earlier stage pinned by itself.
+	lane := defaultVITTSFake(t, h)
+	lane.DurationMs = 330
+
+	assetID := ingestSyntheticAssetWithFrequency(t, h.server.URL, h.dir, "issue157_supersede.mp4", 2.0, 2500)
+	jobID := createJob(t, h.server.URL, assetID, domain.TargetLanguageVI)
+	runID := enqueueRun(t, h.server.URL, jobID)
+
+	parked := pollRunStatus(t, h.server.URL, runID, domain.RunStatusPaused, 30*time.Second)
+	items := issue157ReviewItems(t, h, runID)
+	if parked.Status != domain.RunStatusPaused || len(items) != 1 {
+		t.Fatalf("expected the pipeline to park on one unresolved unit, got %q with items %+v", parked.Status, items)
+	}
+
+	// The delivery the run published for the variant its own synthesis produced. The preview pin is
+	// never decoded, so an opaque artifact id stands for the preview that delivery advertised.
+	replaced := issue157RunVariant(t, h, runID)
+	replacedMix := issue157MixFromSegments(t, h, assetID, runID, replaced.CASHash)
+	replacedPlan := issue157PinStalePlan(t, h, assetID, runID, replacedMix)
+	replacedPreview := "preview-of-the-replaced-delivery"
+	issue157PinStage(t, h, runID, "audio_mix", replacedMix)
+	issue157PinStage(t, h, runID, "render_plan", replacedPlan)
+	issue157PinStage(t, h, runID, "render_preview", replacedPreview)
+
+	// The acceptance claims its successor and writes the audit row, then fails recording the run's
+	// dub_synthesize stage artifact: the interrupted state a resume has to converge.
+	rawDB, err := sql.Open("sqlite", filepath.Join(h.dir, "douyinie_test.db")+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer rawDB.Close()
+	if _, err := rawDB.ExecContext(ctx, `CREATE TRIGGER fail_dubbing_pin BEFORE INSERT ON stage_executions
+		WHEN NEW.stage = 'dub_synthesize' AND NEW.status = 'succeeded'
+		BEGIN
+			SELECT RAISE(ABORT, 'dubbing stage write failed');
+		END;`); err != nil {
+		t.Fatalf("create failing stage trigger: %v", err)
+	}
+	status, _, refusal := issue157Accept(t, h, runID, issue157Selection(items[0].ID))
+	if status == http.StatusOK {
+		t.Fatalf("expected the failed stage write to surface, got %d (%s)", status, refusal)
+	}
+	if _, err := rawDB.ExecContext(ctx, `DROP TRIGGER fail_dubbing_pin`); err != nil {
+		t.Fatalf("drop failing stage trigger: %v", err)
+	}
+	claimed := issue157RunVariant(t, h, runID)
+	if claimed.CASHash == replaced.CASHash {
+		t.Fatalf("the accepted successor must be claimed, still %s (refusal: %s)", claimed.CASHash, refusal)
+	}
+	if claimed.OverallStatus != "PASS" || len(claimed.AcceptedCandidates) != 1 {
+		t.Fatalf("expected the decision to complete the successor's coverage, got status=%s evidence=%d",
+			claimed.OverallStatus, len(claimed.AcceptedCandidates))
+	}
+	if got := issue157StageArtifact(t, h, runID, "dub_synthesize"); strings.EqualFold(got, claimed.CASHash) {
+		t.Fatalf("the failed write must leave the dubbing stage behind its accepted artifact, got %s", got)
+	}
+	if got := issue157StageArtifact(t, h, runID, "audio_mix"); !strings.EqualFold(got, replacedMix) {
+		t.Fatalf("the replaced delivery's mix must still be the run's pin before the resume, got %s", got)
+	}
+
+	// The operator restarts the host and resumes the run, accepting nothing further.
+	h2 := issue157RestartAutoRunHost(t, h)
+	configureDialogueTranslationGateway(t, h2)
+	if resp, err := http.Post(fmt.Sprintf("%s/api/v1/runs/%s/resume", h2.server.URL, runID), "application/json", nil); err != nil {
+		t.Fatalf("resume run: %v", err)
+	} else {
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected the paused run to resume, got %d", resp.StatusCode)
+		}
+	}
+	settled := issue157Run(t, h2, runID)
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
+		if settled.Status != domain.RunStatusQueued && settled.Status != domain.RunStatusRunning {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+		settled = issue157Run(t, h2, runID)
+	}
+	if settled.Status != domain.RunStatusCompleted {
+		t.Fatalf("expected the resumed run to complete, got %q; pending: %+v; stages: %+v",
+			settled.Status, issue157ReviewItems(t, h2, runID), getRunStages(t, h2.server.URL, runID))
+	}
+
+	// The delivery is the accepted successor's, and no pin of the replaced delivery survives: the mix is
+	// mixed from the accepted successor and the plan is re-frozen from that mix.
+	rebuild := issue157ReadMix(t, h2, runID)
+	if !strings.EqualFold(rebuild.DubSegmentsCAS, claimed.CASHash) {
+		t.Fatalf("the rebuilt mix must be mixed from the accepted successor %s, got %s", claimed.CASHash, rebuild.DubSegmentsCAS)
+	}
+	mixIdx, err := h2.db.GetDubMixArtifactIndexByRun(ctx, runID)
+	if err != nil || mixIdx == nil {
+		t.Fatalf("the resumed run must publish a mix for its accepted successor: %v (%+v)", err, mixIdx)
+	}
+	if strings.EqualFold(mixIdx.CASHash, replacedMix) {
+		t.Fatalf("the resume must not reuse the mix published for the replaced candidate, still %s", replacedMix)
+	}
+	if got := issue157StageArtifact(t, h2, runID, "audio_mix"); !strings.EqualFold(got, mixIdx.CASHash) {
+		t.Fatalf("the run's mix pin must name the rebuilt mix %s, got %s", mixIdx.CASHash, got)
+	}
+	rebuiltMix := mixIdx.CASHash
+	if got := issue157StageArtifact(t, h2, runID, "render_plan"); got == "" || strings.EqualFold(got, replacedPlan) {
+		t.Fatalf("the run's plan pin must be re-frozen, got %s (replaced plan was %s)", got, replacedPlan)
+	}
+	if frozen := issue157ReadPlan(t, h2, runID); !strings.EqualFold(frozen.DubMixCASHash, rebuiltMix) {
+		t.Fatalf("the re-frozen plan must pin the rebuilt mix %s, got %s", rebuiltMix, frozen.DubMixCASHash)
+	}
+	if got := issue157StageArtifact(t, h2, runID, "render_preview"); got == "" || got == replacedPreview {
+		t.Fatalf("the replaced preview must be withdrawn and replaced, got %q", got)
+	}
+	if resp, err := http.Get(fmt.Sprintf("%s/api/v1/assets/%s/render/preview?run_id=%s&target_language=vi", h2.server.URL, assetID, runID)); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected the resumed run to serve its rebuilt preview: status=%v err=%v", statusOf(resp), err)
+	} else {
+		resp.Body.Close()
+	}
+	if pending := issue157ReviewItems(t, h2, runID); len(pending) != 0 {
+		t.Fatalf("the accepted decision must leave no pending unit, got %+v", pending)
+	}
+	if variant := issue157RunVariant(t, h2, runID); variant.CASHash != claimed.CASHash {
+		t.Fatalf("the resume must not mint another decision: %s != %s", variant.CASHash, claimed.CASHash)
+	}
+	if got := issue157OverrideCount(t, h2, runID); got != 1 {
+		t.Fatalf("the resume must not append audit rows, got %d", got)
 	}
 }
 

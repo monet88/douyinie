@@ -248,7 +248,8 @@ Traps:
   showing the natural waveform and the recorded reason instead of a playable alternative. The panel
   resolves the item only through the operator's own acceptance: `Chấp nhận bản tempo` (or
   `Chấp nhận waveform natural` for a retained waveform that itself fits), after typing the audit
-  reason and ticking the `manual_override` quality waiver the transformed waveform requires. It sends
+  reason; tick the `manual_override` quality waiver only when accepting the transformed waveform,
+  which is the one the host requires it for. It sends
   `POST /api/v1/runs/<run>/review/accept-candidate` with the item id and `candidate: "transformed"`
   (or `candidate: "natural"`).
   Until that click the item stays `pending` and nothing reaches the mix or a final render. The

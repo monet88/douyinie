@@ -1596,6 +1596,54 @@ test("an acceptance response never clears an exception the operator opened meanw
     null,
     "the rebuilt delivery invalidates this run's handoff even while another exception is open"
   );
+  assert.equal(
+    h.els.inspectTempoStatus.textContent.includes("đã chấp nhận"),
+    false,
+    `a settled acceptance must not leave its message beside another exception, got ${h.els.inspectTempoStatus.textContent}`
+  );
+});
+
+// Issue #157: the acceptance status node is shared by every exception item, so a settled request may
+// only describe its outcome there while the operator is still looking at the item it belongs to.
+test("an acceptance refusal never lands in the status node of another exception", async () => {
+  const h = createHarness();
+  await h.ready();
+  h.evalIn(tempoCandidateItem);
+  h.els.inspectTempoReason.value = "đã nghe và chấp nhận bản tempo";
+  h.els.inspectTempoWaiver.checked = true;
+
+  let release = null;
+  h.setResponder((url) => {
+    if (url.includes("/review/accept-candidate")) {
+      return new Promise((resolve) => {
+        release = () => resolve({ status: 409, payload: { error: "reviewed candidate selection refused: superseded" } });
+      });
+    }
+    if (url.includes("/review-items")) {
+      return { status: 200, payload: { review_items: [{ id: "rev-plain-1", run_id: "run-1", type: "low_confidence", severity: "warning", status: "pending" }] } };
+    }
+    return { status: 200, payload: {} };
+  });
+
+  const transformed = h.els.inspectTempoAcceptTransformed;
+  transformed.dispatch("click", { currentTarget: transformed, target: { closest: () => null } });
+  await h.settle();
+
+  // The operator opens another exception while the refusal is still in flight.
+  h.evalIn("state.selectedReviewItem = state.reviewItems[1]; renderInspector();");
+  release();
+  await h.settle();
+
+  assert.equal(
+    h.evalIn("state.selectedReviewItem && state.selectedReviewItem.id"),
+    "rev-plain-1",
+    "the refusal must not move the operator off the exception they opened"
+  );
+  assert.equal(
+    h.els.inspectTempoStatus.textContent.includes("Không chấp nhận được"),
+    false,
+    `a refusal for another item must not land in the shared status node, got ${h.els.inspectTempoStatus.textContent}`
+  );
 });
 
 let failed = 0;

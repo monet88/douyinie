@@ -1490,6 +1490,14 @@ func (s *ReviewService) reportReplayedAcceptance(
 	if err := s.ensureAcceptanceAudit(ctx, runID, in, targetLang, jobID, existing); err != nil {
 		return nil, err
 	}
+	// A first acceptance that claimed the successor and then failed before recording the run's
+	// dub_synthesize stage artifact leaves the run's index row on the accepted successor while the
+	// stage row still names the pre-acceptance variant - and the stage row is what a resumed run
+	// reads. The retry converges that state for the successor it just re-read from the run's own
+	// index before reporting on, or rebuilding from, that successor.
+	if err := s.RecordAcceptedDubbingArtifact(ctx, runID, variant.CASHash); err != nil {
+		return nil, err
+	}
 	result := &AcceptReviewedCandidateResult{
 		AssetID:               in.AssetID,
 		RunID:                 runID,
@@ -1857,6 +1865,32 @@ func (s *ReviewService) recordCorrectionStage(ctx context.Context, runID, stage,
 // any previously succeeded execution of this stage so a resumed run will not reuse stale artifacts.
 func (s *ReviewService) invalidateCorrectionStage(ctx context.Context, runID, stage string) error {
 	return s.recordStageExecution(ctx, runID, stage, domain.StageStatusQueued, "")
+}
+
+// RecordAcceptedDubbingArtifact records the run's dub_synthesize stage artifact as the accepted
+// successor the run currently carries, so the run's stage lineage names the artifact its mix is
+// built from rather than the variant the accepted candidate replaced.
+//
+// Two paths converge the same state. An acceptance that claimed its successor and then failed before
+// recording the stage artifact leaves the run's index row on the accepted successor while the stage
+// row still names the pre-acceptance variant: the retry re-records it there. A resumed run that
+// reuses the accepted successor its index row claims - because the pipeline's dubbing reuse reads
+// both records - converges it here, so the run's recorded lineage does not contradict the media it
+// published. A stage row that already names the artifact is left untouched: stage rows are
+// append-only evidence, and this only moves the run's own record forward to the artifact its index
+// row (the run's dubbing claim) resolves to.
+func (s *ReviewService) RecordAcceptedDubbingArtifact(ctx context.Context, runID, casHash string) error {
+	if strings.TrimSpace(casHash) == "" {
+		return nil
+	}
+	bound, err := s.db.GetStageArtifactHash(ctx, runID, "dub_synthesize")
+	if err != nil {
+		return fmt.Errorf("read run %s dub_synthesize stage artifact: %w", runID, err)
+	}
+	if strings.EqualFold(bound, casHash) {
+		return nil
+	}
+	return s.recordCorrectionStage(ctx, runID, "dub_synthesize", casHash)
 }
 
 // CorrectTargetText updates target text for a segment and triggers targeted rerun of only declared downstream descendants:
@@ -3033,53 +3067,20 @@ func (s *ReviewService) staleDeliveryLineage(ctx context.Context, assetID, targe
 	if err != nil {
 		return "", fmt.Errorf("read run %s delivery lineage: %w", runID, err)
 	}
-	// ListStageExecutions is ordered by creation, so the last row per stage is its newest attempt.
-	newest := make(map[string]domain.StageExecution, len(finalRenderDeliveryStages))
-	for _, se := range stages {
-		for _, stage := range finalRenderDeliveryStages {
-			if se.Stage == stage {
-				newest[stage] = se
-			}
-		}
-	}
+	newest := newestStageExecutions(stages, finalRenderDeliveryStages)
 	for _, stage := range finalRenderDeliveryStages {
 		if se, ok := newest[stage]; ok && se.Status == domain.StageStatusQueued {
 			return fmt.Sprintf("final render handoff refused: a correction invalidated the run's %s artifact and the run has not rebuilt it yet; resume the run to re-freeze the corrected lineage before final render", stage), nil
 		}
 	}
 
-	mixCAS := ""
-	if se, ok := newest["audio_mix"]; ok && se.Status == domain.StageStatusSucceeded {
-		mixCAS = strings.TrimSpace(se.ArtifactSHA256)
+	mixCAS, err := s.runDubMixCAS(ctx, runID, newest)
+	if err != nil {
+		return "", err
 	}
-	if mixCAS == "" {
-		idx, err := s.db.GetDubMixArtifactIndexByRun(ctx, runID)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return "", fmt.Errorf("read run %s dub mix lineage: %w", runID, err)
-		}
-		if idx != nil {
-			mixCAS = strings.TrimSpace(idx.CASHash)
-		}
-	}
-
-	planCAS := ""
-	if se, ok := newest["render_plan"]; ok && se.Status == domain.StageStatusSucceeded {
-		planCAS = strings.TrimSpace(se.ArtifactSHA256)
-	}
-	if planCAS == "" {
-		// The run's own render-plan index row is the only other lineage evidence: an asset-latest plan
-		// belongs to whichever run wrote it last and cannot stand in for this run's lineage (#153).
-		idx, err := s.db.GetRenderPlanIndexByRun(ctx, runID)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return "", fmt.Errorf("read run %s render plan lineage: %w", runID, err)
-		}
-		if idx != nil {
-			if idx.AssetID != assetID || !strings.EqualFold(idx.TargetLanguage, targetLang) {
-				return "", fmt.Errorf("run %s render plan lineage belongs to asset %s language %s, not %s/%s",
-					runID, idx.AssetID, idx.TargetLanguage, assetID, targetLang)
-			}
-			planCAS = strings.TrimSpace(idx.CASHash)
-		}
+	planCAS, err := s.runRenderPlanCAS(ctx, assetID, targetLang, runID, newest)
+	if err != nil {
+		return "", err
 	}
 	if mixCAS == "" {
 		return "", nil
@@ -3091,19 +3092,212 @@ func (s *ReviewService) staleDeliveryLineage(ctx context.Context, assetID, targe
 		return fmt.Sprintf("final render handoff refused: run %s has no render plan in its own lineage; re-freeze the render plan from its current dub mix before final render", runID), nil
 	}
 
-	rc, err := s.cas.Get(planCAS)
+	plan, err := s.loadRenderPlan(ctx, planCAS)
 	if err != nil {
-		return "", fmt.Errorf("read render plan %s for handoff lineage: %w", planCAS, err)
-	}
-	defer rc.Close()
-	var plan domain.RenderPlan
-	if err := json.NewDecoder(rc).Decode(&plan); err != nil {
-		return "", fmt.Errorf("decode render plan %s for handoff lineage: %w", planCAS, err)
+		return "", err
 	}
 	if plan.DubMixCASHash != "" && plan.DubMixCASHash != mixCAS {
 		return fmt.Sprintf("final render handoff refused: render plan %s still pins dub mix %s but the run's current dub mix is %s; re-freeze the render plan from the corrected mix before final render", planCAS, plan.DubMixCASHash, mixCAS), nil
 	}
 	return "", nil
+}
+
+// newestStageExecutions indexes the newest attempt recorded for each named stage.
+// ListStageExecutions is ordered by creation, so the last row per stage is its newest attempt.
+func newestStageExecutions(stages []domain.StageExecution, names []string) map[string]domain.StageExecution {
+	newest := make(map[string]domain.StageExecution, len(names))
+	for _, se := range stages {
+		for _, stage := range names {
+			if se.Stage == stage {
+				newest[stage] = se
+			}
+		}
+	}
+	return newest
+}
+
+// runDubMixCAS resolves the dub mix artifact the run's delivery holds: the artifact its newest mix
+// stage recorded, else the artifact its own mix index row carries. "" means the run holds no mix of
+// its own. Only this run's evidence is read - an asset-latest mix belongs to whichever run wrote it
+// last (#153).
+func (s *ReviewService) runDubMixCAS(ctx context.Context, runID string, newest map[string]domain.StageExecution) (string, error) {
+	if se, ok := newest["audio_mix"]; ok && se.Status == domain.StageStatusSucceeded {
+		if casHash := strings.TrimSpace(se.ArtifactSHA256); casHash != "" {
+			return casHash, nil
+		}
+	}
+	idx, err := s.db.GetDubMixArtifactIndexByRun(ctx, runID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return "", fmt.Errorf("read run %s dub mix lineage: %w", runID, err)
+	}
+	if idx == nil {
+		return "", nil
+	}
+	return strings.TrimSpace(idx.CASHash), nil
+}
+
+// runRenderPlanCAS resolves the render plan artifact the run's delivery holds: the artifact its
+// newest plan stage recorded, else the artifact its own plan index row carries. "" means the run
+// holds no plan of its own. The index row is checked against the requested asset and language,
+// because a row that belongs to another pairing is not this run's lineage.
+func (s *ReviewService) runRenderPlanCAS(ctx context.Context, assetID, targetLang, runID string, newest map[string]domain.StageExecution) (string, error) {
+	if se, ok := newest["render_plan"]; ok && se.Status == domain.StageStatusSucceeded {
+		if casHash := strings.TrimSpace(se.ArtifactSHA256); casHash != "" {
+			return casHash, nil
+		}
+	}
+	// The run's own render-plan index row is the only other lineage evidence: an asset-latest plan
+	// belongs to whichever run wrote it last and cannot stand in for this run's lineage (#153).
+	idx, err := s.db.GetRenderPlanIndexByRun(ctx, runID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return "", fmt.Errorf("read run %s render plan lineage: %w", runID, err)
+	}
+	if idx == nil {
+		return "", nil
+	}
+	if idx.AssetID != assetID || !strings.EqualFold(idx.TargetLanguage, targetLang) {
+		return "", fmt.Errorf("run %s render plan lineage belongs to asset %s language %s, not %s/%s",
+			runID, idx.AssetID, idx.TargetLanguage, assetID, targetLang)
+	}
+	return strings.TrimSpace(idx.CASHash), nil
+}
+
+// AcceptedDubbingArtifact returns the artifact the run's own dub-segments index row claims for this
+// asset and language when that claim carries accepted reviewed-candidate evidence, and "" when the
+// run holds no such claim.
+//
+// A run keeps two records of its dubbing stage: the stage artifact its dub_synthesize row pins, which
+// the pipeline reuses, and the index row an acceptance moves to the successor it released. An
+// acceptance commits that claim first and records the stage artifact after it, so a failure in
+// between leaves the stage row naming the variant the accepted candidate replaced. The index row is
+// the run's dubbing artifact everywhere else - the acceptance admission resolves the run's artifact
+// through it and so does the portable bundle export - so a resumed run takes the accepted claim
+// rather than the superseded pin. The caller still validates the returned artifact against the run's
+// current contracts before reusing it, and a row that carries no acceptance is never preferred: a run
+// whose review items were all auto-passed resumes exactly as before.
+func (s *ReviewService) AcceptedDubbingArtifact(ctx context.Context, runID, assetID, targetLang string) (string, error) {
+	if s.db == nil || strings.TrimSpace(runID) == "" {
+		return "", nil
+	}
+	idx, err := s.db.GetDubSegmentsVariantIndexByRun(ctx, runID)
+	if errors.Is(err, storage.ErrNotFound) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read run %s dubbing claim: %w", runID, err)
+	}
+	if idx == nil || strings.TrimSpace(idx.CASHash) == "" {
+		return "", nil
+	}
+	if idx.AssetID != assetID || !strings.EqualFold(idx.TargetLanguage, targetLang) {
+		return "", nil
+	}
+	variant, err := s.loadRunDubbingVariant(idx, assetID, targetLang)
+	if err != nil {
+		return "", err
+	}
+	if len(variant.AcceptedCandidates) == 0 {
+		return "", nil
+	}
+	return strings.TrimSpace(idx.CASHash), nil
+}
+
+// ReconcileDeliveryLineage makes the run's published delivery records consistent with the dubbing
+// artifact a resumed run is about to deliver, reporting whether it had to supersede any of them.
+//
+// The mix, render plan and preview a run holds are records of the dubbing artifact they were built
+// from, and the pipeline reuses them through their stage rows without reading the lineage they name.
+// An acceptance moves the run's dubbing artifact to its accepted successor and rebuilds the delivery
+// from it; a run resumed in the middle of that rebuild - or before it started - still records the
+// replaced variant's mix and plan, so resuming would render and publish media the operator's
+// acceptance superseded. A delivery that does not name dubSegmentsCAS is therefore withdrawn and its
+// stages invalidated, exactly as an acceptance withdraws the delivery it is about to rebuild, so the
+// resumed run rebuilds the delivery from the artifact it now holds. A run whose delivery already
+// names that artifact, or that published no delivery of its own, is left untouched.
+//
+// The invalidation is durable, but the caller has already read the run's stage rows for its own reuse
+// decisions: a true return means those decisions describe superseded artifacts and the caller must
+// recompute the delivery in this execution too, not only in the next one.
+func (s *ReviewService) ReconcileDeliveryLineage(ctx context.Context, runID, assetID, targetLang, dubSegmentsCAS string) (bool, error) {
+	if s.db == nil || strings.TrimSpace(runID) == "" || strings.TrimSpace(dubSegmentsCAS) == "" {
+		return false, nil
+	}
+	stages, err := s.db.ListStageExecutions(ctx, runID)
+	if err != nil {
+		return false, fmt.Errorf("read run %s delivery lineage: %w", runID, err)
+	}
+	newest := newestStageExecutions(stages, finalRenderDeliveryStages)
+	mixCAS, err := s.runDubMixCAS(ctx, runID, newest)
+	if err != nil {
+		return false, err
+	}
+	planCAS, err := s.runRenderPlanCAS(ctx, assetID, targetLang, runID, newest)
+	if err != nil {
+		return false, err
+	}
+	superseded := false
+	if mixCAS != "" {
+		mix, err := s.loadDubMixArtifact(ctx, mixCAS)
+		if err != nil {
+			return false, err
+		}
+		superseded = !strings.EqualFold(strings.TrimSpace(mix.DubSegmentsCAS), dubSegmentsCAS)
+	}
+	if !superseded && planCAS != "" {
+		plan, err := s.loadRenderPlan(ctx, planCAS)
+		if err != nil {
+			return false, err
+		}
+		// The same contract the final render handoff enforces: a plan that pins another mix would
+		// render media from it, so it is re-frozen from the mix the run now holds.
+		superseded = plan.DubMixCASHash != "" && !strings.EqualFold(plan.DubMixCASHash, mixCAS)
+	}
+	if !superseded {
+		return false, nil
+	}
+	if err := s.withdrawRunRenderArtifacts(ctx, runID, targetLang); err != nil {
+		return false, err
+	}
+	for _, stage := range supersededDeliveryStages {
+		if err := s.invalidateCorrectionStage(ctx, runID, stage); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// supersededDeliveryStages name the run stages a delivery artifact that was built from a replaced
+// dubbing artifact is invalidated in: the accepted successor moves the dubbing artifact, so the mix,
+// render plan and preview derived from the replaced one are rebuilt, and the final render and handoff
+// stage rows are cleared with them.
+var supersededDeliveryStages = []string{"audio_mix", "render_plan", "render_preview", "render_final", "final_render_handoff"}
+
+// loadDubMixArtifact reads and decodes one dub mix artifact.
+func (s *ReviewService) loadDubMixArtifact(ctx context.Context, casHash string) (*domain.DubMixArtifact, error) {
+	rc, err := s.cas.Get(casHash)
+	if err != nil {
+		return nil, fmt.Errorf("read dub mix %s: %w", casHash, err)
+	}
+	defer rc.Close()
+	var mix domain.DubMixArtifact
+	if err := json.NewDecoder(rc).Decode(&mix); err != nil {
+		return nil, fmt.Errorf("decode dub mix %s: %w", casHash, err)
+	}
+	return &mix, nil
+}
+
+// loadRenderPlan reads and decodes one render plan artifact.
+func (s *ReviewService) loadRenderPlan(ctx context.Context, casHash string) (*domain.RenderPlan, error) {
+	rc, err := s.cas.Get(casHash)
+	if err != nil {
+		return nil, fmt.Errorf("read render plan %s: %w", casHash, err)
+	}
+	defer rc.Close()
+	var plan domain.RenderPlan
+	if err := json.NewDecoder(rc).Decode(&plan); err != nil {
+		return nil, fmt.Errorf("decode render plan %s: %w", casHash, err)
+	}
+	return &plan, nil
 }
 
 // ProjectReviewItems collects and projects all actionable review exceptions for a given asset and target language.

@@ -1890,6 +1890,15 @@ function renderTempoCandidate(item) {
   bindTempoAudio($("#inspect-tempo-transformed"), tempoMediaURL(runId, candidate.transformed_audio_sha256 || ""));
 }
 
+// The acceptance status node is shared by every exception item, so a settled request may only write
+// into it while the operator is still looking at the item that request belongs to: a message that
+// lands after the operator moved on would describe the wrong candidate.
+function selectionStillCurrent(item, runId) {
+  const selected = state.selectedReviewItem;
+  if (!selected || selected.id !== item.id) return false;
+  return (selected.run_id || state.selectedRunId || "") === runId;
+}
+
 // submitTempoAcceptance accepts exactly one of the two auditioned waveforms for the selected review
 // item. The binding is the item identity the run projected, so a superseded artifact or a foreign
 // run is refused by the host rather than applied to whatever the operator was looking at; a
@@ -1936,10 +1945,12 @@ async function submitTempoAcceptance(candidate, button) {
     });
     const message = body?.result?.message || "";
     toast("Đã chấp nhận candidate", message || `Đã chấp nhận waveform ${candidate}.`, "success");
-    if (status) status.textContent = message;
     // The operator may have opened another exception while this acceptance was in flight: only the
-    // selection this request belongs to may be cleared, so a new one is never dropped. The rebuilt
-    // delivery is the run's, though, so this run's handoff is stale either way.
+    // selection this request belongs to may be reported or cleared, so a new one is never dropped and
+    // a settled message never lands beside the wrong candidate. The rebuilt delivery is the run's,
+    // though, so this run's handoff is stale either way.
+    const stillSelected = selectionStillCurrent(item, runId);
+    if (status && stillSelected) status.textContent = message;
     const sameRun = (state.selectedReviewItem?.run_id || state.selectedRunId || "") === runId;
     if (sameRun) {
       state.handoff = null;
@@ -1949,8 +1960,11 @@ async function submitTempoAcceptance(candidate, button) {
     renderInspector();
   } catch (error) {
     // The refusal is the operator's answer: it stays in the panel next to the waveforms that were
-    // auditioned, so a stale binding or a hard media gate is readable without hunting the toast.
-    if (status) status.textContent = `Không chấp nhận được: ${error?.message || String(error)}`;
+    // auditioned, so a stale binding or a hard media gate is readable without hunting the toast - but
+    // only while that item is still the one on screen.
+    if (status && selectionStillCurrent(item, runId)) {
+      status.textContent = `Không chấp nhận được: ${error?.message || String(error)}`;
+    }
     showError(error);
   } finally {
     setBusy(button, false);

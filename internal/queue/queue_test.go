@@ -256,16 +256,38 @@ func TestQueue_Cancel_StatusContract(t *testing.T) {
 		}
 	})
 
-	t.Run("a cancellation that arrives after the completion is refused", func(t *testing.T) {
+	t.Run("a completion between the cancellation's read and its guarded write keeps the run completed", func(t *testing.T) {
 		db, qSvc, runID := newCancellableRun(t)
-		if applied, err := db.CompleteQueueEntryIfActive(ctx, runID, false); err != nil || !applied {
-			t.Fatalf("complete run: applied=%v err=%v", applied, err)
+
+		// Step 1: the read a cancellation's precheck performs, seeing a status that still admits it.
+		entry, err := db.GetQueueEntryByRunID(ctx, runID)
+		if err != nil {
+			t.Fatalf("read queue entry: %v", err)
+		}
+		if entry.Status != domain.RunStatusRunning {
+			t.Fatalf("the cancellation must read an active run, got %s", entry.Status)
 		}
 
-		// The completion committed between this cancellation's read of the running entry and its
-		// write, so the read cannot be what refuses it - the transition's own guard is.
+		// Step 2: the completion commits between that read and the write. This ordering is the race
+		// the precheck cannot see: it decided on a status the completion then replaced.
+		if applied, err := db.CompleteQueueEntryIfActive(ctx, runID, false); err != nil || !applied {
+			t.Fatalf("complete run between the read and the write: applied=%v err=%v", applied, err)
+		}
+
+		// Step 3: the write the cancellation issues next is refused by the state itself - the
+		// precheck is not what protects the completion, the guarded write is - so the completion's
+		// result stands and the loser cannot overwrite the winner.
+		if applied, err := db.CancelQueueEntryIfNonTerminal(ctx, runID); err != nil {
+			t.Fatalf("cancel after the completion: %v", err)
+		} else if applied {
+			t.Fatal("a cancellation that reaches its write after the completion must not be applied")
+		}
+		assertRunLifecycleStatus(t, db, runID, domain.RunStatusCompleted)
+
+		// A later cancellation of the finished run is refused too, so the operator sees one answer
+		// whichever half of the sequence refuses them.
 		if err := qSvc.Cancel(ctx, runID); !errors.Is(err, queue.ErrNotQueued) {
-			t.Fatalf("expected ErrNotQueued after the completion won the run, got %v", err)
+			t.Fatalf("expected ErrNotQueued cancelling a completed run, got %v", err)
 		}
 		assertRunLifecycleStatus(t, db, runID, domain.RunStatusCompleted)
 	})

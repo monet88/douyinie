@@ -1357,6 +1357,32 @@ func TestCompleteQueueEntryIfActiveGuardsTheTransition(t *testing.T) {
 	} else if run.Status != domain.RunStatusRunning {
 		t.Errorf("a refused completion must not write the run row either, got %s", run.Status)
 	}
+
+	// The inverse divergence: an entry that still looks active while the run row already holds a
+	// terminal status. The entry half of the guard admits the completion here, so the run row is what
+	// must refuse it - and the refusal must not complete the still-active entry either.
+	inverseRun := seedTransitionRun(t, ctx, db, "divergent-run", domain.RunStatusRunning)
+	if _, err := db.db.ExecContext(ctx, `UPDATE localization_runs SET status = ? WHERE id = ?`,
+		domain.RunStatusCancelled, inverseRun); err != nil {
+		t.Fatalf("stop the run row only: %v", err)
+	}
+	applied, err = db.CompleteQueueEntryIfActive(ctx, inverseRun, true)
+	if err != nil {
+		t.Fatalf("inverse divergence: CompleteQueueEntryIfActive failed: %v", err)
+	}
+	if applied {
+		t.Error("a run row that already stopped must refuse the completion on its own")
+	}
+	if entry, err := db.GetQueueEntryByRunID(ctx, inverseRun); err != nil {
+		t.Fatalf("inverse divergence: GetQueueEntryByRunID failed: %v", err)
+	} else if entry.Status != domain.RunStatusRunning {
+		t.Errorf("a refused completion must not complete the active queue entry, got %s", entry.Status)
+	}
+	if run, err := db.GetRun(ctx, inverseRun); err != nil {
+		t.Fatalf("inverse divergence: GetRun failed: %v", err)
+	} else if run.Status != domain.RunStatusCancelled {
+		t.Errorf("a refused completion must not overwrite the terminal run row, got %s", run.Status)
+	}
 }
 
 // seedTransitionRun creates one rights-attested job, run and queue entry in the given status, for
@@ -1543,6 +1569,37 @@ func TestCancelQueueEntryIfNonTerminalGuardsTheTransition(t *testing.T) {
 	}
 	if after.CompletedAt == nil || !after.CompletedAt.Equal(*completed.CompletedAt) {
 		t.Errorf("the refused cancellation must not touch the completion timestamp: %v -> %v", completed.CompletedAt, after.CompletedAt)
+	}
+
+	// The inverse divergence for the cancellation: the entry still looks active (its half of the guard
+	// admits the cancellation) while the run row is already terminal, so the run half is what must
+	// refuse it - without releasing the active entry's position or touching the run row.
+	inverseRun := seedTransitionRun(t, ctx, db, "cancel-divergent-run", domain.RunStatusRunning)
+	if _, err := db.db.ExecContext(ctx, `UPDATE localization_runs SET status = ? WHERE id = ?`,
+		domain.RunStatusCompleted, inverseRun); err != nil {
+		t.Fatalf("complete the run row only: %v", err)
+	}
+	applied, err = db.CancelQueueEntryIfNonTerminal(ctx, inverseRun)
+	if err != nil {
+		t.Fatalf("CancelQueueEntryIfNonTerminal failed: %v", err)
+	}
+	if applied {
+		t.Error("a run row that already finished must refuse the cancellation on its own")
+	}
+	if entry, err := db.GetQueueEntryByRunID(ctx, inverseRun); err != nil {
+		t.Fatalf("GetQueueEntryByRunID failed: %v", err)
+	} else {
+		if entry.Status != domain.RunStatusRunning {
+			t.Errorf("a refused cancellation must not cancel the active queue entry, got %s", entry.Status)
+		}
+		if entry.Position == 0 {
+			t.Error("a refused cancellation must leave the active position in place")
+		}
+	}
+	if run, err := db.GetRun(ctx, inverseRun); err != nil {
+		t.Fatalf("GetRun failed: %v", err)
+	} else if run.Status != domain.RunStatusCompleted {
+		t.Errorf("a refused cancellation must not overwrite the finished run row, got %s", run.Status)
 	}
 }
 
