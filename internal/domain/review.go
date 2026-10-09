@@ -27,6 +27,13 @@ const (
 	// ReviewOverrideActionRegionGeometry records an applied text-region
 	// geometry/role correction (drag, resize, reclassify, relabel).
 	ReviewOverrideActionRegionGeometry ReviewOverrideAction = "region_geometry_correction"
+	// ReviewOverrideActionReviewedCandidate records an operator's exact-candidate selection:
+	// one unresolved review unit accepted with a named, verified waveform (Issue #157). Unlike
+	// a manual_override it is not an audit-only note: the successor DubSegmentsVariant it is
+	// linked from is what actually releases the accepted audio, and a generic manual_override
+	// can never stand in for it. It is still recorded as an operator override, so the
+	// transformed-audio quality waiver is a manual_override action rather than a pass.
+	ReviewOverrideActionReviewedCandidate ReviewOverrideAction = "reviewed_candidate_selection"
 )
 
 // ReviewItemStatus tracks the resolution lifecycle of a review exception.

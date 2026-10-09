@@ -344,11 +344,14 @@ func unresolvedDubReason(dubSegments *domain.DubSegmentsVariant, dubArtifactErr 
 		len(dubSegments.ReviewSegments), unacceptedCount)
 }
 
-func (s *AudioMixService) loadMixTranscript(casHash, assetID string) (*domain.TranscriptArtifact, error) {
+// loadPinnedTranscript reads the canonical transcript a dub artifact pins. It is the one reader of
+// that pin, shared by the mixer and by the reviewed-candidate acceptance that proves a selection
+// against the same canonical source membership the mixer will enforce.
+func loadPinnedTranscript(store *cas.Store, casHash, assetID string) (*domain.TranscriptArtifact, error) {
 	if strings.TrimSpace(casHash) == "" {
 		return nil, errors.New("dub artifact does not pin transcript_artifact_cas")
 	}
-	r, err := s.cas.Get(casHash)
+	r, err := store.Get(casHash)
 	if err != nil {
 		return nil, fmt.Errorf("read pinned transcript %s: %w", casHash, err)
 	}
@@ -803,7 +806,7 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 			}
 			fitByIndex[fp.SegmentIndex] = fp
 		}
-		transcript, err := s.loadMixTranscript(dubSegments.TranscriptArtifactCAS, input.AssetID)
+		transcript, err := loadPinnedTranscript(s.cas, dubSegments.TranscriptArtifactCAS, input.AssetID)
 		if err != nil {
 			return refuse(err.Error())
 		}

@@ -2671,77 +2671,157 @@ func (s *DB) NextQueuedEntry(ctx context.Context) (*domain.QueueEntry, error) {
 	return scanQueueEntry(row)
 }
 
+// queueEntryReleasePositionSQL is the one terminal write of a queue entry's own row: a terminal
+// status releases the position so active entries keep an unbroken 1..N position space. It is one
+// fragment so the transitions that finish a queue entry cannot drift on how they release the slot.
+const queueEntryReleasePositionSQL = `UPDATE queue_entries SET status = ?, position = NULL, updated_at = ? WHERE run_id = ?`
+
+// queueEntryClaimPositionSQL is the one non-terminal write of a queue entry's own row: an entry that
+// stays in (or returns to) the active set claims the next free position, so active entries always
+// own an unbroken 1..N position space.
+const queueEntryClaimPositionSQL = `UPDATE queue_entries SET status = ?, position = COALESCE(position, (SELECT COALESCE(MAX(position), 0) + 1 FROM queue_entries WHERE position IS NOT NULL)), updated_at = ? WHERE run_id = ?`
+
+// runStatusTransitionSQL is the one write of a run row's status: completed_at moves only when the
+// new status supplies one, so a caller that has none passes SQL NULL and the prior value survives.
+const runStatusTransitionSQL = `UPDATE localization_runs SET status = ?, completed_at = COALESCE(?, completed_at) WHERE id = ?`
+
 // UpdateQueueStatus updates the status of a queue entry (and its linked run status) atomically.
 // Terminal transitions (cancelled/completed/interrupted) release the entry's position (set NULL)
 // so active entries always own positions 1..N, and completed_at is set only on terminal transitions.
+//
+// Completion and cancellation have no conditions attached: they are written whenever the caller asks,
+// so callers that prechecked a status must use CompleteQueueEntryIfActive/CancelQueueEntryIfNonTerminal
+// instead of reading a status and racing another writer to this write.
+func (s *DB) UpdateQueueStatus(ctx context.Context, runID, queueStatus, runStatus string) error {
+	_, err := s.transitionQueueEntry(ctx, runID, queueStatus, runStatus, "", nil)
+	return err
+}
+
+// CompleteQueueEntryIfActive completes a queue entry and its run only while the entry is still an
+// active run: running, or paused when allowParked is set. The guard admits the running run the
+// pipeline finishes, plus - only when the caller resolves the park - the paused run an acceptance
+// completes. It reports whether the transition was applied.
+func (s *DB) CompleteQueueEntryIfActive(ctx context.Context, runID string, allowParked bool) (bool, error) {
+	activeStatusSQL := `status = ?`
+	activeStatusArgs := []any{domain.RunStatusRunning}
+	if allowParked {
+		activeStatusSQL = `status IN (?, ?)`
+		activeStatusArgs = []any{domain.RunStatusRunning, domain.RunStatusPaused}
+	}
+	return s.transitionQueueEntry(ctx, runID, domain.RunStatusCompleted, domain.RunStatusCompleted,
+		activeStatusSQL, activeStatusArgs)
+}
+
+// CancelQueueEntryIfNonTerminal cancels a queue entry and its run only while the entry is still
+// non-terminal, and reports whether the transition was applied. Interrupted is non-terminal here:
+// it is recoverable (Resume re-drains it), so abandoning it must stay possible; only completed and
+// cancelled are refused (QueueService.Cancel's documented semantics).
+func (s *DB) CancelQueueEntryIfNonTerminal(ctx context.Context, runID string) (bool, error) {
+	return s.transitionQueueEntry(ctx, runID, domain.RunStatusCancelled, domain.RunStatusCancelled,
+		`status NOT IN (?, ?)`, []any{domain.RunStatusCompleted, domain.RunStatusCancelled})
+}
+
+// ResumeQueueEntryIfResumable returns a paused or interrupted queue entry to queued only while the
+// entry is still in one of those statuses, and reports whether the transition was applied.
+func (s *DB) ResumeQueueEntryIfResumable(ctx context.Context, runID string) (bool, error) {
+	return s.transitionQueueEntry(ctx, runID, domain.RunStatusQueued, domain.RunStatusQueued,
+		`status IN (?, ?)`, []any{domain.RunStatusPaused, domain.RunStatusInterrupted})
+}
+
+// transitionQueueEntry is the one implementation of a queue-entry transition: the entry's own row,
+// the stage alignment of the new run state, and the run row, in one transaction.
 //
 // Stage execution alignment: because active stage states are QUEUED/RUNNING/CANCELLING
 // (locked #13/#16), a run that stops actively executing must never leave its stages in the
 // active set. Pause returns running/cancelling stages to queued (reversible); cancel and
 // interrupted terminalize running/cancelling stages to interrupted. Both happen in the same
 // transaction so the run and its stages always agree.
-func (s *DB) UpdateQueueStatus(ctx context.Context, runID, queueStatus, runStatus string) error {
+//
+// guardSQL, when set, is a predicate over the transitioning row's own status that must still hold
+// for the transition to apply, and guardArgs are its arguments. Both the queue entry and the run row
+// carry the guard, so two lifecycle decisions that raced past their prechecks cannot both land -
+// the loser is refused rather than overwriting the winner (a cancellation cannot overwrite a
+// completion, a resume cannot resurrect a cancelled run, Issue #157) - and refusing reports false
+// with the whole transaction rolled back, never half a transition.
+func (s *DB) transitionQueueEntry(ctx context.Context, runID, queueStatus, runStatus, guardSQL string, guardArgs []any) (bool, error) {
 	s.txMu.Lock()
 	defer s.txMu.Unlock()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	guard := ""
+	if guardSQL != "" {
+		guard = ` AND ` + guardSQL
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin queue status tx: %w", err)
+		return false, fmt.Errorf("begin queue status tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
 	isTerminal := queueStatus == domain.RunStatusCancelled || queueStatus == domain.RunStatusCompleted || queueStatus == domain.RunStatusInterrupted
-
+	entrySQL := queueEntryClaimPositionSQL
 	if isTerminal {
-		// Release the position so active entries keep an unbroken 1..N position space.
-		if _, err := tx.ExecContext(ctx, `UPDATE queue_entries SET status = ?, position = NULL, updated_at = ? WHERE run_id = ?`,
-			queueStatus, time.Now().UTC().Format(time.RFC3339Nano), runID); err != nil {
-			return fmt.Errorf("update queue_entry status: %w", err)
-		}
-	} else {
-		if _, err := tx.ExecContext(ctx, `UPDATE queue_entries SET status = ?, position = COALESCE(position, (SELECT COALESCE(MAX(position), 0) + 1 FROM queue_entries WHERE position IS NOT NULL)), updated_at = ? WHERE run_id = ?`,
-			queueStatus, time.Now().UTC().Format(time.RFC3339Nano), runID); err != nil {
-			return fmt.Errorf("update queue_entry status: %w", err)
+		entrySQL = queueEntryReleasePositionSQL
+	}
+	res, err := tx.ExecContext(ctx, entrySQL+guard,
+		append([]any{queueStatus, nowStr, runID}, guardArgs...)...)
+	if err != nil {
+		return false, fmt.Errorf("update queue_entry status: %w", err)
+	}
+	if guardSQL != "" {
+		if applied, err := res.RowsAffected(); err != nil {
+			return false, fmt.Errorf("count queue_entry rows: %w", err)
+		} else if applied == 0 {
+			return false, nil
 		}
 	}
 
 	// Align the run's stage executions with the new run state (see doc comment).
 	stageSnapSQL := `UPDATE stage_executions SET status = ?, updated_at = ? WHERE run_id = ? AND status IN ('running','cancelling')`
-	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
 	switch queueStatus {
 	case domain.RunStatusPaused:
 		// Paused runs are not actively executing; return in-flight stages to queued so resume can restart them.
 		if _, err := tx.ExecContext(ctx, stageSnapSQL, domain.StageStatusQueued, nowStr, runID); err != nil {
-			return fmt.Errorf("snap stages to queued on pause: %w", err)
+			return false, fmt.Errorf("snap stages to queued on pause: %w", err)
 		}
 	case domain.RunStatusCancelled, domain.RunStatusInterrupted:
 		// Deliberate termination or failure mid-execution is interrupted (same as crash recovery).
 		if _, err := tx.ExecContext(ctx, stageSnapSQL, domain.StageStatusInterrupted, nowStr, runID); err != nil {
-			return fmt.Errorf("snap stages to interrupted on %s: %w", queueStatus, err)
+			return false, fmt.Errorf("snap stages to interrupted on %s: %w", queueStatus, err)
 		}
 	}
 
 	// Set completed_at only for terminal statuses; preserve it otherwise (pass SQL NULL).
 	var completedExpr any
 	if runStatus == domain.RunStatusCompleted || runStatus == domain.RunStatusInterrupted {
-		completedExpr = time.Now().UTC().Format(time.RFC3339Nano)
+		completedExpr = nowStr
 	} else {
 		completedExpr = nil // SQL NULL -> COALESCE(NULL, completed_at) preserves prior value
 	}
 	if runStatus != "" {
-		query := `UPDATE localization_runs SET status = ?, completed_at = COALESCE(?, completed_at) WHERE id = ?`
-		if _, err := tx.ExecContext(ctx, query, runStatus, completedExpr, runID); err != nil {
-			return fmt.Errorf("update localization_run status: %w", err)
+		res, err := tx.ExecContext(ctx, runStatusTransitionSQL+guard,
+			append([]any{runStatus, completedExpr, runID}, guardArgs...)...)
+		if err != nil {
+			return false, fmt.Errorf("update localization_run status: %w", err)
+		}
+		if guardSQL != "" {
+			if applied, err := res.RowsAffected(); err != nil {
+				return false, fmt.Errorf("count localization_run rows: %w", err)
+			} else if applied == 0 {
+				// The run row disagrees with its queue entry: refuse rather than transition half a run.
+				return false, nil
+			}
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit queue status tx: %w", err)
+		return false, fmt.Errorf("commit queue status tx: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // ReorderQueueEntries reassigns positions within a single transaction (append-only: never deletes).
@@ -2857,7 +2937,7 @@ func (s *DB) MarkAllActiveInterrupted(ctx context.Context) ([]string, error) {
 
 	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, rid := range runIDs {
-		if _, err := tx.ExecContext(ctx, `UPDATE queue_entries SET status = 'interrupted', position = NULL, updated_at = ? WHERE run_id = ?`, nowStr, rid); err != nil {
+		if _, err := tx.ExecContext(ctx, queueEntryReleasePositionSQL, domain.RunStatusInterrupted, nowStr, rid); err != nil {
 			return nil, fmt.Errorf("mark queue entry interrupted: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE localization_runs SET status = 'interrupted', completed_at = ? WHERE id = ?`, nowStr, rid); err != nil {
@@ -3554,6 +3634,15 @@ func (s *DB) SaveDubSegmentsVariantIndex(ctx context.Context, idx DubSegmentsVar
 	return nil
 }
 
+// voiceAssignmentGuardSQL is the ownership guard both variant claim paths write as part of their own
+// statement: a variant row is claimable only while no voice assignment other than the variant's own
+// is in force for the run (Issues #155, #156, #157). It is one fragment so the supersede rule cannot
+// drift between the paths that enforce it.
+const voiceAssignmentGuardSQL = `NOT EXISTS (
+			SELECT 1 FROM voice_assignments
+			WHERE asset_id = ? AND run_id = ? AND target_language = ? AND cas_hash <> ?
+		)`
+
 // ClaimDubSegmentsVariantIndexForAssignment records the index row for a CAS-stored
 // DubSegmentsVariant only while no voice assignment other than assignmentCAS is in force for the
 // run, and reports whether the row was claimed (§156). The ownership test and the row write are
@@ -3572,10 +3661,7 @@ func (s *DB) ClaimDubSegmentsVariantIndexForAssignment(ctx context.Context, idx 
 			overall_status, created_at
 		)
 		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
-		WHERE NOT EXISTS (
-			SELECT 1 FROM voice_assignments
-			WHERE asset_id = ? AND run_id = ? AND target_language = ? AND cas_hash <> ?
-		)
+		WHERE ` + voiceAssignmentGuardSQL + `
 		ON CONFLICT(provenance_hash) DO UPDATE SET
 			cas_hash = excluded.cas_hash,
 			overall_status = excluded.overall_status
@@ -3588,6 +3674,62 @@ func (s *DB) ClaimDubSegmentsVariantIndexForAssignment(ctx context.Context, idx 
 	affected, err := res.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("claim dub_segments_variant index: %w", err)
+	}
+	return affected > 0, nil
+}
+
+// ClaimDubSegmentsVariantIndexFromBase records the index row for a successor DubSegmentsVariant
+// and reports whether it was claimed, but only while the row still names the exact base variant
+// the successor was derived from (§157). An acceptance rebuilds one successor from the base the
+// operator saw; two operators accepting different review units concurrently must not both win
+// with the second silently discarding the first's promotion, and an acceptance built from a
+// variant that a later synthesis or reassignment already superseded must not take over the row
+// the inspector, the review projection and playback resolve.
+//
+// The base test and the row write are one statement, so a concurrent acceptance that already
+// claimed the row - moving it to its own successor bytes - refuses this write. A provenance row
+// that does not exist yet is claimable: a replay run can resolve its variant through its own
+// dub_synthesize stage artifact without owning an index row.
+//
+// The voice-assignment guard of ClaimDubSegmentsVariantIndexForAssignment still applies, so a
+// superseded-assignment successor can never claim the row either.
+func (s *DB) ClaimDubSegmentsVariantIndexFromBase(ctx context.Context, idx DubSegmentsVariantIndex, assignmentCAS, baseCAS string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if strings.TrimSpace(baseCAS) == "" {
+		return false, errors.New("base dub segments variant cas hash is required to claim a successor")
+	}
+
+	query := `
+		INSERT INTO dub_segments_variants (
+			id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash,
+			overall_status, created_at
+		)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE ` + voiceAssignmentGuardSQL + `
+		AND (
+			NOT EXISTS (
+				SELECT 1 FROM dub_segments_variants WHERE provenance_hash = ?
+			)
+			OR EXISTS (
+				SELECT 1 FROM dub_segments_variants
+				WHERE provenance_hash = ? AND cas_hash = ?
+			)
+		)
+		ON CONFLICT(provenance_hash) DO UPDATE SET
+			cas_hash = excluded.cas_hash,
+			overall_status = excluded.overall_status
+	`
+	res, err := s.db.ExecContext(ctx, query, append(dubSegmentsVariantIndexArgs(idx),
+		idx.AssetID, idx.RunID, idx.TargetLanguage, assignmentCAS,
+		idx.ProvenanceHash, idx.ProvenanceHash, strings.ToLower(strings.TrimSpace(baseCAS)))...)
+	if err != nil {
+		return false, fmt.Errorf("claim successor dub_segments_variant index: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("claim successor dub_segments_variant index: %w", err)
 	}
 	return affected > 0, nil
 }
@@ -6122,18 +6264,20 @@ func (s *DB) UpsertDubSegmentsVariantIndex(ctx context.Context, idx DubSegmentsV
 	defer s.mu.Unlock()
 
 	query := `
-		INSERT INTO dub_segments_variants (id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO dub_segments_variants (id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash, overall_status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			asset_id = excluded.asset_id,
 			run_id = excluded.run_id,
+			job_id = excluded.job_id,
 			target_language = excluded.target_language,
 			cas_hash = excluded.cas_hash,
 			provenance_hash = excluded.provenance_hash,
+			overall_status = excluded.overall_status,
 			created_at = excluded.created_at
 	`
 	_, err := s.db.ExecContext(ctx, query,
-		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+		idx.ID, idx.AssetID, idx.RunID, idx.JobID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.OverallStatus, idx.CreatedAt.Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert dub segments variant index: %w", err)
@@ -6147,17 +6291,19 @@ func (s *DB) UpsertAudioStemsArtifactIndex(ctx context.Context, idx AudioStemsAr
 	defer s.mu.Unlock()
 
 	query := `
-		INSERT INTO audio_stems_artifacts (id, asset_id, provider_id, cas_hash, provenance_hash, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO audio_stems_artifacts (id, asset_id, provider_id, model_name, model_version, cas_hash, provenance_hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			asset_id = excluded.asset_id,
 			provider_id = excluded.provider_id,
+			model_name = excluded.model_name,
+			model_version = excluded.model_version,
 			cas_hash = excluded.cas_hash,
 			provenance_hash = excluded.provenance_hash,
 			created_at = excluded.created_at
 	`
 	_, err := s.db.ExecContext(ctx, query,
-		idx.ID, idx.AssetID, idx.ProviderID, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+		idx.ID, idx.AssetID, idx.ProviderID, idx.ModelName, idx.ModelVersion, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert audio stems artifact index: %w", err)

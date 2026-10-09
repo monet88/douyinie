@@ -1805,9 +1805,31 @@ function bindTempoAudio(node, url) {
   node.classList.remove("hidden");
 }
 
+// renderedTempoItemID is the review item whose acceptance controls are currently on screen. It is
+// what tells a re-render of the same item (keep what the operator typed) apart from a switch to
+// another item (clear the previous item's refusal and half-filled reason).
+let renderedTempoItemID = "";
+
+// resetTempoAcceptance clears the acceptance controls, so a stale status line or reason from a
+// previously selected review item can never be submitted against the item now shown.
+function resetTempoAcceptance() {
+  const reason = $("#inspect-tempo-reason");
+  if (reason) reason.value = "";
+  const waiver = $("#inspect-tempo-waiver");
+  if (waiver) waiver.checked = false;
+  const status = $("#inspect-tempo-status");
+  if (status) status.textContent = "";
+}
+
 function renderTempoCandidate(item) {
   const panel = $("#inspect-tempo");
   if (!panel) return;
+
+  const itemID = item?.id || "";
+  if (itemID !== renderedTempoItemID) {
+    renderedTempoItemID = itemID;
+    resetTempoAcceptance();
+  }
 
   const meta = $("#inspect-tempo-meta");
   const selectable = $("#inspect-tempo-selectable");
@@ -1834,7 +1856,7 @@ function renderTempoCandidate(item) {
   }
   if (note) {
     note.textContent = candidate.selectable
-      ? "Bản tempo nằm trong cửa sổ phát đã chấp nhận nhưng chưa được chọn; việc phê duyệt thuộc ticket kế tiếp."
+      ? "Bản tempo nằm trong cửa sổ phát đã chấp nhận nhưng chưa được chọn: nghe cả hai waveform rồi chấp nhận đúng một bản ở dưới."
       : "Chưa có bản tempo dùng được (xem lý do bên dưới); bản ghi gốc vẫn giữ nguyên.";
   }
   if (meta) {
@@ -1852,8 +1874,104 @@ function renderTempoCandidate(item) {
       .map(([label, value]) => `<div><dt>${esc(label)}</dt><dd title="${esc(value)}">${esc(value)}</dd></div>`)
       .join("");
   }
+  // The transformed alternative is only acceptable when its own recorded gate says it is
+  // selectable; the retained natural waveform is always offerable, and the run's own window gate
+  // refuses it if the actual bytes do not fit.
+  const transformedButton = $("#inspect-tempo-accept-transformed");
+  if (transformedButton) {
+    transformedButton.disabled = !candidate.selectable;
+    transformedButton.title = candidate.selectable
+      ? ""
+      : "Bản tempo chưa dùng được nên không thể chấp nhận; hãy xử lý lý do bên dưới trước.";
+  }
+  const naturalButton = $("#inspect-tempo-accept-natural");
+  if (naturalButton) naturalButton.disabled = false;
   bindTempoAudio($("#inspect-tempo-natural"), tempoMediaURL(runId, naturalHash));
   bindTempoAudio($("#inspect-tempo-transformed"), tempoMediaURL(runId, candidate.transformed_audio_sha256 || ""));
+}
+
+// The acceptance status node is shared by every exception item, so a settled request may only write
+// into it while the operator is still looking at the item that request belongs to: a message that
+// lands after the operator moved on would describe the wrong candidate.
+function selectionStillCurrent(item, runId) {
+  const selected = state.selectedReviewItem;
+  if (!selected || selected.id !== item.id) return false;
+  return (selected.run_id || state.selectedRunId || "") === runId;
+}
+
+// submitTempoAcceptance accepts exactly one of the two auditioned waveforms for the selected review
+// item. The binding is the item identity the run projected, so a superseded artifact or a foreign
+// run is refused by the host rather than applied to whatever the operator was looking at; a
+// transformed waveform additionally requires the explicit quality waiver.
+async function submitTempoAcceptance(candidate, button) {
+  const item = state.selectedReviewItem;
+  const status = $("#inspect-tempo-status");
+  if (!item) return;
+  const runId = item.run_id || state.selectedRunId || "";
+  if (!runId) {
+    if (status) status.textContent = "Chưa chọn run nào để chấp nhận.";
+    return;
+  }
+  const reasonField = $("#inspect-tempo-reason");
+  const reason = (reasonField?.value || "").trim();
+  if (!reason) {
+    if (status) status.textContent = "Cần nhập lý do chấp nhận để ghi vào audit trail.";
+    reasonField?.focus();
+    return;
+  }
+  if (candidate === "transformed" && !$("#inspect-tempo-waiver")?.checked) {
+    if (status) status.textContent = "Waveform tempo đã biến đổi cần xác nhận manual_override chất lượng trước khi chấp nhận.";
+    return;
+  }
+
+  // Both choices are locked while the request is in flight: the run resolves one decision, so a
+  // click on the opposite waveform during the POST could only be refused by the host after the
+  // first acceptance already landed.
+  for (const control of [$("#inspect-tempo-accept-transformed"), $("#inspect-tempo-accept-natural")]) {
+    if (control) control.disabled = true;
+  }
+  setBusy(button, true, "Đang chấp nhận…");
+  if (status) status.textContent = "";
+  try {
+    const body = await api(`/api/v1/runs/${encodeURIComponent(runId)}/review/accept-candidate`, {
+      method: "POST",
+      body: jsonBody({
+        review_item_id: item.id,
+        candidate,
+        manual_override: candidate === "transformed",
+        reason,
+        operator: operatorName(),
+      }),
+    });
+    const message = body?.result?.message || "";
+    toast("Đã chấp nhận candidate", message || `Đã chấp nhận waveform ${candidate}.`, "success");
+    // The operator may have opened another exception while this acceptance was in flight: only the
+    // selection this request belongs to may be reported or cleared, so a new one is never dropped and
+    // a settled message never lands beside the wrong candidate. The rebuilt delivery is the run's,
+    // though, so this run's handoff is stale either way.
+    const stillSelected = selectionStillCurrent(item, runId);
+    if (status && stillSelected) status.textContent = message;
+    const sameRun = (state.selectedReviewItem?.run_id || state.selectedRunId || "") === runId;
+    if (sameRun) {
+      state.handoff = null;
+      if (state.selectedReviewItem?.id === item.id) state.selectedReviewItem = null;
+    }
+    await loadReviewItems();
+    renderInspector();
+  } catch (error) {
+    // The refusal is the operator's answer: it stays in the panel next to the waveforms that were
+    // auditioned, so a stale binding or a hard media gate is readable without hunting the toast - but
+    // only while that item is still the one on screen.
+    if (status && selectionStillCurrent(item, runId)) {
+      status.textContent = `Không chấp nhận được: ${error?.message || String(error)}`;
+    }
+    showError(error);
+  } finally {
+    setBusy(button, false);
+    // Re-render so each button's disabled state (owned by the candidate's own gate, not by setBusy)
+    // replaces the in-flight lock once the request settled.
+    renderTempoCandidate(state.selectedReviewItem);
+  }
 }
 
 function renderInspectorEditor() {
@@ -3260,6 +3378,12 @@ function bindEvents() {
 
   // Forms
   $("#accept-form")?.addEventListener("submit", submitManualOverride);
+  $("#inspect-tempo-accept-transformed")?.addEventListener("click", (event) =>
+    submitTempoAcceptance("transformed", event.currentTarget)
+  );
+  $("#inspect-tempo-accept-natural")?.addEventListener("click", (event) =>
+    submitTempoAcceptance("natural", event.currentTarget)
+  );
   $("#text-form")?.addEventListener("submit", submitTextCorrection);
   $("#voice-form")?.addEventListener("submit", submitVoiceCorrection);
   $("#region-form")?.addEventListener("submit", submitRegionCorrection);

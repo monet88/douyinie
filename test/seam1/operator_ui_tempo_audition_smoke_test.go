@@ -2,7 +2,6 @@ package seam1_test
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"os"
 	"os/exec"
@@ -11,18 +10,18 @@ import (
 	"testing"
 
 	"github.com/monet88/douyinie/internal/domain"
-	"github.com/monet88/douyinie/internal/storage"
 )
 
 // TestSeam1_OperatorUITempoAuditionBrowserSmoke drives the real Operator UI in a real headless
-// browser against a live RuntimeHost for the Issue #156 audition surface: the operator hears
-// the retained natural waveform and one eligible tempo alternative through the run-scoped media
-// endpoint, and nothing in that surface selects, approves or publishes the alternative.
+// browser against a live RuntimeHost: the operator hears the retained natural waveform and one
+// eligible tempo alternative through the run-scoped media endpoint, is refused an acceptance that
+// omits the audit reason or the quality waiver, and then accepts that exact alternative through
+// the panel's own control, which rebuilds the run's delivery on the auditioned waveform.
 //
 // The seam-1 API test (TestSeam1_Issue156_DeterministicExhaustionRealFFmpegCandidate) proves the
 // candidate's bytes and ownership bounds over HTTP; the Node VM harness stubs the DOM. Neither
 // covers the client: the two URLs app.js builds, the browser decoding and playing both
-// waveforms, and the absence of any selection control. Requires node, ffmpeg (the candidate is a
+// waveforms, and the panel's own acceptance request. Requires node, ffmpeg (the candidate is a
 // real FFmpeg transform) and a Chromium-family browser; skipped when any is unavailable. Pin the
 // browser with DOUYINIE_CHROME_BIN.
 func TestSeam1_OperatorUITempoAuditionBrowserSmoke(t *testing.T) {
@@ -75,6 +74,10 @@ func TestSeam1_OperatorUITempoAuditionBrowserSmoke(t *testing.T) {
 		t.Fatalf("expected an in-window tempo candidate, got %+v", tc)
 	}
 
+	// The operator's acceptance is the decision that resumes the run: without a paused delivery
+	// the acceptance would only record the decision, so park the run the panel will act on.
+	parkRunForReview(t, h, runID)
+
 	// The item the operator auditions is read from the same run-scoped endpoint the UI drives.
 	items := fetchRunReviewItems(t, h, runID, false)
 	itemID := ""
@@ -107,19 +110,28 @@ func TestSeam1_OperatorUITempoAuditionBrowserSmoke(t *testing.T) {
 	}
 	t.Logf("browser smoke output:\n%s", out)
 
-	// Auditioning the alternative is playback of two stored artifacts, never synthesis.
+	// Auditioning and accepting the alternative consume stored artifacts, never synthesis.
 	if lane.Invocations != published {
-		t.Errorf("auditioning the candidate invoked the TTS provider: %d -> %d invocations", published, lane.Invocations)
+		t.Errorf("the browser acceptance invoked the TTS provider: %d -> %d invocations", published, lane.Invocations)
 	}
-	// Nothing the browser surfaced may select the alternative or produce unattended output.
+	// The acceptance the browser drove is the operator's own, and it pins the exact waveform the
+	// panel auditioned: the item leaves the queue, the run records that candidate as its decision,
+	// and the delivery rebuilds on it.
 	after := fetchRunReviewItems(t, h, runID, false)
-	if len(after) != 1 || after[0].Status != domain.ReviewItemStatusPending || after[0].Details["tempo_candidate"] == nil {
-		t.Errorf("the audition changed the review item: %+v", after)
+	if len(after) != 0 {
+		t.Errorf("expected the accepted item to leave the review queue, got %+v", after)
 	}
-	if _, err := h.db.GetLatestRenderArtifactIndex(ctx, assetID, "vi", domain.RenderKindFinal); !errors.Is(err, storage.ErrNotFound) {
-		t.Errorf("the audition produced a final render: err=%v", err)
+	successor := issue157RunVariant(t, h, runID)
+	if len(successor.AcceptedCandidates) != 1 {
+		t.Fatalf("expected the browser acceptance to publish exactly one decision, got %+v", successor.AcceptedCandidates)
 	}
-	if mix, err := h.db.GetDubMixArtifactIndexByRun(ctx, runID); !errors.Is(err, storage.ErrNotFound) {
-		t.Errorf("the audition consumed the candidate into a dub mix: mix=%v err=%v", mix, err)
+	if got := successor.AcceptedCandidates[0].SelectedAudioSHA256; got != tc.TransformedAudioSHA256 {
+		t.Errorf("the accepted waveform must be the auditioned candidate %s, got %s", tc.TransformedAudioSHA256, got)
+	}
+	if successor.OverallStatus != "PASS" {
+		t.Errorf("the accepted candidate must resolve the run, got status %s", successor.OverallStatus)
+	}
+	if mix, err := h.db.GetDubMixArtifactIndexByRun(ctx, runID); err != nil || mix == nil {
+		t.Errorf("the acceptance must rebuild the run's dub mix on the accepted waveform: mix=%v err=%v", mix, err)
 	}
 }

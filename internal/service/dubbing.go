@@ -1834,7 +1834,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 	// geometry the fit must prove its window against. It is resolved once per pass: a missing
 	// stems artifact, unreadable header, or report is not a synthesis failure, it only drops
 	// the fit back to the millisecond window (rate 0) while the mix stage keeps its own gate.
-	outputSampleRate := s.outputSampleRateForAsset(ctx, in.AssetID)
+	outputSampleRate := resolveMixOutputSampleRate(ctx, s.db, s.cas, in.AssetID)
 
 	for i := 0; i < len(dubScript.Segments); i++ {
 		seg := dubScript.Segments[i]
@@ -2696,22 +2696,24 @@ func (s *DubbingService) attachTempoCandidates(ctx context.Context, variant *dom
 			continue
 		}
 		if !outRateResolved {
-			outRate = s.outputSampleRateForAsset(ctx, variant.AssetID)
+			outRate = resolveMixOutputSampleRate(ctx, s.db, s.cas, variant.AssetID)
 			outRateResolved = true
 		}
 		rev.TempoCandidate = s.tempoCandidateForReview(ctx, variant.FitPolicyID, outRate, rev)
 	}
 }
 
-// outputSampleRateForAsset resolves the rate the mixer resamples every candidate to: the
-// background stem's header rate (header-only, no decode), falling back to the preflight
-// report's probed rate. 0 means "unknown" and keeps the fit on its millisecond window.
-func (s *DubbingService) outputSampleRateForAsset(ctx context.Context, assetID string) int {
-	if s.db == nil || s.cas == nil || assetID == "" {
+// resolveMixOutputSampleRate resolves the rate the mixer resamples every dub candidate to: the
+// background stem's header rate (header-only, no decode), falling back to the preflight report's
+// probed rate. 0 means "unknown" and keeps a fit on its millisecond window. It is the one
+// resolution of that rate, shared by synthesis and by the reviewed-candidate acceptance that
+// proves a selected waveform against the window the mixer will place it in.
+func resolveMixOutputSampleRate(ctx context.Context, db *storage.DB, store *cas.Store, assetID string) int {
+	if db == nil || store == nil || assetID == "" {
 		return 0
 	}
-	if idx, err := s.db.GetAudioStemsArtifactIndex(ctx, assetID); err == nil && idx != nil && idx.AssetID == assetID && idx.CASHash != "" {
-		if rc, err := s.cas.Get(idx.CASHash); err == nil {
+	if idx, err := db.GetAudioStemsArtifactIndex(ctx, assetID); err == nil && idx != nil && idx.AssetID == assetID && idx.CASHash != "" {
+		if rc, err := store.Get(idx.CASHash); err == nil {
 			var stems domain.AudioStemArtifacts
 			decodeErr := json.NewDecoder(rc).Decode(&stems)
 			rc.Close()
@@ -2720,7 +2722,7 @@ func (s *DubbingService) outputSampleRateForAsset(ctx context.Context, assetID s
 					if stem.Type != domain.StemTypeBackground || stem.AudioCASHash == "" {
 						continue
 					}
-					bgRC, err := s.cas.Get(stem.AudioCASHash)
+					bgRC, err := store.Get(stem.AudioCASHash)
 					if err != nil {
 						break
 					}
@@ -2737,7 +2739,7 @@ func (s *DubbingService) outputSampleRateForAsset(ctx context.Context, assetID s
 			}
 		}
 	}
-	report, err := s.db.GetPreflightReport(ctx, assetID)
+	report, err := db.GetPreflightReport(ctx, assetID)
 	if err != nil || report == nil || report.AudioSampleRate <= 0 {
 		return 0
 	}

@@ -10,12 +10,15 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
+	"github.com/monet88/douyinie/internal/media"
 	"github.com/monet88/douyinie/internal/provider"
 	"github.com/monet88/douyinie/internal/storage"
 )
@@ -306,6 +309,1437 @@ func (s *ReviewService) RecordManualOverride(ctx context.Context, in ManualOverr
 	return &override, nil
 }
 
+// ---------------------------------------------------------------------------
+// Issue #157 - exact reviewed-candidate selection
+// ---------------------------------------------------------------------------
+
+// ReviewedCandidateKind names which of a review unit's own waveforms an acceptance selects.
+type ReviewedCandidateKind string
+
+const (
+	// ReviewedCandidateNatural selects the unit's retained natural waveform itself. It is legal
+	// only when the actual committed bytes fit the accepted playback window frame-exactly - the
+	// one case a floored whole-millisecond overrun probe cannot rule out.
+	ReviewedCandidateNatural ReviewedCandidateKind = "natural"
+	// ReviewedCandidateTransformed selects the review-only atempo alternative of #156. The
+	// operator must waive the transformed-audio quality concern explicitly; the run never does,
+	// and duration fit alone never becomes a quality PASS.
+	ReviewedCandidateTransformed ReviewedCandidateKind = "transformed"
+)
+
+// The reviewed-candidate selection refusals. Every one is a refusal, never a silent downgrade:
+// timing, absent audio, wrong ownership, invalid lineage and incomplete required coverage are
+// hard gates that no override argument waives.
+var (
+	// ErrReviewedCandidateNotPending reports a review item that is not currently unresolved
+	// against the run's own dubbing artifact.
+	ErrReviewedCandidateNotPending = errors.New("reviewed candidate selection refused: the review item is not pending for this run")
+	// ErrReviewedCandidateStale reports a review item projected from a dubbing artifact the run
+	// no longer holds, i.e. a concurrent acceptance, synthesis or reassignment moved on.
+	ErrReviewedCandidateStale = errors.New("reviewed candidate selection refused: the review item belongs to a superseded dubbing artifact")
+	// ErrReviewedCandidateNotSelectable reports a candidate whose actual bytes do not fit the
+	// accepted playback window under the governing policy.
+	ErrReviewedCandidateNotSelectable = errors.New("reviewed candidate selection refused: the candidate does not fit the accepted playback window")
+	// ErrReviewedCandidateUnavailable reports a named candidate waveform that is missing,
+	// unreadable, corrupt or not valid 16-bit PCM audio.
+	ErrReviewedCandidateUnavailable = errors.New("reviewed candidate selection refused: the named candidate waveform is unavailable")
+	// ErrReviewedCandidateWaiverRequired reports a transformed-audio selection without the
+	// explicit operator quality waiver.
+	ErrReviewedCandidateWaiverRequired = errors.New("reviewed candidate selection refused: accepting a transformed waveform requires an explicit manual_override quality waiver")
+	// ErrReviewedCandidateConflict reports a run whose dubbing artifact changed while this
+	// selection was being applied, or a repeated selection with different parameters.
+	ErrReviewedCandidateConflict = errors.New("reviewed candidate selection refused: the run's dubbing artifact changed while this selection was being applied")
+	// ErrReviewedCandidateInvalid reports a malformed selection request: a missing asset, run,
+	// item or audit reason, or an unsupported candidate/language. It is a caller error, not a
+	// gate the operator can argue with.
+	ErrReviewedCandidateInvalid = errors.New("reviewed candidate selection refused: malformed selection request")
+)
+
+// AcceptReviewedCandidateInput names the exact unresolved review unit and the exact waveform an
+// operator accepts for it.
+type AcceptReviewedCandidateInput struct {
+	RunID          string `json:"run_id"`
+	JobID          string `json:"job_id,omitempty"`
+	AssetID        string `json:"asset_id"`
+	TargetLanguage string `json:"target_language"`
+	// ReviewItemID is the exact pending review item, which carries the dubbing artifact identity
+	// the operator was looking at.
+	ReviewItemID string `json:"review_item_id"`
+	// Candidate selects the natural parent or the transformed tempo alternative.
+	Candidate      ReviewedCandidateKind `json:"candidate"`
+	ManualOverride bool                  `json:"manual_override,omitempty"`
+	// Reason and Operator are the auditable decision note and actor.
+	Reason                string                  `json:"reason"`
+	Operator              string                  `json:"operator,omitempty"`
+	ExecutionProfile      domain.ExecutionProfile `json:"execution_profile,omitempty"`
+	AuthorizedCredentials []string                `json:"authorized_credentials,omitempty"`
+}
+
+// AcceptReviewedCandidateResult reports the artifacts the acceptance produced and what the run may
+// do next. It never reports an acceptance as complete while unresolved coverage remains.
+type AcceptReviewedCandidateResult struct {
+	AssetID          string `json:"asset_id"`
+	RunID            string `json:"run_id"`
+	JobID            string `json:"job_id,omitempty"`
+	TargetLanguage   string `json:"target_language"`
+	ReviewItemID     string `json:"review_item_id"`
+	ReviewOverrideID string `json:"review_override_id,omitempty"`
+	// DubSegmentsVariantCAS is the successor variant carrying the acceptance evidence.
+	DubSegmentsVariantCAS string `json:"dub_segments_variant_cas"`
+	SelectedAudioSHA256   string `json:"selected_audio_sha256"`
+	NaturalAudioSHA256    string `json:"natural_audio_sha256,omitempty"`
+	Transformed           bool   `json:"transformed"`
+	QualityWaiver         bool   `json:"quality_waiver"`
+	// RemainingReviewCount is how many review units the successor variant still carries.
+	RemainingReviewCount int  `json:"remaining_review_count"`
+	CoverageComplete     bool `json:"coverage_complete"`
+	Idempotent           bool `json:"idempotent"`
+	// RunPaused reports that the run is paused: coverage is incomplete, so no partial mix was ever
+	// produced, or the run is in Review posture awaiting the operator's explicit final render. It is
+	// false once an automatic final render released the run, and also false for a run that was
+	// cancelled or interrupted - such a run is neither finished nor waiting on the operator, and
+	// offering it as a resumable pause would misreport the state the operator left it in.
+	RunPaused bool `json:"run_paused"`
+	// RunCompleted reports that the run and its job were finished (auto posture, gates passed).
+	RunCompleted bool `json:"run_completed"`
+	// DubMixCAS, RenderPlanCAS, PreviewRenderCAS and FinalRenderCAS are the rebuilt descendants.
+	DubMixCAS        string                  `json:"dub_mix_cas,omitempty"`
+	RenderPlanCAS    string                  `json:"render_plan_cas,omitempty"`
+	PreviewRenderCAS string                  `json:"preview_render_cas,omitempty"`
+	FinalRenderCAS   string                  `json:"final_render_cas,omitempty"`
+	HandoffAction    string                  `json:"handoff_action,omitempty"`
+	HandoffMessage   string                  `json:"handoff_message,omitempty"`
+	Status           domain.ReviewItemStatus `json:"status"`
+	Message          string                  `json:"message"`
+}
+
+// selectionLineage is the pinned lineage an acceptance is proven against.
+type selectionLineage struct {
+	transcript    *domain.TranscriptArtifact
+	rolePlan      *domain.AudioRolePlan
+	eligible      map[int]domain.SpeechBlock
+	fitController *FitController
+}
+
+// selectedWaveform is one accepted waveform after its actual bytes and frame geometry were proven.
+type selectedWaveform struct {
+	hash          string
+	audioCASPath  string
+	naturalHash   string
+	transformed   bool
+	tempoFactor   float64
+	tempoFilter   string
+	tempoToolID   string
+	qualityWaiver bool
+	measuredMs    int64
+	frames        int64
+	windowFrames  int64
+}
+
+// AcceptReviewedCandidate records the operator's acceptance of one exact reviewed candidate and
+// drives the resulting rebuild (Issue #157).
+//
+// Invariants:
+//   - The acceptance is proven against the run's CURRENT dubbing artifact, translation/dubbing
+//     contract, governing playback policy and the actual committed waveform bytes. Timing,
+//     missing media, wrong ownership, invalid lineage and incomplete coverage are refusals.
+//   - A transformed waveform is only accepted under an explicit manual_override quality waiver.
+//   - The successor variant appends acceptance evidence to the existing artifact family: the
+//     original waveform, QA results, provider attempts and source anchors are preserved, and the
+//     acceptance is linked to the exact ReviewOverride and immutable candidate hash.
+//   - With other units unresolved the run stays paused and no partial mix is produced.
+//   - Once coverage is complete the affected descendants are rebuilt from the accepted waveforms,
+//     superseded preview/final refs are withdrawn, and the run's own posture decides between an
+//     automatic final render and the explicit final-render action.
+func (s *ReviewService) AcceptReviewedCandidate(ctx context.Context, in AcceptReviewedCandidateInput) (*AcceptReviewedCandidateResult, error) {
+	if strings.TrimSpace(in.AssetID) == "" {
+		return nil, fmt.Errorf("%w: asset_id is required", ErrReviewedCandidateInvalid)
+	}
+	runID := strings.TrimSpace(in.RunID)
+	if runID == "" {
+		return nil, fmt.Errorf("%w: run_id is required for reviewed-candidate selection", ErrReviewedCandidateInvalid)
+	}
+	itemID := strings.TrimSpace(in.ReviewItemID)
+	if itemID == "" {
+		return nil, fmt.Errorf("%w: exact pending review_item_id is required for reviewed-candidate selection", ErrReviewedCandidateInvalid)
+	}
+	reason := strings.TrimSpace(in.Reason)
+	if reason == "" {
+		return nil, fmt.Errorf("%w: override reason/notes is required for the acceptance audit trail", ErrReviewedCandidateInvalid)
+	}
+	kind := ReviewedCandidateKind(strings.ToLower(strings.TrimSpace(string(in.Candidate))))
+	if kind == "" {
+		kind = ReviewedCandidateNatural
+	}
+	if kind != ReviewedCandidateNatural && kind != ReviewedCandidateTransformed {
+		return nil, fmt.Errorf("%w: unsupported candidate %q (must be %q or %q)", ErrReviewedCandidateInvalid, in.Candidate, ReviewedCandidateNatural, ReviewedCandidateTransformed)
+	}
+	targetLang := strings.ToLower(strings.TrimSpace(in.TargetLanguage))
+	if targetLang == "" {
+		targetLang = "vi"
+	}
+	if targetLang != "vi" && targetLang != "en" {
+		return nil, fmt.Errorf("%w: unsupported target language '%s' (must be 'vi' or 'en')", ErrReviewedCandidateInvalid, in.TargetLanguage)
+	}
+	operator := strings.TrimSpace(in.Operator)
+	if operator == "" {
+		operator = "operator"
+	}
+	if s.db == nil || s.cas == nil {
+		return nil, errors.New("database and CAS store are required for reviewed-candidate selection")
+	}
+	if s.audioMixSvc == nil || s.renderSvc == nil {
+		return nil, errors.New("audio mix and render services are required for reviewed-candidate selection")
+	}
+
+	// 1. Current run/job/asset/language binding. A selection is always an exact run-scoped act.
+	run, err := s.db.GetRun(ctx, runID)
+	if err != nil {
+		return nil, fmt.Errorf("load run %s for reviewed-candidate selection: %w", runID, err)
+	}
+	if run == nil {
+		return nil, fmt.Errorf("%w: run %s", ErrReviewedCandidateNotPending, runID)
+	}
+	// A selection releases media into a run that is still in flight. A cancelled or interrupted
+	// run keeps its history as evidence, but its stage pins are no longer the run's current
+	// delivery: accepting for it would revive superseded output the operator never selected.
+	switch run.Status {
+	case domain.RunStatusCancelled, domain.RunStatusInterrupted:
+		return nil, fmt.Errorf("%w: run %s is %s and cannot accept a reviewed candidate", ErrReviewedCandidateNotPending, runID, run.Status)
+	}
+	job, err := s.db.GetJob(ctx, run.JobID)
+	if err != nil {
+		return nil, fmt.Errorf("load job %s for reviewed-candidate selection: %w", run.JobID, err)
+	}
+	if job == nil {
+		return nil, fmt.Errorf("%w: job %s", ErrReviewedCandidateNotPending, run.JobID)
+	}
+	if job.SourceAssetID != in.AssetID || !strings.EqualFold(job.TargetLanguage, targetLang) {
+		return nil, fmt.Errorf("%w: run %s belongs to asset %s (%s), not %s (%s)",
+			ErrReviewedCandidateNotPending, runID, job.SourceAssetID, job.TargetLanguage, in.AssetID, targetLang)
+	}
+	if in.JobID != "" && in.JobID != job.ID {
+		return nil, fmt.Errorf("%w: run %s belongs to job %s, not %s", ErrReviewedCandidateNotPending, runID, job.ID, in.JobID)
+	}
+
+	// 2. The run's current dubbing artifact, verified to belong to this asset/language pair and
+	// to the voice assignment still in force.
+	idx, err := s.runScopedDubbingVariantIndex(ctx, runID, in.AssetID, targetLang)
+	if err != nil {
+		return nil, err
+	}
+	if idx == nil || idx.CASHash == "" {
+		return nil, fmt.Errorf("%w: run %s owns no dubbing artifact", ErrReviewedCandidateNotPending, runID)
+	}
+	variant, err := s.loadRunDubbingVariant(idx, in.AssetID, targetLang)
+	if err != nil {
+		return nil, err
+	}
+	variant.CASHash = idx.CASHash
+	if err := s.verifyVariantVoiceLineage(ctx, runID, in.AssetID, targetLang, variant); err != nil {
+		return nil, err
+	}
+
+	// 3. A completed identical acceptance is idempotent: the successor variant already carries
+	// the evidence, so nothing is appended, no duplicate override is written and the same result
+	// is reported. A differently parameterized repeat of the same item fails closed.
+	if existing := variant.AcceptedCandidateFor(itemID); existing != nil {
+		if existing.Transformed != (kind == ReviewedCandidateTransformed) ||
+			(!existing.Transformed && !strings.EqualFold(existing.SelectedAudioSHA256, existing.NaturalAudioSHA256)) {
+			return nil, fmt.Errorf("%w: review item %s was already accepted with waveform %s",
+				ErrReviewedCandidateConflict, itemID, existing.SelectedAudioSHA256)
+		}
+		return s.reportReplayedAcceptance(ctx, in, runID, job.ID, targetLang, variant, *existing)
+	}
+
+	// 4. Exact pending identity. The projected item names the artifact it came from and the fit
+	// unit it belongs to; a unit that is not unresolved in THIS artifact is not selectable.
+	itemVariantCAS, itemIndex, ok := parseDubReviewItemID(itemID)
+	if !ok {
+		return nil, fmt.Errorf("%w: %q is not a dubbing review item", ErrReviewedCandidateNotPending, itemID)
+	}
+	if !strings.EqualFold(itemVariantCAS, idx.CASHash) {
+		return nil, fmt.Errorf("%w: review item %s was projected from dubbing artifact %s but run %s now holds %s",
+			ErrReviewedCandidateStale, itemID, itemVariantCAS, runID, idx.CASHash)
+	}
+	rev, ok := findReviewUnit(variant, itemIndex)
+	if !ok {
+		return nil, fmt.Errorf("%w: fit unit %d is not unresolved in run %s's current dubbing artifact",
+			ErrReviewedCandidateNotPending, itemIndex, runID)
+	}
+	if len(rev.SpeechBlockIndices) == 0 {
+		return nil, fmt.Errorf("%w: fit unit %d carries no canonical source membership", ErrReviewedCandidateNotSelectable, rev.Index)
+	}
+
+	// 5. Translation/dubbing contract, voice lineage and governing playback policy.
+	lineage, err := s.resolveSelectionLineage(ctx, runID, in.AssetID, targetLang, variant)
+	if err != nil {
+		return nil, err
+	}
+	// Group identity: every covered member must still be dub-eligible and covered exactly once
+	// across the variant's units. A foreign, duplicate or ineligible member is not selectable.
+	for _, member := range rev.SpeechBlockIndices {
+		if _, ok := lineage.eligible[member]; !ok {
+			return nil, fmt.Errorf("%w: fit unit %d references foreign or non-dub-eligible source member %d",
+				ErrReviewedCandidateNotSelectable, rev.Index, member)
+		}
+	}
+	if count := coverageCount(variant, itemIndex); count != 1 {
+		return nil, fmt.Errorf("%w: source coverage for fit unit %d is not exactly one (%d)", ErrReviewedCandidateNotSelectable, rev.Index, count)
+	}
+	playbackEnd, reserve, err := lineage.acceptedPlaybackWindow(rev, variant.FitPolicyID)
+	if err != nil {
+		return nil, err
+	}
+
+	// 6. The named waveform's actual committed bytes, re-probed and proven frame-exactly against
+	// the accepted playback window. This is the only evidence that can authorize the selection.
+	selected, err := s.resolveSelectionWaveform(ctx, in.AssetID, rev, kind, playbackEnd, in.ManualOverride)
+	if err != nil {
+		return nil, err
+	}
+
+	// 7. Build the successor variant and its acceptance evidence.
+	overrideID := uuid.NewString()
+	acceptedAt := time.Now().UTC()
+	evidence := acceptanceEvidence(itemID, overrideID, rev, selected, acceptedAt)
+	successor, err := promoteReviewUnit(variant, rev, selected, playbackEnd, reserve, evidence, lineage.eligible)
+	if err != nil {
+		return nil, err
+	}
+
+	// 8. Publish the successor against the exact base the operator saw. The claim is one
+	// statement, so a concurrent acceptance or a superseding synthesis moves the row first and
+	// this one is refused instead of overwriting another decision's promotion.
+	if err := s.commitReviewedCandidateSuccessor(ctx, successor, variant.CASHash); err != nil {
+		return nil, err
+	}
+	// The audit row is written after the successor exists: the successor is what releases audio,
+	// so an audit-only row (or none) can never publish media the operator did not select.
+	override := domain.ReviewOverride{
+		ID:             overrideID,
+		RunID:          runID,
+		JobID:          job.ID,
+		AssetID:        in.AssetID,
+		TargetLanguage: targetLang,
+		ReviewItemID:   itemID,
+		ItemType:       domain.ReviewItemTypeTTSOverrun,
+		Stage:          "dub_synthesize",
+		ItemIndex:      rev.Index,
+		SegmentID:      rev.SpeakerID,
+		Action:         string(domain.ReviewOverrideActionReviewedCandidate),
+		Reason:         selectionAuditReason(reason, selected),
+		Operator:       operator,
+		CreatedAt:      acceptedAt,
+	}
+	if err := s.db.SaveReviewOverride(ctx, override); err != nil {
+		return nil, fmt.Errorf("persist reviewed-candidate acceptance audit: %w", err)
+	}
+	if err := s.recordCorrectionStage(ctx, runID, "dub_synthesize", successor.CASHash); err != nil {
+		return nil, err
+	}
+
+	result := &AcceptReviewedCandidateResult{
+		AssetID:               in.AssetID,
+		RunID:                 runID,
+		JobID:                 job.ID,
+		TargetLanguage:        targetLang,
+		ReviewItemID:          itemID,
+		ReviewOverrideID:      overrideID,
+		DubSegmentsVariantCAS: successor.CASHash,
+		SelectedAudioSHA256:   selected.hash,
+		NaturalAudioSHA256:    selected.naturalHash,
+		Transformed:           selected.transformed,
+		QualityWaiver:         selected.qualityWaiver,
+		RemainingReviewCount:  len(successor.ReviewSegments),
+	}
+
+	// 9. Incomplete coverage: the run stays paused and no partial mix is produced.
+	if successor.OverallStatus != "PASS" {
+		result.CoverageComplete = false
+		result.RunPaused = true
+		result.Status = domain.ReviewItemStatusManualOverride
+		result.Message = fmt.Sprintf(
+			"accepted %s for fit unit %d; %d review unit(s) remain unresolved, so run %s stays paused and no partial mix was produced",
+			selected.hash, rev.Index, len(successor.ReviewSegments), runID)
+		return result, nil
+	}
+
+	// 10. Complete coverage: rebuild the actual affected descendants from the accepted waveform.
+	result.CoverageComplete = true
+	if err := s.rebuildSelectionDelivery(ctx, in, job, targetLang, successor, result); err != nil {
+		return nil, err
+	}
+	result.Status = domain.ReviewItemStatusAutoResolved
+	if result.Message == "" {
+		result.Message = fmt.Sprintf("accepted %s for fit unit %d and rebuilt the run's delivery from the accepted waveform", selected.hash, rev.Index)
+	}
+	return result, nil
+}
+
+// resolveSelectionLineage resolves and validates the pinned contract, policy and canonical source
+// lineage the acceptance must be proven against. Every mismatch is a refusal: an acceptance may
+// never stamp a changed text/voice/contract lineage as previously reviewed.
+func (s *ReviewService) resolveSelectionLineage(ctx context.Context, runID, assetID, targetLang string, variant *domain.DubSegmentsVariant) (*selectionLineage, error) {
+	if variant.SchemaVersion != domain.DubSegmentsSchemaVersion {
+		return nil, fmt.Errorf("%w: dubbing artifact uses stale schema %d", ErrReviewedCandidateStale, variant.SchemaVersion)
+	}
+	if variant.RunID != "" && variant.RunID != runID {
+		return nil, fmt.Errorf("%w: dubbing artifact belongs to run %s, not %s", ErrReviewedCandidateNotPending, variant.RunID, runID)
+	}
+
+	dubScriptIdx, err := s.db.GetDubScriptVariantIndexByRun(ctx, runID)
+	if err != nil || dubScriptIdx == nil || dubScriptIdx.CASHash == "" {
+		return nil, fmt.Errorf("%w: run %s pins no dub script artifact: %v", ErrReviewedCandidateNotPending, runID, err)
+	}
+	if variant.DubScriptVariantCAS != dubScriptIdx.CASHash {
+		return nil, fmt.Errorf("%w: dubbing artifact dub script lineage mismatch: artifact=%s run=%s",
+			ErrReviewedCandidateStale, variant.DubScriptVariantCAS, dubScriptIdx.CASHash)
+	}
+
+	transcriptCAS, err := resolveRunTranscriptCAS(ctx, s.db, runID, assetID, "reviewed-candidate selection")
+	if err != nil {
+		return nil, fmt.Errorf("resolve run transcript for reviewed-candidate selection: %w", err)
+	}
+	if transcriptCAS == "" || variant.TranscriptArtifactCAS != transcriptCAS {
+		return nil, fmt.Errorf("%w: dubbing artifact transcript lineage mismatch: artifact=%s run=%s",
+			ErrReviewedCandidateStale, variant.TranscriptArtifactCAS, transcriptCAS)
+	}
+
+	voiceIdx, err := s.db.GetVoiceAssignmentIndexByRunID(ctx, runID)
+	if err != nil || voiceIdx == nil || voiceIdx.CASHash == "" {
+		return nil, fmt.Errorf("%w: run %s pins no voice assignment: %v", ErrReviewedCandidateNotPending, runID, err)
+	}
+	if variant.VoiceAssignmentCAS != voiceIdx.CASHash {
+		return nil, fmt.Errorf("%w: dubbing artifact voice assignment lineage mismatch: artifact=%s run=%s",
+			ErrReviewedCandidateStale, variant.VoiceAssignmentCAS, voiceIdx.CASHash)
+	}
+
+	rolePlan, err := ResolveRunScopedAudioRolePlan(ctx, s.db, s.cas, assetID, runID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve run-scoped audio role plan for reviewed-candidate selection: %w", err)
+	}
+	if rolePlan == nil || rolePlan.CASHash == "" {
+		return nil, fmt.Errorf("%w: run %s pins no audio role plan", ErrReviewedCandidateNotPending, runID)
+	}
+	if variant.AudioRolePlanCAS != rolePlan.CASHash {
+		return nil, fmt.Errorf("%w: dubbing artifact audio role plan lineage mismatch: artifact=%s run=%s",
+			ErrReviewedCandidateStale, variant.AudioRolePlanCAS, rolePlan.CASHash)
+	}
+
+	fit := NewFitController()
+	if variant.FitConfig != nil {
+		fit = NewFitController(*variant.FitConfig)
+	}
+	if variant.FitPolicyID == "" || fit.policyID() != variant.FitPolicyID {
+		return nil, fmt.Errorf("%w: dubbing artifact fit policy %q is not the governing policy %q",
+			ErrReviewedCandidateStale, variant.FitPolicyID, fit.policyID())
+	}
+
+	transcript, err := loadPinnedTranscript(s.cas, variant.TranscriptArtifactCAS, assetID)
+	if err != nil {
+		// A transcript the acceptance cannot read is a lineage/storage failure of the pinned
+		// canonical source, not a candidate-waveform refusal: report the underlying error so the
+		// caller classifies it as the missing artifact or storage fault it is.
+		return nil, fmt.Errorf("read pinned transcript %s for run %s: %w", variant.TranscriptArtifactCAS, runID, err)
+	}
+	return &selectionLineage{
+		transcript:    transcript,
+		rolePlan:      rolePlan,
+		eligible:      eligibleSpeechBlocks(transcript, rolePlan),
+		fitController: fit,
+	}, nil
+}
+
+// acceptedPlaybackWindow recomputes the accepted playback window for one review unit from the
+// pinned canonical timeline and the governing fit policy, and proves the unit's recorded window
+// is still that policy's own answer. A window that the current policy would no longer resolve the
+// same way is not a window this acceptance may place audio into.
+func (l *selectionLineage) acceptedPlaybackWindow(rev domain.DubSegmentReview, fitPolicyID string) (int64, int64, error) {
+	var last domain.SpeechBlock
+	hasLast := false
+	for _, member := range rev.SpeechBlockIndices {
+		block, ok := l.eligible[member]
+		if !ok {
+			return 0, 0, fmt.Errorf("%w: fit unit %d references non-dub-eligible member %d", ErrReviewedCandidateNotSelectable, rev.Index, member)
+		}
+		if !hasLast || block.EndMs > last.EndMs {
+			last = block
+			hasLast = true
+		}
+	}
+	if !hasLast {
+		return 0, 0, fmt.Errorf("%w: fit unit %d carries no canonical source membership", ErrReviewedCandidateNotSelectable, rev.Index)
+	}
+	nextBoundary, err := playbackBoundaryForBlock(last.Index, last.StartMs, last.EndMs, l.transcript, l.rolePlan)
+	if err != nil {
+		return 0, 0, fmt.Errorf("%w: %v", ErrReviewedCandidateNotSelectable, err)
+	}
+	playbackEnd, reserve, policyID := l.fitController.ResolvePlaybackWindow(rev.EndMs, nextBoundary)
+	if policyID != fitPolicyID || playbackEnd != rev.DubPlaybackEndMs || reserve != rev.EffectiveReserveMs {
+		return 0, 0, fmt.Errorf("%w: fit unit %d recorded playback window end=%d reserve=%d, governing policy %s resolves end=%d reserve=%d",
+			ErrReviewedCandidateNotSelectable, rev.Index, rev.DubPlaybackEndMs, rev.EffectiveReserveMs, policyID, playbackEnd, reserve)
+	}
+	if playbackEnd <= rev.StartMs {
+		return 0, 0, fmt.Errorf("%w: fit unit %d has no positive accepted playback window", ErrReviewedCandidateNotSelectable, rev.Index)
+	}
+	return playbackEnd, reserve, nil
+}
+
+// resolveSelectionWaveform loads the named candidate's actual committed bytes, re-probes them and
+// proves the frame-exact fit the mixer will re-enforce. Advertisement, recorded duration evidence
+// and the tempo candidate's own flag are never the proof: the bytes are.
+func (s *ReviewService) resolveSelectionWaveform(
+	ctx context.Context,
+	assetID string,
+	rev domain.DubSegmentReview,
+	kind ReviewedCandidateKind,
+	playbackEndMs int64,
+	manualOverride bool,
+) (*selectedWaveform, error) {
+	if strings.TrimSpace(rev.AudioSHA256) == "" {
+		return nil, fmt.Errorf("%w: fit unit %d carries no retained natural waveform", ErrReviewedCandidateUnavailable, rev.Index)
+	}
+	out := &selectedWaveform{
+		hash:         rev.AudioSHA256,
+		audioCASPath: rev.AudioCASPath,
+		naturalHash:  rev.AudioSHA256,
+	}
+	if kind == ReviewedCandidateTransformed {
+		tc := rev.TempoCandidate
+		if tc == nil || strings.TrimSpace(tc.TransformedAudioSHA256) == "" {
+			return nil, fmt.Errorf("%w: fit unit %d has no transformed tempo candidate", ErrReviewedCandidateUnavailable, rev.Index)
+		}
+		if !manualOverride {
+			return nil, fmt.Errorf("%w: fit unit %d", ErrReviewedCandidateWaiverRequired, rev.Index)
+		}
+		if !tc.Selectable {
+			return nil, fmt.Errorf("%w: fit unit %d's transformed candidate is recorded as %s",
+				ErrReviewedCandidateNotSelectable, rev.Index, tc.Reason)
+		}
+		out.hash = strings.ToLower(strings.TrimSpace(tc.TransformedAudioSHA256))
+		// The transformed artifact is addressed by hash only; no machine-local path is published
+		// for it, so playback and this selection both resolve it through CAS.
+		out.audioCASPath = ""
+		out.transformed = true
+		out.qualityWaiver = true
+		out.tempoFactor = tc.Factor
+		out.tempoFilter = tc.Filter
+		out.tempoToolID = tc.ToolID
+		if tc.NaturalAudioSHA256 != "" && !strings.EqualFold(tc.NaturalAudioSHA256, rev.AudioSHA256) {
+			return nil, fmt.Errorf("%w: tempo candidate for fit unit %d was derived from %s, not the unit's retained waveform",
+				ErrReviewedCandidateUnavailable, rev.Index, tc.NaturalAudioSHA256)
+		}
+	}
+
+	reader, err := s.cas.Get(out.hash)
+	if err != nil {
+		return nil, fmt.Errorf("%w: read candidate waveform %s: %v", ErrReviewedCandidateUnavailable, out.hash, err)
+	}
+	audioBytes, readErr := io.ReadAll(reader)
+	reader.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("%w: read candidate waveform %s: %v", ErrReviewedCandidateUnavailable, out.hash, readErr)
+	}
+	sum := sha256.Sum256(audioBytes)
+	if !strings.EqualFold(hex.EncodeToString(sum[:]), out.hash) {
+		return nil, fmt.Errorf("%w: candidate waveform %s does not match its committed bytes", ErrReviewedCandidateUnavailable, out.hash)
+	}
+	samples, header, err := media.ExtractPCM16Samples(audioBytes)
+	if err != nil {
+		return nil, fmt.Errorf("%w: decode candidate waveform %s: %v", ErrReviewedCandidateUnavailable, out.hash, err)
+	}
+	if header.NumChannels == 0 || header.SampleRate == 0 || len(samples) == 0 {
+		return nil, fmt.Errorf("%w: candidate waveform %s is not valid 16-bit PCM audio", ErrReviewedCandidateUnavailable, out.hash)
+	}
+	out.measuredMs = int64(header.DurationMs)
+
+	// Prove the fit in the geometry the mixer will place: resample to the output rate first, then
+	// compare frame-exactly against the accepted window.
+	channels := int(header.NumChannels)
+	inRate := int(header.SampleRate)
+	outRate := inRate
+	if resolved := resolveMixOutputSampleRate(ctx, s.db, s.cas, assetID); resolved > 0 {
+		outRate = resolved
+	}
+	if outRate != inRate {
+		samples = media.ResamplePCM16(samples, inRate, channels, outRate, channels)
+	}
+	out.frames = int64(len(samples) / channels)
+	out.windowFrames = media.PlaybackWindowFrames(rev.StartMs, playbackEndMs, outRate)
+	if out.frames > out.windowFrames {
+		return nil, fmt.Errorf("%w: fit unit %d candidate %s measures %d frames, the accepted playback window holds %d frames (%dms..%dms at %dHz)",
+			ErrReviewedCandidateNotSelectable, rev.Index, out.hash, out.frames, out.windowFrames, rev.StartMs, playbackEndMs, outRate)
+	}
+	return out, nil
+}
+
+// promoteReviewUnit builds the successor variant: the accepted unit leaves ReviewSegments, becomes
+// a mixable segment backed by the accepted waveform and its matching accepted fit evidence, and
+// the acceptance is appended to the variant's own evidence. The original waveform reference, the
+// other units, the fit plans, the escalations and every source anchor are preserved untouched.
+func promoteReviewUnit(
+	variant *domain.DubSegmentsVariant,
+	rev domain.DubSegmentReview,
+	selected *selectedWaveform,
+	playbackEndMs, reserveMs int64,
+	evidence domain.AcceptedReviewCandidate,
+	eligible map[int]domain.SpeechBlock,
+) (*domain.DubSegmentsVariant, error) {
+	if variant == nil {
+		return nil, errors.New("dubbing artifact is required to promote a reviewed candidate")
+	}
+	next := *variant
+	next.Segments = slices.Clone(variant.Segments)
+	next.ReviewSegments = make([]domain.DubSegmentReview, 0, len(variant.ReviewSegments))
+	for _, unit := range variant.ReviewSegments {
+		if unit.Index == rev.Index {
+			continue
+		}
+		next.ReviewSegments = append(next.ReviewSegments, unit)
+	}
+	if len(next.ReviewSegments) == len(variant.ReviewSegments) {
+		return nil, fmt.Errorf("%w: fit unit %d is not unresolved in this dubbing artifact", ErrReviewedCandidateNotPending, rev.Index)
+	}
+
+	// The promoted unit's own fit evidence becomes an accepted plan, so the mixer's fit/playback
+	// contract check resolves the same window and membership the acceptance proved.
+	priorPlan := findFitPlan(variant, rev.Index)
+	promoted := domain.DubbingFitPlan{
+		SegmentIndex:       rev.Index,
+		SpeakerID:          rev.SpeakerID,
+		SlotDurationMs:     rev.SlotDurationMs,
+		MeasuredDurationMs: selected.measuredMs,
+		SpeedFactor:        1.0,
+		DubPlaybackEndMs:   playbackEndMs,
+		EffectiveReserveMs: reserveMs,
+		FitPolicyID:        variant.FitPolicyID,
+		CalibrationID:      rev.CalibrationID,
+		SpeechBlockIndices: slices.Clone(rev.SpeechBlockIndices),
+		Decision:           domain.FitActionAccept,
+		DecisionReason:     "OPERATOR_ACCEPTED_REVIEWED_CANDIDATE",
+	}
+	if priorPlan != nil {
+		promoted.UsableSlotMs = priorPlan.UsableSlotMs
+		promoted.SpeedFactor = priorPlan.SpeedFactor
+		promoted.NaturalGapMs = priorPlan.NaturalGapMs
+		promoted.AttemptCount = priorPlan.AttemptCount
+	}
+	if promoted.UsableSlotMs <= 0 {
+		promoted.UsableSlotMs = rev.SlotDurationMs
+	}
+	promoted.DurationDeltaMs = promoted.MeasuredDurationMs - promoted.UsableSlotMs
+
+	next.FitPlans = make([]domain.DubbingFitPlan, 0, len(variant.FitPlans)+1)
+	replaced := false
+	for _, plan := range variant.FitPlans {
+		if plan.SegmentIndex == rev.Index {
+			next.FitPlans = append(next.FitPlans, promoted)
+			replaced = true
+			continue
+		}
+		next.FitPlans = append(next.FitPlans, plan)
+	}
+	if !replaced {
+		next.FitPlans = append(next.FitPlans, promoted)
+	}
+
+	segment := domain.DubSegment{
+		Index:              rev.Index,
+		SpeechBlockIndices: slices.Clone(rev.SpeechBlockIndices),
+		SpeakerID:          rev.SpeakerID,
+		StartMs:            rev.StartMs,
+		EndMs:              rev.EndMs,
+		SlotDurationMs:     rev.SlotDurationMs,
+		SourceText:         rev.SourceText,
+		SpokenText:         rev.SpokenText,
+		AudioCASPath:       selected.audioCASPath,
+		AudioSHA256:        selected.hash,
+		MeasuredDurationMs: selected.measuredMs,
+		Voice:              rev.Voice,
+		FitDecision:        domain.FitActionAccept,
+		NaturalGapAfterMs:  promoted.NaturalGapMs,
+		DubPlaybackEndMs:   playbackEndMs,
+		EffectiveReserveMs: reserveMs,
+		CalibrationID:      rev.CalibrationID,
+	}
+	next.Segments = append(next.Segments, segment)
+	sort.SliceStable(next.Segments, func(i, j int) bool {
+		if next.Segments[i].StartMs == next.Segments[j].StartMs {
+			return next.Segments[i].Index < next.Segments[j].Index
+		}
+		return next.Segments[i].StartMs < next.Segments[j].StartMs
+	})
+
+	next.AcceptedCandidates = append(slices.Clone(variant.AcceptedCandidates), evidence)
+	next.OverallStatus = dubVariantStatus(&next, eligible)
+	next.CASHash = ""
+	return &next, nil
+}
+
+// dubVariantStatus recomputes a variant's overall status from its own units: it is PASS only when
+// every dub-eligible canonical block is covered by exactly one accepted segment and no review unit
+// remains. PASS is what authorizes the delivery rebuild, so the full coverage contract the mixer
+// will enforce is proven here rather than discovered inside the mix. It never invents PASS.
+func dubVariantStatus(variant *domain.DubSegmentsVariant, eligible map[int]domain.SpeechBlock) string {
+	if variant == nil || len(variant.Segments) == 0 || len(eligible) == 0 {
+		return "REVIEW_REQUIRED"
+	}
+	if len(variant.ReviewSegments) > 0 {
+		return "REVIEW_REQUIRED"
+	}
+	for _, seg := range variant.Segments {
+		if seg.RequiresReview || seg.FitDecision != domain.FitActionAccept {
+			return "REVIEW_REQUIRED"
+		}
+	}
+	covered := make(map[int]int, len(eligible))
+	for _, seg := range variant.Segments {
+		for _, member := range seg.SpeechBlockIndices {
+			if _, ok := eligible[member]; !ok {
+				// A foreign member is neither covered nor coverable: it is not a canonical
+				// dub-eligible block of this run's pinned source.
+				return "REVIEW_REQUIRED"
+			}
+			covered[member]++
+		}
+	}
+	for member := range eligible {
+		if covered[member] != 1 {
+			return "REVIEW_REQUIRED"
+		}
+	}
+	return "PASS"
+}
+
+// findFitPlan returns the fit evidence recorded for one fit unit index, or nil.
+func findFitPlan(variant *domain.DubSegmentsVariant, index int) *domain.DubbingFitPlan {
+	for i := range variant.FitPlans {
+		if variant.FitPlans[i].SegmentIndex == index {
+			return &variant.FitPlans[i]
+		}
+	}
+	return nil
+}
+
+// findReviewUnit returns the unresolved review unit with one fit unit index, or false.
+func findReviewUnit(variant *domain.DubSegmentsVariant, index int) (domain.DubSegmentReview, bool) {
+	for _, unit := range variant.ReviewSegments {
+		if unit.Index == index {
+			return unit, true
+		}
+	}
+	return domain.DubSegmentReview{}, false
+}
+
+// coverageCount counts how many units of a variant cover one fit unit index, so a duplicated or
+// missing unit is refused before it can be accepted.
+func coverageCount(variant *domain.DubSegmentsVariant, index int) int {
+	count := 0
+	for _, seg := range variant.Segments {
+		if seg.Index == index {
+			count++
+		}
+	}
+	for _, unit := range variant.ReviewSegments {
+		if unit.Index == index {
+			count++
+		}
+	}
+	return count
+}
+
+// dubReviewItemPrefix opens every dubbing review item identity.
+const dubReviewItemPrefix = "rev-dubseg-rev-"
+
+// dubReviewItemID is the one construction of a dubbing review item identity: the artifact CAS hash
+// it was projected from and the fit unit index it names. The projection and the parser share it, so
+// a change to the shape cannot leave one side minting an identity the other cannot read.
+func dubReviewItemID(variantCAS string, index int) string {
+	return fmt.Sprintf("%s%s-%d", dubReviewItemPrefix, variantCAS, index)
+}
+
+// parseDubReviewItemID parses the identity a dubbing review item carries: the artifact CAS hash it
+// was projected from and the fit unit index it names.
+func parseDubReviewItemID(itemID string) (variantCAS string, index int, ok bool) {
+	rest, ok := strings.CutPrefix(itemID, dubReviewItemPrefix)
+	if !ok {
+		return "", 0, false
+	}
+	sep := strings.LastIndex(rest, "-")
+	if sep <= 0 {
+		return "", 0, false
+	}
+	parsed, err := strconv.Atoi(rest[sep+1:])
+	if err != nil || parsed < 0 {
+		return "", 0, false
+	}
+	return rest[:sep], parsed, true
+}
+
+// selectionAuditReason records the operator's note together with the exact waveform contract that
+// was selected, so the audit row states what was accepted and not merely that something was.
+func selectionAuditReason(reason string, selected *selectedWaveform) string {
+	if !selected.transformed {
+		return reason + " [candidate=natural sha256=" + selected.hash + "]"
+	}
+	return fmt.Sprintf("%s [candidate=transformed sha256=%s manual_override quality waiver filter=%s factor=%s tool=%s]",
+		reason, selected.hash, selected.tempoFilter, strconv.FormatFloat(selected.tempoFactor, 'f', -1, 64), selected.tempoToolID)
+}
+
+// commitReviewedCandidateSuccessor publishes the successor variant and moves the run's dubbing
+// artifact row to it, but only while the row still names the exact base variant this acceptance
+// was derived from.
+func (s *ReviewService) commitReviewedCandidateSuccessor(ctx context.Context, successor *domain.DubSegmentsVariant, baseCAS string) error {
+	successor.CASHash = ""
+	data, err := json.Marshal(successor)
+	if err != nil {
+		return fmt.Errorf("marshal successor dub segments variant: %w", err)
+	}
+	obj, err := s.cas.Put(bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("store successor dub segments variant in CAS: %w", err)
+	}
+	successor.CASHash = obj.SHA256
+	claimed, err := s.db.ClaimDubSegmentsVariantIndexFromBase(ctx, storage.DubSegmentsVariantIndex{
+		ID:             successor.ID,
+		AssetID:        successor.AssetID,
+		RunID:          successor.RunID,
+		JobID:          successor.JobID,
+		TargetLanguage: successor.TargetLanguage,
+		CASHash:        successor.CASHash,
+		ProvenanceHash: successor.ProvenanceHash,
+		OverallStatus:  successor.OverallStatus,
+		CreatedAt:      successor.CreatedAt,
+	}, successor.VoiceAssignmentCAS, baseCAS)
+	if err != nil {
+		return fmt.Errorf("claim successor dub segments variant: %w", err)
+	}
+	if !claimed {
+		return fmt.Errorf("%w: run %s's dubbing artifact no longer holds %s", ErrReviewedCandidateConflict, successor.RunID, baseCAS)
+	}
+	return nil
+}
+
+// rebuildSelectionDelivery rebuilds the actual affected target descendants of a completed
+// acceptance and hands off under the run's own posture.
+//
+// Ordering is the safety property: the accepted successor is already the run's current dubbing
+// artifact, so a failure here leaves the run visibly mid-delivery (a queued delivery stage the
+// handoff refuses) instead of serving the superseded media. Retrying resumes from the stage that
+// failed through the existing stage records.
+func (s *ReviewService) rebuildSelectionDelivery(
+	ctx context.Context,
+	in AcceptReviewedCandidateInput,
+	job *domain.LocalizationJob,
+	targetLang string,
+	successor *domain.DubSegmentsVariant,
+	result *AcceptReviewedCandidateResult,
+) error {
+	// The accepted successor is already the run's dubbing artifact, so every preview/final the run
+	// currently serves was rendered from the delivery it just replaced. They are withdrawn before any
+	// of the new delivery exists: a rebuild can fail between its stages, and an artifact rendered from
+	// the superseded media must not stay servable as current while the accepted media is only partly
+	// published. The CAS blobs are immutable and stay; the index rows and stage pins are what make an
+	// artifact the one a reader resolves.
+	// A cancellation that lands while this rebuild runs does not change that: cancelling owns the
+	// run's lifecycle status and forbids a new acceptance into it, but nothing in the product
+	// withdraws media a run has already produced (the pipeline's own renders survive a cancel the
+	// same way), and what this rebuild publishes belongs to the delivery the operator accepted. The
+	// superseded rows are taken back either way, so a cancellation can never leave the replaced
+	// media servable.
+	if err := s.withdrawRunRenderArtifacts(ctx, successor.RunID, targetLang); err != nil {
+		return err
+	}
+	for _, stage := range []string{"render_preview", "render_final", "final_render_handoff"} {
+		if err := s.invalidateCorrectionStage(ctx, successor.RunID, stage); err != nil {
+			return err
+		}
+	}
+
+	dubMix, err := s.audioMixSvc.MixAudio(ctx, AudioMixInput{
+		RunID:                 successor.RunID,
+		JobID:                 job.ID,
+		AssetID:               in.AssetID,
+		TargetLanguage:        targetLang,
+		DubSegmentsCAS:        successor.CASHash,
+		ExecutionProfile:      in.ExecutionProfile,
+		AuthorizedCredentials: in.AuthorizedCredentials,
+	})
+	if err != nil {
+		// No mix was published from the superseded variant: take the stage record back so the
+		// run's delivery lineage stays refused until it is actually rebuilt.
+		if invErr := s.invalidateCorrectionStage(ctx, successor.RunID, "audio_mix"); invErr != nil {
+			return fmt.Errorf("rebuild dub mix from the accepted candidate: %v; record invalidated audio_mix stage: %w", err, invErr)
+		}
+		return fmt.Errorf("rebuild dub mix from the accepted candidate: %w", err)
+	}
+	result.DubMixCAS = dubMix.CASHash
+	if err := s.recordCorrectionStage(ctx, successor.RunID, "audio_mix", dubMix.CASHash); err != nil {
+		return err
+	}
+
+	plan, err := s.freezeRunRenderPlan(ctx, successor.RunID, job.ID, in.AssetID, targetLang, dubMix.CASHash)
+	if err != nil {
+		if invErr := s.invalidateCorrectionStage(ctx, successor.RunID, "render_plan"); invErr != nil {
+			return fmt.Errorf("rebuild render plan from the accepted mix: %v; record invalidated render_plan stage: %w", err, invErr)
+		}
+		return fmt.Errorf("rebuild render plan from the accepted mix: %w", err)
+	}
+	result.RenderPlanCAS = plan.CASHash
+	if err := s.recordCorrectionStage(ctx, successor.RunID, "render_plan", plan.CASHash); err != nil {
+		return err
+	}
+
+	// An index row is what makes a preview/final the artifact a reader resolves. The superseded ones
+	// were withdrawn before this rebuild started, so the preview rendered below is the only one the
+	// run can resolve.
+	preview, err := s.renderSvc.RenderPreview(ctx, RenderExecutionInput{
+		RunID:          successor.RunID,
+		JobID:          job.ID,
+		AssetID:        in.AssetID,
+		TargetLanguage: targetLang,
+		PlanProvenance: plan.ProvenanceHash,
+	})
+	if err != nil {
+		return fmt.Errorf("rebuild preview render from the accepted mix: %w", err)
+	}
+	result.PreviewRenderCAS = preview.CASHash
+	if err := s.recordCorrectionStage(ctx, successor.RunID, "render_preview", preview.CASHash); err != nil {
+		return err
+	}
+
+	// Posture and readiness are the run's own: auto mode starts the final render once the queue
+	// reaches zero, review mode exposes the explicit action and renders nothing.
+	posture, err := ResolveRunPosture(ctx, s.db, successor.RunID)
+	if err != nil {
+		return err
+	}
+	handoff, err := s.EvaluateFinalRenderHandoff(ctx, domain.FinalRenderHandoffInput{
+		AssetID:        in.AssetID,
+		RunID:          successor.RunID,
+		JobID:          job.ID,
+		TargetLanguage: targetLang,
+		Posture:        posture,
+	})
+	if err != nil {
+		return fmt.Errorf("final render handoff after accepted selection: %w", err)
+	}
+	result.HandoffAction = handoff.Action
+	result.HandoffMessage = handoff.Message
+	result.FinalRenderCAS = handoff.FinalRenderCAS
+	if err := s.recordHandoffStage(ctx, successor.RunID, posture, handoff); err != nil {
+		return err
+	}
+
+	if handoff.Action == "auto_render_started" {
+		// The acceptance resolves the park that held the run, so the paused entry is the one this
+		// gate admits; the terminal transition and its rollback are the shared ones.
+		if err := CompleteDeliveredRun(ctx, s.db, successor.RunID, true); err != nil {
+			return err
+		}
+		// The transition refuses a run that a cancellation or a recovery already took out of the
+		// active state, so the run's state is reported from what it really reached instead of being
+		// assumed: the rebuilt delivery is delivered either way, but a run that stopped on its own
+		// terms is never reported as completed by this acceptance.
+		entry, err := s.db.GetQueueEntryByRunID(ctx, successor.RunID)
+		if err != nil {
+			return fmt.Errorf("read run %s state after the accepted rebuild: %w", successor.RunID, err)
+		}
+		if entry.Status != domain.RunStatusCompleted {
+			result.Message = fmt.Sprintf("accepted candidate and rebuilt the run's delivery; the run is %s: %s",
+				entry.Status, handoff.Message)
+			return nil
+		}
+		result.RunCompleted = true
+		result.Message = "accepted candidate, rebuilt the run's delivery, and completed the run: " + handoff.Message
+		return nil
+	}
+	// Review posture renders nothing: the delivery is rebuilt and the run stays paused on the
+	// operator's explicit final-render start, so the result must not report it as released.
+	result.RunPaused = true
+	result.Message = fmt.Sprintf("accepted candidate and rebuilt the run's delivery; %s", handoff.Message)
+	return nil
+}
+
+// ResolveRunPosture resolves a run's frozen review posture from its config snapshot. It is the one
+// resolver of that contract: the host's own resolution and the service-side acceptance both call it,
+// so a run cannot be treated as one posture by the pipeline and another by an acceptance.
+func ResolveRunPosture(ctx context.Context, db *storage.DB, runID string) (domain.ReviewPosture, error) {
+	run, err := db.GetRun(ctx, runID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get run %s: %w", runID, err)
+	}
+	if run == nil || strings.TrimSpace(run.ConfigSnapshotJSON) == "" {
+		return domain.ReviewPostureAuto, nil
+	}
+	var cfg struct {
+		Posture       domain.ReviewPosture `json:"posture"`
+		ReviewPosture domain.ReviewPosture `json:"review_posture"`
+	}
+	if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
+		return "", fmt.Errorf("malformed run config snapshot JSON: %w", err)
+	}
+	p := cfg.Posture
+	if p == "" {
+		p = cfg.ReviewPosture
+	}
+	if p != "" {
+		if p != domain.ReviewPostureAuto && p != domain.ReviewPostureReview {
+			return "", fmt.Errorf("invalid run posture: %q", p)
+		}
+		return p, nil
+	}
+	return domain.ReviewPostureAuto, nil
+}
+
+// recordHandoffStage records the handoff outcome the way the run pipeline does: the result is
+// committed to CAS and the stage execution names it, so the run's own lineage describes the
+// delivery it reached.
+func (s *ReviewService) recordHandoffStage(ctx context.Context, runID string, posture domain.ReviewPosture, handoff *domain.FinalRenderHandoffResult) error {
+	if handoff == nil {
+		return nil
+	}
+	stageName := "render_final"
+	if posture == domain.ReviewPostureReview {
+		stageName = "final_render_handoff"
+	}
+	data, err := json.Marshal(handoff)
+	if err != nil {
+		return fmt.Errorf("marshal final render handoff result: %w", err)
+	}
+	obj, err := s.cas.Put(bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("persist final render handoff result to CAS: %w", err)
+	}
+	if obj.SHA256 == "" {
+		return errors.New("persisted final render handoff result produced empty CAS hash")
+	}
+	return s.recordCorrectionStage(ctx, runID, stageName, obj.SHA256)
+}
+
+// ErrRunCompletionTransition marks a failed write of the terminal run/job transition. Only that
+// case is the pipeline's to recover (it marks the run failed); a refusal to complete, and a failed
+// queue lookup, are different outcomes and are surfaced as they are.
+var ErrRunCompletionTransition = errors.New("run completion transition failed")
+
+// CompleteDeliveredRun finishes a run and its job at the end of a delivery that actually exists,
+// under the run's own queue gate. It is the one terminal transition both callers use - the pipeline
+// completes the running run whose handoff stage just succeeded, and an accepted reviewed-candidate
+// rebuild completes the run that was parked for the operator's decision - so the two cannot drift
+// on the gate, the job/queue order or the rollback, and a cancelled, interrupted, already-finished
+// or never-started run can never be promoted to a finished one.
+//
+// allowParked is the gate's one deliberate delta: the pipeline only ever completes a running run,
+// while an acceptance resolves the park that held it and therefore also completes a paused one.
+//
+// The job write comes before the queue transition so a failed write leaves the run unfinished with
+// the error surfaced, and a failed queue transition rolls the job back, instead of leaving a
+// completed job behind a live run.
+func CompleteDeliveredRun(ctx context.Context, db *storage.DB, runID string, allowParked bool) error {
+	if db == nil || strings.TrimSpace(runID) == "" {
+		return errors.New("database and run id are required to complete a run")
+	}
+	entry, err := db.GetQueueEntryByRunID(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("check queue status before completion for run %s: %w", runID, err)
+	}
+	switch entry.Status {
+	case domain.RunStatusRunning:
+	case domain.RunStatusPaused:
+		if !allowParked {
+			return nil
+		}
+	case domain.RunStatusCancelled, domain.RunStatusInterrupted:
+		return nil
+	default:
+		return fmt.Errorf("unexpected queue status %s before completion for run %s", entry.Status, runID)
+	}
+
+	jobID := strings.TrimSpace(entry.JobID)
+	if jobID == "" {
+		if run, err := db.GetRun(ctx, runID); err == nil && run != nil {
+			jobID = strings.TrimSpace(run.JobID)
+		}
+	}
+	// The job's status follows the work the run actually finished, not the queue transition. In
+	// Review posture the handoff stage is a readiness gate that stops at 'start_final_render' and
+	// renders nothing, so the job must stay open until the operator's explicit render succeeds. The
+	// posture is re-read here rather than assumed from the caller.
+	var priorJobStatus string
+	if jobID != "" {
+		posture, err := ResolveRunPosture(ctx, db, runID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("resolve posture before completing job %s of run %s: %w", jobID, runID, err)
+		}
+		if posture != domain.ReviewPostureReview {
+			if job, err := db.GetJob(ctx, jobID); err == nil && job != nil {
+				priorJobStatus = job.Status
+			}
+			if err := db.UpdateJobStatus(ctx, jobID, "completed"); err != nil {
+				return fmt.Errorf("complete job %s of run %s: %w", jobID, runID, err)
+			}
+		}
+	}
+	rollbackCompletedJob := func() error {
+		if jobID == "" || priorJobStatus == "" {
+			return nil // the posture kept the job open: there is nothing to undo
+		}
+		return db.UpdateJobStatus(ctx, jobID, priorJobStatus)
+	}
+
+	// The gate above only reads the status; this write is what it guards. The transition applies
+	// only while the run is still active, so a cancellation or recovery that lands in between
+	// refuses the completion instead of being overwritten by it.
+	applied, err := db.CompleteQueueEntryIfActive(ctx, runID, allowParked)
+	if err != nil {
+		if rollbackErr := rollbackCompletedJob(); rollbackErr != nil {
+			return fmt.Errorf("%w: %v (rolling job %s back to %s also failed: %v)",
+				ErrRunCompletionTransition, err, jobID, priorJobStatus, rollbackErr)
+		}
+		return fmt.Errorf("%w: %v", ErrRunCompletionTransition, err)
+	}
+	if !applied {
+		// The run left the active state under this completion: its own terminal status stands, so
+		// the job write is undone and the delivery is not reported as finished. This is a refusal,
+		// not a failure - the caller must not mark the run failed over another caller's decision.
+		if rollbackErr := rollbackCompletedJob(); rollbackErr != nil {
+			return fmt.Errorf("refuse completing run %s (no longer active): rolling job %s back to %s failed: %w",
+				runID, jobID, priorJobStatus, rollbackErr)
+		}
+	}
+	return nil
+}
+
+// withdrawRunRenderArtifacts withdraws the run's preview/final index rows while its delivery is
+// rebuilt from a newly accepted candidate. Every one of them was rendered from the delivery the
+// acceptance replaced, and the rebuild may fail between its stages, so none of them may stay
+// servable as current. The CAS blobs are immutable and stay; the index row is what makes an artifact
+// the one a reader resolves.
+func (s *ReviewService) withdrawRunRenderArtifacts(ctx context.Context, runID, targetLang string) error {
+	if strings.TrimSpace(runID) == "" {
+		return nil
+	}
+	indices, err := s.db.GetRenderArtifactIndicesByRun(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("read run %s render artifacts: %w", runID, err)
+	}
+	for _, idx := range indices {
+		if !strings.EqualFold(idx.TargetLanguage, targetLang) {
+			continue
+		}
+		if err := s.db.DeleteRenderArtifactIndex(ctx, idx.ProvenanceHash); err != nil {
+			return fmt.Errorf("withdraw superseded render artifact %s: %w", idx.ProvenanceHash, err)
+		}
+	}
+	return nil
+}
+
+// freezeRunRenderPlan re-freezes the run's render plan from the localized visual track the run
+// itself pinned, pinning the given dub mix. Shared by every correction that rebuilds the run's
+// delivery so they resolve the same cues the same way.
+func (s *ReviewService) freezeRunRenderPlan(ctx context.Context, runID, jobID, assetID, targetLang, dubMixCAS string) (*domain.RenderPlan, error) {
+	var cues []domain.SubtitleCue
+	visIdx, err := s.db.GetLocalizedVisualTrackIndexByRun(ctx, runID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return nil, fmt.Errorf("get run localized visual track index: %w", err)
+	}
+	if visIdx != nil && (visIdx.AssetID != assetID || !strings.EqualFold(visIdx.TargetLanguage, targetLang)) {
+		return nil, fmt.Errorf("localized visual track run binding mismatch for run %s", runID)
+	}
+	if visIdx != nil {
+		rc, err := s.cas.Get(visIdx.CASHash)
+		if err != nil {
+			return nil, fmt.Errorf("load localized visual track from CAS (%s): %w", visIdx.CASHash, err)
+		}
+		var visTrack domain.LocalizedVisualTrack
+		if err := json.NewDecoder(rc).Decode(&visTrack); err != nil {
+			rc.Close()
+			return nil, fmt.Errorf("decode localized visual track (%s): %w", visIdx.CASHash, err)
+		}
+		rc.Close()
+		cues = visTrack.SubtitleCues
+	}
+	plan, err := s.renderSvc.FreezeRenderPlan(ctx, RenderPlanInput{
+		RunID:          runID,
+		JobID:          jobID,
+		AssetID:        assetID,
+		TargetLanguage: targetLang,
+		DubMixCAS:      dubMixCAS,
+		SubtitleCues:   cues,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("freeze render plan: %w", err)
+	}
+	return plan, nil
+}
+
+// reportReplayedAcceptance answers a repeated identical selection from the evidence the successor
+// already carries: no new artifact, no duplicate override, and the run's current delivery state
+// as it stands.
+func (s *ReviewService) reportReplayedAcceptance(
+	ctx context.Context,
+	in AcceptReviewedCandidateInput,
+	runID, jobID, targetLang string,
+	variant *domain.DubSegmentsVariant,
+	existing domain.AcceptedReviewCandidate,
+) (*AcceptReviewedCandidateResult, error) {
+	// A successor can be complete in CAS while a retried request failed before its audit row was
+	// written. The audit row is part of the acceptance, so the replay completes it rather than
+	// reporting a decision history never recorded.
+	if err := s.ensureAcceptanceAudit(ctx, runID, in, targetLang, jobID, existing); err != nil {
+		return nil, err
+	}
+	// A first acceptance that claimed the successor and then failed before recording the run's
+	// dub_synthesize stage artifact leaves the run's index row on the accepted successor while the
+	// stage row still names the pre-acceptance variant - and the stage row is what a resumed run
+	// reads. The retry converges that state for the successor it just re-read from the run's own
+	// index before reporting on, or rebuilding from, that successor.
+	if err := s.RecordAcceptedDubbingArtifact(ctx, runID, variant.CASHash); err != nil {
+		return nil, err
+	}
+	result := &AcceptReviewedCandidateResult{
+		AssetID:               in.AssetID,
+		RunID:                 runID,
+		JobID:                 jobID,
+		TargetLanguage:        targetLang,
+		ReviewItemID:          existing.ReviewItemID,
+		ReviewOverrideID:      existing.ReviewOverrideID,
+		DubSegmentsVariantCAS: variant.CASHash,
+		SelectedAudioSHA256:   existing.SelectedAudioSHA256,
+		NaturalAudioSHA256:    existing.NaturalAudioSHA256,
+		Transformed:           existing.Transformed,
+		QualityWaiver:         existing.QualityWaiver,
+		RemainingReviewCount:  len(variant.ReviewSegments),
+		CoverageComplete:      variant.OverallStatus == "PASS",
+		Idempotent:            true,
+		Status:                domain.ReviewItemStatusAutoResolved,
+	}
+	// The queue entry is the authority for the run's own state: it may have finished, been paused,
+	// cancelled or interrupted since the original acceptance, and the replay reports that instead of
+	// assuming the acceptance's own outcome still stands. A cancelled or interrupted run is neither
+	// finished nor waiting on the operator, so it is never reported as a resumable pause.
+	entry, err := s.db.GetQueueEntryByRunID(ctx, runID)
+	if err != nil {
+		return nil, fmt.Errorf("read run %s queue entry for the replayed acceptance: %w", runID, err)
+	}
+	result.RunCompleted = entry.Status == domain.RunStatusCompleted
+	result.RunPaused = entry.Status == domain.RunStatusPaused
+	if !result.CoverageComplete {
+		result.Status = domain.ReviewItemStatusManualOverride
+		result.Message = fmt.Sprintf("review item %s was already accepted with waveform %s; %d review unit(s) remain unresolved and no partial mix was produced",
+			existing.ReviewItemID, existing.SelectedAudioSHA256, len(variant.ReviewSegments))
+		return result, nil
+	}
+
+	// Complete coverage means the run's delivery must be the one built from this successor. A
+	// rebuild that failed after the successor was published leaves an approved decision with no
+	// media, so the retry re-drives the rebuild through the same stages instead of reporting a
+	// delivery the run does not actually serve.
+	handoff, built := s.deliveryBuiltFrom(ctx, runID, variant)
+	if !built {
+		job, err := s.db.GetJob(ctx, jobID)
+		if err != nil {
+			return nil, fmt.Errorf("load job %s to re-drive the replayed acceptance's rebuild: %w", jobID, err)
+		}
+		if err := s.rebuildSelectionDelivery(ctx, in, job, targetLang, variant, result); err != nil {
+			return nil, err
+		}
+		result.Status = domain.ReviewItemStatusAutoResolved
+		result.Message = fmt.Sprintf("review item %s was already accepted with waveform %s; the interrupted delivery rebuild was re-driven: %s",
+			existing.ReviewItemID, existing.SelectedAudioSHA256, result.Message)
+		return result, nil
+	}
+
+	// The descendants and the handoff are read back from what the run recorded. A stage lookup
+	// failure is a storage fault, not "no delivery": reporting an empty artifact would tell the
+	// operator media exists when the store could not be read.
+	for _, stage := range []struct {
+		name string
+		into *string
+	}{
+		{"audio_mix", &result.DubMixCAS},
+		{"render_plan", &result.RenderPlanCAS},
+		{"render_preview", &result.PreviewRenderCAS},
+	} {
+		casHash, err := s.db.GetStageArtifactHash(ctx, runID, stage.name)
+		if err != nil {
+			return nil, fmt.Errorf("read run %s %s stage artifact: %w", runID, stage.name, err)
+		}
+		*stage.into = casHash
+	}
+	// The recorded decision states what the run reached, so the replay reports that and not a
+	// re-derivation: an Auto handoff released the run, while a Review handoff left it paused on the
+	// operator's explicit render.
+	result.FinalRenderCAS = handoff.FinalRenderCAS
+	result.HandoffAction = handoff.Action
+	result.HandoffMessage = handoff.Message
+	// An Auto handoff released the run, so the only thing the replay may still do is finish a terminal
+	// write that never landed. That write is attempted only from the statuses a completion admits: a
+	// run that is still queued (re-drained) or already cancelled/interrupted is reported as it is
+	// rather than forced through a transition of its own, and the guard is what admits the write.
+	if handoff.Action == "auto_render_started" && (entry.Status == domain.RunStatusRunning || entry.Status == domain.RunStatusPaused) {
+		if err := CompleteDeliveredRun(ctx, s.db, runID, true); err != nil {
+			return nil, err
+		}
+		if entry, err = s.db.GetQueueEntryByRunID(ctx, runID); err != nil {
+			return nil, fmt.Errorf("read run %s queue entry after completion: %w", runID, err)
+		}
+		result.RunCompleted = entry.Status == domain.RunStatusCompleted
+		result.RunPaused = entry.Status == domain.RunStatusPaused
+	}
+	result.Message = fmt.Sprintf("review item %s was already accepted with waveform %s; nothing was re-selected or rebuilt",
+		existing.ReviewItemID, existing.SelectedAudioSHA256)
+	return result, nil
+}
+
+// recordedFinalRenderHandoff reads the final-render handoff a run reached from its recorded result.
+// The stage names whichever posture froze the decision and the artifact carries the action it
+// decided, so a replay reports the decision that was actually made instead of re-deriving one from
+// which stages happen to hold artifacts.
+func (s *ReviewService) recordedFinalRenderHandoff(ctx context.Context, runID string) (*domain.FinalRenderHandoffResult, error) {
+	for _, stage := range []string{"render_final", "final_render_handoff"} {
+		casHash, err := s.db.GetStageArtifactHash(ctx, runID, stage)
+		if err != nil {
+			return nil, fmt.Errorf("read run %s %s stage artifact: %w", runID, stage, err)
+		}
+		if casHash == "" {
+			continue
+		}
+		rc, err := s.cas.Get(casHash)
+		if err != nil {
+			return nil, fmt.Errorf("read recorded %s handoff for run %s: %w", stage, runID, err)
+		}
+		var handoff domain.FinalRenderHandoffResult
+		decodeErr := json.NewDecoder(rc).Decode(&handoff)
+		rc.Close()
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode recorded %s handoff for run %s: %w", stage, runID, decodeErr)
+		}
+		return &handoff, nil
+	}
+	return nil, nil
+}
+
+// deliveryBuiltFrom reports whether the delivery the run serves was actually produced from this
+// variant, and returns the terminal handoff it recorded. The published mix must name the variant as
+// its source, the plan and preview the rebuild writes must still be present, and the final-render
+// decision must be recorded. That last condition is what tells a finished delivery apart from one
+// whose final render failed after the mix and preview were pinned: without it a retry would report
+// media the run never produced.
+func (s *ReviewService) deliveryBuiltFrom(ctx context.Context, runID string, variant *domain.DubSegmentsVariant) (*domain.FinalRenderHandoffResult, bool) {
+	mixIdx, err := s.db.GetDubMixArtifactIndexByRun(ctx, runID)
+	if err != nil || mixIdx == nil || mixIdx.CASHash == "" {
+		return nil, false
+	}
+	rc, err := s.cas.Get(mixIdx.CASHash)
+	if err != nil {
+		return nil, false
+	}
+	defer rc.Close()
+	var mix domain.DubMixArtifact
+	if err := json.NewDecoder(rc).Decode(&mix); err != nil {
+		return nil, false
+	}
+	if mix.DubSegmentsCAS != variant.CASHash {
+		return nil, false
+	}
+	for _, stage := range []string{"render_plan", "render_preview"} {
+		casHash, err := s.db.GetStageArtifactHash(ctx, runID, stage)
+		if err != nil || casHash == "" {
+			return nil, false
+		}
+	}
+	handoff, err := s.recordedFinalRenderHandoff(ctx, runID)
+	if err != nil || handoff == nil {
+		return nil, false
+	}
+	return handoff, true
+}
+
+// ensureAcceptanceAudit writes the acceptance audit row when a retried request finds the successor
+// already carries the evidence but the row is missing. It is keyed by the recorded override id, so
+// a replay never appends a duplicate decision.
+func (s *ReviewService) ensureAcceptanceAudit(
+	ctx context.Context,
+	runID string,
+	in AcceptReviewedCandidateInput,
+	targetLang, jobID string,
+	existing domain.AcceptedReviewCandidate,
+) error {
+	rows, err := s.db.GetReviewOverridesByRun(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("read run %s review overrides: %w", runID, err)
+	}
+	for _, row := range rows {
+		if row.ID == existing.ReviewOverrideID {
+			return nil
+		}
+	}
+	operator := strings.TrimSpace(in.Operator)
+	if operator == "" {
+		operator = "operator"
+	}
+	row := domain.ReviewOverride{
+		ID:             existing.ReviewOverrideID,
+		RunID:          runID,
+		JobID:          jobID,
+		AssetID:        in.AssetID,
+		TargetLanguage: targetLang,
+		ReviewItemID:   existing.ReviewItemID,
+		ItemType:       domain.ReviewItemTypeTTSOverrun,
+		Stage:          "dub_synthesize",
+		ItemIndex:      existing.ReviewSegmentIndex,
+		SegmentID:      existing.SpeakerID,
+		Action:         string(domain.ReviewOverrideActionReviewedCandidate),
+		Reason:         selectionAuditReason(strings.TrimSpace(in.Reason), selectedWaveformFromEvidence(existing)),
+		Operator:       operator,
+		CreatedAt:      existing.AcceptedAt,
+	}
+	if err := s.db.SaveReviewOverride(ctx, row); err != nil {
+		return fmt.Errorf("persist reviewed-candidate acceptance audit: %w", err)
+	}
+	return nil
+}
+
+// acceptanceEvidence is the one construction of an acceptance's persisted lineage from the waveform
+// the operator selected. Paired with selectedWaveformFromEvidence below, the artifact and the audit
+// sentence can never describe different bytes, because neither side lists the lineage fields again.
+func acceptanceEvidence(
+	itemID, overrideID string,
+	rev domain.DubSegmentReview,
+	selected *selectedWaveform,
+	acceptedAt time.Time,
+) domain.AcceptedReviewCandidate {
+	return domain.AcceptedReviewCandidate{
+		ReviewItemID:        itemID,
+		ReviewOverrideID:    overrideID,
+		ReviewSegmentIndex:  rev.Index,
+		SpeakerID:           rev.SpeakerID,
+		NaturalAudioSHA256:  selected.naturalHash,
+		SelectedAudioSHA256: selected.hash,
+		Transformed:         selected.transformed,
+		TempoFactor:         selected.tempoFactor,
+		TempoFilter:         selected.tempoFilter,
+		TempoToolID:         selected.tempoToolID,
+		QualityWaiver:       selected.qualityWaiver,
+		AcceptedAt:          acceptedAt,
+	}
+}
+
+// selectedWaveformFromEvidence rebuilds the selected waveform of a recorded acceptance, so a
+// replayed request can restate its audit sentence from the evidence alone.
+func selectedWaveformFromEvidence(evidence domain.AcceptedReviewCandidate) *selectedWaveform {
+	return &selectedWaveform{
+		hash:        evidence.SelectedAudioSHA256,
+		naturalHash: evidence.NaturalAudioSHA256,
+		transformed: evidence.Transformed,
+		tempoFactor: evidence.TempoFactor,
+		tempoFilter: evidence.TempoFilter,
+		tempoToolID: evidence.TempoToolID,
+	}
+}
+
 // TargetTextCorrectionInput defines parameters for inspector target text editing and targeted rerun.
 type TargetTextCorrectionInput struct {
 	RunID                 string                  `json:"run_id"`
@@ -431,6 +1865,32 @@ func (s *ReviewService) recordCorrectionStage(ctx context.Context, runID, stage,
 // any previously succeeded execution of this stage so a resumed run will not reuse stale artifacts.
 func (s *ReviewService) invalidateCorrectionStage(ctx context.Context, runID, stage string) error {
 	return s.recordStageExecution(ctx, runID, stage, domain.StageStatusQueued, "")
+}
+
+// RecordAcceptedDubbingArtifact records the run's dub_synthesize stage artifact as the accepted
+// successor the run currently carries, so the run's stage lineage names the artifact its mix is
+// built from rather than the variant the accepted candidate replaced.
+//
+// Two paths converge the same state. An acceptance that claimed its successor and then failed before
+// recording the stage artifact leaves the run's index row on the accepted successor while the stage
+// row still names the pre-acceptance variant: the retry re-records it there. A resumed run that
+// reuses the accepted successor its index row claims - because the pipeline's dubbing reuse reads
+// both records - converges it here, so the run's recorded lineage does not contradict the media it
+// published. A stage row that already names the artifact is left untouched: stage rows are
+// append-only evidence, and this only moves the run's own record forward to the artifact its index
+// row (the run's dubbing claim) resolves to.
+func (s *ReviewService) RecordAcceptedDubbingArtifact(ctx context.Context, runID, casHash string) error {
+	if strings.TrimSpace(casHash) == "" {
+		return nil
+	}
+	bound, err := s.db.GetStageArtifactHash(ctx, runID, "dub_synthesize")
+	if err != nil {
+		return fmt.Errorf("read run %s dub_synthesize stage artifact: %w", runID, err)
+	}
+	if strings.EqualFold(bound, casHash) {
+		return nil
+	}
+	return s.recordCorrectionStage(ctx, runID, "dub_synthesize", casHash)
 }
 
 // CorrectTargetText updates target text for a segment and triggers targeted rerun of only declared downstream descendants:
@@ -1017,41 +2477,11 @@ func (s *ReviewService) ReassignVoice(ctx context.Context, in VoiceReassignCorre
 	}
 	result.DubMixCAS = dubMix.CASHash
 
-	// 5. Refreeze RenderPlan. in.RunID is guaranteed populated by step 1 (the
-	// legacy route adopts the resolved variant's run), so the visual track must
-	// always resolve run-bound: an asset-scoped lookup here would let a newer
+	// 5. Refreeze RenderPlan from the run's own pinned visual track. in.RunID is guaranteed
+	// populated by step 1 (the legacy route adopts the resolved variant's run), so the visual
+	// track must always resolve run-bound: an asset-scoped lookup here would let a newer
 	// track from another run bleed its cues into the regenerated plan.
-	var cues []domain.SubtitleCue
-	var visIdx *storage.LocalizedVisualTrackIndex
-	visIdx, err = s.db.GetLocalizedVisualTrackIndexByRun(ctx, in.RunID)
-	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return nil, fmt.Errorf("get run localized visual track index: %w", err)
-	}
-	if visIdx != nil && (visIdx.AssetID != in.AssetID || !strings.EqualFold(visIdx.TargetLanguage, in.TargetLanguage)) {
-		return nil, fmt.Errorf("localized visual track run binding mismatch for run %s", in.RunID)
-	}
-	if visIdx != nil {
-		rc, err := s.cas.Get(visIdx.CASHash)
-		if err != nil {
-			return nil, fmt.Errorf("load localized visual track from CAS (%s): %w", visIdx.CASHash, err)
-		}
-		var visTrack domain.LocalizedVisualTrack
-		if err := json.NewDecoder(rc).Decode(&visTrack); err != nil {
-			rc.Close()
-			return nil, fmt.Errorf("decode localized visual track (%s): %w", visIdx.CASHash, err)
-		}
-		rc.Close()
-		cues = visTrack.SubtitleCues
-	}
-	planIn := RenderPlanInput{
-		RunID:          in.RunID,
-		JobID:          in.JobID,
-		AssetID:        in.AssetID,
-		TargetLanguage: in.TargetLanguage,
-		DubMixCAS:      dubMix.CASHash,
-		SubtitleCues:   cues,
-	}
-	rPlan, err := s.renderSvc.FreezeRenderPlan(ctx, planIn)
+	rPlan, err := s.freezeRunRenderPlan(ctx, in.RunID, in.JobID, in.AssetID, in.TargetLanguage, dubMix.CASHash)
 	if err != nil {
 		return nil, fmt.Errorf("freeze render plan rerun failed: %w", err)
 	}
@@ -1637,53 +3067,20 @@ func (s *ReviewService) staleDeliveryLineage(ctx context.Context, assetID, targe
 	if err != nil {
 		return "", fmt.Errorf("read run %s delivery lineage: %w", runID, err)
 	}
-	// ListStageExecutions is ordered by creation, so the last row per stage is its newest attempt.
-	newest := make(map[string]domain.StageExecution, len(finalRenderDeliveryStages))
-	for _, se := range stages {
-		for _, stage := range finalRenderDeliveryStages {
-			if se.Stage == stage {
-				newest[stage] = se
-			}
-		}
-	}
+	newest := newestStageExecutions(stages, finalRenderDeliveryStages)
 	for _, stage := range finalRenderDeliveryStages {
 		if se, ok := newest[stage]; ok && se.Status == domain.StageStatusQueued {
 			return fmt.Sprintf("final render handoff refused: a correction invalidated the run's %s artifact and the run has not rebuilt it yet; resume the run to re-freeze the corrected lineage before final render", stage), nil
 		}
 	}
 
-	mixCAS := ""
-	if se, ok := newest["audio_mix"]; ok && se.Status == domain.StageStatusSucceeded {
-		mixCAS = strings.TrimSpace(se.ArtifactSHA256)
+	mixCAS, err := s.runDubMixCAS(ctx, runID, newest)
+	if err != nil {
+		return "", err
 	}
-	if mixCAS == "" {
-		idx, err := s.db.GetDubMixArtifactIndexByRun(ctx, runID)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return "", fmt.Errorf("read run %s dub mix lineage: %w", runID, err)
-		}
-		if idx != nil {
-			mixCAS = strings.TrimSpace(idx.CASHash)
-		}
-	}
-
-	planCAS := ""
-	if se, ok := newest["render_plan"]; ok && se.Status == domain.StageStatusSucceeded {
-		planCAS = strings.TrimSpace(se.ArtifactSHA256)
-	}
-	if planCAS == "" {
-		// The run's own render-plan index row is the only other lineage evidence: an asset-latest plan
-		// belongs to whichever run wrote it last and cannot stand in for this run's lineage (#153).
-		idx, err := s.db.GetRenderPlanIndexByRun(ctx, runID)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return "", fmt.Errorf("read run %s render plan lineage: %w", runID, err)
-		}
-		if idx != nil {
-			if idx.AssetID != assetID || !strings.EqualFold(idx.TargetLanguage, targetLang) {
-				return "", fmt.Errorf("run %s render plan lineage belongs to asset %s language %s, not %s/%s",
-					runID, idx.AssetID, idx.TargetLanguage, assetID, targetLang)
-			}
-			planCAS = strings.TrimSpace(idx.CASHash)
-		}
+	planCAS, err := s.runRenderPlanCAS(ctx, assetID, targetLang, runID, newest)
+	if err != nil {
+		return "", err
 	}
 	if mixCAS == "" {
 		return "", nil
@@ -1695,19 +3092,212 @@ func (s *ReviewService) staleDeliveryLineage(ctx context.Context, assetID, targe
 		return fmt.Sprintf("final render handoff refused: run %s has no render plan in its own lineage; re-freeze the render plan from its current dub mix before final render", runID), nil
 	}
 
-	rc, err := s.cas.Get(planCAS)
+	plan, err := s.loadRenderPlan(ctx, planCAS)
 	if err != nil {
-		return "", fmt.Errorf("read render plan %s for handoff lineage: %w", planCAS, err)
-	}
-	defer rc.Close()
-	var plan domain.RenderPlan
-	if err := json.NewDecoder(rc).Decode(&plan); err != nil {
-		return "", fmt.Errorf("decode render plan %s for handoff lineage: %w", planCAS, err)
+		return "", err
 	}
 	if plan.DubMixCASHash != "" && plan.DubMixCASHash != mixCAS {
 		return fmt.Sprintf("final render handoff refused: render plan %s still pins dub mix %s but the run's current dub mix is %s; re-freeze the render plan from the corrected mix before final render", planCAS, plan.DubMixCASHash, mixCAS), nil
 	}
 	return "", nil
+}
+
+// newestStageExecutions indexes the newest attempt recorded for each named stage.
+// ListStageExecutions is ordered by creation, so the last row per stage is its newest attempt.
+func newestStageExecutions(stages []domain.StageExecution, names []string) map[string]domain.StageExecution {
+	newest := make(map[string]domain.StageExecution, len(names))
+	for _, se := range stages {
+		for _, stage := range names {
+			if se.Stage == stage {
+				newest[stage] = se
+			}
+		}
+	}
+	return newest
+}
+
+// runDubMixCAS resolves the dub mix artifact the run's delivery holds: the artifact its newest mix
+// stage recorded, else the artifact its own mix index row carries. "" means the run holds no mix of
+// its own. Only this run's evidence is read - an asset-latest mix belongs to whichever run wrote it
+// last (#153).
+func (s *ReviewService) runDubMixCAS(ctx context.Context, runID string, newest map[string]domain.StageExecution) (string, error) {
+	if se, ok := newest["audio_mix"]; ok && se.Status == domain.StageStatusSucceeded {
+		if casHash := strings.TrimSpace(se.ArtifactSHA256); casHash != "" {
+			return casHash, nil
+		}
+	}
+	idx, err := s.db.GetDubMixArtifactIndexByRun(ctx, runID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return "", fmt.Errorf("read run %s dub mix lineage: %w", runID, err)
+	}
+	if idx == nil {
+		return "", nil
+	}
+	return strings.TrimSpace(idx.CASHash), nil
+}
+
+// runRenderPlanCAS resolves the render plan artifact the run's delivery holds: the artifact its
+// newest plan stage recorded, else the artifact its own plan index row carries. "" means the run
+// holds no plan of its own. The index row is checked against the requested asset and language,
+// because a row that belongs to another pairing is not this run's lineage.
+func (s *ReviewService) runRenderPlanCAS(ctx context.Context, assetID, targetLang, runID string, newest map[string]domain.StageExecution) (string, error) {
+	if se, ok := newest["render_plan"]; ok && se.Status == domain.StageStatusSucceeded {
+		if casHash := strings.TrimSpace(se.ArtifactSHA256); casHash != "" {
+			return casHash, nil
+		}
+	}
+	// The run's own render-plan index row is the only other lineage evidence: an asset-latest plan
+	// belongs to whichever run wrote it last and cannot stand in for this run's lineage (#153).
+	idx, err := s.db.GetRenderPlanIndexByRun(ctx, runID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return "", fmt.Errorf("read run %s render plan lineage: %w", runID, err)
+	}
+	if idx == nil {
+		return "", nil
+	}
+	if idx.AssetID != assetID || !strings.EqualFold(idx.TargetLanguage, targetLang) {
+		return "", fmt.Errorf("run %s render plan lineage belongs to asset %s language %s, not %s/%s",
+			runID, idx.AssetID, idx.TargetLanguage, assetID, targetLang)
+	}
+	return strings.TrimSpace(idx.CASHash), nil
+}
+
+// AcceptedDubbingArtifact returns the artifact the run's own dub-segments index row claims for this
+// asset and language when that claim carries accepted reviewed-candidate evidence, and "" when the
+// run holds no such claim.
+//
+// A run keeps two records of its dubbing stage: the stage artifact its dub_synthesize row pins, which
+// the pipeline reuses, and the index row an acceptance moves to the successor it released. An
+// acceptance commits that claim first and records the stage artifact after it, so a failure in
+// between leaves the stage row naming the variant the accepted candidate replaced. The index row is
+// the run's dubbing artifact everywhere else - the acceptance admission resolves the run's artifact
+// through it and so does the portable bundle export - so a resumed run takes the accepted claim
+// rather than the superseded pin. The caller still validates the returned artifact against the run's
+// current contracts before reusing it, and a row that carries no acceptance is never preferred: a run
+// whose review items were all auto-passed resumes exactly as before.
+func (s *ReviewService) AcceptedDubbingArtifact(ctx context.Context, runID, assetID, targetLang string) (string, error) {
+	if s.db == nil || strings.TrimSpace(runID) == "" {
+		return "", nil
+	}
+	idx, err := s.db.GetDubSegmentsVariantIndexByRun(ctx, runID)
+	if errors.Is(err, storage.ErrNotFound) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read run %s dubbing claim: %w", runID, err)
+	}
+	if idx == nil || strings.TrimSpace(idx.CASHash) == "" {
+		return "", nil
+	}
+	if idx.AssetID != assetID || !strings.EqualFold(idx.TargetLanguage, targetLang) {
+		return "", nil
+	}
+	variant, err := s.loadRunDubbingVariant(idx, assetID, targetLang)
+	if err != nil {
+		return "", err
+	}
+	if len(variant.AcceptedCandidates) == 0 {
+		return "", nil
+	}
+	return strings.TrimSpace(idx.CASHash), nil
+}
+
+// ReconcileDeliveryLineage makes the run's published delivery records consistent with the dubbing
+// artifact a resumed run is about to deliver, reporting whether it had to supersede any of them.
+//
+// The mix, render plan and preview a run holds are records of the dubbing artifact they were built
+// from, and the pipeline reuses them through their stage rows without reading the lineage they name.
+// An acceptance moves the run's dubbing artifact to its accepted successor and rebuilds the delivery
+// from it; a run resumed in the middle of that rebuild - or before it started - still records the
+// replaced variant's mix and plan, so resuming would render and publish media the operator's
+// acceptance superseded. A delivery that does not name dubSegmentsCAS is therefore withdrawn and its
+// stages invalidated, exactly as an acceptance withdraws the delivery it is about to rebuild, so the
+// resumed run rebuilds the delivery from the artifact it now holds. A run whose delivery already
+// names that artifact, or that published no delivery of its own, is left untouched.
+//
+// The invalidation is durable, but the caller has already read the run's stage rows for its own reuse
+// decisions: a true return means those decisions describe superseded artifacts and the caller must
+// recompute the delivery in this execution too, not only in the next one.
+func (s *ReviewService) ReconcileDeliveryLineage(ctx context.Context, runID, assetID, targetLang, dubSegmentsCAS string) (bool, error) {
+	if s.db == nil || strings.TrimSpace(runID) == "" || strings.TrimSpace(dubSegmentsCAS) == "" {
+		return false, nil
+	}
+	stages, err := s.db.ListStageExecutions(ctx, runID)
+	if err != nil {
+		return false, fmt.Errorf("read run %s delivery lineage: %w", runID, err)
+	}
+	newest := newestStageExecutions(stages, finalRenderDeliveryStages)
+	mixCAS, err := s.runDubMixCAS(ctx, runID, newest)
+	if err != nil {
+		return false, err
+	}
+	planCAS, err := s.runRenderPlanCAS(ctx, assetID, targetLang, runID, newest)
+	if err != nil {
+		return false, err
+	}
+	superseded := false
+	if mixCAS != "" {
+		mix, err := s.loadDubMixArtifact(ctx, mixCAS)
+		if err != nil {
+			return false, err
+		}
+		superseded = !strings.EqualFold(strings.TrimSpace(mix.DubSegmentsCAS), dubSegmentsCAS)
+	}
+	if !superseded && planCAS != "" {
+		plan, err := s.loadRenderPlan(ctx, planCAS)
+		if err != nil {
+			return false, err
+		}
+		// The same contract the final render handoff enforces: a plan that pins another mix would
+		// render media from it, so it is re-frozen from the mix the run now holds.
+		superseded = plan.DubMixCASHash != "" && !strings.EqualFold(plan.DubMixCASHash, mixCAS)
+	}
+	if !superseded {
+		return false, nil
+	}
+	if err := s.withdrawRunRenderArtifacts(ctx, runID, targetLang); err != nil {
+		return false, err
+	}
+	for _, stage := range supersededDeliveryStages {
+		if err := s.invalidateCorrectionStage(ctx, runID, stage); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// supersededDeliveryStages name the run stages a delivery artifact that was built from a replaced
+// dubbing artifact is invalidated in: the accepted successor moves the dubbing artifact, so the mix,
+// render plan and preview derived from the replaced one are rebuilt, and the final render and handoff
+// stage rows are cleared with them.
+var supersededDeliveryStages = []string{"audio_mix", "render_plan", "render_preview", "render_final", "final_render_handoff"}
+
+// loadDubMixArtifact reads and decodes one dub mix artifact.
+func (s *ReviewService) loadDubMixArtifact(ctx context.Context, casHash string) (*domain.DubMixArtifact, error) {
+	rc, err := s.cas.Get(casHash)
+	if err != nil {
+		return nil, fmt.Errorf("read dub mix %s: %w", casHash, err)
+	}
+	defer rc.Close()
+	var mix domain.DubMixArtifact
+	if err := json.NewDecoder(rc).Decode(&mix); err != nil {
+		return nil, fmt.Errorf("decode dub mix %s: %w", casHash, err)
+	}
+	return &mix, nil
+}
+
+// loadRenderPlan reads and decodes one render plan artifact.
+func (s *ReviewService) loadRenderPlan(ctx context.Context, casHash string) (*domain.RenderPlan, error) {
+	rc, err := s.cas.Get(casHash)
+	if err != nil {
+		return nil, fmt.Errorf("read render plan %s: %w", casHash, err)
+	}
+	defer rc.Close()
+	var plan domain.RenderPlan
+	if err := json.NewDecoder(rc).Decode(&plan); err != nil {
+		return nil, fmt.Errorf("decode render plan %s: %w", casHash, err)
+	}
+	return &plan, nil
 }
 
 // ProjectReviewItems collects and projects all actionable review exceptions for a given asset and target language.
@@ -1853,14 +3443,23 @@ func (s *ReviewService) OpenRunDubMedia(ctx context.Context, runID, rawHash stri
 }
 
 // dubVariantOwnsAudioHash reports whether hash is one of the variant's committed audio
-// references: a selected segment waveform, a review segment's retained natural waveform, or
-// either side of its tempo candidate.
+// references: a selected segment waveform, a review segment's retained natural waveform, either
+// side of its tempo candidate, or either side of an accepted reviewed candidate (#157). The last
+// one is what keeps a promoted unit's own retained natural parent playable and auditable after the
+// acceptance: the unit leaves ReviewSegments, so the acceptance evidence is the only remaining
+// reference to the bytes the operator compared against.
 func dubVariantOwnsAudioHash(variant *domain.DubSegmentsVariant, hash string) bool {
 	if variant == nil || hash == "" {
 		return false
 	}
 	if slices.ContainsFunc(variant.Segments, func(seg domain.DubSegment) bool {
 		return strings.EqualFold(seg.AudioSHA256, hash)
+	}) {
+		return true
+	}
+	if slices.ContainsFunc(variant.AcceptedCandidates, func(accepted domain.AcceptedReviewCandidate) bool {
+		return strings.EqualFold(accepted.SelectedAudioSHA256, hash) ||
+			strings.EqualFold(accepted.NaturalAudioSHA256, hash)
 	}) {
 		return true
 	}
@@ -2267,7 +3866,7 @@ func (s *ReviewService) projectAllReviewItems(ctx context.Context, assetID, targ
 				}
 			}
 			items = append(items, domain.ReviewItem{
-				ID:             fmt.Sprintf("rev-dubseg-rev-%s-%d", dubSegIdx.CASHash, rev.Index),
+				ID:             dubReviewItemID(dubSegIdx.CASHash, rev.Index),
 				RunID:          dsVar.RunID,
 				AssetID:        assetID,
 				JobID:          dsVar.JobID,

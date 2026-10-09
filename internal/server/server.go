@@ -430,85 +430,29 @@ func (s *Server) shouldContinueRun(ctx context.Context, runID string) (bool, err
 	}
 }
 
-func (s *Server) resolveRunPosture(ctx context.Context, runID string) (domain.ReviewPosture, error) {
-	run, err := s.db.GetRun(ctx, runID)
-	if err != nil {
-		return "", fmt.Errorf("failed to get run %s: %w", runID, err)
-	}
-	if run == nil || strings.TrimSpace(run.ConfigSnapshotJSON) == "" {
-		return domain.ReviewPostureAuto, nil
-	}
-	var cfg struct {
-		Posture       domain.ReviewPosture `json:"posture"`
-		ReviewPosture domain.ReviewPosture `json:"review_posture"`
-	}
-	if err := json.Unmarshal([]byte(run.ConfigSnapshotJSON), &cfg); err != nil {
-		return "", fmt.Errorf("malformed run config snapshot JSON: %w", err)
-	}
-	p := cfg.Posture
-	if p == "" {
-		p = cfg.ReviewPosture
-	}
-	if p != "" {
-		if p != domain.ReviewPostureAuto && p != domain.ReviewPostureReview {
-			return "", fmt.Errorf("invalid run posture: %q", p)
-		}
-		return p, nil
-	}
-	return domain.ReviewPostureAuto, nil
-}
-
 func (s *Server) completeRunSafely(ctx context.Context, runID string) error {
 	s.activeRunMu.Lock()
 	defer s.activeRunMu.Unlock()
 
 	lookupCtx := context.WithoutCancel(ctx)
-	entry, err := s.db.GetQueueEntryByRunID(lookupCtx, runID)
-	if err != nil {
-		return fmt.Errorf("check queue status before completion for run %s: %w", runID, err)
-	}
-	switch entry.Status {
-	case domain.RunStatusRunning:
-		// The job's status follows the work the run actually finished, not the queue transition.
-		// In Review posture the handoff stage is a readiness gate that stops at 'start_final_render'
-		// and renders nothing, so the job must stay open until the operator's explicit render succeeds
-		// (handleRenderFinal finishes it through completeJobAfterExplicitFinalRender).
-		// In Auto posture, final render was executed automatically during the handoff, so the job is
-		// completed here.
-		//
-		// The job write comes before the queue transition so a failed write leaves the run unfinished
-		// with the error surfaced, instead of a run that reports completion while its job is left behind.
-		// If the subsequent queue transition fails, we roll back the job status to prevent divergence.
-		var priorJobStatus string
-		if entry.JobID != "" {
-			posture, err := s.resolveRunPosture(lookupCtx, runID)
-			if err != nil && !errors.Is(err, storage.ErrNotFound) {
-				return fmt.Errorf("resolve posture before completing job %s of run %s: %w", entry.JobID, runID, err)
-			}
-			if posture != domain.ReviewPostureReview {
-				if job, err := s.db.GetJob(lookupCtx, entry.JobID); err == nil && job != nil {
-					priorJobStatus = job.Status
-				}
-				if err := s.db.UpdateJobStatus(lookupCtx, entry.JobID, "completed"); err != nil {
-					return fmt.Errorf("complete job %s of run %s: %w", entry.JobID, runID, err)
-				}
-			}
-		}
-		if err := s.db.UpdateQueueStatus(lookupCtx, runID, domain.RunStatusCompleted, domain.RunStatusCompleted); err != nil {
-			if entry.JobID != "" && priorJobStatus != "" {
-				_ = s.db.UpdateJobStatus(lookupCtx, entry.JobID, priorJobStatus)
-			}
-			if failErr := s.failRun(lookupCtx, runID, "run_completion", fmt.Sprintf("failed to mark run completed: %v", err)); failErr != nil {
-				return fmt.Errorf("complete run failed: %v (failRun error: %w)", err, failErr)
-			}
-			return fmt.Errorf("complete run failed: %w", err)
-		}
+	// The terminal transition is service.CompleteDeliveredRun, the same one an accepted
+	// reviewed-candidate rebuild uses, so the pipeline and the acceptance cannot drift on the queue
+	// gate, the job/queue order or the rollback. The pipeline only ever completes a running run, so
+	// it passes the running-only gate.
+	err := service.CompleteDeliveredRun(lookupCtx, s.db, runID, false)
+	if err == nil {
 		return nil
-	case domain.RunStatusPaused, domain.RunStatusCancelled, domain.RunStatusInterrupted:
-		return nil
-	default:
-		return fmt.Errorf("unexpected queue status %s before completion for run %s", entry.Status, runID)
 	}
+	// Only a failed transition write is this caller's to recover - it marks the run failed so the
+	// divergence is visible instead of a run that reports completion while its job is left behind.
+	// A refusal to complete, and a failed queue lookup, are surfaced as they are.
+	if !errors.Is(err, service.ErrRunCompletionTransition) {
+		return err
+	}
+	if failErr := s.failRun(lookupCtx, runID, "run_completion", fmt.Sprintf("failed to mark run completed: %v", err)); failErr != nil {
+		return fmt.Errorf("complete run failed: %v (failRun error: %w)", err, failErr)
+	}
+	return fmt.Errorf("complete run failed: %w", err)
 }
 
 // completeJobAfterExplicitFinalRender finishes the job a completed run left open for the operator's
@@ -650,7 +594,7 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 	}
 
 	// Validate run config snapshot and posture fail-closed
-	posture, err := s.resolveRunPosture(ctx, runID)
+	posture, err := service.ResolveRunPosture(ctx, s.db, runID)
 	if err != nil {
 		return s.failRun(ctx, runID, "run_config", err.Error())
 	}
@@ -1073,37 +1017,80 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		}
 
 		// 2e. TTS / Dub Synthesis (T14)
+		// A run keeps two records of this stage: the artifact its stage row pins, which the reuse below
+		// reads, and the index row an acceptance moves to the successor it released. The acceptance
+		// commits the claim first and records the stage artifact after it, so a failure in between
+		// leaves the stage row naming the variant the accepted candidate replaced. The index row is the
+		// run's dubbing artifact everywhere else - the acceptance admission and the portable bundle
+		// export both resolve the run through it - so the accepted claim is tried first and a resumed
+		// run continues on the operator's selection instead of re-parking on superseded media. Every
+		// candidate is validated exactly like the pinned artifact, so a claim that no longer matches the
+		// run's contracts falls back to the pin, or to a fresh synthesis, rather than releasing audio
+		// the run's current lineage does not own.
+		dubbingInput := domain.DubbingJobInput{
+			RunID: runID, AssetID: assetID, JobID: jobID, TargetLanguage: targetLang,
+			DubScriptVariantCAS: dubScriptVariant.CASHash, VoiceAssignmentCAS: voiceAssignment.CASHash,
+			TranscriptArtifactCAS: transcriptArtifact.CASHash,
+		}
+		acceptedCAS := ""
+		if s.reviewSvc != nil {
+			casHash, err := s.reviewSvc.AcceptedDubbingArtifact(ctx, runID, assetID, targetLang)
+			if err != nil {
+				return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("resolve the run's accepted dubbing artifact: %v", err))
+			}
+			acceptedCAS = casHash
+		}
+		pinCAS := ""
 		if reusable, casHash := isStageReusable("dub_synthesize"); reusable {
-			if s.casStore != nil && s.dubbingSvc != nil {
-				rc, err := s.casStore.Get(casHash)
-				if err == nil {
-					var dv domain.DubSegmentsVariant
-					if err := json.NewDecoder(rc).Decode(&dv); err == nil && s.dubbingSvc.CanReuseVariant(ctx, domain.DubbingJobInput{
-						RunID: runID, AssetID: assetID, JobID: jobID, TargetLanguage: targetLang,
-						DubScriptVariantCAS: dubScriptVariant.CASHash, VoiceAssignmentCAS: voiceAssignment.CASHash,
-						TranscriptArtifactCAS: transcriptArtifact.CASHash,
-					}, &dv) {
-						dv.CASHash = casHash
-						dubSegmentsCAS = casHash
-						if dv.OverallStatus == "REVIEW_REQUIRED" {
-							if err := s.db.UpdateJobStatus(ctx, jobID, "review_required"); err != nil {
-								rc.Close()
-								return fmt.Errorf("mark job %s review_required: %w", jobID, err)
-							}
-							if err := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusPaused, domain.RunStatusPaused); err != nil {
-								rc.Close()
-								return fmt.Errorf("pause run %s for dubbing timing review: %w", runID, err)
-							}
-							rc.Close()
-							return nil
-						}
-					}
-					rc.Close()
+			pinCAS = casHash
+		}
+		dubCandidates := make([]string, 0, 2)
+		if acceptedCAS != "" {
+			dubCandidates = append(dubCandidates, acceptedCAS)
+		}
+		if pinCAS != "" && pinCAS != acceptedCAS {
+			dubCandidates = append(dubCandidates, pinCAS)
+		}
+		for _, casHash := range dubCandidates {
+			if s.casStore == nil || s.dubbingSvc == nil {
+				break
+			}
+			rc, err := s.casStore.Get(casHash)
+			if err != nil {
+				continue
+			}
+			var dv domain.DubSegmentsVariant
+			decodeErr := json.NewDecoder(rc).Decode(&dv)
+			reusable := decodeErr == nil && s.dubbingSvc.CanReuseVariant(ctx, dubbingInput, &dv)
+			rc.Close()
+			if !reusable {
+				continue
+			}
+			dv.CASHash = casHash
+			dubSegmentsCAS = casHash
+			if casHash == acceptedCAS && casHash != pinCAS {
+				// The run delivers the accepted successor while its stage row still names the artifact the
+				// accepted candidate replaced. Recording the artifact this run reuses converges the run's
+				// recorded lineage to what its mix is built from, so a replay does not read the superseded
+				// variant as the successful stage. Failing here fails the run: publishing media whose
+				// recorded lineage contradicts it is what the issue forbids.
+				if err := s.reviewSvc.RecordAcceptedDubbingArtifact(ctx, runID, casHash); err != nil {
+					return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("record the accepted dubbing artifact: %v", err))
 				}
 			}
-			if dubSegmentsCAS == "" {
-				canReuse = false
+			if dv.OverallStatus == "REVIEW_REQUIRED" {
+				if err := s.db.UpdateJobStatus(ctx, jobID, "review_required"); err != nil {
+					return fmt.Errorf("mark job %s review_required: %w", jobID, err)
+				}
+				if err := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusPaused, domain.RunStatusPaused); err != nil {
+					return fmt.Errorf("pause run %s for dubbing timing review: %w", runID, err)
+				}
+				return nil
 			}
+			break
+		}
+		if len(dubCandidates) > 0 && dubSegmentsCAS == "" {
+			canReuse = false
 		}
 		if dubSegmentsCAS == "" {
 			if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
@@ -1115,15 +1102,7 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 				return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("failed to record stage start: %v", err))
 			}
 
-			dubSegmentsVariant, ttsErr := s.dubbingSvc.SynthesizeAndFit(ctx, domain.DubbingJobInput{
-				RunID:                 runID,
-				AssetID:               assetID,
-				JobID:                 jobID,
-				TargetLanguage:        targetLang,
-				DubScriptVariantCAS:   dubScriptVariant.CASHash,
-				VoiceAssignmentCAS:    voiceAssignment.CASHash,
-				TranscriptArtifactCAS: transcriptArtifact.CASHash,
-			})
+			dubSegmentsVariant, ttsErr := s.dubbingSvc.SynthesizeAndFit(ctx, dubbingInput)
 			if ttsErr != nil {
 				if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 					return err
@@ -1156,6 +1135,26 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 	}
 
 	// 2. AudioMix (T15) - separation / passthrough
+	// The mix is a record of the dubbing artifact it was mixed from, and the stage row below is what
+	// the reuse reads. An acceptance that moved the run's dubbing artifact to its accepted successor
+	// withdraws and rebuilds the delivery, so a run resumed in the middle of that rebuild records the
+	// variant the accepted candidate replaced: that delivery is withdrawn here and rebuilt from the
+	// artifact the run now holds instead of publishing superseded media (#157).
+	//
+	// The withdrawal is durable, but this execution already read the run's stage rows for its own reuse
+	// decisions, so an invalidated delivery must also stop being reusable for the rest of this pass -
+	// without that, the mix below would still be skipped on the superseded row the reconcile just
+	// invalidated. Everything derived from the mix is recomputed with it, which is the run's existing
+	// semantics for any stage this pass had to rebuild.
+	if s.reviewSvc != nil {
+		invalidated, err := s.reviewSvc.ReconcileDeliveryLineage(ctx, runID, assetID, targetLang, dubSegmentsCAS)
+		if err != nil {
+			return s.failRun(ctx, runID, "audio_mix", fmt.Sprintf("reconcile the run's delivery lineage: %v", err))
+		}
+		if invalidated {
+			canReuse = false
+		}
+	}
 	if reusable, _ := isStageReusable("audio_mix"); reusable {
 		// Reused audio_mix
 	} else {
@@ -1620,6 +1619,10 @@ func (s *Server) routes() {
 	// Final Render Handoff (T20: Auto queue-zero vs Review explicit action)
 	s.mux.HandleFunc("POST /api/v1/assets/{id}/render/handoff", s.handleFinalRenderHandoff)
 	s.mux.HandleFunc("POST /api/v1/runs/{id}/render/handoff", s.handleRunFinalRenderHandoff)
+
+	// Exact reviewed-candidate selection (Issue #157: accept one reviewed candidate, then rebuild)
+	s.mux.HandleFunc("POST /api/v1/assets/{id}/review/accept-candidate", s.handleAcceptReviewedCandidate)
+	s.mux.HandleFunc("POST /api/v1/runs/{id}/review/accept-candidate", s.handleRunAcceptReviewedCandidate)
 
 	// Multimodal Quality Results (T19)
 	s.mux.HandleFunc("POST /api/v1/quality-results", s.handleCreateQualityResult)
@@ -5386,6 +5389,113 @@ func (s *Server) handleFinalRenderHandoff(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{
 		"handoff": result,
 	})
+}
+
+// handleAcceptReviewedCandidate is the asset-scoped entry point of the exact reviewed-candidate
+// selection (#157). It requires an explicit run_id: a selection is always an exact run-scoped act
+// and never falls back to another run's dubbing artifact.
+func (s *Server) handleAcceptReviewedCandidate(w http.ResponseWriter, r *http.Request) {
+	assetID := r.PathValue("id")
+	if s.reviewSvc == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+
+	var in service.AcceptReviewedCandidateInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(in.RunID) == "" {
+		writeError(w, http.StatusBadRequest, "run_id is required for reviewed-candidate selection")
+		return
+	}
+
+	in.AssetID = assetID
+	s.writeAcceptReviewedCandidate(w, r, in)
+}
+
+// handleRunAcceptReviewedCandidate is the run-scoped entry point. The run owns the asset, language
+// and job the selection is bound to, so the caller cannot name a different one.
+func (s *Server) handleRunAcceptReviewedCandidate(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+	if s.reviewSvc == nil || s.db == nil {
+		writeError(w, http.StatusInternalServerError, "review service is not configured")
+		return
+	}
+
+	run, err := s.db.GetRun(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	job, err := s.db.GetJob(r.Context(), run.JobID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var in service.AcceptReviewedCandidateInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	in.RunID = runID
+	// The run owns its job, asset and language. A body that omits them is filled from the run; a
+	// body that names a different one is left as sent so the selection is refused as a wrong
+	// binding instead of silently using the run's own values.
+	if in.JobID == "" {
+		in.JobID = job.ID
+	}
+	if in.AssetID == "" {
+		in.AssetID = job.SourceAssetID
+	}
+	if in.TargetLanguage == "" {
+		in.TargetLanguage = job.TargetLanguage
+	}
+	s.writeAcceptReviewedCandidate(w, r, in)
+}
+
+// writeAcceptReviewedCandidate maps the selection service's refusal classes to status codes. They
+// stay distinct on purpose: an operator must be able to tell a stale decision from a hard media
+// gate from a missing quality waiver.
+func (s *Server) writeAcceptReviewedCandidate(w http.ResponseWriter, r *http.Request, in service.AcceptReviewedCandidateInput) {
+	result, err := s.reviewSvc.AcceptReviewedCandidate(r.Context(), in)
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrNotFound), errors.Is(err, domain.ErrAssetNotFound):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, service.ErrReviewedCandidateStale),
+			errors.Is(err, service.ErrReviewedCandidateNotPending),
+			errors.Is(err, service.ErrReviewedCandidateConflict):
+			writeError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, service.ErrReviewedCandidateNotSelectable),
+			errors.Is(err, service.ErrReviewedCandidateUnavailable):
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+		// A hard media/timing gate raised by the rebuild itself - the mixer refusing the accepted
+		// waveform's placement or coverage, a soundtrack the pinned stems cannot satisfy, a pinned
+		// role plan the mix requires - is the same class of refusal as the selection-time gate and
+		// keeps its documented status: the successor and its audit row stay as evidence, and the
+		// operator sees the gate that refused instead of an opaque server fault.
+		case errors.Is(err, domain.ErrMixerOverrunRefused),
+			errors.Is(err, domain.ErrSoundtrackPreservationFailed),
+			errors.Is(err, domain.ErrAudioRolePlanRequired),
+			errors.Is(err, domain.ErrRunPinnedAudioRolePlanMissing):
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+		case errors.Is(err, service.ErrReviewedCandidateWaiverRequired),
+			errors.Is(err, service.ErrReviewedCandidateInvalid):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"result": result})
 }
 
 func (s *Server) handleRunFinalRenderHandoff(w http.ResponseWriter, r *http.Request) {

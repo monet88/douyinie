@@ -603,6 +603,31 @@
                           ></audio>
                         </div>
                       </div>
+
+                      <!-- Issue #157: the operator's explicit acceptance of exactly one of the two
+                           waveforms above. The audition panel stays evidence - this control is what
+                           releases the accepted waveform into the run's successor dubbing artifact. -->
+                      <div class="tempo-accept">
+                        <label class="field">
+                          <span>Lý do chấp nhận</span>
+                          <input
+                            id="inspect-tempo-reason"
+                            type="text"
+                            placeholder="Ví dụ: đã nghe bản tempo và chấp nhận chất lượng"
+                          />
+                        </label>
+                        <label class="tempo-waiver">
+                          <input type="checkbox" id="inspect-tempo-waiver" />
+                          <span>Xác nhận manual_override chất lượng cho waveform tempo đã biến đổi</span>
+                        </label>
+                        <div class="tempo-accept-actions">
+                          <button class="primary-button" type="button" id="inspect-tempo-accept-transformed">
+                            Chấp nhận bản tempo
+                          </button>
+                          <button type="button" id="inspect-tempo-accept-natural">Chấp nhận waveform natural</button>
+                        </div>
+                        <p class="tempo-note" id="inspect-tempo-status" role="status"></p>
+                      </div>
                     </div>
 
                     <div class="editor-tabs" role="tablist" aria-label="Loại sửa">

@@ -541,9 +541,14 @@ func (s *BundleService) ImportBundle(ctx context.Context, r io.ReaderAt, size in
 			return nil, fmt.Errorf("restore audio stems to CAS: %w", err)
 		}
 		idx := storage.AudioStemsArtifactIndex{
-			ID:             manifest.AudioStems.ID,
-			AssetID:        manifest.AudioStems.AssetID,
-			ProviderID:     manifest.AudioStems.ProviderID,
+			ID:         manifest.AudioStems.ID,
+			AssetID:    manifest.AudioStems.AssetID,
+			ProviderID: manifest.AudioStems.ProviderID,
+			// The provider identity of the stems has to be restored with the row: the index schema
+			// requires it, and without it the import of any run that carries stems aborts before a
+			// replayed accepted candidate can be served at all (#157 portable replay).
+			ModelName:      manifest.AudioStems.ModelName,
+			ModelVersion:   manifest.AudioStems.ModelVersion,
 			CASHash:        obj.SHA256,
 			ProvenanceHash: manifest.AudioStems.ProvenanceHash,
 			CreatedAt:      manifest.AudioStems.CreatedAt,
@@ -705,12 +710,20 @@ func (s *BundleService) ImportBundle(ctx context.Context, r io.ReaderAt, size in
 					ID:             dsv.ID,
 					AssetID:        dsv.AssetID,
 					RunID:          dsv.RunID,
+					JobID:          dsv.JobID,
 					TargetLanguage: dsv.TargetLanguage,
 					CASHash:        obj.SHA256,
 					ProvenanceHash: dsv.ProvenanceHash,
+					OverallStatus:  dsv.OverallStatus,
 					CreatedAt:      dsv.CreatedAt,
 				}
-				_ = s.db.UpsertDubSegmentsVariantIndex(ctx, idx)
+				// The restored row is what makes the imported run's dubbing artifact - including
+				// its accepted reviewed-candidate evidence - resolvable as a run-scoped index row
+				// on the target host. A failed restore must fail the import rather than leave the
+				// run resolvable only through its stage pin.
+				if err := s.db.UpsertDubSegmentsVariantIndex(ctx, idx); err != nil {
+					return nil, fmt.Errorf("restore dub segments variant index: %w", err)
+				}
 			}
 		}
 
@@ -1013,6 +1026,17 @@ func (s *BundleService) collectReachableCASHashes(manifest *domain.JobBundleMani
 					}
 				}
 			}
+			// Issue #157: an accepted candidate's natural parent is not reachable through the
+			// promoted segment when the selected waveform is the transformed one, so the
+			// acceptance evidence is the only reference keeping that parent in closure.
+			for _, accepted := range dsv.AcceptedCandidates {
+				if err := addIfCAS(accepted.NaturalAudioSHA256); err != nil {
+					return nil, err
+				}
+				if err := addIfCAS(accepted.SelectedAudioSHA256); err != nil {
+					return nil, err
+				}
+			}
 		}
 		if dma := runData.DubMixArtifact; dma != nil {
 			if err := addIfCAS(dma.CASHash); err != nil {
@@ -1123,6 +1147,13 @@ func (s *BundleService) collectManifestReferencedHashes(manifest *domain.JobBund
 					addHash(tc.NaturalAudioSHA256)
 					addHash(tc.TransformedAudioSHA256)
 				}
+			}
+			// Issue #157: the natural parent of an accepted candidate is required from the archive
+			// even when the selected waveform is the transformed one, so it is never dropped from
+			// closure by the unit leaving ReviewSegments.
+			for _, accepted := range dsv.AcceptedCandidates {
+				addHash(accepted.NaturalAudioSHA256)
+				addHash(accepted.SelectedAudioSHA256)
 			}
 		}
 		if dma := runData.DubMixArtifact; dma != nil {
