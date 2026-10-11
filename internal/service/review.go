@@ -45,29 +45,54 @@ type ReviewService struct {
 	// why the acceptance needs no lock of its own, and acceptances of different runs never wait on
 	// each other.
 	//
-	// ponytail: one mutex per run is kept for the process lifetime. Fine for a local host; delete the
+	// ponytail: one token per run is kept for the process lifetime. Fine for a local host; delete the
 	// entry when a run terminates if a long-lived host ever accumulates runs.
 	runDeliveryMu sync.Mutex
-	runDelivery   map[string]*sync.Mutex
+	runDelivery   map[string]chan struct{}
+}
+
+// deliveryToken returns the run's own delivery token, creating it on first use. At most one caller
+// holds it at a time, so the map is only ever read and grown under runDeliveryMu.
+func (s *ReviewService) deliveryToken(runID string) chan struct{} {
+	runID = strings.TrimSpace(runID)
+	s.runDeliveryMu.Lock()
+	defer s.runDeliveryMu.Unlock()
+	if s.runDelivery == nil {
+		s.runDelivery = make(map[string]chan struct{})
+	}
+	token, ok := s.runDelivery[runID]
+	if !ok {
+		token = make(chan struct{}, 1)
+		s.runDelivery[runID] = token
+	}
+	return token
 }
 
 // LockRunDelivery takes the run's delivery lock and returns the release. The caller owns the run's
 // mix, plan, preview and final while it holds it. The lock is per run, so unrelated runs still render
 // in parallel; a run keeps one lock, so a caller must never take it twice.
 func (s *ReviewService) LockRunDelivery(runID string) func() {
-	runID = strings.TrimSpace(runID)
-	s.runDeliveryMu.Lock()
-	mu, ok := s.runDelivery[runID]
-	if !ok {
-		mu = &sync.Mutex{}
-		if s.runDelivery == nil {
-			s.runDelivery = make(map[string]*sync.Mutex)
-		}
-		s.runDelivery[runID] = mu
+	token := s.deliveryToken(runID)
+	token <- struct{}{}
+	return func() { <-token }
+}
+
+// LockRunDeliveryContext is LockRunDelivery for a caller that must not block past its own
+// cancellation: a queue drain waiting on a run an acceptance is rebuilding would otherwise hold the
+// whole drain until that request finishes. It returns ctx.Err() instead of blocking when the caller
+// is cancelled before it holds the lock, and the release it returns is the same one
+// LockRunDelivery returns - the lock is per run, so both forms take turns on it.
+func (s *ReviewService) LockRunDeliveryContext(ctx context.Context, runID string) (func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	s.runDeliveryMu.Unlock()
-	mu.Lock()
-	return mu.Unlock
+	token := s.deliveryToken(runID)
+	select {
+	case token <- struct{}{}:
+		return func() { <-token }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // NewReviewService creates a new ReviewService instance.

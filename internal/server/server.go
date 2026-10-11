@@ -613,11 +613,24 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 	// ponytail: a pass holds it until it ends, so an acceptance arriving while a long pass runs waits
 	// for it. Fine for one operator on one host; switch to a try-lock with the documented conflict
 	// answer if an acceptance must fail fast instead of waiting.
-	releaseDelivery := func() {}
 	if s.reviewSvc != nil {
-		releaseDelivery = s.reviewSvc.LockRunDelivery(runID)
+		release, err := s.reviewSvc.LockRunDeliveryContext(ctx, runID)
+		if err != nil {
+			// The drain was cancelled while it waited for the run's delivery lock, so another pass or
+			// an acceptance holds it and owns the run's state. This pass reports the cancellation as
+			// its own end instead of failing a run it never started working on.
+			return err
+		}
+		// The release is registered before the state re-read below can end this pass: the run's token
+		// must come back whatever the pass decides to do with the lock it just took.
+		defer release()
+		// Waiting moved the run: the state this pass admitted before the wait is not necessarily the
+		// state it starts from now, so the same admission is re-read where the run stands. A run the
+		// operator resolved, cancelled, completed or interrupted while this pass waited stops here.
+		if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
+			return err
+		}
 	}
-	defer releaseDelivery()
 
 	job, err := s.db.GetJob(ctx, jobID)
 	if err != nil {

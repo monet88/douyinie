@@ -724,6 +724,86 @@ func TestSeam1_Issue157_JoinedPipelineSelectionThroughRenderAndPortableReplay(t 
 		t.Errorf("a bundle exported by the importing host must not carry either host's paths, found in: %s", strings.Join(reexportLeaks, ", "))
 	}
 
+	// The re-export must be the run's delivery again, not merely a well-formed archive: what the
+	// export path writes for this run, with the bytes behind the artifacts it serves. An empty or
+	// partial archive has no manifest and no payload, so both are required here.
+	entries := make(map[string]int, len(rezr.File))
+	manifestFound := false
+	for _, f := range rezr.File {
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatalf("open the re-exported entry %s: %v", f.Name, err)
+		}
+		raw, readErr := io.ReadAll(rc)
+		rc.Close()
+		if readErr != nil {
+			t.Fatalf("read the re-exported entry %s: %v", f.Name, readErr)
+		}
+		entries[f.Name] = len(raw)
+		if strings.HasSuffix(f.Name, "manifest.json") && len(raw) > 0 {
+			manifestFound = true
+		}
+	}
+	if !manifestFound {
+		t.Fatalf("the re-exported bundle must carry a nonempty manifest, got %d entries: %v", len(entries), entries)
+	}
+	reexportVariant := issue157RunVariant(t, importRestarted, runID)
+	for _, required := range []struct {
+		name string
+		hash string
+	}{
+		{"retained natural waveform", evidence.NaturalAudioSHA256},
+		{"accepted waveform", evidence.SelectedAudioSHA256},
+		{"accepted dubbing artifact", reexportVariant.CASHash},
+	} {
+		found := false
+		for name, size := range entries {
+			if strings.Contains(name, required.hash) && size > 0 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("the re-exported bundle must ship the %s %s with its bytes, got %v",
+				required.name, required.hash, entries)
+		}
+	}
+
+	// Multi-hop portability is the claim under test, so the re-export is imported a second time: a
+	// third host with its own CAS root must resolve the same delivery from what the middle host wrote.
+	thirdHost := setupHarness(t)
+	if thirdHost.dir == h.dir || thirdHost.dir == importHost.dir {
+		t.Fatal("expected the third host to use a different CAS root from both earlier hosts")
+	}
+	thirdResp, err := http.Post(thirdHost.server.URL+"/api/v1/jobs/import", "application/zip", bytes.NewReader(reexportBytes))
+	if err != nil {
+		t.Fatalf("import the re-exported bundle: %v", err)
+	}
+	thirdBody, _ := io.ReadAll(thirdResp.Body)
+	thirdResp.Body.Close()
+	if thirdResp.StatusCode != http.StatusOK && thirdResp.StatusCode != http.StatusCreated {
+		t.Fatalf("import the re-exported bundle: status=%d body=%s", thirdResp.StatusCode, string(thirdBody))
+	}
+	thirdServed, err := http.Get(fmt.Sprintf("%s/api/v1/runs/%s/dub-media/%s", thirdHost.server.URL, runID, evidence.SelectedAudioSHA256))
+	if err != nil || thirdServed.StatusCode != http.StatusOK {
+		t.Fatalf("the third host must serve the accepted waveform from the re-export: status=%v err=%v",
+			statusOf(thirdServed), err)
+	}
+	thirdBytes, err := io.ReadAll(thirdServed.Body)
+	thirdServed.Body.Close()
+	if err != nil {
+		t.Fatalf("read the third host's accepted waveform: %v", err)
+	}
+	if sum := sha256.Sum256(thirdBytes); !strings.EqualFold(hex.EncodeToString(sum[:]), evidence.SelectedAudioSHA256) {
+		t.Fatalf("the third host served %d bytes that are not the accepted waveform %s",
+			len(thirdBytes), evidence.SelectedAudioSHA256)
+	}
+	if thirdVariant := issue157RunVariant(t, thirdHost, runID); len(thirdVariant.AcceptedCandidates) != 1 ||
+		thirdVariant.AcceptedCandidates[0].SelectedAudioSHA256 != evidence.SelectedAudioSHA256 {
+		t.Fatalf("the third host must resolve the acceptance lineage the re-export carried, got %+v",
+			thirdVariant.AcceptedCandidates)
+	}
+
 	// An identical replay on the importing host answers from the recorded decision: the run the
 	// bundle carried is acceptable there without re-deciding anything.
 	replayStatus, replay, replayRefusal := issue157Accept(t, importRestarted, runID, issue157Selection(item.ID))

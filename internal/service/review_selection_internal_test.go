@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/monet88/douyinie/internal/cas"
 	"github.com/monet88/douyinie/internal/domain"
@@ -172,4 +174,40 @@ func TestInvalidateCorrectionStageStaysAppendOnly(t *testing.T) {
 	if hash, err := db.GetStageArtifactHash(ctx, runID, "render_preview"); err != nil || hash != "" {
 		t.Fatalf("expected an invalidated stage to resolve no artifact, got %q (err %v)", hash, err)
 	}
+}
+
+// TestLockRunDeliveryIsCancellableAndStillMutual pins both halves of the run delivery lock's contract.
+//
+// A caller that must not block past its own cancellation - the queue drain waiting on a run an
+// acceptance is rebuilding - is released with its context's error instead of waiting for the holder,
+// and the abandoned wait leaves nothing held behind it: the lock is free the moment the holder releases
+// it. The lock stays per run, so a waiter that gives up on one run never blocks a different run.
+func TestLockRunDeliveryIsCancellableAndStillMutual(t *testing.T) {
+	ctx := context.Background()
+	svc := NewReviewService(nil, nil)
+
+	release := svc.LockRunDelivery("run-lock")
+	waitCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if _, err := svc.LockRunDeliveryContext(waitCtx, "run-lock"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a cancelled waiter must be released with its context error, got %v", err)
+	}
+	if waited := time.Since(started); waited > 5*time.Second {
+		t.Fatalf("a cancelled waiter must not wait for the holder to finish, waited %s", waited)
+	}
+	// An unrelated run never waits on this run's delivery, whether or not a waiter was abandoned.
+	otherRelease, err := svc.LockRunDeliveryContext(ctx, "run-other")
+	if err != nil {
+		t.Fatalf("an unrelated run must not wait on this run's delivery lock: %v", err)
+	}
+	otherRelease()
+
+	release()
+	// The abandoned wait took nothing: the run's delivery lock is free for the next caller.
+	owned, err := svc.LockRunDeliveryContext(ctx, "run-lock")
+	if err != nil {
+		t.Fatalf("acquire the run's delivery lock after a cancelled waiter: %v", err)
+	}
+	owned()
 }
