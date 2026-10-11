@@ -1956,7 +1956,11 @@ async function submitTempoAcceptance(candidate, button) {
       state.handoff = null;
       if (state.selectedReviewItem?.id === item.id) state.selectedReviewItem = null;
     }
-    await loadReviewItems();
+    // The acceptance withdrew the preview and final the replaced delivery had made current and is
+    // rebuilding them from the accepted waveform, and in auto posture it may also have completed the
+    // run. Re-reading the run (and the queue the settled item left) is what keeps the inspector from
+    // playing media the run no longer serves and from showing a state the run has already left.
+    await loadSelectedRun();
     renderInspector();
   } catch (error) {
     // The refusal is the operator's answer: it stays in the panel next to the waveforms that were
@@ -2199,9 +2203,16 @@ async function loadSelectedRun() {
   // Review state is control-plane truth, not an optional artifact. Clear the
   // prior run projection before loading so a failed request can never leave a
   // previous run's exceptions attached to the newly selected run.
+  const priorSelection = state.selectedReviewItem;
   state.reviewItems = [];
   state.selectedReviewItem = null;
   await loadReviewItems();
+  // A reload refreshes this run's data; it is not a decision to close the exception the operator is
+  // working on. An item the run still projects stays selected across the refresh, and a selection
+  // belonging to another run is absent from this run's fresh projection, so it is dropped as before.
+  if (priorSelection) {
+    state.selectedReviewItem = state.reviewItems.find((item) => item.id === priorSelection.id) || null;
+  }
 
   // Each artifact read is independent: a missing artifact (404) is a normal
   // empty panel, but any other RuntimeHost failure must reach the operator

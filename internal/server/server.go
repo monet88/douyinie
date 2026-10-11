@@ -578,10 +578,46 @@ func (s *Server) failStageAndInterrupt(ctx context.Context, se *domain.StageExec
 	return nil
 }
 
+// pauseRunForReview parks a run on an unresolved dubbing unit and, before parking it, withdraws a
+// delivery the run's current artifact no longer backs. A pass that replaces the run's dubbing
+// artifact and then parks never reaches the delivery stages that would reconcile them, so the media
+// mixed from the replaced artifact would stay servable: the stale output the accepted-candidate
+// contract forbids. The reconcile is a no-op for a run that served nothing, or whose delivery already
+// pins the artifact this pass works from.
+func (s *Server) pauseRunForReview(ctx context.Context, runID, jobID, assetID, targetLang, dubSegmentsCAS string) error {
+	if s.reviewSvc != nil && strings.TrimSpace(dubSegmentsCAS) != "" {
+		if _, err := s.reviewSvc.ReconcileDeliveryLineage(ctx, runID, assetID, targetLang, dubSegmentsCAS); err != nil {
+			return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("reconcile the run's delivery lineage before parking on review: %v", err))
+		}
+	}
+	if err := s.db.UpdateJobStatus(ctx, jobID, "review_required"); err != nil {
+		return fmt.Errorf("mark job %s review_required: %w", jobID, err)
+	}
+	if err := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusPaused, domain.RunStatusPaused); err != nil {
+		return fmt.Errorf("pause run %s for dubbing timing review: %w", runID, err)
+	}
+	return nil
+}
+
 func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 	if cont, err := s.shouldContinueRun(ctx, runID); err != nil || !cont {
 		return err
 	}
+
+	// An acceptance of this run rebuilds the same artifact lineage this pass works from - the
+	// translation, dub script, dubbing artifact and delivery - and either may move it while the other
+	// is binding to it. The run holds one lock across both, so the operator's decision and the run's
+	// own pass take turns: whichever runs second works from the lineage the first left behind. Only
+	// this run is held, so unrelated runs still execute in parallel.
+	//
+	// ponytail: a pass holds it until it ends, so an acceptance arriving while a long pass runs waits
+	// for it. Fine for one operator on one host; switch to a try-lock with the documented conflict
+	// answer if an acceptance must fail fast instead of waiting.
+	releaseDelivery := func() {}
+	if s.reviewSvc != nil {
+		releaseDelivery = s.reviewSvc.LockRunDelivery(runID)
+	}
+	defer releaseDelivery()
 
 	job, err := s.db.GetJob(ctx, jobID)
 	if err != nil {
@@ -1034,6 +1070,12 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 		}
 		acceptedCAS := ""
 		if s.reviewSvc != nil {
+			// The decision an accepted claim carries is recorded before the run releases the media it
+			// argues for, so a pass interrupted between the claim and its audit row fails the stage
+			// instead of delivering undecided audio. The resolver that follows stays read-only.
+			if err := s.reviewSvc.EnsureAcceptedAuditRecords(ctx, runID, assetID, targetLang); err != nil {
+				return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("record the run's accepted decisions: %v", err))
+			}
 			casHash, err := s.reviewSvc.AcceptedDubbingArtifact(ctx, runID, assetID, targetLang)
 			if err != nil {
 				return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("resolve the run's accepted dubbing artifact: %v", err))
@@ -1055,14 +1097,25 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 			if s.casStore == nil || s.dubbingSvc == nil {
 				break
 			}
+			acceptedCandidate := acceptedCAS != "" && casHash == acceptedCAS
 			rc, err := s.casStore.Get(casHash)
 			if err != nil {
+				// A store fault on the accepted claim is not a reuse miss: falling back would deliver
+				// the pin the operator's acceptance replaced, which is exactly the stale output the
+				// issue forbids. The stage fails visibly instead, and the operator's retry - or the
+				// replay that re-drives the rebuild - is what resolves it.
+				if acceptedCandidate {
+					return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("read the run's accepted dubbing artifact %s: %v", casHash, err))
+				}
 				continue
 			}
 			var dv domain.DubSegmentsVariant
 			decodeErr := json.NewDecoder(rc).Decode(&dv)
-			reusable := decodeErr == nil && s.dubbingSvc.CanReuseVariant(ctx, dubbingInput, &dv)
 			rc.Close()
+			if decodeErr != nil && acceptedCandidate {
+				return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("decode the run's accepted dubbing artifact %s: %v", casHash, decodeErr))
+			}
+			reusable := decodeErr == nil && s.dubbingSvc.CanReuseVariant(ctx, dubbingInput, &dv)
 			if !reusable {
 				continue
 			}
@@ -1079,13 +1132,10 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 				}
 			}
 			if dv.OverallStatus == "REVIEW_REQUIRED" {
-				if err := s.db.UpdateJobStatus(ctx, jobID, "review_required"); err != nil {
-					return fmt.Errorf("mark job %s review_required: %w", jobID, err)
-				}
-				if err := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusPaused, domain.RunStatusPaused); err != nil {
-					return fmt.Errorf("pause run %s for dubbing timing review: %w", runID, err)
-				}
-				return nil
+				// The artifact this pass works from is unresolved, so the run parks again. Any delivery
+				// the run still served was mixed from another artifact and goes with the park: media whose
+				// recorded lineage contradicts the run is the stale output the contract forbids.
+				return s.pauseRunForReview(ctx, runID, jobID, assetID, targetLang, dubSegmentsCAS)
 			}
 			break
 		}
@@ -1123,13 +1173,9 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 				return s.failRun(ctx, runID, "dub_synthesize", fmt.Sprintf("failed to record stage completion: %v", err))
 			}
 			if dubSegmentsVariant.OverallStatus == "REVIEW_REQUIRED" {
-				if err := s.db.UpdateJobStatus(ctx, jobID, "review_required"); err != nil {
-					return fmt.Errorf("mark job %s review_required: %w", jobID, err)
-				}
-				if err := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusPaused, domain.RunStatusPaused); err != nil {
-					return fmt.Errorf("pause run %s for dubbing timing review: %w", runID, err)
-				}
-				return nil
+				// The pass just published an unresolved artifact: whatever the run served before it was
+				// mixed from another one, so it is withdrawn with the park.
+				return s.pauseRunForReview(ctx, runID, jobID, assetID, targetLang, dubSegmentsCAS)
 			}
 		}
 	}
@@ -1146,12 +1192,25 @@ func (s *Server) executeRun(ctx context.Context, runID, jobID string) error {
 	// without that, the mix below would still be skipped on the superseded row the reconcile just
 	// invalidated. Everything derived from the mix is recomputed with it, which is the run's existing
 	// semantics for any stage this pass had to rebuild.
+	//
+	// Those reads are refreshed, not just disabled: the reconcile's invalidation is the newest row for
+	// every stage it touched, and startStage promotes the row this pass cached. Publishing on the older
+	// row would leave the rebuilt artifact shadowed by a queued row no reader resolves, so the pass
+	// re-reads here and rebuilds each stage on the row the reconcile made newest.
 	if s.reviewSvc != nil {
 		invalidated, err := s.reviewSvc.ReconcileDeliveryLineage(ctx, runID, assetID, targetLang, dubSegmentsCAS)
 		if err != nil {
 			return s.failRun(ctx, runID, "audio_mix", fmt.Sprintf("reconcile the run's delivery lineage: %v", err))
 		}
 		if invalidated {
+			refreshed, err := s.db.ListStageExecutions(ctx, runID)
+			if err != nil {
+				return s.failRun(ctx, runID, "audio_mix", fmt.Sprintf("re-read run stage rows after delivery reconciliation: %v", err))
+			}
+			clear(latestStageMap)
+			for _, st := range refreshed {
+				latestStageMap[st.Stage] = st
+			}
 			canReuse = false
 		}
 	}
@@ -5464,6 +5523,10 @@ func (s *Server) handleRunAcceptReviewedCandidate(w http.ResponseWriter, r *http
 // stay distinct on purpose: an operator must be able to tell a stale decision from a hard media
 // gate from a missing quality waiver.
 func (s *Server) writeAcceptReviewedCandidate(w http.ResponseWriter, r *http.Request, in service.AcceptReviewedCandidateInput) {
+	// The acceptance serializes itself against the run's own delivery pass, and against an identical
+	// replay of the same decision, through the run's delivery lock (service.ReviewService.LockRunDelivery):
+	// an acceptance arriving while the pipeline or another request is publishing that run's delivery
+	// waits for it and then reads what it left behind instead of withdrawing and re-rendering it.
 	result, err := s.reviewSvc.AcceptReviewedCandidate(r.Context(), in)
 	if err != nil {
 		switch {
@@ -5489,8 +5552,23 @@ func (s *Server) writeAcceptReviewedCandidate(w http.ResponseWriter, r *http.Req
 		case errors.Is(err, service.ErrReviewedCandidateWaiverRequired),
 			errors.Is(err, service.ErrReviewedCandidateInvalid):
 			writeError(w, http.StatusBadRequest, err.Error())
+		// The run's dubbing artifact is bound to another asset, language or run, or was produced under
+		// a voice assignment the run no longer carries. That is an expected, classified refusal - the
+		// same class the sibling review routes answer with 403 - not an internal fault.
+		case errors.Is(err, service.ErrDubMediaNotOwned):
+			writeError(w, http.StatusForbidden, err.Error())
+		// An owned hash whose CAS object is absent is the class the sibling dub-media resolver answers
+		// with 404: the run's pinned lineage cannot be read, so nothing is accepted.
+		case errors.Is(err, service.ErrDubMediaObjectMissing):
+			writeError(w, http.StatusNotFound, err.Error())
 		default:
-			writeError(w, http.StatusInternalServerError, err.Error())
+			// An unclassified failure is logged server-side and answered with a fixed message: it can
+			// wrap *os.PathError or *os.LinkError values that embed absolute CAS paths (and a CAS read
+			// or commit can also report a hash mismatch naming the destination path), and this endpoint
+			// never exposes filesystem paths to the client - the rule writeDubMediaError records for
+			// Issue #156.
+			log.Printf("[accept-reviewed-candidate] run %s acceptance failed: %v", in.RunID, err)
+			writeError(w, http.StatusInternalServerError, "reviewed candidate acceptance failed")
 		}
 		return
 	}

@@ -1574,6 +1574,15 @@ test("an acceptance response never clears an exception the operator opened meanw
     if (url.includes("/review-items")) {
       return { status: 200, payload: { review_items: [{ id: "rev-plain-1", run_id: "run-1", type: "low_confidence", severity: "warning", status: "pending" }] } };
     }
+    // A settled acceptance re-reads the run and its queue, so the stub serves the daemon's shape
+    // rather than an empty payload the surface can only read as "this run has nothing".
+    if (url === "/api/v1/runs/run-1") {
+      return { status: 200, payload: { run: { id: "run-1", job_id: "job-1", status: "paused" } } };
+    }
+    if (url === "/api/v1/runs/run-1/stages") return { status: 200, payload: { stages: [] } };
+    if (url === "/api/v1/jobs") {
+      return { status: 200, payload: { jobs: [{ id: "job-1", source_asset_id: "asset-1", target_language: "vi" }] } };
+    }
     return { status: 200, payload: {} };
   });
 
@@ -1643,6 +1652,62 @@ test("an acceptance refusal never lands in the status node of another exception"
     h.els.inspectTempoStatus.textContent.includes("Không chấp nhận được"),
     false,
     `a refusal for another item must not land in the shared status node, got ${h.els.inspectTempoStatus.textContent}`
+  );
+});
+
+// Issue #157: an acceptance withdraws the preview and final the replaced delivery made current and
+// rebuilds them from the accepted waveform, and in auto posture it can also complete the run. A
+// surface that only reloads the exception queue keeps playing the replaced media and shows a state
+// the run has already left, so the settled acceptance must re-read the run it changed.
+test("a settled acceptance re-reads the run so replaced render media stops being served", async () => {
+  const h = createHarness();
+  await h.ready();
+  h.evalIn(tempoCandidateItem);
+  h.els.inspectTempoReason.value = "đã nghe và chấp nhận bản tempo";
+  h.els.inspectTempoWaiver.checked = true;
+
+  let runStatus = "running";
+  let previewCAS = "preview-before-acceptance";
+  h.setResponder((url) => {
+    if (url.includes("/review/accept-candidate")) {
+      runStatus = "completed";
+      previewCAS = "preview-after-acceptance";
+      return { status: 200, payload: { result: { message: "đã chấp nhận" } } };
+    }
+    if (url === "/api/v1/runs/run-1") {
+      return { status: 200, payload: { run: { id: "run-1", job_id: "job-1", status: runStatus } } };
+    }
+    if (url === "/api/v1/runs/run-1/stages") return { status: 200, payload: { stages: [] } };
+    if (url === "/api/v1/jobs") {
+      return { status: 200, payload: { jobs: [{ id: "job-1", source_asset_id: "asset-1", target_language: "vi" }] } };
+    }
+    if (url === "/api/v1/jobs/job-1") {
+      return { status: 200, payload: { job: { id: "job-1", source_asset_id: "asset-1", target_language: "vi" } } };
+    }
+    if (url.includes("/render/preview")) return { status: 200, payload: { preview_render: { cas_hash: previewCAS } } };
+    if (url.includes("/review-items")) return { status: 200, payload: { review_items: [] } };
+    if (url.includes("/render/final")) return { status: 200, payload: { final_render: { cas_hash: "final-1" } } };
+    return { status: 200, payload: {} };
+  });
+
+  const transformed = h.els.inspectTempoAcceptTransformed;
+  h.requests.length = 0;
+  transformed.dispatch("click", { currentTarget: transformed, target: { closest: () => null } });
+  await h.settle();
+
+  assert.ok(
+    h.requests.some((req) => req.url === "/api/v1/runs/run-1"),
+    `a settled acceptance must re-read the run whose delivery it replaced, got ${JSON.stringify(h.requests.map((r) => r.url))}`
+  );
+  assert.equal(
+    h.evalIn("state.selectedRun && state.selectedRun.status"),
+    "completed",
+    "the surface must show the state the run holds after the acceptance, not the one it had before"
+  );
+  assert.equal(
+    h.evalIn("state.preview && state.preview.cas_hash"),
+    "preview-after-acceptance",
+    "the replaced preview must not stay the media the surface serves"
   );
 });
 

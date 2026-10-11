@@ -6181,22 +6181,24 @@ func (s *DB) UpsertTranslationVariantIndex(ctx context.Context, idx TranslationV
 	defer s.mu.Unlock()
 
 	query := `
-		INSERT INTO translation_variants (id, asset_id, run_id, target_language, cas_hash, provenance_hash, provider_id, model_name, model_version, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO translation_variants (id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash, provider_id, model_name, model_version, overall_qa_score, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			asset_id = excluded.asset_id,
 			run_id = excluded.run_id,
+			job_id = excluded.job_id,
 			target_language = excluded.target_language,
 			cas_hash = excluded.cas_hash,
 			provenance_hash = excluded.provenance_hash,
 			provider_id = excluded.provider_id,
 			model_name = excluded.model_name,
 			model_version = excluded.model_version,
+			overall_qa_score = excluded.overall_qa_score,
 			created_at = excluded.created_at
 	`
 	_, err := s.db.ExecContext(ctx, query,
-		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash,
-		idx.ProviderID, idx.ModelName, idx.ModelVersion, idx.CreatedAt.Format(time.RFC3339Nano),
+		idx.ID, idx.AssetID, idx.RunID, idx.JobID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash,
+		idx.ProviderID, idx.ModelName, idx.ModelVersion, idx.OverallQAScore, idx.CreatedAt.Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert translation variant index: %w", err)
@@ -6210,22 +6212,24 @@ func (s *DB) UpsertDubScriptVariantIndex(ctx context.Context, idx DubScriptVaria
 	defer s.mu.Unlock()
 
 	query := `
-		INSERT INTO dub_script_variants (id, asset_id, run_id, target_language, cas_hash, provenance_hash, provider_id, model_name, model_version, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO dub_script_variants (id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash, provider_id, model_name, model_version, overall_qa_score, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			asset_id = excluded.asset_id,
 			run_id = excluded.run_id,
+			job_id = excluded.job_id,
 			target_language = excluded.target_language,
 			cas_hash = excluded.cas_hash,
 			provenance_hash = excluded.provenance_hash,
 			provider_id = excluded.provider_id,
 			model_name = excluded.model_name,
 			model_version = excluded.model_version,
+			overall_qa_score = excluded.overall_qa_score,
 			created_at = excluded.created_at
 	`
 	_, err := s.db.ExecContext(ctx, query,
-		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash,
-		idx.ProviderID, idx.ModelName, idx.ModelVersion, idx.CreatedAt.Format(time.RFC3339Nano),
+		idx.ID, idx.AssetID, idx.RunID, idx.JobID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash,
+		idx.ProviderID, idx.ModelName, idx.ModelVersion, idx.OverallQAScore, idx.CreatedAt.Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert dub script variant index: %w", err)
@@ -6239,18 +6243,26 @@ func (s *DB) UpsertVoiceAssignmentIndex(ctx context.Context, idx VoiceAssignment
 	defer s.mu.Unlock()
 
 	query := `
-		INSERT INTO voice_assignments (id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO voice_assignments (id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash, assignments_json, use_same_voice_for_all, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			asset_id = excluded.asset_id,
 			run_id = excluded.run_id,
+			job_id = excluded.job_id,
 			target_language = excluded.target_language,
 			cas_hash = excluded.cas_hash,
 			provenance_hash = excluded.provenance_hash,
+			assignments_json = excluded.assignments_json,
+			use_same_voice_for_all = excluded.use_same_voice_for_all,
 			created_at = excluded.created_at
 	`
+	useSameVoice := 0
+	if idx.UseSameVoiceForAll {
+		useSameVoice = 1
+	}
 	_, err := s.db.ExecContext(ctx, query,
-		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+		idx.ID, idx.AssetID, idx.RunID, idx.JobID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash,
+		idx.AssignmentsJSON, useSameVoice, idx.CreatedAt.Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert voice assignment index: %w", err)
@@ -6317,18 +6329,22 @@ func (s *DB) UpsertDubMixArtifactIndex(ctx context.Context, idx DubMixArtifactIn
 	defer s.mu.Unlock()
 
 	query := `
-		INSERT INTO dub_mix_artifacts (id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO dub_mix_artifacts (id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash, overall_status, refusal_reason, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			asset_id = excluded.asset_id,
 			run_id = excluded.run_id,
+			job_id = excluded.job_id,
 			target_language = excluded.target_language,
 			cas_hash = excluded.cas_hash,
 			provenance_hash = excluded.provenance_hash,
+			overall_status = excluded.overall_status,
+			refusal_reason = excluded.refusal_reason,
 			created_at = excluded.created_at
 	`
 	_, err := s.db.ExecContext(ctx, query,
-		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+		idx.ID, idx.AssetID, idx.RunID, idx.JobID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash,
+		idx.OverallStatus, idx.RefusalReason, idx.CreatedAt.Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert dub mix artifact index: %w", err)
@@ -6366,18 +6382,19 @@ func (s *DB) UpsertRenderPlanIndex(ctx context.Context, idx RenderPlanIndex) err
 	defer s.mu.Unlock()
 
 	query := `
-		INSERT INTO render_plans (id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO render_plans (id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			asset_id = excluded.asset_id,
 			run_id = excluded.run_id,
+			job_id = excluded.job_id,
 			target_language = excluded.target_language,
 			cas_hash = excluded.cas_hash,
 			provenance_hash = excluded.provenance_hash,
 			created_at = excluded.created_at
 	`
 	_, err := s.db.ExecContext(ctx, query,
-		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+		idx.ID, idx.AssetID, idx.RunID, idx.JobID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert render plan index: %w", err)
@@ -6427,18 +6444,20 @@ func (s *DB) UpsertLocalizedSubtitleTrackIndex(ctx context.Context, idx Localize
 	defer s.mu.Unlock()
 
 	query := `
-		INSERT INTO localized_subtitle_tracks (id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO localized_subtitle_tracks (id, asset_id, run_id, job_id, target_language, cas_hash, provenance_hash, cue_count, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			asset_id = excluded.asset_id,
 			run_id = excluded.run_id,
+			job_id = excluded.job_id,
 			target_language = excluded.target_language,
 			cas_hash = excluded.cas_hash,
 			provenance_hash = excluded.provenance_hash,
+			cue_count = excluded.cue_count,
 			created_at = excluded.created_at
 	`
 	_, err := s.db.ExecContext(ctx, query,
-		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+		idx.ID, idx.AssetID, idx.RunID, idx.JobID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.CueCount, idx.CreatedAt.Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert localized subtitle track index: %w", err)
@@ -6452,18 +6471,20 @@ func (s *DB) UpsertLocalizedVisualTrackIndex(ctx context.Context, idx LocalizedV
 	defer s.mu.Unlock()
 
 	query := `
-		INSERT INTO localized_visual_tracks (id, asset_id, run_id, target_language, cas_hash, provenance_hash, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO localized_visual_tracks (id, asset_id, run_id, job_id, target_language, text_region_plan_cas, cas_hash, provenance_hash, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			asset_id = excluded.asset_id,
 			run_id = excluded.run_id,
+			job_id = excluded.job_id,
 			target_language = excluded.target_language,
+			text_region_plan_cas = excluded.text_region_plan_cas,
 			cas_hash = excluded.cas_hash,
 			provenance_hash = excluded.provenance_hash,
 			created_at = excluded.created_at
 	`
 	_, err := s.db.ExecContext(ctx, query,
-		idx.ID, idx.AssetID, idx.RunID, idx.TargetLanguage, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
+		idx.ID, idx.AssetID, idx.RunID, idx.JobID, idx.TargetLanguage, idx.TextRegionPlanCAS, idx.CASHash, idx.ProvenanceHash, idx.CreatedAt.Format(time.RFC3339Nano),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert localized visual track index: %w", err)

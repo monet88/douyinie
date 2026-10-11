@@ -35,8 +35,13 @@ var (
 const (
 	// RenderPlanSchemaVersion 2 adds frozen CoverBoxes and OverlayCues to the plan identity.
 	// Cover and overlay slices participate directly in slice order; producers emit them deterministically.
-	RenderPlanSchemaVersion    = 2
-	SubtitlePlanSchemaVersion  = 1
+	RenderPlanSchemaVersion   = 2
+	SubtitlePlanSchemaVersion = 1
+	// A render resolves its media through OutputCASHash and never writes OutputCASPath into what it
+	// persists. The field is optional and stays in the payload so artifacts committed before that rule
+	// keep decoding, and no reader resolves media through it - omitting an optional host-local path is a
+	// write-side change only, which is why the schema does not move and committed v1 renders, here and in
+	// a bundle that carried one, stay valid and usable.
 	PreviewRenderSchemaVersion = 1
 	FinalRenderSchemaVersion   = 1
 
@@ -243,6 +248,11 @@ type ConsumedPlanRef struct {
 }
 
 // PreviewRenderArtifact is the distinct immutable artifact produced by a preview render.
+//
+// OutputCASPath is not written by a render and no reader resolves media through it: a render is
+// resolved through OutputCASHash, on this host and on any host a bundle carried it to. The field
+// survives in the payload so artifacts committed before that rule still decode, which is also why the
+// bundle scrub still rewrites it when it ships one of them (scrub.go).
 type PreviewRenderArtifact struct {
 	ID               string          `json:"id"`
 	SchemaVersion    int             `json:"schema_version"`
@@ -263,7 +273,8 @@ type PreviewRenderArtifact struct {
 	CreatedAt        time.Time       `json:"created_at"`
 }
 
-// FinalRenderArtifact is the distinct immutable artifact produced by a final render.
+// FinalRenderArtifact is the distinct immutable artifact produced by a final render. OutputCASPath
+// follows the same rule as PreviewRenderArtifact: it is not written and not read.
 type FinalRenderArtifact struct {
 	ID               string          `json:"id"`
 	SchemaVersion    int             `json:"schema_version"`

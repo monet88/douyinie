@@ -1,6 +1,7 @@
 package service_test
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -236,5 +237,88 @@ func TestValidateManifestJSON_SpecialCharSecrets(t *testing.T) {
 		if err := service.ValidateManifestJSON([]byte(scrubbed)); err != nil {
 			t.Errorf("scrubbed json failed validation: %v, scrubbed: %s", err, scrubbed)
 		}
+	}
+}
+
+// TestValidateManifestJSON_AcceptedCandidateFreeText pins the fail-closed guarantee the portable bundle
+// keeps over the operator's own words. An acceptance publishes the decision it recorded inside the run's
+// dubbing artifact, and a bundle ships that artifact as an immutable, content-addressed payload no export
+// can rewrite; the manifest carries the same text, so a decision naming a machine-local path or a
+// credential is refused at export rather than travelling inside the payload. Scrubbing the manifest's copy
+// instead of refusing is exactly what would let the payload carry the raw text unnoticed.
+func TestValidateManifestJSON_AcceptedCandidateFreeText(t *testing.T) {
+	cases := map[string]struct {
+		reason string
+		want   error
+	}{
+		"a machine-local path":    {`accepted the corrected take stored at C:\Users\monet\private\plan.txt`, domain.ErrJobBundleMachineLocalPath},
+		"a prohibited credential": {`accepted with the operator token sk-abcdefghijklmnopqrstuvwxyz`, domain.ErrJobBundleSecretDetected},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			manifest := &domain.JobBundleManifest{
+				BundleVersion: 1,
+				ExportedAt:    time.Now().UTC(),
+				Job: domain.LocalizationJob{
+					ID:             "job-1",
+					SourceAssetID:  "asset-1",
+					TargetLanguage: domain.TargetLanguageVI,
+					Status:         "completed",
+				},
+				SourceAsset: domain.SourceAsset{
+					ID:       "asset-1",
+					SHA256:   "4b971e41be8a65fa6319808a7beee79b9b1e5f8f8b03126ab56627045b85a3c0",
+					ByteSize: 1000,
+				},
+				LicenseManifests: []domain.LicenseManifestEntry{{
+					DependencyName: "qwen3-asr",
+					Version:        "1.7b",
+					SHA256:         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+					CodeLicense:    "Apache-2.0",
+					ModelLicense:   "Qwen-Research",
+					DataLicense:    "Common-Voice",
+					ServiceTerms:   "Local-Offline",
+					Verified:       true,
+				}},
+				Runs: []domain.JobBundleRunData{{
+					Run: domain.LocalizationRun{ID: "run-1", JobID: "job-1"},
+					DubSegmentsVariant: &domain.DubSegmentsVariant{
+						ID:             "dsv-1",
+						SchemaVersion:  domain.DubSegmentsSchemaVersion,
+						AssetID:        "asset-1",
+						RunID:          "run-1",
+						TargetLanguage: domain.TargetLanguageVI,
+						OverallStatus:  "PASS",
+						AcceptedCandidates: []domain.AcceptedReviewCandidate{{
+							ReviewItemID:        "ri-1",
+							ReviewOverrideID:    "ro-1",
+							SelectedAudioSHA256: "a97b2f6f8d4f0f2fbbe8dffbcb7a5a34d70a3a6b3f5b0b0dd3a5d7f2b1c4e6a8",
+							Operator:            "qa_lead",
+							Reason:              tc.reason,
+							AcceptedAt:          time.Now().UTC(),
+						}},
+					},
+				}},
+			}
+			raw, err := json.MarshalIndent(manifest, "", "  ")
+			if err != nil {
+				t.Fatalf("marshal the manifest: %v", err)
+			}
+			// JSON escapes a Windows path's separators, so the manifest carries the text in that form.
+			carried := false
+			for _, form := range []string{tc.reason, strings.ReplaceAll(tc.reason, `\`, `\\`)} {
+				if strings.Contains(string(raw), form) {
+					carried = true
+					break
+				}
+			}
+			if !carried {
+				t.Fatalf("the manifest must carry the acceptance's own words, got %s", raw)
+			}
+			if err := service.ValidateManifestJSON(raw); !errors.Is(err, tc.want) {
+				t.Fatalf("a bundle carrying %s must be refused with %v, got %v", name, tc.want, err)
+			}
+		})
 	}
 }

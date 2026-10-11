@@ -167,6 +167,13 @@ type PreservationWindow struct {
 }
 
 // DubMixArtifact is the final mixed audio track combining localized speech with preserved soundtrack.
+//
+// AudioCASPath is the path this host resolved for the media the artifact names. The copy committed to
+// CAS - the one that ships inside a bundle under its own hash - is written without it, because a bundle
+// has to reproduce on a host that never had that path, and every reader, here and there, resolves the
+// media through AudioCASHash. The field stays in the payload and stays optional, so mixes committed
+// before that rule keep decoding and keep working: omitting it is a write-side change only, which is why
+// the schema version does not move and a cached v2 mix stays valid and usable.
 type DubMixArtifact struct {
 	ID                  string                     `json:"id"`
 	SchemaVersion       int                        `json:"schema_version"`

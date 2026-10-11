@@ -1854,7 +1854,8 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 		// If this VoiceAssignment supersedes a prior assignment and this speaker was NOT invalidated,
 		// reuse the prior validated DubSegment and FitPlan directly without re-synthesizing ONLY IF:
 		// 0) The prior variant was produced under this exact stage cache identity (priorReusable).
-		// 1) Matching prior segment is present and valid with non-empty audio and accepted status.
+		// 1) Matching prior segment is present, its audio is committed in CAS, and it is accepted
+		//    and valid.
 		// 2) Corresponding prior DubbingFitPlan exists and was accepted with a measured
 		//    candidate (its own decision is the evidence, not a re-derived window).
 		// 3) Grouped SpeechBlockIndices / timing match the current dub script and speaker sequence.
@@ -1864,7 +1865,8 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 			if segExists && fpExists &&
 				priorSeg.SpeakerID == spkID &&
 				domain.VoiceProfileEquivalent(priorSeg.Voice, voice) &&
-				priorSeg.AudioSHA256 != "" && priorSeg.AudioCASPath != "" &&
+				priorSeg.AudioSHA256 != "" &&
+				s.cas != nil && s.cas.Exists(priorSeg.AudioSHA256) &&
 				priorSeg.FitDecision == domain.FitActionAccept &&
 				!priorSeg.RequiresReview &&
 				// The plan's own accepted decision is the reuse evidence. Re-deriving the window
@@ -2232,7 +2234,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 
 				// Exactly one combined synthesis and probe for the chosen group, and none at
 				// all when the merged text already fails meaning/glossary QA.
-				var groupAudioPath, groupAudioSHA string
+				var groupAudioSHA string
 				var groupProbedMs int64
 				var groupEvalRes FitEvaluationResult
 				accepted := false
@@ -2262,7 +2264,7 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 						if casErr != nil {
 							return nil, fmt.Errorf("regroup commit audio segment %d to CAS: %w", seg.Index, casErr)
 						}
-						groupAudioPath, groupAudioSHA = casObj.Path, casObj.SHA256
+						groupAudioSHA = casObj.SHA256
 					} else {
 						groupAudioSHA = synthRes.AudioSHA256
 					}
@@ -2323,7 +2325,6 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 						SlotDurationMs:     groupEndMs - groupStartMs,
 						SourceText:         groupSourceText,
 						SpokenText:         groupSpokenText,
-						AudioCASPath:       groupAudioPath,
 						AudioSHA256:        groupAudioSHA,
 						MeasuredDurationMs: groupProbedMs,
 						Voice:              voice,
@@ -2370,7 +2371,6 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 						SlotDurationMs:     groupEndMs - groupStartMs,
 						SourceText:         groupSourceText,
 						SpokenText:         groupSpokenText,
-						AudioCASPath:       groupAudioPath,
 						AudioSHA256:        groupAudioSHA,
 						MeasuredDurationMs: groupProbedMs,
 						Voice:              voice,
@@ -2438,7 +2438,6 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				SlotDurationMs:     actualSlotDur,
 				SourceText:         seg.SourceText,
 				SpokenText:         currentText,
-				AudioCASPath:       finalCandidate.AudioCASPath,
 				AudioSHA256:        finalCandidate.AudioSHA256,
 				MeasuredDurationMs: finalCandidate.MeasuredDurationMs,
 				Voice:              voice,
@@ -2462,7 +2461,6 @@ func (s *DubbingService) synthesizeSegmentsPass(ctx context.Context, in domain.D
 				SlotDurationMs:     actualSlotDur,
 				SourceText:         seg.SourceText,
 				SpokenText:         currentText,
-				AudioCASPath:       finalCandidate.AudioCASPath,
 				AudioSHA256:        finalCandidate.AudioSHA256,
 				MeasuredDurationMs: finalCandidate.MeasuredDurationMs,
 				Voice:              voice,

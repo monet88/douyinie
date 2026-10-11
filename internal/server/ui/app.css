@@ -472,7 +472,6 @@ tr.is-selected-row td { background: rgba(231,255,87,.03); }
 .tempo-waiver { display: flex; gap: 6px; align-items: flex-start; color: var(--text-soft); font-size: 10.5px; line-height: 1.4; }
 .tempo-waiver input { width: auto; margin: 1px 0 0; accent-color: var(--accent); }
 .tempo-accept-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.tempo-accept-actions button { font-size: 11px; padding: 6px 10px; }
 #inspect-tempo-status:empty { display: none; }
 
 .editor-tabs { display: flex; gap: 4px; padding: 10px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }

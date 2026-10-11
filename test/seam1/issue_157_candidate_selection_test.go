@@ -1,20 +1,27 @@
 package seam1_test
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/monet88/douyinie/internal/domain"
 	"github.com/monet88/douyinie/internal/service"
+	"github.com/monet88/douyinie/internal/storage"
 )
 
 // Issue #157: exact reviewed-candidate selection through render and portable replay.
@@ -118,27 +125,143 @@ func issue157StageArtifact(t *testing.T, h *testHarness, runID, stage string) st
 	return casHash
 }
 
-// TestSeam1_Issue157_JoinedPipelineSelectionThroughRenderAndPortableReplay is the joined
-// acceptance of the final slice: the production run pipeline (glossary/contract-checked
-// translation, measured playback windows, bounded recovery) parks on an unselectable review-only
-// tempo candidate, the operator accepts that exact candidate, and the accepted selection survives
-// a restart and a bundle replay onto a host with a different CAS root.
+// issue157CarriesHostPath reports whether raw embeds the exporting host's directory. The check has to
+// cover the forms the path takes on disk and inside JSON: a Windows root is written with escaped
+// separators there, so searching the literal string alone would pass on a bundle that leaks it.
+func issue157CarriesHostPath(raw []byte, dir string) bool {
+	for _, form := range []string{dir, filepath.ToSlash(dir), strings.ReplaceAll(dir, `\`, `\\`)} {
+		if form != "" && bytes.Contains(raw, []byte(form)) {
+			return true
+		}
+	}
+	return false
+}
+
+// issue157AnchoredGateway is the HTTP gateway a joined run translates through: a real gateway endpoint
+// the production provider parses, anchor-validates and repairs against, not a provider that answers
+// without any of those steps. It records whether the run's frozen glossary reached the wire payload and
+// answers the first batch with a duplicated index, so the bounded whole-batch repair has to run before a
+// translation can be accepted.
+type issue157AnchoredGateway struct {
+	*httptest.Server
+	calls        int32
+	glossarySeen int32
+}
+
+type issue157GatewayPayload struct {
+	Segments []struct {
+		Index      int    `json:"index"`
+		SourceText string `json:"source_text"`
+	} `json:"segments"`
+	EffectiveGlossary []domain.GlossaryEntry `json:"effective_glossary"`
+}
+
+func newIssue157AnchoredGateway(t *testing.T) *issue157AnchoredGateway {
+	t.Helper()
+	g := &issue157AnchoredGateway{}
+	g.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad gateway request", http.StatusBadRequest)
+			return
+		}
+		var payload issue157GatewayPayload
+		for _, m := range req.Messages {
+			if m.Role == "user" && json.Unmarshal([]byte(m.Content), &payload) == nil {
+				break
+			}
+		}
+		if len(payload.EffectiveGlossary) > 0 {
+			atomic.StoreInt32(&g.glossarySeen, 1)
+		}
+		segments := make([]map[string]any, 0, len(payload.Segments))
+		for _, seg := range payload.Segments {
+			segments = append(segments, map[string]any{
+				"index":             seg.Index,
+				"source_text":       seg.SourceText,
+				"target_text":       fmt.Sprintf("Bản dịch thoại cho đoạn %d", seg.Index+1),
+				"key_facts":         []string{},
+				"negation_polarity": false,
+			})
+		}
+		if atomic.AddInt32(&g.calls, 1) == 1 && len(segments) > 0 {
+			// A duplicated index the production parser has to reject: the whole batch is re-asked and
+			// only the complete answer is accepted, which is the repair the joined acceptance asserts.
+			segments = append(segments, segments[0])
+		}
+		body, _ := json.Marshal(map[string]any{"segments": segments})
+		writeGatewayJSON(w, "gemini-3.8-flash-001", "fp_joined_157", string(body))
+	}))
+	t.Cleanup(g.Close)
+	return g
+}
+
+func (g *issue157AnchoredGateway) callCount() int    { return int(atomic.LoadInt32(&g.calls)) }
+func (g *issue157AnchoredGateway) sawGlossary() bool { return atomic.LoadInt32(&g.glossarySeen) == 1 }
+
+// issue157EnqueueRunWithGlossary starts the run with a glossary frozen into its config snapshot, the way
+// an operator's request freezes it before any stage reads it.
+func issue157EnqueueRunWithGlossary(t *testing.T, h *testHarness, jobID, source, target string) string {
+	t.Helper()
+	cfg := mustJSON(t, map[string]any{"glossary": []domain.GlossaryEntry{{Source: source, Target: target}}})
+	body := mustJSON(t, map[string]string{"config_snapshot_json": string(cfg)})
+	resp, err := http.Post(fmt.Sprintf("%s/api/v1/jobs/%s/runs", h.server.URL, jobID), "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("create run with a frozen glossary failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 create run with a frozen glossary, got %d", resp.StatusCode)
+	}
+	var res struct {
+		Run domain.LocalizationRun `json:"run"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&res)
+	return res.Run.ID
+}
+
+// issue157TranslationVariant decodes the run's pinned translation variant from CAS.
+func issue157TranslationVariant(t *testing.T, h *testHarness, casHash string) *domain.TranslationVariant {
+	t.Helper()
+	rc, err := h.casStore.Get(casHash)
+	if err != nil {
+		t.Fatalf("read translation variant %s from CAS: %v", casHash, err)
+	}
+	defer rc.Close()
+	var variant domain.TranslationVariant
+	if err := json.NewDecoder(rc).Decode(&variant); err != nil {
+		t.Fatalf("decode translation variant %s: %v", casHash, err)
+	}
+	return &variant
+}
+
+// TestSeam1_Issue157_JoinedPipelineSelectionThroughRenderAndPortableReplay is the joined acceptance of
+// the final slice: the production run pipeline translates through the real gateway parser - the run's
+// frozen glossary travels on the wire and the malformed first batch is repaired in bounded fashion -
+// then parks on an unselectable review-only tempo candidate, the operator accepts that exact candidate,
+// and the accepted selection survives a restart and a bundle replay onto a host with a different CAS root.
 func TestSeam1_Issue157_JoinedPipelineSelectionThroughRenderAndPortableReplay(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg is required to build the tempo candidate and render the rebuilt preview")
 	}
 
-	h := setupAutoRunHarness(t)
-	configureDialogueTranslationGateway(t, h)
+	gateway := newIssue157AnchoredGateway(t)
+	h := setupHarnessWithOptions(t, harnessOptions{autoRunExecutor: true, translationGatewayURL: gateway.URL})
 
 	// One 300ms dialogue slot; a 330ms fixed-rate candidate needs a 1.1x transform, which is the
-	// review-only atempo band (#156) and therefore parks the run with exactly one candidate.
+	// review-only atempo band (#156) and therefore parks the run with exactly one candidate. The
+	// glossary term is one the transcribed turn actually contains, so it is effective, not inert.
 	lane := defaultVITTSFake(t, h)
 	lane.DurationMs = 330
 
 	assetID := ingestSyntheticAssetWithFrequency(t, h.server.URL, h.dir, "issue157_joined.mp4", 2.0, 2500)
 	jobID := createJob(t, h.server.URL, assetID, domain.TargetLanguageVI)
-	runID := enqueueRun(t, h.server.URL, jobID)
+	runID := issue157EnqueueRunWithGlossary(t, h, jobID, "语音", "thoại")
 
 	parked := pollRunStatus(t, h.server.URL, runID, domain.RunStatusPaused, 30*time.Second)
 	if parked.Status != domain.RunStatusPaused {
@@ -150,6 +273,30 @@ func TestSeam1_Issue157_JoinedPipelineSelectionThroughRenderAndPortableReplay(t 
 	}
 	if mix := issue157StageArtifact(t, h, runID, "audio_mix"); mix != "" {
 		t.Fatalf("a parked run must not have mixed, got audio_mix artifact %s", mix)
+	}
+
+	// AC8: this run translated through the production gateway path, not around it - the parser rejected
+	// the malformed first batch, the bounded repair re-asked exactly once, and the run's frozen glossary
+	// travelled on the wire and resolved onto the translation the run actually carries.
+	if calls := gateway.callCount(); calls != 2 {
+		t.Fatalf("expected the malformed first batch to be repaired in one re-ask, got %d gateway calls", calls)
+	}
+	if !gateway.sawGlossary() {
+		t.Fatal("the run's frozen glossary never reached the gateway payload")
+	}
+	transIdx, err := h.db.GetTranslationVariantIndexByRun(context.Background(), runID)
+	if err != nil || transIdx == nil {
+		t.Fatalf("read the run's translation index: %v", err)
+	}
+	translation := issue157TranslationVariant(t, h, transIdx.CASHash)
+	if len(translation.EffectiveGlossary.Entries) != 1 || translation.EffectiveGlossary.Hash == "" {
+		t.Fatalf("expected the frozen glossary to resolve onto the run's translation, got %+v", translation.EffectiveGlossary)
+	}
+	if len(translation.Segments) == 0 {
+		t.Fatalf("expected the repaired batch to be translated, got %+v", translation)
+	}
+	if got := strings.TrimSpace(translation.Segments[0].TargetText); got == "" || got == translation.Segments[0].SourceText {
+		t.Fatalf("expected an anchored translation of the repaired batch, got %+v", translation.Segments[0])
 	}
 
 	items := issue157ReviewItems(t, h, runID)
@@ -354,6 +501,61 @@ func TestSeam1_Issue157_JoinedPipelineSelectionThroughRenderAndPortableReplay(t 
 	if err != nil || len(zipBytes) == 0 {
 		t.Fatalf("read exported bundle: %v (len %d)", err, len(zipBytes))
 	}
+	// What the second host receives is scrubbed: the exporting host's own directory never travels
+	// inside the bundle. The import below is what proves the accepted candidate, its natural parent and
+	// the approval lineage survive the replay onto a different CAS root.
+	zr, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+	if err != nil {
+		t.Fatalf("read the exported bundle as a zip: %v", err)
+	}
+	checkedManifest := false
+	for _, f := range zr.File {
+		if !strings.HasSuffix(f.Name, "manifest.json") {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatalf("open the exported manifest %s: %v", f.Name, err)
+		}
+		raw, readErr := io.ReadAll(rc)
+		rc.Close()
+		if readErr != nil {
+			t.Fatalf("read the exported manifest %s: %v", f.Name, readErr)
+		}
+		checkedManifest = true
+		if issue157CarriesHostPath(raw, h.dir) {
+			t.Fatalf("the exported manifest must not carry the exporting host's path, found %s", h.dir)
+		}
+	}
+	if !checkedManifest {
+		t.Fatal("the exported bundle carries no manifest to verify")
+	}
+	// The manifest is the human-readable half of the delivery; the payload half is the committed
+	// artifacts themselves, shipped under their own hashes. A machine-local path inside one of them
+	// travels with that hash into every bundle - and the dubbing artifact's hash is the acceptance
+	// identity - so the payload is scanned too, not only the manifest.
+	var leaked []string
+	for _, f := range zr.File {
+		if strings.HasSuffix(f.Name, "manifest.json") {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatalf("open the exported payload %s: %v", f.Name, err)
+		}
+		raw, readErr := io.ReadAll(rc)
+		rc.Close()
+		if readErr != nil {
+			t.Fatalf("read the exported payload %s: %v", f.Name, readErr)
+		}
+		if issue157CarriesHostPath(raw, h.dir) {
+			leaked = append(leaked, fmt.Sprintf("%s (%d bytes)", f.Name, len(raw)))
+		}
+	}
+	if len(leaked) > 0 {
+		t.Errorf("the exported payload must not carry the exporting host's path %s, found in: %s",
+			h.dir, strings.Join(leaked, ", "))
+	}
 
 	importHost := setupHarness(t)
 	if importHost.dir == h.dir {
@@ -393,6 +595,141 @@ func TestSeam1_Issue157_JoinedPipelineSelectionThroughRenderAndPortableReplay(t 
 		}
 		importPlay.Body.Close()
 	}
+
+	// The importing host restores the run's dubbing artifact under the hash every other record of that
+	// run names: its dub_synthesize pin, its mix's DubSegmentsCAS and the acceptance evidence inside
+	// the artifact itself. A locally re-encoded second hash would leave the imported delivery looking
+	// stale, so an identical replay would withdraw and rebuild media the target host already serves.
+	sourceVariant, err := h.db.GetDubSegmentsVariantIndexByRun(context.Background(), runID)
+	if err != nil || sourceVariant == nil || sourceVariant.CASHash == "" {
+		t.Fatalf("read the source dubbing artifact row: %v (%+v)", err, sourceVariant)
+	}
+	importVariant, err := importHost.db.GetDubSegmentsVariantIndexByRun(context.Background(), runID)
+	if err != nil || importVariant == nil {
+		t.Fatalf("read the imported dubbing artifact row: %v (%+v)", err, importVariant)
+	}
+	if !strings.EqualFold(importVariant.CASHash, sourceVariant.CASHash) {
+		t.Fatalf("the imported run must resolve the dubbing artifact %s it was exported with, got %s",
+			sourceVariant.CASHash, importVariant.CASHash)
+	}
+	importPin, err := importHost.db.GetStageArtifactHash(context.Background(), runID, "dub_synthesize")
+	if err != nil || strings.TrimSpace(importPin) == "" {
+		t.Fatalf("read the imported run's dubbing stage pin: %v (%q)", err, importPin)
+	}
+	if !strings.EqualFold(importPin, importVariant.CASHash) {
+		t.Fatalf("the imported run's dubbing stage pin %s must be the artifact its index row claims, got %s",
+			importPin, importVariant.CASHash)
+	}
+	// A bundle is the run's portable delivery, so the importing host must resolve the artifacts the
+	// run was exported with - its script, voice assignment and mix - not only the dubbing artifact.
+	for _, probe := range []struct {
+		name string
+		read func() error
+	}{
+		{"dub script", func() error {
+			_, err := importHost.db.GetDubScriptVariantIndexByRun(context.Background(), runID)
+			return err
+		}},
+		{"voice assignment", func() error {
+			_, err := importHost.db.GetVoiceAssignmentIndexByRunID(context.Background(), runID)
+			return err
+		}},
+		{"dub mix", func() error {
+			_, err := importHost.db.GetDubMixArtifactIndexByRun(context.Background(), runID)
+			return err
+		}},
+	} {
+		if err := probe.read(); err != nil {
+			t.Fatalf("the imported host must resolve the run's exported %s: %v", probe.name, err)
+		}
+	}
+
+	// Playback on the importing host has to survive a restart of that host, and it has to be the
+	// committed waveform: the target host serves it from its own CAS root, so a read that followed a
+	// path recorded by the exporting host would either fail or serve different bytes.
+	importRestarted := issue157RestartHost(t, importHost)
+	servedResp, err := http.Get(fmt.Sprintf("%s/api/v1/runs/%s/dub-media/%s", importRestarted.server.URL, runID, evidence.SelectedAudioSHA256))
+	if err != nil || servedResp.StatusCode != http.StatusOK {
+		t.Fatalf("the importing host must serve the accepted waveform after restart: status=%v err=%v", statusOf(servedResp), err)
+	}
+	servedBytes, readErr := io.ReadAll(servedResp.Body)
+	servedResp.Body.Close()
+	if readErr != nil {
+		t.Fatalf("read the served accepted waveform: %v", readErr)
+	}
+	if sum := sha256.Sum256(servedBytes); !strings.EqualFold(hex.EncodeToString(sum[:]), evidence.SelectedAudioSHA256) {
+		t.Fatalf("the importing host served %d bytes that are not the accepted waveform %s",
+			len(servedBytes), evidence.SelectedAudioSHA256)
+	}
+
+	// The rendered half of the delivery resolves there too, from its own CAS root, and it is the same
+	// media: the accepted candidate rebuilt this render, so the output object the importing host
+	// serves is the one the exporting host serves, and the row it resolves it through is the artifact
+	// the bundle shipped rather than a copy rewritten for this host.
+	for _, probe := range []struct {
+		name string
+		path string
+		key  string
+	}{
+		{"preview", fmt.Sprintf("/api/v1/assets/%s/render/preview?run_id=%s&target_language=vi", assetID, runID), "preview_render"},
+		{"final", fmt.Sprintf("/api/v1/assets/%s/render/final?run_id=%s&target_language=vi", assetID, runID), "final_render"},
+	} {
+		sourcePlan, sourceOutput := issue157RenderLineage(t, h, probe.path, probe.key)
+		importPlan, importOutput := issue157RenderLineage(t, importRestarted, probe.path, probe.key)
+		if importOutput == "" || !strings.EqualFold(importOutput, sourceOutput) {
+			t.Fatalf("the importing host must resolve the run's %s media %s, got %s", probe.name, sourceOutput, importOutput)
+		}
+		if !strings.EqualFold(importPlan, sourcePlan) {
+			t.Fatalf("the importing host must resolve the %s plan %s the render was frozen from, got %s", probe.name, sourcePlan, importPlan)
+		}
+	}
+
+	// A bundle is portable through more than one hop: what the importing host exports must be as free
+	// of machine-local paths as the bundle it received, checked against both hosts' directories. A
+	// rewrite that resolved an artifact for the importing host would show up here and nowhere else.
+	reexport, err := http.Post(importRestarted.server.URL+"/api/v1/jobs/"+jobID+"/export", "application/json", nil)
+	if err != nil {
+		t.Fatalf("re-export the imported job: %v", err)
+	}
+	if reexport.StatusCode != http.StatusOK && reexport.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(reexport.Body)
+		reexport.Body.Close()
+		t.Fatalf("re-export the imported job: status=%d body=%s", reexport.StatusCode, string(body))
+	}
+	reexportBytes, err := io.ReadAll(reexport.Body)
+	reexport.Body.Close()
+	if err != nil || len(reexportBytes) == 0 {
+		t.Fatalf("read the re-exported bundle: %v (len %d)", err, len(reexportBytes))
+	}
+	rezr, err := zip.NewReader(bytes.NewReader(reexportBytes), int64(len(reexportBytes)))
+	if err != nil {
+		t.Fatalf("read the re-exported bundle as a zip: %v", err)
+	}
+	var reexportLeaks []string
+	for _, f := range rezr.File {
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatalf("open the re-exported payload %s: %v", f.Name, err)
+		}
+		raw, readErr := io.ReadAll(rc)
+		rc.Close()
+		if readErr != nil {
+			t.Fatalf("read the re-exported payload %s: %v", f.Name, readErr)
+		}
+		if issue157CarriesHostPath(raw, h.dir) || issue157CarriesHostPath(raw, importHost.dir) {
+			reexportLeaks = append(reexportLeaks, f.Name)
+		}
+	}
+	if len(reexportLeaks) > 0 {
+		t.Errorf("a bundle exported by the importing host must not carry either host's paths, found in: %s", strings.Join(reexportLeaks, ", "))
+	}
+
+	// An identical replay on the importing host answers from the recorded decision: the run the
+	// bundle carried is acceptable there without re-deciding anything.
+	replayStatus, replay, replayRefusal := issue157Accept(t, importRestarted, runID, issue157Selection(item.ID))
+	if replayStatus != http.StatusOK || replay == nil || !replay.Idempotent {
+		t.Fatalf("expected the imported acceptance replay to answer from the recorded decision, got %d (%s)", replayStatus, replayRefusal)
+	}
 }
 
 func statusOf(resp *http.Response) int {
@@ -410,6 +747,103 @@ func issue157OverrideCount(t *testing.T, h *testHarness, runID string) int {
 		t.Fatalf("read review overrides for run %s: %v", runID, err)
 	}
 	return len(rows)
+}
+
+// TestSeam1_Issue157_AcceptanceOnAnImportedRunRebuildsWithoutAQueueRow is the regression for a host
+// that imported the run: a bundle carries the run, not the exporting host's local pipeline row, so the
+// importing host holds no queue entry for it. An acceptance that completes the run's coverage there
+// must still rebuild and deliver the accepted waveform instead of faulting on the missing row, and it
+// must report the state the run was restored with rather than a completion it never performed - the
+// same tolerance the replayed acceptance already applies to that case.
+func TestSeam1_Issue157_AcceptanceOnAnImportedRunRebuildsWithoutAQueueRow(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is required to rebuild the accepted delivery")
+	}
+	ctx := context.Background()
+	h := setupHarness(t)
+	jobID, _, runID, items := issue157ParkedFixture(t, h, false)
+	if len(items) == 0 {
+		t.Fatal("expected a parked run with a pending review item")
+	}
+
+	// Export while the items are still undecided: the bundle carries the review state the importing
+	// host has to finish, which is what makes its acceptance a fresh decision and not a replay.
+	exportResp, err := http.Post(fmt.Sprintf("%s/api/v1/jobs/%s/export", h.server.URL, jobID), "application/json", nil)
+	if err != nil {
+		t.Fatalf("export bundle: %v", err)
+	}
+	if exportResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(exportResp.Body)
+		exportResp.Body.Close()
+		t.Fatalf("export bundle status=%d body=%s", exportResp.StatusCode, string(body))
+	}
+	zipBytes, err := io.ReadAll(exportResp.Body)
+	exportResp.Body.Close()
+	if err != nil || len(zipBytes) == 0 {
+		t.Fatalf("read exported bundle: %v (len %d)", err, len(zipBytes))
+	}
+
+	importHost := setupHarness(t)
+	if importHost.dir == h.dir {
+		t.Fatal("expected the importing host to use a different CAS root")
+	}
+	defaultVITTSFake(t, importHost)
+	impResp, err := http.Post(importHost.server.URL+"/api/v1/jobs/import", "application/zip", bytes.NewReader(zipBytes))
+	if err != nil {
+		t.Fatalf("import bundle: %v", err)
+	}
+	impBody, _ := io.ReadAll(impResp.Body)
+	impResp.Body.Close()
+	if impResp.StatusCode != http.StatusOK && impResp.StatusCode != http.StatusCreated {
+		t.Fatalf("import bundle status=%d body=%s", impResp.StatusCode, string(impBody))
+	}
+	if _, err := importHost.db.GetQueueEntryByRunID(ctx, runID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("the importing host must hold no queue row for the imported run, got %v", err)
+	}
+
+	// Drive every group the imported run still owes, exactly as an operator would.
+	rebuilt := false
+	for {
+		pending := issue157ReviewItems(t, importHost, runID)
+		if len(pending) == 0 {
+			break
+		}
+		status, result, refusal := issue157Accept(t, importHost, runID, issue157Selection(pending[0].ID))
+		if status != http.StatusOK || result == nil {
+			t.Fatalf("accepting %s on the importing host failed: status=%d refusal=%s", pending[0].ID, status, refusal)
+		}
+		if result.RunCompleted {
+			t.Errorf("an imported run holds no local queue row, so the acceptance must not report a completion it never performed: %+v", result)
+		}
+		if !result.CoverageComplete {
+			continue
+		}
+		// Closing the coverage is where the rebuild runs, and the delivery it produced is this
+		// acceptance's own: a missing local queue row must not turn it into a fault.
+		if result.SelectedAudioSHA256 == "" || result.FinalRenderCAS == "" {
+			t.Fatalf("the acceptance must rebuild the delivery on the accepted waveform, got %+v", result)
+		}
+		rebuilt = true
+	}
+	if !rebuilt {
+		t.Fatal("expected an acceptance that closed the imported run's coverage")
+	}
+	if pending := issue157ReviewItems(t, importHost, runID); len(pending) != 0 {
+		t.Fatalf("expected every imported review item to be resolved, got %+v", pending)
+	}
+	successor := issue157RunVariant(t, importHost, runID)
+	if successor.OverallStatus != "PASS" || len(successor.AcceptedCandidates) == 0 {
+		t.Fatalf("the imported run must carry the accepted decisions, got status=%s decisions=%+v",
+			successor.OverallStatus, successor.AcceptedCandidates)
+	}
+	mix := issue157ReadMix(t, importHost, runID)
+	if mix == nil {
+		t.Fatal("the accepted decisions must rebuild the imported run's mix")
+	}
+	if !strings.EqualFold(mix.DubSegmentsCAS, successor.CASHash) {
+		t.Fatalf("the imported run's mix must be built from its accepted successor %s, got %s",
+			successor.CASHash, mix.DubSegmentsCAS)
+	}
 }
 
 // issue157RestartHost rebuilds a RuntimeHost over the same database and CAS root, simulating a
