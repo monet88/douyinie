@@ -174,6 +174,12 @@ function createHarness() {
     inspectTempoNote: register("#inspect-tempo-note"),
     inspectTempoNatural: register("#inspect-tempo-natural", { tag: "audio", classes: ["hidden"] }),
     inspectTempoTransformed: register("#inspect-tempo-transformed", { tag: "audio", classes: ["hidden"] }),
+    // Issue #157: the operator's explicit acceptance of one auditioned waveform.
+    inspectTempoReason: register("#inspect-tempo-reason"),
+    inspectTempoWaiver: register("#inspect-tempo-waiver", { tag: "input" }),
+    inspectTempoAcceptTransformed: register("#inspect-tempo-accept-transformed", { tag: "button" }),
+    inspectTempoAcceptNatural: register("#inspect-tempo-accept-natural", { tag: "button" }),
+    inspectTempoStatus: register("#inspect-tempo-status"),
     textForm: register("#text-form", { dataset: { editorPanel: "text" }, classes: ["hidden"] }),
     acceptForm: register("#accept-form", { dataset: { editorPanel: "accept" } }),
     voiceForm: register("#voice-form", { dataset: { editorPanel: "voice" }, classes: ["hidden"] }),
@@ -1506,6 +1512,203 @@ test("selecting an exception without a candidate clears the audition panel and i
   assert.equal(h.els.inspectTempoMeta.innerHTML, "", "the evidence rows must be cleared");
   assert.equal(h.els.inspectTempoNatural.src, "", "the natural player must not keep a stale source");
   assert.equal(h.els.inspectTempoTransformed.src, "", "the tempo player must not keep a stale source");
+});
+
+// Issue #157: accepting an auditioned waveform is one decision for the run, so the surface must
+// lock both choices while the request is in flight and must not clear an exception the operator
+// opened in the meantime.
+test("both acceptance controls are locked while the acceptance is in flight", async () => {
+  const h = createHarness();
+  await h.ready();
+  h.evalIn(tempoCandidateItem);
+  h.els.inspectTempoReason.value = "đã nghe và chấp nhận bản tempo";
+  h.els.inspectTempoWaiver.checked = true;
+
+  let release = null;
+  h.setResponder((url) => {
+    if (url.includes("/review/accept-candidate")) {
+      return new Promise((resolve) => {
+        release = () => resolve({ status: 409, payload: { error: "reviewed candidate selection refused: superseded" } });
+      });
+    }
+    return { status: 200, payload: {} };
+  });
+
+  const transformed = h.els.inspectTempoAcceptTransformed;
+  transformed.dispatch("click", { currentTarget: transformed, target: { closest: () => null } });
+  await h.settle();
+
+  assert.ok(release, "the transformed acceptance must be posted");
+  assert.equal(transformed.disabled, true, "the clicked control must be locked while the acceptance is in flight");
+  assert.equal(
+    h.els.inspectTempoAcceptNatural.disabled,
+    true,
+    "the opposite waveform must be locked too: the run resolves one decision, not two racing ones"
+  );
+
+  release();
+  await h.settle();
+
+  assert.equal(transformed.disabled, false, "an in-window candidate must be offerable again once the request settled");
+  assert.equal(h.els.inspectTempoAcceptNatural.disabled, false, "the restored control states must replace the in-flight lock");
+  assert.ok(
+    h.els.inspectTempoStatus.textContent.includes("Không chấp nhận được"),
+    `the refusal must stay readable in the panel, got ${h.els.inspectTempoStatus.textContent}`
+  );
+});
+
+test("an acceptance response never clears an exception the operator opened meanwhile", async () => {
+  const h = createHarness();
+  await h.ready();
+  h.evalIn(tempoCandidateItem);
+  h.els.inspectTempoReason.value = "đã nghe và chấp nhận bản tempo";
+  h.els.inspectTempoWaiver.checked = true;
+
+  let release = null;
+  h.setResponder((url) => {
+    if (url.includes("/review/accept-candidate")) {
+      return new Promise((resolve) => {
+        release = () => resolve({ status: 200, payload: { result: { message: "đã chấp nhận" } } });
+      });
+    }
+    if (url.includes("/review-items")) {
+      return { status: 200, payload: { review_items: [{ id: "rev-plain-1", run_id: "run-1", type: "low_confidence", severity: "warning", status: "pending" }] } };
+    }
+    // A settled acceptance re-reads the run and its queue, so the stub serves the daemon's shape
+    // rather than an empty payload the surface can only read as "this run has nothing".
+    if (url === "/api/v1/runs/run-1") {
+      return { status: 200, payload: { run: { id: "run-1", job_id: "job-1", status: "paused" } } };
+    }
+    if (url === "/api/v1/runs/run-1/stages") return { status: 200, payload: { stages: [] } };
+    if (url === "/api/v1/jobs") {
+      return { status: 200, payload: { jobs: [{ id: "job-1", source_asset_id: "asset-1", target_language: "vi" }] } };
+    }
+    return { status: 200, payload: {} };
+  });
+
+  const transformed = h.els.inspectTempoAcceptTransformed;
+  transformed.dispatch("click", { currentTarget: transformed, target: { closest: () => null } });
+  await h.settle();
+
+  // The operator opens another exception in the same run while the acceptance is still in flight.
+  h.evalIn("state.selectedReviewItem = state.reviewItems[1]; state.handoff = { action: 'start_final_render' }; renderInspector();");
+  release();
+  await h.settle();
+
+  assert.equal(
+    h.evalIn("state.selectedReviewItem && state.selectedReviewItem.id"),
+    "rev-plain-1",
+    "the settled acceptance must not clear the exception the operator selected meanwhile"
+  );
+  assert.equal(
+    h.evalIn("state.handoff"),
+    null,
+    "the rebuilt delivery invalidates this run's handoff even while another exception is open"
+  );
+  assert.equal(
+    h.els.inspectTempoStatus.textContent.includes("đã chấp nhận"),
+    false,
+    `a settled acceptance must not leave its message beside another exception, got ${h.els.inspectTempoStatus.textContent}`
+  );
+});
+
+// Issue #157: the acceptance status node is shared by every exception item, so a settled request may
+// only describe its outcome there while the operator is still looking at the item it belongs to.
+test("an acceptance refusal never lands in the status node of another exception", async () => {
+  const h = createHarness();
+  await h.ready();
+  h.evalIn(tempoCandidateItem);
+  h.els.inspectTempoReason.value = "đã nghe và chấp nhận bản tempo";
+  h.els.inspectTempoWaiver.checked = true;
+
+  let release = null;
+  h.setResponder((url) => {
+    if (url.includes("/review/accept-candidate")) {
+      return new Promise((resolve) => {
+        release = () => resolve({ status: 409, payload: { error: "reviewed candidate selection refused: superseded" } });
+      });
+    }
+    if (url.includes("/review-items")) {
+      return { status: 200, payload: { review_items: [{ id: "rev-plain-1", run_id: "run-1", type: "low_confidence", severity: "warning", status: "pending" }] } };
+    }
+    return { status: 200, payload: {} };
+  });
+
+  const transformed = h.els.inspectTempoAcceptTransformed;
+  transformed.dispatch("click", { currentTarget: transformed, target: { closest: () => null } });
+  await h.settle();
+
+  // The operator opens another exception while the refusal is still in flight.
+  h.evalIn("state.selectedReviewItem = state.reviewItems[1]; renderInspector();");
+  release();
+  await h.settle();
+
+  assert.equal(
+    h.evalIn("state.selectedReviewItem && state.selectedReviewItem.id"),
+    "rev-plain-1",
+    "the refusal must not move the operator off the exception they opened"
+  );
+  assert.equal(
+    h.els.inspectTempoStatus.textContent.includes("Không chấp nhận được"),
+    false,
+    `a refusal for another item must not land in the shared status node, got ${h.els.inspectTempoStatus.textContent}`
+  );
+});
+
+// Issue #157: an acceptance withdraws the preview and final the replaced delivery made current and
+// rebuilds them from the accepted waveform, and in auto posture it can also complete the run. A
+// surface that only reloads the exception queue keeps playing the replaced media and shows a state
+// the run has already left, so the settled acceptance must re-read the run it changed.
+test("a settled acceptance re-reads the run so replaced render media stops being served", async () => {
+  const h = createHarness();
+  await h.ready();
+  h.evalIn(tempoCandidateItem);
+  h.els.inspectTempoReason.value = "đã nghe và chấp nhận bản tempo";
+  h.els.inspectTempoWaiver.checked = true;
+
+  let runStatus = "running";
+  let previewCAS = "preview-before-acceptance";
+  h.setResponder((url) => {
+    if (url.includes("/review/accept-candidate")) {
+      runStatus = "completed";
+      previewCAS = "preview-after-acceptance";
+      return { status: 200, payload: { result: { message: "đã chấp nhận" } } };
+    }
+    if (url === "/api/v1/runs/run-1") {
+      return { status: 200, payload: { run: { id: "run-1", job_id: "job-1", status: runStatus } } };
+    }
+    if (url === "/api/v1/runs/run-1/stages") return { status: 200, payload: { stages: [] } };
+    if (url === "/api/v1/jobs") {
+      return { status: 200, payload: { jobs: [{ id: "job-1", source_asset_id: "asset-1", target_language: "vi" }] } };
+    }
+    if (url === "/api/v1/jobs/job-1") {
+      return { status: 200, payload: { job: { id: "job-1", source_asset_id: "asset-1", target_language: "vi" } } };
+    }
+    if (url.includes("/render/preview")) return { status: 200, payload: { preview_render: { cas_hash: previewCAS } } };
+    if (url.includes("/review-items")) return { status: 200, payload: { review_items: [] } };
+    if (url.includes("/render/final")) return { status: 200, payload: { final_render: { cas_hash: "final-1" } } };
+    return { status: 200, payload: {} };
+  });
+
+  const transformed = h.els.inspectTempoAcceptTransformed;
+  h.requests.length = 0;
+  transformed.dispatch("click", { currentTarget: transformed, target: { closest: () => null } });
+  await h.settle();
+
+  assert.ok(
+    h.requests.some((req) => req.url === "/api/v1/runs/run-1"),
+    `a settled acceptance must re-read the run whose delivery it replaced, got ${JSON.stringify(h.requests.map((r) => r.url))}`
+  );
+  assert.equal(
+    h.evalIn("state.selectedRun && state.selectedRun.status"),
+    "completed",
+    "the surface must show the state the run holds after the acceptance, not the one it had before"
+  );
+  assert.equal(
+    h.evalIn("state.preview && state.preview.cas_hash"),
+    "preview-after-acceptance",
+    "the replaced preview must not stay the media the surface serves"
+  );
 });
 
 let failed = 0;

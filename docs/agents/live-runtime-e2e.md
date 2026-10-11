@@ -245,9 +245,19 @@ Traps:
   candidate's measured factor falls within `(1, 1.25]` and the FFmpeg `atempo` transform actually
   succeeds - one eligible transformed alternative served by `GET /api/v1/runs/<run>/dub-media/<hash>`.
   An out-of-range factor, an unavailable `ffmpeg`, or a failed or cancelled transform leaves the panel
-  showing the natural waveform and the recorded reason instead of a playable alternative. That panel
-  does not resolve the item - the alternative stays unselected, the item stays `pending`, and nothing
-  reaches the mix or a final render - so it is evidence for the two ways out above, not a third decision.
+  showing the natural waveform and the recorded reason instead of a playable alternative. The panel
+  resolves the item only through the operator's own acceptance: `Chấp nhận bản tempo` (or
+  `Chấp nhận waveform natural` for a retained waveform that itself fits), after typing the audit
+  reason; tick the `manual_override` quality waiver only when accepting the transformed waveform,
+  which is the one the host requires it for. It sends
+  `POST /api/v1/runs/<run>/review/accept-candidate` with the item id and `candidate: "transformed"`
+  (or `candidate: "natural"`).
+  Until that click the item stays `pending` and nothing reaches the mix or a final render. The
+  acceptance releases only the accepted waveform into a successor dubbing artifact,
+  keeps the run paused while any other unit is unresolved, and rebuilds mix, render plan and preview
+  once the last required group is accepted - see `CONTEXT.md` §4.3. It replaces nothing above: the
+  rewrite and escalation ways out remain alternatives to accepting either auditioned waveform, and
+  only accepting `candidate: "transformed"` releases a transformed waveform.
 - **Why the automatic fit lane may never engage.** The VI default lane (ZeroTTS) and the VieNeu
   compatibility lane are fixed-rate: they reject any speed other than 1.0, so overrun can only go through
   rewrite/regroup and then the whole-speaker escalation to the duration-controlled lane (`cosyvoice3_tts`,

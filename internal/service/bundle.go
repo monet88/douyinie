@@ -192,6 +192,10 @@ func (s *BundleService) ExportBundle(ctx context.Context, jobID string, w io.Wri
 			if blob, err := s.loadJSONFromCAS(ctx, idx.CASHash); err == nil {
 				var dsv domain.DubSegmentsVariant
 				if json.Unmarshal(blob, &dsv) == nil {
+					// The artifact's own hash travels with it: it is the identity the run's stage pin,
+					// its mix and its acceptance evidence all name, so the importing host must restore
+					// that same hash instead of minting a second one for a locally rewritten copy.
+					dsv.CASHash = idx.CASHash
 					runData.DubSegmentsVariant = &dsv
 				}
 			}
@@ -202,6 +206,10 @@ func (s *BundleService) ExportBundle(ctx context.Context, jobID string, w io.Wri
 			if blob, err := s.loadJSONFromCAS(ctx, idx.CASHash); err == nil {
 				var dma domain.DubMixArtifact
 				if json.Unmarshal(blob, &dma) == nil {
+					// The hash travels with the artifact for the same reason the dubbing variant's does:
+					// the importing host restores it under this identity instead of minting a second one
+					// for a copy it rewrote locally.
+					dma.CASHash = idx.CASHash
 					runData.DubMixArtifact = &dma
 				}
 			}
@@ -245,6 +253,9 @@ func (s *BundleService) ExportBundle(ctx context.Context, jobID string, w io.Wri
 					if blob, err := s.loadJSONFromCAS(ctx, raIdx.CASHash); err == nil {
 						var pra domain.PreviewRenderArtifact
 						if json.Unmarshal(blob, &pra) == nil {
+							// The rendered artifact's own hash travels with it, as the dubbing variant's
+							// does: the importing host restores it under that identity.
+							pra.CASHash = raIdx.CASHash
 							rad.Preview = &pra
 						}
 					}
@@ -252,6 +263,7 @@ func (s *BundleService) ExportBundle(ctx context.Context, jobID string, w io.Wri
 					if blob, err := s.loadJSONFromCAS(ctx, raIdx.CASHash); err == nil {
 						var fra domain.FinalRenderArtifact
 						if json.Unmarshal(blob, &fra) == nil {
+							fra.CASHash = raIdx.CASHash
 							rad.Final = &fra
 						}
 					}
@@ -369,6 +381,23 @@ func (s *BundleService) ExportBundle(ctx context.Context, jobID string, w io.Wri
 	}
 
 	return manifest, nil
+}
+
+// restoreShippedArtifact reports the hash an artifact that travelled in a bundle must be restored
+// under. The bundle ships the blob under the hash the exporting host named, and the run's stage pins,
+// its mix and its renders all name that same hash, so a locally re-marshalled copy would be a second
+// artifact none of them resolve. A bundle that predates the stamp carries no hash to restore it under
+// and is rewritten locally instead; a bundle whose stamp names an object it does not ship is refused,
+// because restoring that artifact under a second identity is what the stamp exists to prevent.
+func (s *BundleService) restoreShippedArtifact(kind, shipped string) (string, bool, error) {
+	h := strings.ToLower(strings.TrimSpace(shipped))
+	if h == "" {
+		return "", false, nil
+	}
+	if !s.cas.Exists(h) {
+		return "", false, fmt.Errorf("%w: %s %s", domain.ErrJobBundleArtifactMissing, kind, h)
+	}
+	return h, true, nil
 }
 
 // ImportBundle imports and verifies a self-contained job bundle from a random-access reader.
@@ -541,9 +570,14 @@ func (s *BundleService) ImportBundle(ctx context.Context, r io.ReaderAt, size in
 			return nil, fmt.Errorf("restore audio stems to CAS: %w", err)
 		}
 		idx := storage.AudioStemsArtifactIndex{
-			ID:             manifest.AudioStems.ID,
-			AssetID:        manifest.AudioStems.AssetID,
-			ProviderID:     manifest.AudioStems.ProviderID,
+			ID:         manifest.AudioStems.ID,
+			AssetID:    manifest.AudioStems.AssetID,
+			ProviderID: manifest.AudioStems.ProviderID,
+			// The provider identity of the stems has to be restored with the row: the index schema
+			// requires it, and without it the import of any run that carries stems aborts before a
+			// replayed accepted candidate can be served at all (#157 portable replay).
+			ModelName:      manifest.AudioStems.ModelName,
+			ModelVersion:   manifest.AudioStems.ModelVersion,
 			CASHash:        obj.SHA256,
 			ProvenanceHash: manifest.AudioStems.ProvenanceHash,
 			CreatedAt:      manifest.AudioStems.CreatedAt,
@@ -581,6 +615,13 @@ func (s *BundleService) ImportBundle(ctx context.Context, r io.ReaderAt, size in
 	for _, runData := range manifest.Runs {
 		if err := s.db.UpsertRun(ctx, runData.Run); err != nil {
 			return nil, fmt.Errorf("restore run %s: %w", runData.Run.ID, err)
+		}
+		// Every restored artifact index row belongs to the run's job and the index tables require that
+		// reference. The run's own field is the first authority; a bundle is scoped to exactly one job,
+		// so the manifest's job identifies the row when the run record travelled without one.
+		jobRef := runData.Run.JobID
+		if jobRef == "" {
+			jobRef = manifest.Job.ID
 		}
 
 		for _, se := range runData.StageExecutions {
@@ -637,80 +678,126 @@ func (s *BundleService) ImportBundle(ctx context.Context, r io.ReaderAt, size in
 		// Translation variant
 		if tv := runData.TranslationVariant; tv != nil {
 			blob, _ := json.Marshal(tv)
-			if obj, err := s.cas.Put(bytes.NewReader(blob)); err == nil {
-				idx := storage.TranslationVariantIndex{
-					ID:             tv.ID,
-					AssetID:        tv.AssetID,
-					RunID:          tv.RunID,
-					TargetLanguage: tv.TargetLanguage,
-					CASHash:        obj.SHA256,
-					ProvenanceHash: tv.ProvenanceHash,
-					ProviderID:     tv.ProviderID,
-					ModelName:      tv.ModelName,
-					ModelVersion:   tv.ModelVersion,
-					CreatedAt:      tv.CreatedAt,
-				}
-				_ = s.db.UpsertTranslationVariantIndex(ctx, idx)
+			obj, err := s.cas.Put(bytes.NewReader(blob))
+			if err != nil {
+				return nil, fmt.Errorf("restore translation variant in cas: %w", err)
+			}
+			idx := storage.TranslationVariantIndex{
+				ID:             tv.ID,
+				AssetID:        tv.AssetID,
+				RunID:          tv.RunID,
+				JobID:          jobRef,
+				TargetLanguage: tv.TargetLanguage,
+				CASHash:        obj.SHA256,
+				ProvenanceHash: tv.ProvenanceHash,
+				ProviderID:     tv.ProviderID,
+				ModelName:      tv.ModelName,
+				ModelVersion:   tv.ModelVersion,
+				OverallQAScore: tv.OverallQAScore,
+				CreatedAt:      tv.CreatedAt,
+			}
+			// The restored row is what makes this artifact resolvable on the importing host: a bundle
+			// is the run's portable delivery, so a skipped row must fail the import rather than leave
+			// the run unable to resolve what it carries.
+			if err := s.db.UpsertTranslationVariantIndex(ctx, idx); err != nil {
+				return nil, fmt.Errorf("restore translation variant index: %w", err)
 			}
 		}
 
 		// Dub script variant
 		if dsv := runData.DubScriptVariant; dsv != nil {
 			blob, _ := json.Marshal(dsv)
-			if obj, err := s.cas.Put(bytes.NewReader(blob)); err == nil {
-				idx := storage.DubScriptVariantIndex{
-					ID:             dsv.ID,
-					AssetID:        dsv.AssetID,
-					RunID:          dsv.RunID,
-					TargetLanguage: dsv.TargetLanguage,
-					CASHash:        obj.SHA256,
-					ProvenanceHash: dsv.ProvenanceHash,
-					ProviderID:     dsv.ProviderID,
-					ModelName:      dsv.ModelName,
-					ModelVersion:   dsv.ModelVersion,
-					CreatedAt:      dsv.CreatedAt,
-				}
-				_ = s.db.UpsertDubScriptVariantIndex(ctx, idx)
+			obj, err := s.cas.Put(bytes.NewReader(blob))
+			if err != nil {
+				return nil, fmt.Errorf("restore dub script variant in cas: %w", err)
+			}
+			idx := storage.DubScriptVariantIndex{
+				ID:             dsv.ID,
+				AssetID:        dsv.AssetID,
+				RunID:          dsv.RunID,
+				JobID:          jobRef,
+				TargetLanguage: dsv.TargetLanguage,
+				CASHash:        obj.SHA256,
+				ProvenanceHash: dsv.ProvenanceHash,
+				ProviderID:     dsv.ProviderID,
+				ModelName:      dsv.ModelName,
+				ModelVersion:   dsv.ModelVersion,
+				OverallQAScore: dsv.OverallQAScore,
+				CreatedAt:      dsv.CreatedAt,
+			}
+			if err := s.db.UpsertDubScriptVariantIndex(ctx, idx); err != nil {
+				return nil, fmt.Errorf("restore dub script variant index: %w", err)
 			}
 		}
 
 		// Voice assignment
 		if va := runData.VoiceAssignment; va != nil {
 			blob, _ := json.Marshal(va)
-			if obj, err := s.cas.Put(bytes.NewReader(blob)); err == nil {
-				idx := storage.VoiceAssignmentIndex{
-					ID:             va.ID,
-					AssetID:        va.AssetID,
-					RunID:          va.RunID,
-					TargetLanguage: va.TargetLanguage,
-					CASHash:        obj.SHA256,
-					ProvenanceHash: va.ProvenanceHash,
-					CreatedAt:      va.CreatedAt,
-				}
-				_ = s.db.UpsertVoiceAssignmentIndex(ctx, idx)
+			obj, err := s.cas.Put(bytes.NewReader(blob))
+			if err != nil {
+				return nil, fmt.Errorf("restore voice assignment in cas: %w", err)
+			}
+			idx := storage.VoiceAssignmentIndex{
+				ID:                 va.ID,
+				AssetID:            va.AssetID,
+				RunID:              va.RunID,
+				JobID:              jobRef,
+				TargetLanguage:     va.TargetLanguage,
+				CASHash:            obj.SHA256,
+				ProvenanceHash:     va.ProvenanceHash,
+				AssignmentsJSON:    string(blob),
+				UseSameVoiceForAll: va.UseSameVoiceForAll,
+				CreatedAt:          va.CreatedAt,
+			}
+			if err := s.db.UpsertVoiceAssignmentIndex(ctx, idx); err != nil {
+				return nil, fmt.Errorf("restore voice assignment index: %w", err)
 			}
 		}
 
 		// Dub segments variant
 		if dsv := runData.DubSegmentsVariant; dsv != nil {
-			for segIdx := range dsv.Segments {
-				seg := &dsv.Segments[segIdx]
-				if p, err := s.cas.ResolvePath(seg.AudioSHA256); err == nil {
-					seg.AudioCASPath = p
-				}
+			// The successor is content-addressed evidence: its hash is what the run's dub_synthesize
+			// pin, its mix's DubSegmentsCAS and its acceptance evidence all name, and the shipped blob
+			// under that hash is already committed in phase 4. Re-marshalling a destination-resolved
+			// copy here would publish a second, differently hashed artifact that no reader of this run
+			// resolves - leaving an imported accepted delivery looking stale, so a replay or a resume
+			// on the importing host would withdraw and rebuild media it already serves. A segment path
+			// is never the proof (the mix reads the segment by hash and verifies what it read), so the
+			// shipped artifact is restored as it is; only a bundle that predates this hash needs the
+			// local re-encode, which must fail the import rather than silently skip the row.
+			idx := storage.DubSegmentsVariantIndex{
+				ID:             dsv.ID,
+				AssetID:        dsv.AssetID,
+				RunID:          dsv.RunID,
+				JobID:          jobRef,
+				TargetLanguage: dsv.TargetLanguage,
+				ProvenanceHash: dsv.ProvenanceHash,
+				OverallStatus:  dsv.OverallStatus,
+				CreatedAt:      dsv.CreatedAt,
 			}
-			blob, _ := json.Marshal(dsv)
-			if obj, err := s.cas.Put(bytes.NewReader(blob)); err == nil {
-				idx := storage.DubSegmentsVariantIndex{
-					ID:             dsv.ID,
-					AssetID:        dsv.AssetID,
-					RunID:          dsv.RunID,
-					TargetLanguage: dsv.TargetLanguage,
-					CASHash:        obj.SHA256,
-					ProvenanceHash: dsv.ProvenanceHash,
-					CreatedAt:      dsv.CreatedAt,
+			shipped, restored, err := s.restoreShippedArtifact("dubbing artifact", dsv.CASHash)
+			if err != nil {
+				return nil, err
+			}
+			if restored {
+				idx.CASHash = shipped
+			} else {
+				blob, err := json.Marshal(dsv)
+				if err != nil {
+					return nil, fmt.Errorf("encode dub segments variant for import: %w", err)
 				}
-				_ = s.db.UpsertDubSegmentsVariantIndex(ctx, idx)
+				obj, err := s.cas.Put(bytes.NewReader(blob))
+				if err != nil {
+					return nil, fmt.Errorf("restore dub segments variant in cas: %w", err)
+				}
+				idx.CASHash = obj.SHA256
+			}
+			// The restored row is what makes the imported run's dubbing artifact - including its
+			// accepted reviewed-candidate evidence - resolvable as a run-scoped index row on the
+			// target host. A failed restore must fail the import rather than leave the run resolvable
+			// only through its stage pin.
+			if err := s.db.UpsertDubSegmentsVariantIndex(ctx, idx); err != nil {
+				return nil, fmt.Errorf("restore dub segments variant index: %w", err)
 			}
 		}
 
@@ -718,135 +805,186 @@ func (s *BundleService) ImportBundle(ctx context.Context, r io.ReaderAt, size in
 		// not be re-established as a canonical index row, because render/review would then consume
 		// its pre-current-contract PASS as if it were current acceptance evidence.
 		if dma := runData.DubMixArtifact; dma != nil && dma.ValidateCurrentSchema() == nil {
-			if p, err := s.cas.ResolvePath(dma.AudioCASHash); err == nil {
-				dma.AudioCASPath = p
+			idx := storage.DubMixArtifactIndex{
+				ID:             dma.ID,
+				AssetID:        dma.AssetID,
+				RunID:          dma.RunID,
+				JobID:          jobRef,
+				TargetLanguage: dma.TargetLanguage,
+				ProvenanceHash: dma.ProvenanceHash,
+				OverallStatus:  dma.OverallStatus,
+				CreatedAt:      dma.CreatedAt,
 			}
-			blob, _ := json.Marshal(dma)
-			if obj, err := s.cas.Put(bytes.NewReader(blob)); err == nil {
-				idx := storage.DubMixArtifactIndex{
-					ID:             dma.ID,
-					AssetID:        dma.AssetID,
-					RunID:          dma.RunID,
-					TargetLanguage: dma.TargetLanguage,
-					CASHash:        obj.SHA256,
-					ProvenanceHash: dma.ProvenanceHash,
-					CreatedAt:      dma.CreatedAt,
+			shipped, restored, err := s.restoreShippedArtifact("dub mix artifact", dma.CASHash)
+			if err != nil {
+				return nil, err
+			}
+			if restored {
+				idx.CASHash = shipped
+			} else {
+				// A bundle that predates the stamp carries no hash to restore the mix under, so the
+				// payload is committed here and the row records the copy it produced.
+				blob, err := json.Marshal(dma)
+				if err != nil {
+					return nil, fmt.Errorf("marshal dub mix artifact for import: %w", err)
 				}
-				_ = s.db.UpsertDubMixArtifactIndex(ctx, idx)
+				obj, err := s.cas.Put(bytes.NewReader(blob))
+				if err != nil {
+					return nil, fmt.Errorf("restore dub mix in cas: %w", err)
+				}
+				idx.CASHash = obj.SHA256
+			}
+			if err := s.db.UpsertDubMixArtifactIndex(ctx, idx); err != nil {
+				return nil, fmt.Errorf("restore dub mix index: %w", err)
 			}
 		}
 
 		// Localized subtitle track
 		if lst := runData.LocalizedSubtitleTrack; lst != nil {
 			blob, _ := json.Marshal(lst)
-			if obj, err := s.cas.Put(bytes.NewReader(blob)); err == nil {
-				idx := storage.LocalizedSubtitleTrackIndex{
-					ID:             lst.ID,
-					AssetID:        lst.AssetID,
-					RunID:          lst.RunID,
-					TargetLanguage: lst.TargetLanguage,
-					CASHash:        obj.SHA256,
-					ProvenanceHash: lst.ProvenanceHash,
-					CreatedAt:      lst.CreatedAt,
-				}
-				_ = s.db.UpsertLocalizedSubtitleTrackIndex(ctx, idx)
+			obj, err := s.cas.Put(bytes.NewReader(blob))
+			if err != nil {
+				return nil, fmt.Errorf("restore localized subtitle track in cas: %w", err)
+			}
+			idx := storage.LocalizedSubtitleTrackIndex{
+				ID:             lst.ID,
+				AssetID:        lst.AssetID,
+				RunID:          lst.RunID,
+				JobID:          jobRef,
+				TargetLanguage: lst.TargetLanguage,
+				CASHash:        obj.SHA256,
+				ProvenanceHash: lst.ProvenanceHash,
+				CueCount:       len(lst.Cues),
+				CreatedAt:      lst.CreatedAt,
+			}
+			if err := s.db.UpsertLocalizedSubtitleTrackIndex(ctx, idx); err != nil {
+				return nil, fmt.Errorf("restore localized subtitle track index: %w", err)
 			}
 		}
 
 		// Localized visual track
 		if lvt := runData.LocalizedVisualTrack; lvt != nil {
 			blob, _ := json.Marshal(lvt)
-			if obj, err := s.cas.Put(bytes.NewReader(blob)); err == nil {
-				idx := storage.LocalizedVisualTrackIndex{
-					ID:             lvt.ID,
-					AssetID:        lvt.AssetID,
-					RunID:          lvt.RunID,
-					TargetLanguage: lvt.TargetLanguage,
-					CASHash:        obj.SHA256,
-					ProvenanceHash: lvt.ProvenanceHash,
-					CreatedAt:      lvt.CreatedAt,
-				}
-				_ = s.db.UpsertLocalizedVisualTrackIndex(ctx, idx)
+			obj, err := s.cas.Put(bytes.NewReader(blob))
+			if err != nil {
+				return nil, fmt.Errorf("restore localized visual track in cas: %w", err)
+			}
+			idx := storage.LocalizedVisualTrackIndex{
+				ID:                lvt.ID,
+				AssetID:           lvt.AssetID,
+				RunID:             lvt.RunID,
+				JobID:             jobRef,
+				TargetLanguage:    lvt.TargetLanguage,
+				TextRegionPlanCAS: lvt.TextRegionPlanCAS,
+				CASHash:           obj.SHA256,
+				ProvenanceHash:    lvt.ProvenanceHash,
+				CreatedAt:         lvt.CreatedAt,
+			}
+			if err := s.db.UpsertLocalizedVisualTrackIndex(ctx, idx); err != nil {
+				return nil, fmt.Errorf("restore localized visual track index: %w", err)
 			}
 		}
 
 		// Render plan
 		if rp := runData.RenderPlan; rp != nil {
 			blob, _ := json.Marshal(rp)
-			if obj, err := s.cas.Put(bytes.NewReader(blob)); err == nil {
-				idx := storage.RenderPlanIndex{
-					ID:             rp.ID,
-					AssetID:        rp.AssetID,
-					RunID:          rp.RunID,
-					TargetLanguage: rp.TargetLanguage,
-					CASHash:        obj.SHA256,
-					ProvenanceHash: rp.ProvenanceHash,
-					CreatedAt:      rp.CreatedAt,
-				}
-				_ = s.db.UpsertRenderPlanIndex(ctx, idx)
+			obj, err := s.cas.Put(bytes.NewReader(blob))
+			if err != nil {
+				return nil, fmt.Errorf("restore render plan in cas: %w", err)
+			}
+			idx := storage.RenderPlanIndex{
+				ID:             rp.ID,
+				AssetID:        rp.AssetID,
+				RunID:          rp.RunID,
+				JobID:          jobRef,
+				TargetLanguage: rp.TargetLanguage,
+				CASHash:        obj.SHA256,
+				ProvenanceHash: rp.ProvenanceHash,
+				CreatedAt:      rp.CreatedAt,
+			}
+			if err := s.db.UpsertRenderPlanIndex(ctx, idx); err != nil {
+				return nil, fmt.Errorf("restore render plan index: %w", err)
 			}
 		}
 
 		// Render artifact
 		if rad := runData.RenderArtifact; rad != nil {
 			if rad.Preview != nil {
-				if p, err := s.cas.ResolvePath(rad.Preview.OutputCASHash); err == nil {
-					rad.Preview.OutputCASPath = p
+				idx := storage.RenderArtifactIndex{
+					ID:             rad.Preview.ID,
+					AssetID:        rad.Preview.AssetID,
+					RunID:          rad.Preview.RunID,
+					JobID:          jobRef,
+					TargetLanguage: rad.Preview.TargetLanguage,
+					Kind:           domain.RenderKindPreview,
+					PlanProvenance: rad.Preview.ConsumedPlan.PlanProvenanceHash,
+					PlanCASHash:    rad.Preview.ConsumedPlan.PlanCASHash,
+					OutputCASHash:  rad.Preview.OutputCASHash,
+					ProvenanceHash: rad.Preview.ProvenanceHash,
+					OverallStatus:  rad.Preview.OverallStatus,
+					CreatedAt:      rad.Preview.CreatedAt,
 				}
-				blob, _ := json.Marshal(rad.Preview)
-				if obj, err := s.cas.Put(bytes.NewReader(blob)); err == nil {
-					idx := storage.RenderArtifactIndex{
-						ID:             rad.Preview.ID,
-						AssetID:        rad.Preview.AssetID,
-						RunID:          rad.Preview.RunID,
-						JobID:          rad.Preview.JobID,
-						TargetLanguage: rad.Preview.TargetLanguage,
-						Kind:           "preview",
-						PlanProvenance: rad.Preview.ConsumedPlan.PlanProvenanceHash,
-						PlanCASHash:    rad.Preview.ConsumedPlan.PlanCASHash,
-						OutputCASHash:  rad.Preview.OutputCASHash,
-						CASHash:        obj.SHA256,
-						ProvenanceHash: rad.Preview.ProvenanceHash,
-						OverallStatus:  rad.Preview.OverallStatus,
-						CreatedAt:      rad.Preview.CreatedAt,
+				shipped, restored, err := s.restoreShippedArtifact("preview render artifact", rad.Preview.CASHash)
+				if err != nil {
+					return nil, err
+				}
+				if restored {
+					idx.CASHash = shipped
+				} else {
+					blob, err := json.Marshal(rad.Preview)
+					if err != nil {
+						return nil, fmt.Errorf("marshal preview render artifact for import: %w", err)
 					}
-					if idx.JobID == "" {
-						idx.JobID = runData.Run.JobID
+					obj, err := s.cas.Put(bytes.NewReader(blob))
+					if err != nil {
+						return nil, fmt.Errorf("restore preview render in cas: %w", err)
 					}
-					if idx.OverallStatus == "" {
-						idx.OverallStatus = "PASS"
-					}
-					_ = s.db.UpsertRenderArtifactIndex(ctx, idx)
+					idx.CASHash = obj.SHA256
+				}
+				if idx.OverallStatus == "" {
+					idx.OverallStatus = "PASS"
+				}
+				if err := s.db.UpsertRenderArtifactIndex(ctx, idx); err != nil {
+					return nil, fmt.Errorf("restore preview render index: %w", err)
 				}
 			}
 			if rad.Final != nil {
-				if p, err := s.cas.ResolvePath(rad.Final.OutputCASHash); err == nil {
-					rad.Final.OutputCASPath = p
+				idx := storage.RenderArtifactIndex{
+					ID:             rad.Final.ID,
+					AssetID:        rad.Final.AssetID,
+					RunID:          rad.Final.RunID,
+					JobID:          jobRef,
+					TargetLanguage: rad.Final.TargetLanguage,
+					Kind:           domain.RenderKindFinal,
+					PlanProvenance: rad.Final.ConsumedPlan.PlanProvenanceHash,
+					PlanCASHash:    rad.Final.ConsumedPlan.PlanCASHash,
+					OutputCASHash:  rad.Final.OutputCASHash,
+					ProvenanceHash: rad.Final.ProvenanceHash,
+					OverallStatus:  rad.Final.OverallStatus,
+					CreatedAt:      rad.Final.CreatedAt,
 				}
-				blob, _ := json.Marshal(rad.Final)
-				if obj, err := s.cas.Put(bytes.NewReader(blob)); err == nil {
-					idx := storage.RenderArtifactIndex{
-						ID:             rad.Final.ID,
-						AssetID:        rad.Final.AssetID,
-						RunID:          rad.Final.RunID,
-						JobID:          rad.Final.JobID,
-						TargetLanguage: rad.Final.TargetLanguage,
-						Kind:           "final",
-						PlanProvenance: rad.Final.ConsumedPlan.PlanProvenanceHash,
-						PlanCASHash:    rad.Final.ConsumedPlan.PlanCASHash,
-						OutputCASHash:  rad.Final.OutputCASHash,
-						CASHash:        obj.SHA256,
-						ProvenanceHash: rad.Final.ProvenanceHash,
-						OverallStatus:  rad.Final.OverallStatus,
-						CreatedAt:      rad.Final.CreatedAt,
+				shipped, restored, err := s.restoreShippedArtifact("final render artifact", rad.Final.CASHash)
+				if err != nil {
+					return nil, err
+				}
+				if restored {
+					idx.CASHash = shipped
+				} else {
+					blob, err := json.Marshal(rad.Final)
+					if err != nil {
+						return nil, fmt.Errorf("marshal final render artifact for import: %w", err)
 					}
-					if idx.JobID == "" {
-						idx.JobID = runData.Run.JobID
+					obj, err := s.cas.Put(bytes.NewReader(blob))
+					if err != nil {
+						return nil, fmt.Errorf("restore final render in cas: %w", err)
 					}
-					if idx.OverallStatus == "" {
-						idx.OverallStatus = "PASS"
-					}
-					_ = s.db.UpsertRenderArtifactIndex(ctx, idx)
+					idx.CASHash = obj.SHA256
+				}
+				if idx.OverallStatus == "" {
+					idx.OverallStatus = "PASS"
+				}
+				if err := s.db.UpsertRenderArtifactIndex(ctx, idx); err != nil {
+					return nil, fmt.Errorf("restore final render index: %w", err)
 				}
 			}
 		}
@@ -1013,6 +1151,17 @@ func (s *BundleService) collectReachableCASHashes(manifest *domain.JobBundleMani
 					}
 				}
 			}
+			// Issue #157: an accepted candidate's natural parent is not reachable through the
+			// promoted segment when the selected waveform is the transformed one, so the
+			// acceptance evidence is the only reference keeping that parent in closure.
+			for _, accepted := range dsv.AcceptedCandidates {
+				if err := addIfCAS(accepted.NaturalAudioSHA256); err != nil {
+					return nil, err
+				}
+				if err := addIfCAS(accepted.SelectedAudioSHA256); err != nil {
+					return nil, err
+				}
+			}
 		}
 		if dma := runData.DubMixArtifact; dma != nil {
 			if err := addIfCAS(dma.CASHash); err != nil {
@@ -1123,6 +1272,13 @@ func (s *BundleService) collectManifestReferencedHashes(manifest *domain.JobBund
 					addHash(tc.NaturalAudioSHA256)
 					addHash(tc.TransformedAudioSHA256)
 				}
+			}
+			// Issue #157: the natural parent of an accepted candidate is required from the archive
+			// even when the selected waveform is the transformed one, so it is never dropped from
+			// closure by the unit leaving ReviewSegments.
+			for _, accepted := range dsv.AcceptedCandidates {
+				addHash(accepted.NaturalAudioSHA256)
+				addHash(accepted.SelectedAudioSHA256)
 			}
 		}
 		if dma := runData.DubMixArtifact; dma != nil {

@@ -79,6 +79,10 @@ type harnessOptions struct {
 	autoRunExecutor   bool
 	audioRoleAnalyzer domain.AudioRoleAnalyzer
 	dubbingSvc        *service.DubbingService
+	// translationGatewayURL registers the production gateway translation providers instead of the
+	// stand-in fakes, pointed at a test gateway: a joined test then exercises the real anchored-repair
+	// path over the router, HTTP and the run's frozen glossary, not a provider that skips the parser.
+	translationGatewayURL string
 }
 
 func setupHarnessWithOptions(t *testing.T, opts harnessOptions) *testHarness {
@@ -132,6 +136,49 @@ func setupAutoRunHarness(t *testing.T) *testHarness {
 	return setupHarnessWithOptions(t, harnessOptions{autoRunExecutor: true})
 }
 
+// registerGatewayTranslationLanes installs the production gateway translation providers, pointed at a
+// test gateway, so a joined run translates through the real wire parser, its source-anchor validation
+// and bounded repair instead of a stand-in that answers without any of them. The harness's manifest
+// pass licenses them like every other provider, and the policy state is the one the router requires.
+func registerGatewayTranslationLanes(t *testing.T, reg *provider.Registry, gatewayURL string) {
+	t.Helper()
+	lanes := []struct {
+		id       string
+		alias    string
+		baseline string
+		score    float64
+	}{
+		{provider.GatewayGeminiTranslationProviderID, provider.GatewayGeminiModelAlias, "baseline-seam1-gateway-gemini", 0.99},
+		{provider.GatewayDeepSeekTranslationProviderID, provider.GatewayDeepSeekModelAlias, "baseline-seam1-gateway-deepseek", 0.95},
+	}
+	stubSecret := func(context.Context, string, string) (string, error) { return "sec-token", nil }
+	// The pipeline's own translation request carries no credential reference, so the provider resolves
+	// the gateway key from the environment exactly as a host configured for the authorized lane does.
+	t.Setenv("DOUYINIE_GATEWAY_API_KEY", "seam1-gateway-key")
+	for _, lane := range lanes {
+		p, err := provider.NewGatewayTranslationProvider(lane.id, lane.alias, lane.baseline, lane.score, stubSecret, gatewayURL)
+		if err != nil {
+			t.Fatalf("construct gateway translation provider %s: %v", lane.id, err)
+		}
+		p.SetPolicyState(domain.PolicyAllowed)
+		if err := reg.Register(p); err != nil {
+			t.Fatalf("register gateway translation provider %s: %v", lane.id, err)
+		}
+	}
+}
+
+// parkRunForReview puts a run into the state the drained pipeline leaves it in when a mandatory
+// replacement is missing: paused, with the review decision owed to the operator. Fixtures that
+// synthesize a dubbing pass directly never drain the run, so without this an acceptance would act
+// on a never-started (queued) run - a state an operator can never review from, and one the
+// terminal completion gate refuses.
+func parkRunForReview(t *testing.T, h *testHarness, runID string) {
+	t.Helper()
+	if err := h.db.UpdateQueueStatus(context.Background(), runID, domain.RunStatusPaused, domain.RunStatusPaused); err != nil {
+		t.Fatalf("park run %s for review: %v", runID, err)
+	}
+}
+
 // newRuntimeHost constructs a Seam-1 RuntimeHost server over the given open DB and
 // CAS store, returning the server plus its registry and router. It is used both for
 // the initial harness and to reconstruct a fresh RuntimeHost over reopened persisted
@@ -149,6 +196,9 @@ func newRuntimeHostWithOptions(t *testing.T, db *storage.DB, casStore *cas.Store
 
 	ingestSvc := service.NewIngestService(db, casStore, prober)
 	fakeRegistry := provider.NewSeam1FakeRegistry()
+	if opts.translationGatewayURL != "" {
+		registerGatewayTranslationLanes(t, fakeRegistry, opts.translationGatewayURL)
+	}
 	// Seam 1 models production translation as remote gateway execution. Keep all
 	// voice/audio/CV fakes local; only the legacy translation fixtures are remote.
 	for _, id := range []string{"fake_llm_translator", "fake_local_translator_fallback"} {

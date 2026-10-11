@@ -93,7 +93,9 @@ func (s *Service) Pause(ctx context.Context, runID string) error {
 
 // Cancel transitions any non-terminal run to cancelled. `interrupted` is recoverable (Resume
 // re-drains it from the last incomplete stage), so abandoning it must stay possible; only the
-// terminal statuses are refused.
+// terminal statuses are refused. The refusal is decided by the transition's own guard, not by the
+// read above: a run that completes while the cancellation is being applied keeps its completed
+// result, because the two writers cannot both land (Issue #157).
 func (s *Service) Cancel(ctx context.Context, runID string) error {
 	e, err := s.db.GetQueueEntryByRunID(ctx, runID)
 	if err != nil {
@@ -102,13 +104,19 @@ func (s *Service) Cancel(ctx context.Context, runID string) error {
 	if e.Status == domain.RunStatusCompleted || e.Status == domain.RunStatusCancelled {
 		return fmt.Errorf("%w: status is %s", ErrNotQueued, e.Status)
 	}
-	if err := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusCancelled, domain.RunStatusCancelled); err != nil {
+	applied, err := s.db.CancelQueueEntryIfNonTerminal(ctx, runID)
+	if err != nil {
 		return fmt.Errorf("cancel run: %w", err)
+	}
+	if !applied {
+		return fmt.Errorf("%w: the run is no longer cancellable", ErrNotQueued)
 	}
 	return nil
 }
 
-// Resume transitions a paused or interrupted run back to queued.
+// Resume transitions a paused or interrupted run back to queued. As in Cancel, the transition's
+// guard is what admits it: a run that is cancelled while the resume is being applied is not
+// resurrected into the queue.
 func (s *Service) Resume(ctx context.Context, runID string) error {
 	e, err := s.db.GetQueueEntryByRunID(ctx, runID)
 	if err != nil {
@@ -117,8 +125,12 @@ func (s *Service) Resume(ctx context.Context, runID string) error {
 	if e.Status != domain.RunStatusPaused && e.Status != domain.RunStatusInterrupted {
 		return fmt.Errorf("%w: status is %s", ErrNotQueued, e.Status)
 	}
-	if err := s.db.UpdateQueueStatus(ctx, runID, domain.RunStatusQueued, domain.RunStatusQueued); err != nil {
+	applied, err := s.db.ResumeQueueEntryIfResumable(ctx, runID)
+	if err != nil {
 		return fmt.Errorf("resume run: %w", err)
+	}
+	if !applied {
+		return fmt.Errorf("%w: the run is no longer resumable", ErrNotQueued)
 	}
 	return nil
 }

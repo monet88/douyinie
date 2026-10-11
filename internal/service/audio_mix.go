@@ -344,11 +344,14 @@ func unresolvedDubReason(dubSegments *domain.DubSegmentsVariant, dubArtifactErr 
 		len(dubSegments.ReviewSegments), unacceptedCount)
 }
 
-func (s *AudioMixService) loadMixTranscript(casHash, assetID string) (*domain.TranscriptArtifact, error) {
+// loadPinnedTranscript reads the canonical transcript a dub artifact pins. It is the one reader of
+// that pin, shared by the mixer and by the reviewed-candidate acceptance that proves a selection
+// against the same canonical source membership the mixer will enforce.
+func loadPinnedTranscript(store *cas.Store, casHash, assetID string) (*domain.TranscriptArtifact, error) {
 	if strings.TrimSpace(casHash) == "" {
 		return nil, errors.New("dub artifact does not pin transcript_artifact_cas")
 	}
-	r, err := s.cas.Get(casHash)
+	r, err := store.Get(casHash)
 	if err != nil {
 		return nil, fmt.Errorf("read pinned transcript %s: %w", casHash, err)
 	}
@@ -512,6 +515,9 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 			preservationPlan,
 		)
 
+		// The live artifact carries the path this host resolved for the media it names, which is what a
+		// reader on this host consumes. The bundle export is a separate representation: it drops the
+		// path, because the shipped copy has to reproduce on a host that never had it.
 		mixArtifact := domain.DubMixArtifact{
 			ID:                  uuid.NewString(),
 			SchemaVersion:       domain.DubMixSchemaVersion,
@@ -535,7 +541,14 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 			CreatedAt:           time.Now().UTC(),
 		}
 
-		mixBytes, err := json.Marshal(mixArtifact)
+		// The copy committed to CAS is the one that ships inside bundles, under its own hash, so it is
+		// written without a path that only exists on this host: the artifact returned to this host's
+		// callers keeps the path it resolved, and every reader on another host resolves the media through
+		// AudioCASHash. The committed copy carries no cas_hash either - the identity is the CAS address
+		// it is stored at, which is why a bundle stamps it when it ships the artifact.
+		persisted := mixArtifact
+		persisted.AudioCASPath = ""
+		mixBytes, err := json.Marshal(persisted)
 		if err != nil {
 			return nil, fmt.Errorf("marshal dub mix artifact: %w", err)
 		}
@@ -803,7 +816,7 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 			}
 			fitByIndex[fp.SegmentIndex] = fp
 		}
-		transcript, err := s.loadMixTranscript(dubSegments.TranscriptArtifactCAS, input.AssetID)
+		transcript, err := loadPinnedTranscript(s.cas, dubSegments.TranscriptArtifactCAS, input.AssetID)
 		if err != nil {
 			return refuse(err.Error())
 		}
@@ -1025,6 +1038,8 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 		preservationPlan,
 	)
 
+	// As above: the live artifact names the path this host resolved, and the bundle export is the
+	// representation that drops it.
 	mixArtifact := domain.DubMixArtifact{
 		ID:                  uuid.NewString(),
 		SchemaVersion:       domain.DubMixSchemaVersion,
@@ -1048,7 +1063,12 @@ func (s *AudioMixService) MixAudio(ctx context.Context, input AudioMixInput) (*d
 		CreatedAt:           time.Now().UTC(),
 	}
 
-	mixBytes, err := json.Marshal(mixArtifact)
+	// As in the passthrough above: what ships under this hash is written without this host's resolved
+	// path, because the bundle copy has to reproduce on a host that never had it, and the media stays
+	// resolvable there through AudioCASHash.
+	persisted := mixArtifact
+	persisted.AudioCASPath = ""
+	mixBytes, err := json.Marshal(persisted)
 	if err != nil {
 		return nil, fmt.Errorf("marshal dub mix artifact: %w", err)
 	}

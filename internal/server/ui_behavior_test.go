@@ -28,9 +28,9 @@ func TestOperatorUIFollowedCreatorSurface(t *testing.T) {
 	}
 }
 
-// TestOperatorUITempoAuditionSurface pins the markup the Issue #156 audition panel needs in the
-// real page: the behavior harness stubs the DOM, so only this check catches a panel, player or
-// status node that was dropped from index.html.
+// TestOperatorUITempoAuditionSurface pins the markup the Issue #156 audition panel and the Issue
+// #157 acceptance control need in the real page: the behavior harness stubs the DOM, so only this
+// check catches a panel, player or status node that was dropped from index.html.
 func TestOperatorUITempoAuditionSurface(t *testing.T) {
 	index, err := operatorUIFS.ReadFile("ui/index.html")
 	if err != nil {
@@ -40,14 +40,30 @@ func TestOperatorUITempoAuditionSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, marker := range []string{`id="inspect-tempo"`, `id="inspect-tempo-selectable"`, `id="inspect-tempo-meta"`, `id="inspect-tempo-natural"`, `id="inspect-tempo-transformed"`} {
+	for _, marker := range []string{
+		`id="inspect-tempo"`, `id="inspect-tempo-selectable"`, `id="inspect-tempo-meta"`,
+		`id="inspect-tempo-natural"`, `id="inspect-tempo-transformed"`,
+		// Issue #157: the operator's explicit acceptance of exactly one auditioned waveform.
+		`id="inspect-tempo-accept-transformed"`, `id="inspect-tempo-accept-natural"`,
+		`id="inspect-tempo-waiver"`, `id="inspect-tempo-reason"`, `id="inspect-tempo-status"`,
+	} {
 		if !strings.Contains(string(index), marker) {
 			t.Fatalf("tempo audition UI missing %q", marker)
 		}
 	}
-	for _, marker := range []string{"/dub-media/", "tempo_candidate", "playback_duration_ms"} {
+	for _, marker := range []string{
+		"/dub-media/", "tempo_candidate", "playback_duration_ms",
+		"/review/accept-candidate", "submitTempoAcceptance",
+	} {
 		if !strings.Contains(string(app), marker) {
 			t.Fatalf("tempo audition UI behavior missing %q", marker)
+		}
+	}
+	// The panel is evidence that now names its own way out: the pre-#157 copy that deferred the
+	// decision to a future ticket must not survive next to a working control.
+	for _, stale := range []string{"ticket kế tiếp", "thuộc ticket"} {
+		if strings.Contains(string(app), stale) {
+			t.Fatalf("tempo acceptance copy still defers the decision to another ticket: %q", stale)
 		}
 	}
 }

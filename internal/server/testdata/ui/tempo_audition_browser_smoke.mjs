@@ -1,14 +1,17 @@
-// Real-browser acceptance smoke for the Issue #156 review-only tempo audition surface.
+// Real-browser acceptance smoke for the Issue #156 audition surface and the Issue #157 explicit
+// acceptance it now leads to.
 //
 // The Node VM harness (app_behavior.mjs) runs app.js against a stubbed DOM and the seam-1 Go
 // test streams the candidate over HTTP, so neither covers what the operator actually gets: a
-// real client resolving the two run-scoped media URLs the panel builds, decoding and playing
-// both waveforms, and showing no way to select the alternative. This script drives a real
-// Chromium-family browser over CDP against a live RuntimeHost and walks that path:
+// real client resolving the two run-scoped media URLs the panel builds, decoding and playing both
+// waveforms, and accepting the exact candidate through the panel's own control. This script drives
+// a real Chromium-family browser over CDP against a live RuntimeHost and walks that path:
 //
 //   select run → open exceptions → select the tempo review item → the panel binds the retained
 //   natural waveform and one eligible alternative → both decode, play and hash to the exact
-//   candidate artifacts → nothing in the surface selects or approves the alternative
+//   candidate artifacts → an acceptance without an audit reason or without the quality waiver is
+//   refused and leaves the item pending → the complete, waived acceptance releases that exact
+//   waveform and the item leaves the queue
 //
 // Usage: node tempo_audition_browser_smoke.mjs <operator-ui-url> <run-id> <review-item-id> <natural-sha256> <transformed-sha256>
 // Exit codes: 0 = pass, 1 = failure, 3 = no Chromium-family browser available (caller skips).
@@ -124,17 +127,23 @@ try {
   check("the panel binds the one eligible tempo alternative", bound.transformedSrc === expectedTransformed, bound.transformedSrc);
   check("both audition waveforms are visible to the operator", bound.visible, JSON.stringify(bound));
 
-  // 4. The surface must stay review-only: the alternative is audible, never choosable.
+  // 4. The surface must audit two waveforms and offer exactly one way out: the operator's explicit
+  // acceptance. Nothing else in the panel may select, approve or publish the alternative.
   const surface = await evaluate(`(() => {
     const rows = [...document.querySelectorAll("#inspect-tempo-meta div")].map((node) => [
       node.querySelector("dt")?.textContent ?? "",
       node.querySelector("dd")?.textContent ?? "",
     ]);
+    const byID = (id) => document.querySelector(id);
     return {
       meta: Object.fromEntries(rows),
-      pill: (document.querySelector("#inspect-tempo-selectable")?.textContent || "").trim(),
-      note: document.querySelector("#inspect-tempo-note")?.textContent || "",
-      controls: document.querySelectorAll("#inspect-tempo button, #inspect-tempo input, #inspect-tempo select, #inspect-tempo form").length,
+      pill: (byID("#inspect-tempo-selectable")?.textContent || "").trim(),
+      note: byID("#inspect-tempo-note")?.textContent || "",
+      acceptButtons: ["inspect-tempo-accept-transformed", "inspect-tempo-accept-natural"]
+        .map((id) => (byID("#" + id) ? id : "")),
+      transformedDisabled: byID("#inspect-tempo-accept-transformed")?.disabled ?? null,
+      reasonPresent: !!byID("#inspect-tempo-reason"),
+      waiverPresent: !!byID("#inspect-tempo-waiver"),
       selectionMarks: document.querySelectorAll("[data-tempo-select], [data-tempo-approve], [data-tempo-selected], #inspect-tempo .is-selected").length,
       itemStatus: document.querySelector(${JSON.stringify(`${itemSelector} small`)})?.textContent || "",
     };
@@ -145,12 +154,22 @@ try {
   check("the panel reports the measured tempo factor", /^1\.\d{4}$/.test(String(surface.meta.Factor || "")), String(surface.meta.Factor));
   check("the candidate is announced as in-window", surface.pill === "trong cửa sổ phát", surface.pill);
   check(
-    "the surface states the alternative is unselected and approval is the next ticket",
-    surface.note.includes("chưa được chọn") && surface.note.includes("ticket kế tiếp"),
+    "the surface states the alternative is unselected and names its own acceptance",
+    surface.note.includes("chưa được chọn") && !surface.note.includes("ticket kế tiếp"),
     surface.note,
   );
-  check("the panel offers no control that selects, approves or publishes the alternative", surface.controls === 0, String(surface.controls));
-  check("no audition element marks the candidate as selected", surface.selectionMarks === 0, String(surface.selectionMarks));
+  check(
+    "the panel offers the explicit acceptance control for both auditioned waveforms",
+    surface.acceptButtons[0] === "inspect-tempo-accept-transformed" && surface.acceptButtons[1] === "inspect-tempo-accept-natural",
+    JSON.stringify(surface.acceptButtons),
+  );
+  check(
+    "the acceptance form carries an audit reason and the explicit quality waiver",
+    surface.reasonPresent && surface.waiverPresent,
+    JSON.stringify({ reason: surface.reasonPresent, waiver: surface.waiverPresent }),
+  );
+  check("an in-window candidate is offerable for acceptance", surface.transformedDisabled === false, String(surface.transformedDisabled));
+  check("no audition element marks the candidate as selected before acceptance", surface.selectionMarks === 0, String(surface.selectionMarks));
   check("the review item stays pending while it is auditioned", surface.itemStatus.includes("pending"), surface.itemStatus);
 
   // 5. The served bytes must be the candidate's exact artifacts, not a re-synthesis.
@@ -233,6 +252,40 @@ try {
     naturalPlayed > 0.1 && transformedPlayed > 0.1,
     `natural=${naturalPlayed}s transformed=${transformedPlayed}s`,
   );
+
+  // 7. The acceptance belongs to the operator, and it is refused until it is explicit: a missing
+  // audit reason and a missing quality waiver both leave the item pending, and only the complete,
+  // waived selection releases the exact waveform the panel auditioned.
+  const clickAccept = async (selector) => {
+    await clickElement(selector);
+    await sleep(200);
+    return evaluate(`document.querySelector("#inspect-tempo-status")?.textContent || ""`);
+  };
+  const itemStillQueued = async () =>
+    (await evaluate(`document.querySelector(${JSON.stringify(itemSelector)}) !== null`)) === true;
+
+  const noReason = await clickAccept("#inspect-tempo-accept-transformed");
+  check("acceptance without an audit reason is refused in the panel", noReason.includes("lý do"), noReason);
+  check("a refused acceptance leaves the review item pending", await itemStillQueued(), "the item left the queue");
+
+  await evaluate(
+    `(() => { const r = document.querySelector("#inspect-tempo-reason"); r.value = "đã nghe và chấp nhận bản tempo"; return r.value; })()`,
+  );
+  const noWaiver = await clickAccept("#inspect-tempo-accept-transformed");
+  check("a transformed acceptance without the quality waiver is refused", noWaiver.includes("manual_override"), noWaiver);
+  check("a refused acceptance leaves the review item pending", await itemStillQueued(), "the item left the queue");
+
+  await evaluate(`(() => { const w = document.querySelector("#inspect-tempo-waiver"); w.checked = true; return w.checked; })()`);
+  await clickElement("#inspect-tempo-accept-transformed");
+  const resolved = await waitFor("the accepted review item to leave the queue", async () =>
+    (await evaluate(`document.querySelector(${JSON.stringify(itemSelector)}) === null`)) || null,
+  );
+  check("the accepted candidate leaves the review queue", resolved === true, String(resolved));
+  const afterAccept = await evaluate(`JSON.stringify({
+    panelHidden: document.querySelector("#inspect-tempo")?.classList.contains("hidden") ?? null,
+    toast: document.querySelector("#toast-region")?.textContent || "",
+  })`);
+  check("the panel reports the acceptance to the operator", String(afterAccept).includes("Đã chấp nhận candidate"), afterAccept);
 
   await sleep(300);
   check("the audition flow produces no console errors", consoleErrors.length === 0, consoleErrors.join(" | "));

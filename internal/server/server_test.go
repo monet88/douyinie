@@ -1379,6 +1379,119 @@ func TestCompleteRunSafely_UpdateJobStatusFailureSurfacesError(t *testing.T) {
 	}
 }
 
+// A failed terminal transition must roll the already-written job status back and surface the
+// failure as the recoverable transition class, so the run is marked interrupted instead of being
+// left reporting completion with its job finished. The pipeline and the accepted reviewed-candidate
+// rebuild share this transition (#157), so the rollback has to hold for both callers.
+func TestCompleteRunSafely_QueueTransitionFailureRollsJobBack(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "queue_transition_failure_test.db")
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Now().UTC()
+	ra := domain.RightsAttestation{
+		ID:              "att-qfail",
+		AttestationType: "OPERATOR_CONFIRMED",
+		DeclaredBy:      "operator",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	}
+	if err := db.CreateRightsAttestation(ctx, ra); err != nil {
+		t.Fatalf("create rights attestation: %v", err)
+	}
+	asset := domain.SourceAsset{
+		ID:                  "asset-qfail",
+		SHA256:              strings.Repeat("5", 64),
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		OriginalFilename:    "dummy.mp4",
+		RightsAttestationID: ra.ID,
+		CASPath:             "dummy.mp4",
+		CreatedAt:           now,
+	}
+	if err := db.CreateSourceAsset(ctx, asset); err != nil {
+		t.Fatalf("save asset: %v", err)
+	}
+
+	job := domain.LocalizationJob{
+		ID:             "job-qfail",
+		SourceAssetID:  asset.ID,
+		TargetLanguage: domain.TargetLanguageVI,
+		Status:         "pending",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := db.CreateJob(ctx, job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	run := domain.LocalizationRun{
+		ID:                 "run-qfail",
+		JobID:              job.ID,
+		Status:             domain.RunStatusRunning,
+		ConfigSnapshotJSON: `{"posture":"auto"}`,
+		CreatedAt:          now,
+	}
+	if err := db.CreateRun(ctx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	qSvc := queue.NewService(db)
+	if _, err := qSvc.Enqueue(ctx, run.ID, job.ID); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := qSvc.MarkRunning(ctx, run.ID); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+
+	// Fail only the completion transition itself. The job write happens first and succeeds, so the
+	// rollback is what has to undo it; the later interrupted transition (the run's failure marking)
+	// still has to go through.
+	rawDB, err := sql.Open("sqlite", fmt.Sprintf("%s?_pragma=busy_timeout(5000)", dbPath))
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer rawDB.Close()
+	_, err = rawDB.ExecContext(ctx, `CREATE TRIGGER fail_completion_transition BEFORE UPDATE ON queue_entries
+		WHEN NEW.status = 'completed'
+		BEGIN SELECT RAISE(ABORT, 'injected completion transition failure'); END;`)
+	if err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+
+	s := New(Config{Addr: "127.0.0.1:0", DB: db, QueueSvc: qSvc})
+	err = s.completeRunSafely(ctx, run.ID)
+	if err == nil {
+		t.Fatal("expected completeRunSafely to fail when the completion transition fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "injected completion transition failure") {
+		t.Errorf("expected the error to name the failed transition, got: %v", err)
+	}
+	if !errors.Is(err, service.ErrRunCompletionTransition) {
+		t.Errorf("expected the failure to stay in the recoverable transition class, got: %v", err)
+	}
+
+	got, err := db.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if got.Status != "pending" {
+		t.Errorf("the job completed before the failed transition must be rolled back to pending, got %s", got.Status)
+	}
+	entry, err := db.GetQueueEntryByRunID(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("get queue entry: %v", err)
+	}
+	if entry.Status != domain.RunStatusInterrupted {
+		t.Errorf("a run whose completion failed must be interrupted, got %s", entry.Status)
+	}
+}
+
 func TestOperatorUIRuntimeLifecycleAndPostureContracts(t *testing.T) {
 	t.Parallel()
 

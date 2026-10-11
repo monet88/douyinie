@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1269,5 +1270,408 @@ func TestStorage_MigrationV19_AudioRolePlanArtifactsIndex(t *testing.T) {
 	}
 	if idxAsset.ID != planID || idxAsset.ProvenanceHash != provHash {
 		t.Errorf("idxAsset mismatch: %+v", idxAsset)
+	}
+}
+
+// TestCompleteQueueEntryIfActiveGuardsTheTransition pins the atomic completion write (Issue #157):
+// the status test and the writes are one transaction, so a run that a cancellation, a crash
+// recovery or a park checker moved out of the active state cannot be overwritten into "completed"
+// by a completion that only prechecked the status.
+func TestCompleteQueueEntryIfActiveGuardsTheTransition(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "complete_if_active.db"))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	cases := []struct {
+		name        string
+		status      string
+		allowParked bool
+		wantApplied bool
+	}{
+		{"a running run is completed", domain.RunStatusRunning, false, true},
+		{"a parked run is completed for the acceptance that resolves it", domain.RunStatusPaused, true, true},
+		{"a parked run is refused for the pipeline", domain.RunStatusPaused, false, false},
+		{"a cancelled run is never overwritten", domain.RunStatusCancelled, true, false},
+		{"an interrupted run is never overwritten", domain.RunStatusInterrupted, true, false},
+		{"a never-started run is refused", domain.RunStatusQueued, true, false},
+	}
+
+	for _, tc := range cases {
+		runID := seedTransitionRun(t, ctx, db, strings.ReplaceAll(tc.name, " ", "-"), tc.status)
+		applied, err := db.CompleteQueueEntryIfActive(ctx, runID, tc.allowParked)
+		if err != nil {
+			t.Fatalf("%s: CompleteQueueEntryIfActive failed: %v", tc.name, err)
+		}
+		if applied != tc.wantApplied {
+			t.Fatalf("%s: applied = %v, want %v", tc.name, applied, tc.wantApplied)
+		}
+		wantStatus := tc.status
+		if tc.wantApplied {
+			wantStatus = domain.RunStatusCompleted
+		}
+		entry, err := db.GetQueueEntryByRunID(ctx, runID)
+		if err != nil {
+			t.Fatalf("%s: GetQueueEntryByRunID failed: %v", tc.name, err)
+		}
+		if entry.Status != wantStatus {
+			t.Errorf("%s: queue status = %s, want %s", tc.name, entry.Status, wantStatus)
+		}
+		run, err := db.GetRun(ctx, runID)
+		if err != nil {
+			t.Fatalf("%s: GetRun failed: %v", tc.name, err)
+		}
+		if run.Status != wantStatus {
+			t.Errorf("%s: run status = %s, want %s", tc.name, run.Status, wantStatus)
+		}
+		// An active entry keeps its position: the refused write must not have released it.
+		if tc.status == domain.RunStatusRunning || tc.status == domain.RunStatusPaused {
+			if tc.wantApplied && entry.Position != 0 {
+				t.Errorf("%s: a completed entry must release its position, got %d", tc.name, entry.Position)
+			}
+			if !tc.wantApplied && entry.Position == 0 {
+				t.Errorf("%s: a refused completion must leave the active position in place", tc.name)
+			}
+		}
+	}
+
+	// The two halves of the guard are independent: a queue entry that already stopped while its run
+	// row still claims to be active is refused by the queue-entry guard alone, and that refusal must
+	// not write the run row either.
+	divergentRun := seedTransitionRun(t, ctx, db, "divergent-queue", domain.RunStatusCancelled)
+	if _, err := db.db.ExecContext(ctx, `UPDATE localization_runs SET status = ? WHERE id = ?`,
+		domain.RunStatusRunning, divergentRun); err != nil {
+		t.Fatalf("restore the divergent run row: %v", err)
+	}
+	applied, err := db.CompleteQueueEntryIfActive(ctx, divergentRun, true)
+	if err != nil {
+		t.Fatalf("divergent queue entry: CompleteQueueEntryIfActive failed: %v", err)
+	}
+	if applied {
+		t.Error("a queue entry that already stopped must refuse the completion on its own")
+	}
+	if run, err := db.GetRun(ctx, divergentRun); err != nil {
+		t.Fatalf("divergent queue entry: GetRun failed: %v", err)
+	} else if run.Status != domain.RunStatusRunning {
+		t.Errorf("a refused completion must not write the run row either, got %s", run.Status)
+	}
+
+	// The inverse divergence: an entry that still looks active while the run row already holds a
+	// terminal status. The entry half of the guard admits the completion here, so the run row is what
+	// must refuse it - and the refusal must not complete the still-active entry either.
+	inverseRun := seedTransitionRun(t, ctx, db, "divergent-run", domain.RunStatusRunning)
+	if _, err := db.db.ExecContext(ctx, `UPDATE localization_runs SET status = ? WHERE id = ?`,
+		domain.RunStatusCancelled, inverseRun); err != nil {
+		t.Fatalf("stop the run row only: %v", err)
+	}
+	applied, err = db.CompleteQueueEntryIfActive(ctx, inverseRun, true)
+	if err != nil {
+		t.Fatalf("inverse divergence: CompleteQueueEntryIfActive failed: %v", err)
+	}
+	if applied {
+		t.Error("a run row that already stopped must refuse the completion on its own")
+	}
+	if entry, err := db.GetQueueEntryByRunID(ctx, inverseRun); err != nil {
+		t.Fatalf("inverse divergence: GetQueueEntryByRunID failed: %v", err)
+	} else if entry.Status != domain.RunStatusRunning {
+		t.Errorf("a refused completion must not complete the active queue entry, got %s", entry.Status)
+	}
+	if run, err := db.GetRun(ctx, inverseRun); err != nil {
+		t.Fatalf("inverse divergence: GetRun failed: %v", err)
+	} else if run.Status != domain.RunStatusCancelled {
+		t.Errorf("a refused completion must not overwrite the terminal run row, got %s", run.Status)
+	}
+}
+
+// seedTransitionRun creates one rights-attested job, run and queue entry in the given status, for
+// the tests that pin the lifecycle transitions' guards.
+func seedTransitionRun(t *testing.T, ctx context.Context, db *DB, name, status string) string {
+	t.Helper()
+	now := time.Now().UTC()
+	assetID, jobID, runID, attestationID := "asset-"+name, "job-"+name, "run-"+name, "att-"+name
+	if err := db.CreateRightsAttestation(ctx, domain.RightsAttestation{
+		ID:              attestationID,
+		AttestationType: "OPERATOR_CONFIRMED",
+		DeclaredBy:      "operator",
+		TermsAccepted:   true,
+		ConfirmedAt:     now,
+	}); err != nil {
+		t.Fatalf("%s: CreateRightsAttestation failed: %v", name, err)
+	}
+	if err := db.CreateSourceAsset(ctx, domain.SourceAsset{
+		ID:                  assetID,
+		SHA256:              name + strings.Repeat("a", 64-len(name)),
+		ByteSize:            1024,
+		MimeType:            "video/mp4",
+		OriginalFilename:    name + ".mp4",
+		RightsAttestationID: attestationID,
+		CASPath:             name + ".mp4",
+		CreatedAt:           now,
+	}); err != nil {
+		t.Fatalf("%s: CreateSourceAsset failed: %v", name, err)
+	}
+	if err := db.CreateJob(ctx, domain.LocalizationJob{
+		ID:             jobID,
+		SourceAssetID:  assetID,
+		TargetLanguage: domain.TargetLanguageVI,
+		Status:         "processing",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("%s: CreateJob failed: %v", name, err)
+	}
+	if err := db.CreateRun(ctx, domain.LocalizationRun{
+		ID:                 runID,
+		JobID:              jobID,
+		Status:             status,
+		ConfigSnapshotJSON: `{"posture":"auto"}`,
+		CreatedAt:          now,
+	}); err != nil {
+		t.Fatalf("%s: CreateRun failed: %v", name, err)
+	}
+	if _, err := db.CreateQueueEntry(ctx, domain.QueueEntry{
+		ID:         "qe-" + name,
+		RunID:      runID,
+		JobID:      jobID,
+		Status:     status,
+		InsertedAt: now,
+		UpdatedAt:  now,
+	}); err != nil {
+		t.Fatalf("%s: CreateQueueEntry failed: %v", name, err)
+	}
+	return runID
+}
+
+// TestCancelQueueEntryIfNonTerminalGuardsTheTransition pins the cancellation side of the atomic
+// transition (Issue #157): the status test and the writes are one transaction, so a run that a
+// completion already released (or that a crash recovery already interrupted the entry of) cannot be
+// overwritten into "cancelled" by a cancellation that only prechecked the status. The terminal
+// result belongs to whoever claimed it first, and a refused cancellation writes neither row.
+func TestCancelQueueEntryIfNonTerminalGuardsTheTransition(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "cancel_if_non_terminal.db"))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	cases := []struct {
+		name    string
+		status  string
+		setup   func(runID string)
+		want    string
+		applied bool
+	}{
+		{"cancelling a running run applies", domain.RunStatusRunning, nil, domain.RunStatusCancelled, true},
+		{"cancelling a paused run applies", domain.RunStatusPaused, nil, domain.RunStatusCancelled, true},
+		{"abandoning an interrupted run stays possible", domain.RunStatusInterrupted, nil, domain.RunStatusCancelled, true},
+		{"cancelling a queued run applies", domain.RunStatusQueued, nil, domain.RunStatusCancelled, true},
+		{"a completed run is never overwritten", domain.RunStatusRunning, func(runID string) {
+			if applied, err := db.CompleteQueueEntryIfActive(ctx, runID, false); err != nil || !applied {
+				t.Fatalf("seed completion: applied=%v err=%v", applied, err)
+			}
+		}, domain.RunStatusCompleted, false},
+		{"a cancelled run is not cancelled twice", domain.RunStatusRunning, func(runID string) {
+			if applied, err := db.CancelQueueEntryIfNonTerminal(ctx, runID); err != nil || !applied {
+				t.Fatalf("seed cancellation: applied=%v err=%v", applied, err)
+			}
+		}, domain.RunStatusCancelled, false},
+	}
+
+	for _, tc := range cases {
+		runID := seedTransitionRun(t, ctx, db, strings.ReplaceAll(tc.name, " ", "-"), tc.status)
+		if tc.setup != nil {
+			tc.setup(runID)
+		}
+		if tc.status == domain.RunStatusRunning {
+			if err := db.CreateStageExecution(ctx, domain.StageExecution{
+				ID: "se-" + runID, RunID: runID, Stage: "render", Status: domain.StageStatusRunning,
+				CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+			}); err != nil {
+				t.Fatalf("%s: CreateStageExecution failed: %v", tc.name, err)
+			}
+		}
+
+		applied, err := db.CancelQueueEntryIfNonTerminal(ctx, runID)
+		if err != nil {
+			t.Fatalf("%s: CancelQueueEntryIfNonTerminal failed: %v", tc.name, err)
+		}
+		if applied != tc.applied {
+			t.Fatalf("%s: applied = %v, want %v", tc.name, applied, tc.applied)
+		}
+		entry, err := db.GetQueueEntryByRunID(ctx, runID)
+		if err != nil {
+			t.Fatalf("%s: GetQueueEntryByRunID failed: %v", tc.name, err)
+		}
+		if entry.Status != tc.want {
+			t.Errorf("%s: queue status = %s, want %s", tc.name, entry.Status, tc.want)
+		}
+		run, err := db.GetRun(ctx, runID)
+		if err != nil {
+			t.Fatalf("%s: GetRun failed: %v", tc.name, err)
+		}
+		if run.Status != tc.want {
+			t.Errorf("%s: run status = %s, want %s", tc.name, run.Status, tc.want)
+		}
+		// An entry the transition never touched keeps its position: a refusal must leave the queue's
+		// 1..N position space as it found it.
+		if tc.setup == nil && tc.status != domain.RunStatusQueued {
+			if tc.applied && entry.Position != 0 {
+				t.Errorf("%s: a cancelled entry must release its position, got %d", tc.name, entry.Position)
+			}
+		}
+		// The run and its stages always agree: a landed cancellation terminalizes in-flight stages,
+		// and a refused one leaves them as they were.
+		if tc.status == domain.RunStatusRunning {
+			stages, err := db.ListStageExecutions(ctx, runID)
+			if err != nil {
+				t.Fatalf("%s: ListStageExecutions failed: %v", tc.name, err)
+			}
+			wantStage := domain.StageStatusRunning
+			if tc.applied {
+				wantStage = domain.StageStatusInterrupted
+			}
+			if len(stages) != 1 || stages[0].Status != wantStage {
+				t.Errorf("%s: stage status = %+v, want %s", tc.name, stages, wantStage)
+			}
+		}
+	}
+
+	// The one-winner case in the order the race produces it: the completion commits first, then the
+	// cancellation that read the entry while it was still running arrives. The completion's zone - its
+	// status, its timestamp and its released position - must survive the late cancellation.
+	runID := seedTransitionRun(t, ctx, db, "one-winner", domain.RunStatusRunning)
+	if applied, err := db.CompleteQueueEntryIfActive(ctx, runID, false); err != nil || !applied {
+		t.Fatalf("the completion must win the run it claimed: applied=%v err=%v", applied, err)
+	}
+	completed, err := db.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun failed: %v", err)
+	}
+	if completed.CompletedAt == nil {
+		t.Fatal("a completed run must carry its completion timestamp")
+	}
+	applied, err := db.CancelQueueEntryIfNonTerminal(ctx, runID)
+	if err != nil {
+		t.Fatalf("CancelQueueEntryIfNonTerminal failed: %v", err)
+	}
+	if applied {
+		t.Error("a cancellation that arrives after the completion must be refused, not overwrite it")
+	}
+	after, err := db.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun failed: %v", err)
+	}
+	if after.Status != domain.RunStatusCompleted {
+		t.Errorf("the completed run must keep its terminal status, got %s", after.Status)
+	}
+	if after.CompletedAt == nil || !after.CompletedAt.Equal(*completed.CompletedAt) {
+		t.Errorf("the refused cancellation must not touch the completion timestamp: %v -> %v", completed.CompletedAt, after.CompletedAt)
+	}
+
+	// The inverse divergence for the cancellation: the entry still looks active (its half of the guard
+	// admits the cancellation) while the run row is already terminal, so the run half is what must
+	// refuse it - without releasing the active entry's position or touching the run row.
+	inverseRun := seedTransitionRun(t, ctx, db, "cancel-divergent-run", domain.RunStatusRunning)
+	if _, err := db.db.ExecContext(ctx, `UPDATE localization_runs SET status = ? WHERE id = ?`,
+		domain.RunStatusCompleted, inverseRun); err != nil {
+		t.Fatalf("complete the run row only: %v", err)
+	}
+	applied, err = db.CancelQueueEntryIfNonTerminal(ctx, inverseRun)
+	if err != nil {
+		t.Fatalf("CancelQueueEntryIfNonTerminal failed: %v", err)
+	}
+	if applied {
+		t.Error("a run row that already finished must refuse the cancellation on its own")
+	}
+	if entry, err := db.GetQueueEntryByRunID(ctx, inverseRun); err != nil {
+		t.Fatalf("GetQueueEntryByRunID failed: %v", err)
+	} else {
+		if entry.Status != domain.RunStatusRunning {
+			t.Errorf("a refused cancellation must not cancel the active queue entry, got %s", entry.Status)
+		}
+		if entry.Position == 0 {
+			t.Error("a refused cancellation must leave the active position in place")
+		}
+	}
+	if run, err := db.GetRun(ctx, inverseRun); err != nil {
+		t.Fatalf("GetRun failed: %v", err)
+	} else if run.Status != domain.RunStatusCompleted {
+		t.Errorf("a refused cancellation must not overwrite the finished run row, got %s", run.Status)
+	}
+}
+
+// TestResumeQueueEntryIfResumableRefusesACancelledRun pins the sibling race of the same transition:
+// a resume that prechecked a paused entry cannot put a run back in the queue after a cancellation
+// claimed it, so an abandoned run is never resurrected for execution.
+func TestResumeQueueEntryIfResumableRefusesACancelledRun(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(filepath.Join(t.TempDir(), "resume_if_resumable.db"))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	cases := []struct {
+		name        string
+		status      string
+		wantApplied bool
+	}{
+		{"a paused run is resumed", domain.RunStatusPaused, true},
+		{"an interrupted run is resumed", domain.RunStatusInterrupted, true},
+		{"a cancelled run is not resurrected", domain.RunStatusCancelled, false},
+		{"a completed run is not resurrected", domain.RunStatusCompleted, false},
+		{"a running run is not resumed", domain.RunStatusRunning, false},
+		{"a queued run is not resumed", domain.RunStatusQueued, false},
+	}
+	for _, tc := range cases {
+		runID := seedTransitionRun(t, ctx, db, strings.ReplaceAll(tc.name, " ", "-"), tc.status)
+		applied, err := db.ResumeQueueEntryIfResumable(ctx, runID)
+		if err != nil {
+			t.Fatalf("%s: ResumeQueueEntryIfResumable failed: %v", tc.name, err)
+		}
+		if applied != tc.wantApplied {
+			t.Fatalf("%s: applied = %v, want %v", tc.name, applied, tc.wantApplied)
+		}
+		wantStatus := tc.status
+		if tc.wantApplied {
+			wantStatus = domain.RunStatusQueued
+		}
+		if entry, err := db.GetQueueEntryByRunID(ctx, runID); err != nil {
+			t.Fatalf("%s: GetQueueEntryByRunID failed: %v", tc.name, err)
+		} else if entry.Status != wantStatus {
+			t.Errorf("%s: queue status = %s, want %s", tc.name, entry.Status, wantStatus)
+		}
+		if run, err := db.GetRun(ctx, runID); err != nil {
+			t.Fatalf("%s: GetRun failed: %v", tc.name, err)
+		} else if run.Status != wantStatus {
+			t.Errorf("%s: run status = %s, want %s", tc.name, run.Status, wantStatus)
+		}
+	}
+
+	// The cancellation commits first; the resume that prechecked the paused entry is refused and the
+	// run stays abandoned with no position of its own.
+	runID := seedTransitionRun(t, ctx, db, "resume-one-winner", domain.RunStatusPaused)
+	if applied, err := db.CancelQueueEntryIfNonTerminal(ctx, runID); err != nil || !applied {
+		t.Fatalf("the cancellation must win the run it claimed: applied=%v err=%v", applied, err)
+	}
+	applied, err := db.ResumeQueueEntryIfResumable(ctx, runID)
+	if err != nil {
+		t.Fatalf("ResumeQueueEntryIfResumable failed: %v", err)
+	}
+	if applied {
+		t.Error("a resume that arrives after the cancellation must be refused, not resurrect the run")
+	}
+	if entry, err := db.GetQueueEntryByRunID(ctx, runID); err != nil {
+		t.Fatalf("GetQueueEntryByRunID failed: %v", err)
+	} else if entry.Status != domain.RunStatusCancelled {
+		t.Errorf("the cancelled run must stay cancelled, got %s", entry.Status)
+	}
+	if entry, err := db.GetQueueEntryByRunID(ctx, runID); err != nil {
+		t.Fatalf("GetQueueEntryByRunID failed: %v", err)
+	} else if entry.Position != 0 {
+		t.Errorf("the refused resume must not claim a position, got %d", entry.Position)
 	}
 }

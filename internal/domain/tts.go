@@ -54,7 +54,12 @@ const (
 	// may carry one atempo alternative derived from its own retained waveform, with a
 	// distinct transformed hash, factor and re-probed durations. A pre-#156 variant has no
 	// such evidence and must not be replayed as if the tempo slice had run for it.
-	DubSegmentsSchemaVersion = 6
+	// Version 7 adds the operator's exact reviewed-candidate acceptance (#157): a successor
+	// variant records, per accepted review unit, the exact override and candidate hashes that
+	// were selected, with the promoted unit moved out of ReviewSegments into Segments. A
+	// pre-#157 variant carries no acceptance evidence and must not be replayed as if a
+	// reviewed candidate had been selected for it.
+	DubSegmentsSchemaVersion = 7
 )
 
 // VoiceProfile represents a preset or cloned voice configuration.
@@ -242,6 +247,11 @@ type TTSCandidate struct {
 
 // DubSegment is the selected audio candidate for a speech segment.
 // It covers 1..N same-speaker SpeechBlocks and is strictly fit-gated against its accepted playback window.
+//
+// AudioCASPath is a legacy local path: the variant committed to CAS is written without one, because its
+// own hash is the content identity that travels in bundles and a machine-local path would make that
+// identity host-specific. Readers resolve AudioSHA256 through CAS - the mixer verifies the bytes it read
+// against it. Responses that project a variant for playback still carry the path this host resolved.
 type DubSegment struct {
 	Index              int          `json:"index"`
 	SpeechBlockIndices []int        `json:"speech_block_indices,omitempty"`
@@ -329,7 +339,8 @@ const (
 	TempoReasonCancelled = "TEMPO_CANCELLED"
 )
 
-// DubSegmentReview records an unselected candidate or segment flagged for operator review.
+// DubSegmentReview records an unselected candidate or segment flagged for operator review. Its
+// AudioCASPath is a legacy local path with the same rule as DubSegment: new review units carry the hash.
 type DubSegmentReview struct {
 	Index              int          `json:"index"`
 	SpeechBlockIndices []int        `json:"speech_block_indices,omitempty"`
@@ -436,6 +447,55 @@ func DefaultFitControllerConfig() FitControllerConfig {
 	}
 }
 
+// AcceptedReviewCandidate is the immutable acceptance evidence of one operator selection
+// (Issue #157): the exact unresolved review unit that was accepted, the waveform that was
+// selected for it, and the append-only ReviewOverride that records the decision. It is
+// appended to the successor DubSegmentsVariant only - the artifact family it extends - and
+// never rewrites the original waveform, the QualityResult, the ProviderAttempt rows or the
+// source anchors the accepted unit already carried.
+//
+// It is structure-only evidence apart from the decision itself: it carries the operator and reason the
+// acceptance recorded, and nothing else free-form, no machine-local path and no credential value. An
+// acceptance claims its successor before it writes the audit row, so those two fields are what let an
+// interrupted acceptance republish that row instead of losing the decision; the audit narrative itself
+// stays in the ReviewOverride row.
+type AcceptedReviewCandidate struct {
+	// ReviewItemID is the projected review item this acceptance resolved, and the identity a
+	// repeated identical acceptance is deduplicated against.
+	ReviewItemID string `json:"review_item_id"`
+	// ReviewOverrideID is the append-only ReviewOverride row recording this decision.
+	ReviewOverrideID string `json:"review_override_id"`
+	// ReviewSegmentIndex is the fit unit index the accepted candidate belonged to. The unit is
+	// promoted out of ReviewSegments into Segments by this acceptance, keeping the canonical
+	// membership and anchors it already carried.
+	ReviewSegmentIndex int    `json:"review_segment_index"`
+	SpeakerID          string `json:"speaker_id"`
+	// NaturalAudioSHA256 is the retained natural waveform (the review unit's own candidate).
+	// It stays the immutable parent of this acceptance and is never overwritten.
+	NaturalAudioSHA256 string `json:"natural_audio_sha256"`
+	// SelectedAudioSHA256 is the waveform actually selected: the natural parent itself, or the
+	// transformed tempo candidate.
+	SelectedAudioSHA256 string `json:"selected_audio_sha256"`
+	// Transformed reports that the accepted waveform is the atempo output, which is the only
+	// case that requires an explicit operator quality waiver.
+	Transformed bool `json:"transformed"`
+	// TempoFactor, TempoFilter and TempoToolID carry the transformation lineage of the
+	// selected waveform (empty for a natural parent selection).
+	TempoFactor float64 `json:"tempo_factor,omitempty"`
+	TempoFilter string  `json:"tempo_filter,omitempty"`
+	TempoToolID string  `json:"tempo_tool_id,omitempty"`
+	// QualityWaiver reports that the operator explicitly waived the transformed-audio quality
+	// concern (manual_override). It is never set for an automatic acceptance.
+	QualityWaiver bool `json:"quality_waiver"`
+	// Operator and Reason are the decision the operator recorded with this acceptance. An acceptance
+	// claims its successor before it writes the audit row, so a run interrupted in between republishes
+	// that row from this evidence: carrying the decision here is what lets the repair state who
+	// accepted the waveform and why rather than attributing it to a default actor with no reason.
+	Operator   string    `json:"operator,omitempty"`
+	Reason     string    `json:"reason,omitempty"`
+	AcceptedAt time.Time `json:"accepted_at"`
+}
+
 // DubSegmentsVariant is the immutable target-language dubbing artifact containing all selected DubSegments.
 type DubSegmentsVariant struct {
 	ID                    string               `json:"id"`
@@ -459,11 +519,29 @@ type DubSegmentsVariant struct {
 	// FixedRateSpeakers lists the speakers whose candidates were produced by a lane
 	// that fails closed on any non-1.0 speed request, i.e. lanes whose overrun cannot
 	// be remediated by resynthesis and may therefore be escalated (Issue #94).
-	FixedRateSpeakers []string  `json:"fixed_rate_speakers,omitempty"`
-	CASHash           string    `json:"cas_hash,omitempty"`
-	ProvenanceHash    string    `json:"provenance_hash,omitempty"`
-	OverallStatus     string    `json:"overall_status"` // "PASS", "REVIEW_REQUIRED", "FAIL"
-	CreatedAt         time.Time `json:"created_at"`
+	FixedRateSpeakers []string `json:"fixed_rate_speakers,omitempty"`
+	// AcceptedCandidates records the operator acceptances that promoted unresolved review
+	// units into selected segments (Issue #157). Append-only: an acceptance is evidence about
+	// an exact review unit and waveform pair and is never rewritten by a later one.
+	AcceptedCandidates []AcceptedReviewCandidate `json:"accepted_candidates,omitempty"`
+	CASHash            string                    `json:"cas_hash,omitempty"`
+	ProvenanceHash     string                    `json:"provenance_hash,omitempty"`
+	OverallStatus      string                    `json:"overall_status"` // "PASS", "REVIEW_REQUIRED", "FAIL"
+	CreatedAt          time.Time                 `json:"created_at"`
+}
+
+// AcceptedCandidateFor returns the acceptance evidence recorded for a review item, or nil when
+// this variant carries none. It is the identity a repeated acceptance is deduplicated against.
+func (v *DubSegmentsVariant) AcceptedCandidateFor(reviewItemID string) *AcceptedReviewCandidate {
+	if v == nil {
+		return nil
+	}
+	for i := range v.AcceptedCandidates {
+		if v.AcceptedCandidates[i].ReviewItemID == reviewItemID {
+			return &v.AcceptedCandidates[i]
+		}
+	}
+	return nil
 }
 
 // VoiceAssignmentInput defines input parameters for generating/freezing a VoiceAssignment.

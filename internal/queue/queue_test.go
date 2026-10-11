@@ -255,6 +255,64 @@ func TestQueue_Cancel_StatusContract(t *testing.T) {
 			assertRunLifecycleStatus(t, db, runID, status)
 		}
 	})
+
+	t.Run("a completion between the cancellation's read and its guarded write keeps the run completed", func(t *testing.T) {
+		db, qSvc, runID := newCancellableRun(t)
+
+		// Step 1: the read a cancellation's precheck performs, seeing a status that still admits it.
+		entry, err := db.GetQueueEntryByRunID(ctx, runID)
+		if err != nil {
+			t.Fatalf("read queue entry: %v", err)
+		}
+		if entry.Status != domain.RunStatusRunning {
+			t.Fatalf("the cancellation must read an active run, got %s", entry.Status)
+		}
+
+		// Step 2: the completion commits between that read and the write. This ordering is the race
+		// the precheck cannot see: it decided on a status the completion then replaced.
+		if applied, err := db.CompleteQueueEntryIfActive(ctx, runID, false); err != nil || !applied {
+			t.Fatalf("complete run between the read and the write: applied=%v err=%v", applied, err)
+		}
+
+		// Step 3: the write the cancellation issues next is refused by the state itself - the
+		// precheck is not what protects the completion, the guarded write is - so the completion's
+		// result stands and the loser cannot overwrite the winner.
+		if applied, err := db.CancelQueueEntryIfNonTerminal(ctx, runID); err != nil {
+			t.Fatalf("cancel after the completion: %v", err)
+		} else if applied {
+			t.Fatal("a cancellation that reaches its write after the completion must not be applied")
+		}
+		assertRunLifecycleStatus(t, db, runID, domain.RunStatusCompleted)
+
+		// A later cancellation of the finished run is refused too, so the operator sees one answer
+		// whichever half of the sequence refuses them.
+		if err := qSvc.Cancel(ctx, runID); !errors.Is(err, queue.ErrNotQueued) {
+			t.Fatalf("expected ErrNotQueued cancelling a completed run, got %v", err)
+		}
+		assertRunLifecycleStatus(t, db, runID, domain.RunStatusCompleted)
+	})
+
+	t.Run("a cancellation is refused while the run row already finished", func(t *testing.T) {
+		db, qSvc, runID := newCancellableRun(t)
+		// The run's two rows disagree - the entry still looks active while the run is finished - which
+		// is the state the cancellation's write has to decide on its own: the entry half of the guard
+		// admits it, and the run half must refuse it and roll the whole transition back rather than
+		// abandon a run that is already completed.
+		if err := db.UpdateQueueStatus(ctx, runID, domain.RunStatusPaused, domain.RunStatusCompleted); err != nil {
+			t.Fatalf("move run row to completed: %v", err)
+		}
+
+		if err := qSvc.Cancel(ctx, runID); !errors.Is(err, queue.ErrNotQueued) {
+			t.Fatalf("expected ErrNotQueued when the run row already finished, got %v", err)
+		}
+		run, err := db.GetRun(ctx, runID)
+		if err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		if run.Status != domain.RunStatusCompleted {
+			t.Fatalf("the refused cancellation must not overwrite the finished run row, got %s", run.Status)
+		}
+	})
 }
 
 // newCancellableRun seeds an isolated db with a running run and its queue entry.
